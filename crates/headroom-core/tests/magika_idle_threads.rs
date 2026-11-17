@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use headroom_core::transforms::magika_detector::{magika_detect, MagikaDetectorError};
+use headroom_core::transforms::magika_detector::magika_detect;
 
 #[cfg(target_os = "linux")]
 fn os_thread_count() -> usize {
@@ -27,31 +27,54 @@ fn os_thread_count() -> usize {
     String::from_utf8_lossy(&out.stdout).lines().count() - 1
 }
 
+/// Thread count once short-lived threads (e.g. `magika-init`) have exited.
+fn settled_thread_count() -> usize {
+    std::thread::sleep(Duration::from_millis(200));
+    os_thread_count()
+}
+
 #[test]
 fn magika_session_does_not_spawn_intra_op_pool() {
-    let before = os_thread_count();
-    match magika_detect("fn main() { println!(\"hi\"); }") {
-        Ok(_) => {}
-        // With an explicit ORT_DYLIB_PATH (as in CI) the runtime is present,
-        // so an init failure is a real session-build regression, not a skip.
-        Err(MagikaDetectorError::Init(reason))
-            if std::env::var("ORT_DYLIB_PATH").map_or(true, |v| v.trim().is_empty()) =>
-        {
-            eprintln!("skipping: magika runtime unavailable on this host: {reason}");
-            return;
-        }
-        Err(e) => panic!("magika detection failed: {e}"),
-    }
-    // Let the short-lived `magika-init` thread finish exiting.
-    std::thread::sleep(Duration::from_millis(200));
-    let after = os_thread_count();
-    // ORT and macOS may leave up to 2 idle background threads (ORT telemetry,
-    // libdispatch); neither spins. A pool adds its workers on top (7 on a
-    // 16-core Mac), but on very small hosts a 1-2 worker pool can hide inside
-    // this allowance, so a pass there is not proof of no spinning.
+    let Some(ort_dylib) = std::env::var("ORT_DYLIB_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        eprintln!("skipping: set ORT_DYLIB_PATH to an onnxruntime library to run this test");
+        return;
+    };
+    ort::init_from(&ort_dylib)
+        .expect("load ONNX Runtime from ORT_DYLIB_PATH")
+        .commit();
+
+    // Sessions also start whatever their execution provider needs. ort's
+    // default policy (MaxEfficiency, i.e. prefer NPU) picks Core ML on the
+    // Apple Neural Engine once ORT 1.31 registers Core ML as a built-in EP,
+    // adding 5-7 idle ANE threads (#4191). The control goes through the same
+    // EP selection, so measure the allowance there instead of guessing it.
+    let start = settled_thread_count();
+    let control = magika::Session::builder()
+        .with_intra_threads(1)
+        .build()
+        .expect("build pool-free control session");
+    let control_alive = settled_thread_count();
+    let allowance = control_alive.saturating_sub(start);
+    drop(control);
+
+    let before = settled_thread_count();
+    magika_detect("fn main() { println!(\"hi\"); }").expect("magika detection failed");
+    let after = settled_thread_count();
+    // The allowance also covers threads the control leaves running for good
+    // (2-4 on macOS), so on a low-core host a pool that small can still hide
+    // inside it; a pass there is not proof of no spinning.
     let extra = after.saturating_sub(before);
+    eprintln!(
+        "OS threads: start={start}, control alive={control_alive}, control dropped={before} \
+         ({} kept); magika session added {extra} (allowance {allowance})",
+        before.saturating_sub(start)
+    );
     assert!(
-        extra <= 2,
-        "magika session left {extra} extra OS thread(s) running (before={before}, after={after})"
+        extra <= allowance,
+        "magika session left {extra} extra OS thread(s) running, a pool-free session \
+         adds {allowance} (before={before}, after={after})"
     );
 }

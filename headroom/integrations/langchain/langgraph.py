@@ -313,11 +313,9 @@ def compress_tool_messages(
         tokens_after = _estimate_tokens(compressed_text)
 
         if was_modified and tokens_after < tokens_before:
-            # Create new ToolMessage with compressed content, preserving tool_call_id
-            compressed_msg = ToolMessage(
-                content=compressed_text,
-                tool_call_id=msg.tool_call_id,
-            )
+            # Copy so id, name and tool_call_id survive: LangGraph's add_messages
+            # replaces a message by id, and appends one without it as a duplicate.
+            compressed_msg = msg.model_copy(update={"content": compressed_text})
             result_messages.append(compressed_msg)
             tokens_saved = tokens_before - tokens_after
 

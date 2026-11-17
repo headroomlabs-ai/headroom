@@ -111,14 +111,23 @@ def test_message_growth_offsets_tools_a_hook_removed(
     assert (net > 0) == (repeat == 5)
     outcome = outcomes[-1]
     headline = headline_tokens_saved(outcome.tokens_saved, outcome.tags)
-    # The gateway compacts tool schemas before hooks run, so compare with the
-    # hook's own measured deltas (the runner's ledger), not the raw schema.
+    # The answer reports the same headline, none of it estimated.
+    data = resp.json()
+    assert data["tokens_saved"] + data["tool_tokens_saved"] == headline
+    assert data["tool_tokens_deferred"] == 0
+    # The gateway compacts tool schemas before hooks run: the hook's own ledger
+    # covers the compacted schema, and the compaction delta is inside
+    # tokens_saved, so the headline is the two together.
+    from headroom.proxy.gateway_turn import compact_gateway_tools
+
+    compacted, _ = compact_gateway_tools([dict(_ADDED_TOOL)])
+    compaction = removed - tok.count_text(json.dumps(compacted, default=str))
     entries = from_tags(outcome.tags)
     if net > 0:
         (entry,) = entries
         hook_net = entry["details"]["tool_tokens_saved"] + entry["details"]["message_tokens_saved"]
         assert entry["details"]["message_tokens_saved"] < 0
-        assert headline == hook_net == entry["tokens"]
+        assert headline == hook_net + compaction == entry["tokens"] + compaction
     else:
         assert entries == []
         assert headline == 0

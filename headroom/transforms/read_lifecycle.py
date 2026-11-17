@@ -97,6 +97,24 @@ class ReadLifecycleResult:
     ccr_hashes: list[str] = field(default_factory=list)
 
 
+def _rejected_before_running(content: Any) -> bool:
+    """True when a tool_result's text is a ``<tool_use_error>`` validation error."""
+    if isinstance(content, list):
+        content = next(
+            (b.get("text") for b in content if isinstance(b, dict) and b.get("type") == "text"),
+            None,
+        )
+    return isinstance(content, str) and content.lstrip().startswith("<tool_use_error>")
+
+
+_NOTICE_PREFIXES = ("[Read content stale: ", "[Read content superseded: ")
+
+
+def is_lifecycle_notice(content: str) -> bool:
+    """True when ``content`` is a Read this pass already replaced."""
+    return content.startswith(_NOTICE_PREFIXES)
+
+
 class ReadLifecycleManager:
     """Event-driven Read lifecycle management.
 
@@ -109,13 +127,19 @@ class ReadLifecycleManager:
         config: ReadLifecycleConfig,
         compression_store: Any | None = None,
         ignore_policy: IgnorePolicy | None = None,
+        *,
+        retrieval_markers: bool = True,
     ):
+        """``retrieval_markers=False`` is for callers that cannot resolve a
+        ``Retrieve original: hash=`` pointer: a replaced Read then gets the
+        stale/superseded notice alone, and nothing is written to the store."""
         self.config = config
         self.store = compression_store
         # File-operation parsing exposes paths for Read tool calls, allowing
         # ignored results to be protected from lifecycle and age-based
         # tool-result compression.
         self._ignore_policy = ignore_policy
+        self.retrieval_markers = retrieval_markers
 
     def apply(
         self,
@@ -201,7 +225,9 @@ class ReadLifecycleManager:
                 if not isinstance(tc, dict):
                     continue
                 tc_id = tc.get("id", "")
-                func = tc.get("function", {})
+                func = tc.get("function")
+                if not isinstance(func, dict):  # "function": null / non-object
+                    continue
                 name = func.get("name", "")
                 if not tc_id or not name:
                     continue
@@ -211,11 +237,15 @@ class ReadLifecycleManager:
                 limit = None
                 try:
                     args = json.loads(func.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    args = None
+                if isinstance(args, dict):  # arguments may decode to a list/str/number
                     file_path = args.get("file_path") or args.get("path")
                     offset = args.get("offset")
                     limit = args.get("limit")
-                except (json.JSONDecodeError, TypeError):
-                    pass
+                # file_path is a dict key downstream; an unhashable value must not reach it.
+                if not isinstance(file_path, str):
+                    file_path = None
                 metadata[tc_id] = (name, file_path, offset, limit)
 
             # Anthropic format: content blocks with type=tool_use
@@ -238,6 +268,8 @@ class ReadLifecycleManager:
                     file_path = inp.get("file_path") or inp.get("path")
                     offset = inp.get("offset")
                     limit = inp.get("limit")
+                if not isinstance(file_path, str):
+                    file_path = None
                 metadata[tc_id] = (name, file_path, offset, limit)
 
         return metadata
@@ -252,6 +284,7 @@ class ReadLifecycleManager:
         Groups all Read/Edit/Write operations by file_path for lifecycle analysis.
         """
         file_ops: dict[str, list[FileOperation]] = defaultdict(list)
+        failed_ids = self._failed_tool_use_ids(messages)
 
         for tc_id, (name, file_path, offset, limit) in tool_metadata.items():
             if not file_path:
@@ -259,7 +292,8 @@ class ReadLifecycleManager:
 
             if name in _READ_TOOL_NAMES:
                 operation = "read"
-            elif name in _MUTATING_TOOL_NAMES:
+            elif name in _MUTATING_TOOL_NAMES and tc_id not in failed_ids:
+                # A failed Edit/Write left the file unchanged, so earlier Reads stay valid.
                 operation = "edit"
             else:
                 continue
@@ -282,6 +316,33 @@ class ReadLifecycleManager:
             )
 
         return dict(file_ops)
+
+    @staticmethod
+    def _failed_tool_use_ids(messages: list[dict[str, Any]]) -> set[str]:
+        """Ids of Anthropic tool_use blocks that were rejected before they ran.
+
+        Only an is_error tool_result whose text is a ``<tool_use_error>`` (the
+        harness's pre-execution validation, e.g. "String to replace not found")
+        proves the file was not touched. Any other error, such as a call that was
+        interrupted and "may have partially or fully completed", still counts as
+        an edit.
+        """
+        failed: set[str] = set()
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and block.get("is_error")
+                ):
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if isinstance(tool_use_id, str) and _rejected_before_running(block.get("content")):
+                    failed.add(tool_use_id)
+        return failed
 
     def _find_tool_call_msg_index(
         self, messages: list[dict[str, Any]], tool_call_id: str
@@ -507,6 +568,10 @@ class ReadLifecycleManager:
         if content_bytes < self.config.min_size_bytes:
             return False, content, None
 
+        file_display = classification.file_path or "unknown"
+        if not self.retrieval_markers:
+            return True, self._notice(classification.state, file_display, None), None
+
         # Best-effort CCR persistence (mirrors read_maturation.py): a store
         # failure must not break compress(), and keeps the Read verbatim — a
         # marker would point at an original nobody stored.
@@ -529,22 +594,22 @@ class ReadLifecycleManager:
                 )
                 return False, content, None
 
-        file_display = classification.file_path or "unknown"
+        return True, self._notice(classification.state, file_display, ccr_hash), ccr_hash
 
+    @staticmethod
+    def _notice(state: ReadState, file_display: str, ccr_hash: str | None) -> str:
         # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
         # the compression-pinning checks in ContentRouter and the
-        # marker-preserving regex in compression_units.py match on it.
-        if classification.state == ReadState.STALE:
-            marker = (
+        # marker-preserving regex in compression_units.py match on it. The
+        # hashless form is not pinned: it stays intact because Read is in
+        # DEFAULT_EXCLUDE_TOOLS and the notice is far below any size floor.
+        retrieve = f" Retrieve original: hash={ccr_hash}" if ccr_hash else ""
+        if state == ReadState.STALE:
+            return (
                 f"[Read content stale: {file_display} was modified after this read — "
-                f"re-read the file for current content. "
-                f"Retrieve original: hash={ccr_hash}]"
+                f"re-read the file for current content.{retrieve}]"
             )
-        else:  # SUPERSEDED
-            marker = (
-                f"[Read content superseded: {file_display} was re-read later — "
-                f"re-read the file if needed. "
-                f"Retrieve original: hash={ccr_hash}]"
-            )
-
-        return True, marker, ccr_hash
+        return (
+            f"[Read content superseded: {file_display} was re-read later — "
+            f"re-read the file if needed.{retrieve}]"
+        )

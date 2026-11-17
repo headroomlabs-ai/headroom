@@ -25,6 +25,14 @@ AnyLLMBackendType: Any = None
 LiteLLMBackendType: Any = None
 
 
+class BackendUnavailableError(RuntimeError):
+    """A selected backend cannot serve and no amount of retrying will help.
+
+    Raised at startup for operator misconfiguration (a missing optional
+    dependency, say) so callers can print the remedy instead of a traceback.
+    """
+
+
 @dataclass(frozen=True)
 class ProviderApiOverrides:
     """Optional upstream API URL overrides configured for the proxy."""
@@ -213,6 +221,36 @@ def build_proxy_provider_runtime(config: Any) -> ProxyProviderRuntime:
     )
 
 
+def _litellm_provider(backend: str) -> str:
+    provider = (backend if backend.startswith("litellm-") else f"litellm-{backend}").replace(
+        "litellm-", ""
+    )
+    # `litellm-vertex` is the name in our docs/help, but LiteLLM (and our
+    # provider registry) keys Google Vertex on `vertex_ai`. Without this alias
+    # the provider falls through to a generic pass-through: wrong model prefix
+    # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
+    if provider in ("vertex", "google-vertex", "googlevertex"):
+        return "vertex_ai"
+    return provider
+
+
+def preflight_backend(backend: str) -> None:
+    """Raise ``BackendUnavailableError`` if ``backend``'s optional SDK is missing.
+
+    Without the Vertex SDK the LiteLLM backend still constructs cleanly and then
+    fails on every call with a provider string that names neither the cause nor
+    the cure. The CLI calls this in the parent process too: with ``--workers >1``
+    each worker builds its own app and uvicorn would just keep restarting them.
+    """
+    if backend == "anthropic" or backend == "anyllm" or backend.startswith("anyllm-"):
+        return
+    if _litellm_provider(backend) in ("vertex_ai", "vertex_ai_beta"):
+        # Imported locally: headroom.providers.vertex imports this module.
+        from headroom.providers.vertex import ensure_vertex_sdk_available
+
+        ensure_vertex_sdk_available()
+
+
 def create_proxy_backend(
     *,
     backend: str,
@@ -249,13 +287,10 @@ def create_proxy_backend(
             return None
 
     normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
-    provider = normalized_backend.replace("litellm-", "")
-    # `litellm-vertex` is the name in our docs/help, but LiteLLM (and our
-    # provider registry) keys Google Vertex on `vertex_ai`. Without this alias
-    # the provider falls through to a generic pass-through: wrong model prefix
-    # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
-    if provider in ("vertex", "google-vertex", "googlevertex"):
-        provider = "vertex_ai"
+    provider = _litellm_provider(backend)
+    if litellm_backend_cls is None:
+        # Skipped when a backend class is injected, so tests can use fakes.
+        preflight_backend(backend)
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
         instance = cast(
@@ -373,6 +408,34 @@ def _call_openai_transport(
     return response
 
 
+def _call_anthropic_create_transport(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    stream: bool,
+    metrics: Any,
+    **kwargs: Any,
+) -> Any:
+    if stream:
+        response = client._original.messages.create(
+            model=model,
+            messages=messages,
+            stream=True,
+            **kwargs,
+        )
+        return client._wrap_stream(response, metrics)
+
+    return _call_anthropic_transport(
+        client,
+        model=model,
+        messages=messages,
+        stream=False,
+        metrics=metrics,
+        **kwargs,
+    )
+
+
 def _call_anthropic_transport(
     client: Any,
     *,
@@ -409,6 +472,7 @@ def _call_anthropic_transport(
 _ClientTransport = Callable[..., Any]
 _CLIENT_TRANSPORTS: dict[str, _ClientTransport] = {
     "anthropic": _call_anthropic_transport,
+    "anthropic_create": _call_anthropic_create_transport,
     "openai": _call_openai_transport,
 }
 

@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use headroom_core::signals::{
     ImportanceCategory, ImportanceContext, KeywordDetector, KeywordRegistry, LineImportanceDetector,
 };
+use headroom_core::transforms::pipeline::JsonMinifier;
 use headroom_core::transforms::smart_crusher::compaction::{
     ClassifyConfig, CompactConfig, DocumentCompactor,
 };
@@ -47,12 +48,20 @@ use headroom_core::transforms::{
     TextCrusherResult as RustTextCrusherResult,
 };
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyBytes, PyDict};
 
 /// Identity stub used by the Python smoke test to verify linkage.
 #[pyfunction]
 fn hello() -> &'static str {
     headroom_core::hello()
+}
+
+/// Run the explicit JSON reformat without copying the immutable Python input.
+#[pyfunction]
+fn minify_json(py: Python<'_>, content: PyBackedStr) -> PyResult<Option<String>> {
+    py.detach(|| JsonMinifier.minify(content.as_str()))
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
 fn type_name(v: &serde_json::Value) -> &'static str {
@@ -1814,6 +1823,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = pyo3_log::try_init();
 
     m.add_function(wrap_pyfunction!(hello, m)?)?;
+    m.add_function(wrap_pyfunction!(minify_json, m)?)?;
     m.add_class::<PyDiffCompressorConfig>()?;
     m.add_class::<PyDiffCompressionResult>()?;
     m.add_class::<PyDiffCompressorStats>()?;

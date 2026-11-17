@@ -393,3 +393,27 @@ async def test_pipeline_extensions_read_both_figures_from_the_snapshot() -> None
         (62_806, 62_806),
         (76_020, 13_214),
     ]
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_says_whose_request_it_was() -> None:
+    """Project, client, conversation and the pre-compression size reach the
+    extension, so it can attribute what it measures without patching core."""
+    from headroom.pipeline import PipelineExtensionManager, PipelineStage
+
+    seen: list[Any] = []
+
+    class _Recorder:
+        def on_pipeline_event(self, event: Any) -> None:
+            if event.stage is PipelineStage.OUTCOME_OBSERVED:
+                seen.append(event.outcome)
+
+    handler = _Handler()
+    handler.pipeline_extensions = PipelineExtensionManager(extensions=[_Recorder()], discover=False)
+    await emit_request_outcome(handler, _responses_outcome(project="web", client="codex"))
+    await emit_request_outcome(handler, _responses_outcome(request_id="req-2"))
+
+    assert dict(seen[0].attribution) == {"project": "web", "client": "codex"}
+    assert seen[0].conversation_key == "conv-a"
+    assert seen[0].original_tokens == 156_260
+    assert dict(seen[1].attribution) == {}

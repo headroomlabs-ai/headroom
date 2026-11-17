@@ -5,7 +5,8 @@ auth mode), TOIN must serve cached recommendations but NEVER write new
 pattern observations from this request. PAYG / OAuth keep writing so
 the network effect keeps growing. The gate is read at the
 ``record_compression`` call site in ``smart_crusher.py`` and
-``content_router.py``.
+``content_router.py``, and — since #4801 — at the Kompress CCR store
+(``store_kompress_in_ccr``), the second write path of #4474.
 
 These tests mirror the structure of
 ``tests/test_smart_crusher_toin_attachment.py`` (the F2.1-era TOIN
@@ -287,3 +288,254 @@ def test_content_router_payg_records_to_toin(fresh_toin):
     assert post >= pre, (
         "PAYG must not be blocked by the F2.2 gate — write should happen or fall through naturally"
     )
+
+
+# ─── ContentRouter → SmartCrusher.crush() (#4474) ───────────────────────
+
+
+@_skip_no_core
+@pytest.mark.parametrize(
+    ("mode", "expect_write"),
+    [(AuthMode.SUBSCRIPTION, False), (AuthMode.PAYG, True)],
+)
+def test_content_router_smart_crusher_path_honours_toin_read_only(fresh_toin, mode, expect_write):
+    """The router compresses JSON arrays via the shared crusher's
+    ``crush()`` and never calls ``crusher.apply()``, so the crusher's
+    own ``_runtime_compression_policy`` stays None. The router must
+    forward the request's ``toin_read_only`` gate to that call.
+    """
+    from headroom.transforms.content_router import ContentRouter
+
+    router = ContentRouter()
+    messages = _wrap_in_tool_message(_bigger_array(60))
+    pre = sum(p.total_compressions for p in fresh_toin._patterns.values())
+
+    result = router.apply(messages, _tokenizer(), compression_policy=policy_for_mode(mode))
+
+    assert any("smart_crusher" in t for t in result.transforms_applied), (
+        "payload must route through SmartCrusher for this test to mean anything"
+    )
+    # The shared crusher's own field is untouched — the gate travels per call.
+    assert router._get_smart_crusher()._runtime_compression_policy is None
+    post = sum(p.total_compressions for p in fresh_toin._patterns.values())
+    if expect_write:
+        assert post > pre, "write-enabled policy must still feed TOIN via the router"
+    else:
+        assert post == pre, "Subscription MUST NOT write to TOIN via router → crush()"
+
+
+@_skip_no_core
+def test_smart_crusher_crush_record_toin_false_skips_write(fresh_toin):
+    """``crush(record_toin=False)`` compresses as usual but skips TOIN;
+    the default keeps the legacy write-enabled behaviour."""
+    from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
+
+    crusher = SmartCrusher(SmartCrusherConfig())
+    payload = _bigger_array(60)
+
+    gated = crusher.crush(payload, record_toin=False)
+    if not gated.was_modified or gated.strategy == "passthrough":
+        pytest.skip("payload didn't trigger compression — bump the size")
+    assert sum(p.total_compressions for p in fresh_toin._patterns.values()) == 0
+
+    crusher.crush(payload)
+    assert sum(p.total_compressions for p in fresh_toin._patterns.values()) > 0
+
+
+# ─── Kompress CCR store: record_toin gate (#4801) ────────────────────────
+
+
+def _toin_total(toin) -> int:
+    return sum(p.total_compressions for p in toin._patterns.values())
+
+
+def test_kompress_store_record_toin_false_skips_write(fresh_toin):
+    """``store_kompress_in_ccr(record_toin=False)`` keeps the CCR mapping
+    (the compressed output stays retrievable) but writes no TOIN
+    observation; the default call writes one."""
+    from headroom.cache.compression_store import get_compression_store
+    from headroom.transforms.kompress_compressor import store_kompress_in_ccr
+
+    cache_key = store_kompress_in_ccr("word " * 400, "word " * 100, 400, record_toin=False)
+    assert cache_key is not None
+    assert get_compression_store().retrieve(cache_key) is not None
+    assert _toin_total(fresh_toin) == 0
+
+    cache_key = store_kompress_in_ccr("other " * 400, "other " * 100, 400)
+    assert cache_key is not None
+    assert _toin_total(fresh_toin) == 1
+
+
+class _FakeEncoding:
+    def __init__(self, word_lists: list[list[str]]):
+        self._word_lists = word_lists
+        self._ids = [[0] * len(w) for w in word_lists]
+
+    def __getitem__(self, key: str):
+        return {"input_ids": self._ids, "attention_mask": self._ids}[key]
+
+    def word_ids(self, batch_index: int = 0) -> list[int]:
+        return list(range(len(self._word_lists[batch_index])))
+
+
+class _FakeTokenizer:
+    def __call__(self, words, **_kwargs):
+        batch = words if (words and isinstance(words[0], list)) else [words]
+        return _FakeEncoding(batch)
+
+
+class _FakeModel:
+    def get_keep_mask(self, input_ids, _attention_mask):
+        return [[i < 2 for i in range(len(input_ids[0]))]]
+
+    def get_scores(self, input_ids, _attention_mask):
+        return [[1.0 if i < 2 else 0.0 for i in range(len(row))] for row in input_ids]
+
+
+def _local_compressor(monkeypatch):
+    from headroom.transforms.kompress_compressor import KompressCompressor
+
+    monkeypatch.setattr(
+        "headroom.transforms.kompress_compressor._load_kompress",
+        lambda *a, **k: (_FakeModel(), _FakeTokenizer(), "onnx"),
+    )
+    return KompressCompressor()
+
+
+def test_kompress_compressor_record_toin_false_skips_write(fresh_toin, monkeypatch):
+    """The local compressor forwards the gate to the CCR store: gated
+    compression still returns a retrieval key but records nothing."""
+    compressor = _local_compressor(monkeypatch)
+    content = "line one\nline two\nline three " * 20
+
+    gated = compressor.compress(content, record_toin=False)
+    assert gated.cache_key is not None
+    assert _toin_total(fresh_toin) == 0
+
+    compressor.compress(content)
+    assert _toin_total(fresh_toin) == 1
+
+
+def test_kompress_compress_batch_record_toin_false_skips_write(fresh_toin, monkeypatch):
+    """The batch path (which reconstructs and stores separately) honours
+    the gate the same way."""
+    compressor = _local_compressor(monkeypatch)
+    content = "line one\nline two\nline three " * 20
+
+    results = compressor.compress_batch([content], record_toin=False)
+    assert results[0].cache_key is not None
+    assert _toin_total(fresh_toin) == 0
+
+
+def test_kompress_compress_batch_forced_batched_record_toin_false_skips_write(
+    fresh_toin, monkeypatch
+):
+    """Forcing the batched path (no sequential fallback) still honours the
+    gate: its separate CCR store write records nothing when gated."""
+    compressor = _local_compressor(monkeypatch)
+    monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
+    content = "line one\nline two\nline three " * 20
+
+    results = compressor.compress_batch([content], record_toin=False)
+    assert results[0].cache_key is not None
+    assert _toin_total(fresh_toin) == 0
+
+    results = compressor.compress_batch([content])
+    assert results[0].cache_key is not None
+    assert _toin_total(fresh_toin) == 1
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def post(self, url, headers=None, json=None):  # noqa: A002, ANN001
+        return _FakeResponse(self._payload)
+
+    def close(self) -> None:
+        return None
+
+
+def test_remote_kompress_record_toin_false_skips_write(fresh_toin, monkeypatch):
+    """The remote client shares the store function, so the same gate
+    applies on the hosted-endpoint path."""
+    from headroom.transforms.kompress_remote import RemoteKompressCompressor
+
+    compressor = RemoteKompressCompressor("https://ml.example.invalid")
+    compressor._client = _FakeClient({"compressed": "short", "compression_ratio": 0.2})  # type: ignore[assignment]
+    compressor.config.enable_ccr = True
+    compressor.config.min_input_words = 10
+    content = "real secret block " * 60
+
+    gated = compressor.compress(content, record_toin=False)
+    assert gated.cache_key is not None
+    assert _toin_total(fresh_toin) == 0
+
+    compressor.compress(content)
+    assert _toin_total(fresh_toin) == 1
+
+
+@_skip_no_core
+def test_content_router_kompress_path_forwards_toin_gate(monkeypatch):
+    """The router never calls ``KompressCompressor.apply()``, so it must
+    forward the request's gate per call, as it does for ``crush()``: the
+    kwarg is sent only when the policy is read-only."""
+    from headroom.transforms.content_router import ContentRouter
+    from headroom.transforms.kompress_compressor import KompressResult
+
+    calls: list[dict] = []
+
+    class _Stub:
+        def is_ready(self) -> bool:
+            return True
+
+        def ensure_background_load(self) -> None:
+            return None
+
+        def compress(self, content: str, **kwargs) -> KompressResult:
+            calls.append(kwargs)
+            return KompressResult(
+                compressed="short",
+                original=content,
+                original_tokens=100,
+                compressed_tokens=1,
+                compression_ratio=0.01,
+            )
+
+    router = ContentRouter()
+    monkeypatch.setattr(router, "_get_kompress", lambda: _Stub())
+    content = "plain prose about workers processing batches steadily " * 20
+
+    router._runtime_compression_policy = policy_for_mode(AuthMode.SUBSCRIPTION)
+    router._try_ml_compressor(content, "")
+    assert calls[-1].get("record_toin") is False
+
+    router._runtime_compression_policy = policy_for_mode(AuthMode.PAYG)
+    router._try_ml_compressor(content, "")
+    assert "record_toin" not in calls[-1]
+
+
+def test_kompress_apply_subscription_policy_skips_write(fresh_toin, monkeypatch):
+    """Through the Transform interface, a Subscription policy reaches
+    ``compress()`` as the gate; no policy keeps the legacy write."""
+    compressor = _local_compressor(monkeypatch)
+    content = "line one\nline two\nline three " * 20
+    messages = [{"role": "tool", "content": content, "tool_call_id": "t1"}]
+
+    policy = policy_for_mode(AuthMode.SUBSCRIPTION)
+    compressor.apply(messages, _tokenizer(), compression_policy=policy)
+    assert _toin_total(fresh_toin) == 0
+
+    compressor.apply(messages, _tokenizer())
+    assert _toin_total(fresh_toin) == 1

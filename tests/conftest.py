@@ -19,6 +19,37 @@ import pytest
 from tests._skip_helpers import external_model_skip_reason
 
 
+@pytest.fixture
+def gemini_request():
+    """A real ASGI request whose JSON arrives in two stream messages."""
+    from starlette.requests import Request
+
+    body = json.dumps({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}).encode()
+    middle = len(body) // 2
+    messages = iter(
+        [
+            {"type": "http.request", "body": body[:middle], "more_body": True},
+            {"type": "http.request", "body": body[middle:], "more_body": False},
+        ]
+    )
+
+    async def receive():
+        return next(messages, {"type": "http.disconnect"})
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1beta/models/gemini-pro:generateContent",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "scheme": "https",
+            "server": ("gemini.example", 443),
+        },
+        receive,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _undo_process_trust_injection():
     """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
@@ -77,6 +108,30 @@ def _skip_proxy_port_preflight_unless_exercised(
     except ModuleNotFoundError:
         return
     monkeypatch.setattr(proxy, "_refuse_busy_port", lambda *args, **kwargs: None)
+
+
+# Credentials the Copilot code reads from the environment (copilot_quota.py,
+# copilot_auth.py). Any test that enters the proxy lifespan starts the Copilot
+# quota poller, which sends such a token to api.github.com; a developer's real
+# GITHUB_TOKEN must never be used by a test. A test that needs one sets it with
+# monkeypatch.setenv, which runs after this fixture.
+_COPILOT_TOKEN_ENV_VARS = (
+    "GITHUB_COPILOT_GITHUB_TOKEN",
+    "GITHUB_COPILOT_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
+    "GITHUB_COPILOT_API_TOKEN",
+    "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT",
+    "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_developer_copilot_tokens(monkeypatch):
+    for key in _COPILOT_TOKEN_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture(autouse=True)

@@ -61,6 +61,26 @@ def _loopback_client() -> TestClient:
     return TestClient(_make_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
 
 
+def test_debug_memory_is_available_to_loopback_published_container_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    app = create_app(ProxyConfig(optimize=False, cache_enabled=False, stateless=True))
+    loopback = TestClient(app, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 1))
+    host = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.1", 1))
+    other_container = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.5", 1))
+    wrong_host = TestClient(app, base_url="http://attacker.example:8787", client=("172.17.0.1", 1))
+
+    assert "/debug/memory" in host.get("/openapi.json").json()["paths"]
+    assert loopback.get("/debug/memory").status_code == 200
+    response = host.get("/debug/memory")
+
+    assert response.status_code == 200, response.text
+    assert "process" in response.json()
+    assert other_container.get("/debug/memory").status_code == 404
+    assert wrong_host.get("/debug/memory").status_code == 404
+
+
 def _seed_ccr_entry() -> str:
     reset_compression_store()
     store = get_compression_store(backend=InMemoryBackend())
@@ -73,22 +93,33 @@ def _seed_ccr_entry() -> str:
     )
 
 
+# What the guard answers: the body FastAPI gives an unknown path, so the route is
+# invisible rather than forbidden. A detail route answers 404 with its OWN message
+# ("No telemetry found for signature: ...") when its key is absent, so a bare 404
+# status cannot tell the guard from a missing key.
+GUARD_DENIAL = {"detail": "Not Found"}
+
+
 @pytest.mark.parametrize("method,path", GATED)
 def test_non_loopback_caller_gets_404(method: str, path: str) -> None:
-    # A vanilla TestClient presents client.host="testclient", which is not a
-    # loopback IP, so the guard returns 404 (invisible, not 403).
-    client = TestClient(_make_app())
+    # A routable, non-loopback peer (TEST-NET-3), with a loopback Host header so the
+    # client-IP check is the only thing that can refuse it. A vanilla TestClient
+    # presents client.host="testclient", which is not an IP at all, so it would
+    # not tell "denies non-loopback IPs" from "denies a peer it cannot parse".
+    client = TestClient(_make_app(), base_url="http://127.0.0.1", client=("203.0.113.9", 4242))
     resp = client.request(method, path)
     assert resp.status_code == 404, resp.text
+    assert resp.json() == GUARD_DENIAL, resp.text
 
 
 @pytest.mark.parametrize("method,path", GATED)
 def test_loopback_caller_allowed(method: str, path: str) -> None:
     client = _loopback_client()
     resp = client.request(method, path, json={} if method == "post" else None)
-    # Detail routes legitimately return 404 when their test key is absent;
-    # the companion non-loopback test proves the guard itself.
+    # Detail routes legitimately return 404 when their test key is absent, but with
+    # their own message; the guard's denial body would mean it refused loopback.
     assert resp.status_code in {200, 404, 422}, resp.text
+    assert resp.json() != GUARD_DENIAL, resp.text
 
 
 def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -678,10 +709,28 @@ def test_dashboard_client_cidr_grants_stats_metadata_to_same_origin_browser(
     assert "config" in payload
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_dashboard_client_cidr_refuses_cross_origin_browser_stats(
+    monkeypatch: pytest.MonkeyPatch, cached: bool
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    response = client.get(
+        "/stats", params={"cached": int(cached)}, headers={"origin": "http://attacker.example"}
+    )
+
+    # The security gate refuses a foreign browser Origin before the route runs.
+    assert response.status_code == 403
+
+
 @pytest.mark.parametrize(
     "headers",
     [
-        {"origin": "http://attacker.example"},
         {"referer": "http://attacker.example/dashboard"},
     ],
 )
@@ -1086,7 +1135,8 @@ def test_metrics_trusted_cidr_cross_origin_browser_rejected(
         client=("10.9.0.7", 40000),
     )
     resp = client.get("/metrics", headers={"Origin": "http://attacker.example"})
-    assert resp.status_code == 404
+    # Refused by the security gate (403) before the route's own guard (404).
+    assert resp.status_code == 403
 
 
 def test_metrics_token_authenticated_network_caller_allowed(
@@ -1099,3 +1149,54 @@ def test_metrics_token_authenticated_network_caller_allowed(
     assert network.get("/metrics").status_code == 401
     ok = network.get("/metrics", headers={"Authorization": "Bearer s3cr3t-token"})
     assert ok.status_code == 200, ok.text
+
+
+def _gateway_peer_client(monkeypatch: pytest.MonkeyPatch, **kwargs) -> TestClient:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "172.17.0.0/16")
+    monkeypatch.delenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", raising=False)
+    return TestClient(
+        _make_app(), base_url="http://localhost:8787", client=("172.17.0.9", 1), **kwargs
+    )
+
+
+def test_settings_read_still_served_to_trusted_gateway_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway-CIDR rule exists so a containerised dashboard can read."""
+    client = _gateway_peer_client(monkeypatch)
+    assert client.get("/settings").status_code == 200
+    assert client.get("/settings/schema").status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/settings", "/settings/apply"])
+def test_settings_write_refused_for_trusted_gateway_peer(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A gateway-CIDR peer is loopback-equivalent for reads only, never writes."""
+    from headroom.install import runtime as install_runtime
+
+    # Safety net: if the guard regresses, /settings/apply must not restart anything.
+    monkeypatch.setattr(install_runtime, "restart_current_deployment", lambda: {"restarted": False})
+    monkeypatch.setattr(install_runtime, "detect_current_deployment", lambda: (None, "foreground"))
+    client = _gateway_peer_client(monkeypatch)
+    resp = client.post(path, json={"values": {}})
+    assert resp.status_code == 404, resp.text
+
+
+def test_settings_write_allowed_for_real_loopback() -> None:
+    resp = _loopback_client().post("/settings", json={"values": {}})
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize("host", ["headroom-remote.invalid", "evil.example:8787"])
+def test_local_only_routes_refuse_the_hosts_the_rust_front_relays_for_remote_callers(
+    host: str,
+) -> None:
+    # The Rust front reaches this proxy from 127.0.0.1. For a caller that is
+    # not local on its side it sends a non-loopback Host (the reserved
+    # headroom-remote.invalid when the Host would otherwise name loopback),
+    # so these routes must refuse a loopback peer carrying such a Host.
+    client = TestClient(_make_app(), base_url=f"http://{host}", client=("127.0.0.1", 12345))
+    assert client.get("/admin/upstream").status_code == 404
+    assert client.get("/debug/tasks").status_code == 404
+    assert client.get("/transformations/feed").status_code == 404

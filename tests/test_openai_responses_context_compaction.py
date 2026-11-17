@@ -355,7 +355,7 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
         lambda value, context, question=None: ("short summary", 2),
     )
 
-    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+    compressed, compressed_tokens, strategy_chain, _reversible = router._apply_strategy_to_content(
         content,
         CompressionStrategy.SMART_CRUSHER,
         context="",

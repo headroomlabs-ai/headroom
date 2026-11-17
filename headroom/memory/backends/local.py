@@ -387,7 +387,9 @@ class LocalBackend:
                 for rel in all_relationships:
                     source_name = rel.get("source", "").lower()
                     target_name = rel.get("target", "").lower()
-                    rel_type = rel.get("type", "related_to")
+                    # The memory_save tool schema names the key `relation`
+                    # (tools.py); direct callers and older docs use `type`.
+                    rel_type = rel.get("type") or rel.get("relation") or "related_to"
 
                     source_id = entity_id_map.get(source_name)
                     target_id = entity_id_map.get(target_name)
@@ -577,7 +579,8 @@ class LocalBackend:
             memory_id: ID of the memory to update.
             new_content: The new content for the memory.
             reason: Reason for the update (stored for audit trail).
-            user_id: User ID for validation (optional).
+            user_id: When given, only a memory owned by this user is updated;
+                any other id is treated as not found.
 
         Returns:
             The new Memory that supersedes the old one.
@@ -585,12 +588,15 @@ class LocalBackend:
         Raises:
             ValueError: If the memory is not found.
         """
-        # Note: reason and user_id are accepted for protocol compliance
-        # but not yet used in the underlying implementation
+        # Note: reason is accepted for protocol compliance but not yet stored.
         _ = reason
-        _ = user_id
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
+
+        if user_id is not None:
+            existing = await self._hierarchical_memory.get(memory_id)
+            if existing is None or existing.user_id != user_id:
+                raise ValueError(f"Memory {memory_id} not found")
 
         # Use supersede for versioned updates
         new_memory = await self._hierarchical_memory.supersede(
@@ -628,22 +634,21 @@ class LocalBackend:
         Args:
             memory_id: ID of the memory to delete.
             reason: Reason for deletion (stored for audit trail).
-            user_id: User ID for validation (optional).
+            user_id: When given, only a memory owned by this user is deleted;
+                any other id is treated as not found.
 
         Returns:
             True if the memory was deleted, False if not found.
         """
-        # Note: reason and user_id are accepted for protocol compliance
-        # but not yet used in the underlying implementation
+        # Note: reason is accepted for protocol compliance but not yet stored.
         _ = reason
-        _ = user_id
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
         assert self._graph is not None
 
         # Get memory to find its user_id for graph cleanup
         memory = await self._hierarchical_memory.get(memory_id)
-        if memory is None:
+        if memory is None or (user_id is not None and memory.user_id != user_id):
             return False
 
         # Delete from HierarchicalMemory
@@ -760,13 +765,13 @@ class LocalBackend:
     async def get_user_memories(
         self,
         user_id: str,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[Memory]:
         """Get all memories for a user.
 
         Args:
             user_id: User identifier.
-            limit: Maximum number of memories to return.
+            limit: Maximum number of memories to return, or None for all memories.
 
         Returns:
             List of memories for the user.
@@ -776,6 +781,21 @@ class LocalBackend:
 
         return await self._hierarchical_memory.get_user_memories(
             user_id=user_id,
+            limit=limit,
+        )
+
+    async def get_session_memories(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 100,
+    ) -> list[Memory]:
+        """List recent memories filtered by both user and session before limiting."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.get_session_memories(
+            user_id=user_id,
+            session_id=session_id,
             limit=limit,
         )
 

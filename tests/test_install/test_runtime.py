@@ -1337,6 +1337,25 @@ def test_stop_runtime_rejects_identity_change_before_clearing_pid(
     assert _read_pid("default") == 4321
 
 
+def test_stop_runtime_tolerates_transient_unknown_identity_during_exit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 4321)
+    identities = iter([True, None, None])
+    alive = iter([True, True, False])
+    monkeypatch.setattr(
+        "headroom.install.runtime._process_identity", lambda pid, current: next(identities)
+    )
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(alive))
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda pid, sig: None)
+    monkeypatch.setattr("headroom.install.runtime.time.sleep", lambda seconds: None)
+
+    stop_runtime(manifest)
+    assert _read_pid("default") is None
+
+
 def test_stop_runtime_keeps_pid_when_sigterm_does_not_stop_process(
     monkeypatch, tmp_path: Path
 ) -> None:
