@@ -224,3 +224,48 @@ fn minimal_upstream_response_pr_c4() {
     // machine status. Genuine completion goes through `response.completed`.
     assert_eq!(s.status, StreamStatus::Open);
 }
+
+/// The `response.`-prefixed item / content-part names (the form the
+/// Python emitter in `headroom/proxy/handlers/openai.py` writes) must
+/// update state exactly like the bare names, not fall into the
+/// unknown-event arm (which never updates state).
+#[test]
+fn prefixed_item_and_content_part_events_update_state() {
+    let mut s = ResponseState::new();
+    let raw = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_p\",\"model\":\"gpt-5\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_P\",\"type\":\"message\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "event: response.content_part.added\n",
+        "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_P\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_P\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n",
+        "event: response.content_part.done\n",
+        "data: {\"type\":\"response.content_part.done\",\"item_id\":\"msg_P\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"hi\"}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_P\",\"type\":\"message\",\"status\":\"completed\"}}\n\n",
+    );
+    run(&mut s, raw.as_bytes());
+
+    let item = s
+        .items
+        .get("msg_P")
+        .expect("prefixed output_item.added must register the item");
+    assert_eq!(item.item_type, "message");
+    assert!(
+        item.complete,
+        "prefixed output_item.done must complete the item"
+    );
+    assert_eq!(item.metadata["status"], "completed");
+    let part = item
+        .content_parts
+        .get(&0)
+        .expect("prefixed content_part.added must register the part");
+    assert_eq!(part.part_type, "output_text");
+    assert!(
+        part.complete,
+        "prefixed content_part.done must complete the part"
+    );
+    assert_eq!(item.output_text, "hi");
+}

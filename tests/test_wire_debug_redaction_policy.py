@@ -81,3 +81,13 @@ def test_wire_debug_keeps_token_usage_counters_visible() -> None:
         "token_count",
     ):
         assert not should_redact_key(key), key
+
+
+def test_wire_debug_redacts_codex_attestation_header() -> None:
+    # The inbound request log line runs every header through this policy, so
+    # without it each Codex request wrote the ~4 KB signed attestation to proxy.log.
+    redacted = redact_for_wire_debug(
+        {"x-oai-attestation": '{"v":1,"s":1,"t":"signed"}', "x-codex-window-id": "w:1"}
+    )
+
+    assert redacted == {"x-oai-attestation": WIRE_DEBUG_REDACTED, "x-codex-window-id": "w:1"}

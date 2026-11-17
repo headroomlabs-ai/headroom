@@ -120,9 +120,11 @@ def test_openai_different_custom_upstream_not_served_from_cache(monkeypatch) -> 
     """Two OpenAI-compatible gateways must not share a response entry (#3346)."""
     calls: list[str] = []
 
+    async def _custom_base(headers):  # noqa: ANN001
+        return headers.get("x-headroom-base-url")
+
     monkeypatch.setattr(
-        "headroom.proxy.handlers.openai._resolve_openai_upstream_base",
-        lambda headers: headers.get("x-headroom-base-url"),
+        "headroom.proxy.handlers.openai._resolve_openai_upstream_base_async", _custom_base
     )
 
     with _make_cached_proxy_client() as client:

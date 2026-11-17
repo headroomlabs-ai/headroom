@@ -117,7 +117,7 @@ FEATURES: dict[str, FeatureSpec] = {
         name="read_maturation",
         available_in=RolloutChannel.BETA,
         legacy_env=("HEADROOM_READ_MATURATION",),
-        description="Hold-back Read maturation before provider cache entry.",
+        description="Hold-back Read maturation: compress a Read once its file quiesces.",
     ),
     "bedrock_openai_prompt_caching": FeatureSpec(
         name="bedrock_openai_prompt_caching",
@@ -478,26 +478,3 @@ def _resolve_snapshot(
         config=config,
         decisions=tuple(decisions),
     )
-
-
-def current_rollout(environ: Mapping[str, str] | None = None) -> RolloutSnapshot:
-    """Compatibility name for resolving a snapshot at a composition boundary."""
-
-    return resolve_rollout(environ)
-
-
-def feature_enabled(
-    feature: str,
-    *,
-    explicit: bool = False,
-    environ: Mapping[str, str] | None = None,
-) -> bool:
-    """Compatibility helper for composition roots; do not use in deep components."""
-
-    requested = (feature,) if explicit else ()
-    return resolve_rollout(environ, requested=requested).is_enabled(feature)
-
-
-# The PR was never released, but this narrow source alias keeps in-branch callers
-# importable while the correction migrates them. It is intentionally undocumented.
-Rollout = RolloutSnapshot

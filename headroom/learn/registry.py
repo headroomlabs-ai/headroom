@@ -12,6 +12,7 @@ import importlib
 import logging
 import pkgutil
 
+from ..log_safety import describe_exception, safe_id
 from .base import LearnPlugin
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,13 @@ def _discover() -> dict[str, LearnPlugin]:
                 if isinstance(p, LearnPlugin):
                     plugins[p.name] = p
                     logger.debug("Loaded built-in learn plugin: %s", p.name)
-        except Exception:
-            logger.debug("Failed to load built-in plugin: %s", mod_name, exc_info=True)
+        except Exception as e:
+            # Exception text can quote paths or credentials: type only at WARNING.
+            logger.warning("Failed to load built-in learn plugin %s (%s)", mod_name, safe_id(e))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Built-in learn plugin %s failure: %s", mod_name, describe_exception(e)
+                )
 
     # 2. External: entry_points(group="headroom.learn_plugin")
     try:
@@ -56,8 +62,16 @@ def _discover() -> dict[str, LearnPlugin]:
                 if isinstance(p, LearnPlugin):
                     plugins[p.name] = p  # External overrides built-in on name collision
                     logger.debug("Loaded external learn plugin: %s (%s)", p.name, ep.name)
-            except Exception:
-                logger.warning("Failed to load external learn plugin: %s", ep.name, exc_info=True)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load external learn plugin %s (%s)", safe_id(ep.name), safe_id(e)
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "External learn plugin %s failure: %s",
+                        safe_id(ep.name),
+                        describe_exception(e),
+                    )
     except Exception:
         logger.debug("Entry point discovery failed", exc_info=True)
 

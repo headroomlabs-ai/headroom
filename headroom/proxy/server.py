@@ -34,7 +34,9 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -75,7 +77,6 @@ from headroom.ccr import (
     CCR_TOOL_NAME,
     # Batch processing
     CCRResponseHandler,
-    CCRToolInjector,
     ContextTracker,
     ContextTrackerConfig,
     ResponseHandlerConfig,
@@ -85,8 +86,11 @@ from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
     CacheAlignerConfig,
     ReadLifecycleConfig,
+    resolve_omlx_target_api_url,
 )
 from headroom.dashboard import get_dashboard_html
+from headroom.exceptions import ConfigurationError
+from headroom.log_safety import describe_exception, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
     OTelMetricsConfig,
@@ -119,7 +123,7 @@ from headroom.providers.registry import (
 )
 from headroom.proxy import runtime_env
 from headroom.proxy.audit import is_auditable_path, record_admin_action
-from headroom.proxy.auth_mode import should_stamp_codex_client
+from headroom.proxy.auth_mode import CLIENT_UA_MAP, should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
 from headroom.proxy.budget_basis_policy import resolve_estimated_basis_policy
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -128,30 +132,33 @@ from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECO
 # Extracted modules (re-exported for backward compatibility)
 # =============================================================================
 from headroom.proxy.cost import (
-    _CACHE_ECONOMICS,  # noqa: F401
-    CostTracker,  # noqa: F401
-    _summarize_transforms,  # noqa: F401
-    build_prefix_cache_stats,  # noqa: F401
-    build_session_summary,  # noqa: F401
-    merge_cost_stats,  # noqa: F401
+    CostTracker,
+    build_prefix_cache_stats,
+    build_session_summary,
+    merge_cost_stats,
+    request_cost_usd,
 )
 from headroom.proxy.helpers import (
     COMPRESSION_CACHE_MAX_ENTRIES,
     COMPRESSION_CACHE_TTL_SECONDS,
-    COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
+    COMPRESSION_TIMEOUT_SECONDS,
     EAGER_PRELOAD_TIMEOUT_SECONDS,
-    MAX_COMPRESSION_CACHE_SESSIONS,  # noqa: F401
-    MAX_MESSAGE_ARRAY_LENGTH,  # noqa: F401
-    MAX_REQUEST_BODY_SIZE,  # noqa: F401
-    MAX_SSE_BUFFER_SIZE,  # noqa: F401
+    MAX_COMPRESSION_CACHE_SESSIONS,
     RETRYABLE_OVERLOAD_STATUSES,
-    _get_image_compressor,  # noqa: F401
-    _read_request_json,  # noqa: F401
-    _setup_file_logging,  # noqa: F401
+    _setup_file_logging,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    overload_retry_is_futile,
     resolve_display_provider,
     retry_after_ms,
+)
+from headroom.proxy.kompress_health_detail_policy import (
+    KOMPRESS_DETAIL_LOADED,
+    KOMPRESS_DETAIL_NOT_CACHED,
+    KOMPRESS_DETAIL_NOT_INSTALLED,
+    KOMPRESS_DETAIL_WARM_FAILED,
+    KOMPRESS_DETAIL_WARMING,
+    public_detail,
 )
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
@@ -160,11 +167,9 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
-from headroom.proxy.models import (  # noqa: F401
-    CacheEntry,
+from headroom.proxy.models import (
+    PROXY_CONFIG_SECRET_FIELDS,
     ProxyConfig,
-    RateLimitState,
-    RequestLog,
     default_periodic_malloc_trim,
 )
 from headroom.proxy.modes import (
@@ -172,6 +177,7 @@ from headroom.proxy.modes import (
     PROXY_MODE_TOKEN,
     is_token_mode,
     normalize_proxy_mode,
+    read_maturation_inert_reason,
 )
 from headroom.proxy.orphan_watchdog import (
     orphan_grace_seconds,
@@ -182,14 +188,20 @@ from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
     set_current_project,
+    set_registered_cwd,
     strip_project_path_prefix,
 )
-from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
-from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
+from headroom.proxy.project_policy import split_project_path
+from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.query_log_policy import (
+    install_access_log_query_filter,
+    redact_query_string_for_log,
+)
+from headroom.proxy.rate_limiter import TokenBucketRateLimiter
 from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
-from headroom.proxy.request_logger import RequestLogger  # noqa: F401
+from headroom.proxy.request_logger import RequestLogger
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
-from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
+from headroom.proxy.semantic_cache import SemanticCache
 from headroom.proxy.ssl_context import (
     build_httpx_verify,
     describe_trust_policy,
@@ -199,6 +211,7 @@ from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
+from headroom.proxy.workspace_registry import resolve_registered_cwd
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
 from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
@@ -208,12 +221,10 @@ from headroom.subscription.tracker import (
     get_subscription_tracker,
 )
 from headroom.telemetry import get_telemetry_collector
-from headroom.telemetry.beacon import is_beacon_enabled, is_telemetry_enabled
+from headroom.telemetry.beacon import beacon_off_reason, is_beacon_enabled, is_telemetry_enabled
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
     CacheAligner,
-    CodeAwareCompressor,
-    CodeCompressorConfig,
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
@@ -232,11 +243,6 @@ try:
     HAS_FCNTL = True
 except ImportError:
     HAS_FCNTL = False
-
-_build_prefix_cache_stats = build_prefix_cache_stats
-_build_session_summary = build_session_summary
-_merge_cost_stats = merge_cost_stats
-
 
 _AGENT_LABELS: dict[str, str] = {
     "claude": "Claude",
@@ -500,6 +506,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("headroom.proxy")
 
+# Liveness/readiness probe routes: auth-exempt, and logged at DEBUG.
+_HEALTH_PROBE_PATHS = frozenset({"/health", "/livez", "/readyz"})
+
 
 def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
     """/stats payload for the output-shaping layer.
@@ -598,6 +607,72 @@ class CompressionQuarantinedError(asyncio.TimeoutError):
 
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
+# The workers' copy of the config's credentials travels in an owner-only file,
+# not in the environment every child process inherits; this names the file.
+_MULTI_WORKER_SECRETS_ENV = "HEADROOM_PROXY_CONFIG_SECRETS_FILE"
+
+
+def _save_prefix_state_on_exit_signal(store: Any, path: str) -> Callable[[], None]:
+    """Save prefix-tracker state as soon as an exit signal arrives.
+
+    ``HeadroomProxy.shutdown`` saves it too, but uvicorn runs the lifespan
+    shutdown only after waiting up to ``timeout_graceful_shutdown`` for
+    in-flight requests, so a supervisor that SIGKILLs sooner (a desktop app's
+    short stop, systemd's ``TimeoutStopSec``) loses that save whenever a request
+    is open. This wraps the handler uvicorn installed (the lifespan runs inside
+    its ``capture_signals``), so uvicorn's shutdown is unchanged and the later
+    save still writes the newer state. The save runs on the event loop, never
+    inside the signal handler, so it cannot read a tracker that a paused
+    coroutine was midway through updating.
+
+    Returns the undo, for the lifespan's shutdown: it restores each handler
+    that is still this wrapper (one another owner installed since is left
+    alone) and turns the wrapper into a pass-through, so a wrapper that could
+    not be removed never schedules onto this lifespan's closed loop.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None  # signals are only delivered to the main thread
+    loop = asyncio.get_running_loop()
+    active = True
+    saved = False
+
+    def save() -> None:
+        nonlocal saved
+        if not saved:
+            saved = True
+            store.save_state(path)
+
+    def chained(previous: Callable[[int, Any], Any]) -> Callable[[int, Any], None]:
+        def handler(signum: int, frame: Any) -> None:
+            if active:
+                with contextlib.suppress(RuntimeError):  # loop closed without a shutdown
+                    loop.call_soon_threadsafe(save)
+            previous(signum, frame)
+
+        return handler
+
+    installed: list[tuple[int, Any, Callable[[int, Any], None]]] = []
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if sig is None:
+            continue
+        previous = signal.getsignal(sig)
+        if not callable(previous):
+            continue  # nobody installed a handler: keep the default exit
+        handler = chained(previous)
+        signal.signal(sig, handler)
+        installed.append((sig, previous, handler))
+
+    def undo() -> None:
+        nonlocal active
+        active = False
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig, previous, handler in installed:
+            if signal.getsignal(sig) is handler:
+                signal.signal(sig, previous)
+
+    return undo
+
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
 # Default behavior: hard-fail at startup if `headroom._core` is unimportable
@@ -798,6 +873,64 @@ from headroom.proxy.handlers import (  # noqa: E402
     OpenAIHandlerMixin,
     StreamingMixin,
 )
+from headroom.proxy.handlers.openai import (  # noqa: E402
+    _is_allowed_websocket_origin,
+    _is_loopback_ws_origin,
+    _normalize_origin,
+)
+
+
+def _is_cors_listed_origin(origin: str) -> bool:
+    """True when ``origin`` is listed in HEADROOM_CORS_ORIGINS (``*`` lists nothing)."""
+    normalized = _normalize_origin(origin)
+    if normalized is None:
+        return False
+    listed = (
+        _normalize_origin(entry.strip())
+        for entry in os.environ.get("HEADROOM_CORS_ORIGINS", "").split(",")
+        if entry.strip() and entry.strip() != "*"
+    )
+    return normalized in listed
+
+
+def _is_refused_browser_request(request: Request) -> bool:
+    """Return True for a browser request from a page the proxy does not trust.
+
+    The proxy adds operator credentials (extra headers, the Copilot token,
+    provider env keys) to what it forwards, and loopback callers skip the
+    proxy token, so a page open in the user's browser must not be able to
+    drive it with a "simple" request (``text/plain`` body, no preflight).
+
+    Requests without ``Origin`` (CLI tools, SDKs, coding agents) pass. With
+    ``Origin``, these pass: loopback pages (the dashboard), the origins the
+    WebSocket routes accept (``HEADROOM_WS_ORIGINS`` / ``HEADROOM_CORS_ORIGINS``),
+    and, for a non-loopback peer, a page served from this proxy's own address
+    (a remote dashboard). A loopback peer gets no same-origin pass: there a
+    non-loopback Host means a page's hostname was pointed at 127.0.0.1.
+    A cross-site subresource load (``<img>``, ``<script>``) carries no
+    ``Origin`` on GET, so ``Sec-Fetch-Site: cross-site`` is refused too, except
+    for a top-level navigation.
+    """
+    headers = request.headers
+    origin = headers.get("origin")
+    if origin:
+        if (
+            _is_loopback_ws_origin(origin)
+            or _is_allowed_websocket_origin(dict(headers))
+            or _is_cors_listed_origin(origin)
+        ):
+            return False
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        host_header = headers.get("host")
+        return (
+            is_loopback_host(peer)
+            or not host_header
+            or not _request_has_same_origin_or_no_provenance(request, host_header)
+        )
+    fetch_site = (headers.get("sec-fetch-site") or "").lower()
+    fetch_mode = (headers.get("sec-fetch-mode") or "").lower()
+    return fetch_site == "cross-site" and fetch_mode != "navigate"
 
 
 def _apply_stateless_persistence(config: ProxyConfig) -> None:
@@ -845,11 +978,35 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     detach_compression_store()
 
 
+# Hop-by-hop fields (RFC 9110 7.6.1) describe the client's connection to the
+# proxy, not the proxy's connection to the provider. Handlers copy the inbound
+# headers, so a client's `Connection: close` reached the provider and made
+# every pooled upstream connection single-use: a fresh DNS lookup, TCP connect
+# and TLS handshake per request. Framing (content-length, transfer-encoding)
+# is httpx's own by the time the hook runs and is never touched.
+_HOP_BY_HOP_REQUEST_HEADERS = frozenset(
+    {"connection", "keep-alive", "proxy-connection", "te", "trailer", "upgrade"}
+)
+_FRAMING_REQUEST_HEADERS = frozenset({"host", "content-length", "transfer-encoding"})
+
+
+async def _drop_hop_by_hop_request_headers(request: httpx.Request) -> None:
+    named = {
+        token.strip().lower()
+        for token in request.headers.get_list("connection", split_commas=True)
+        if token.strip()
+    }
+    for name in (_HOP_BY_HOP_REQUEST_HEADERS | named) - _FRAMING_REQUEST_HEADERS:
+        if name in request.headers:
+            del request.headers[name]
+
+
 def _provider_httpx_client_options(
     config: ProxyConfig,
     verify: Any,
 ) -> tuple[bool, dict[str, Any]]:
     client_kwargs: dict[str, Any] = {
+        "event_hooks": {"request": [_drop_hop_by_hop_request_headers]},
         "timeout": httpx.Timeout(
             connect=config.connect_timeout_seconds,
             read=config.request_timeout_seconds,
@@ -1026,15 +1183,6 @@ class HeadroomProxy(
         # the default request path is unchanged.
         self.model_router = ModelRouter(config.model_router)
 
-        # Initialize transforms based on routing mode.
-        #
-        # Phase B PR-B1 retired the IntelligentContextManager / RollingWindow
-        # message-dropping branch. Live-zone-only compression (PR-B2..B7) does
-        # not drop messages — it operates on content blocks within messages —
-        # so the proxy no longer needs a "context manager" transform stage.
-        # Reported via metrics as `_context_manager_status = "passthrough"`.
-        self._context_manager_status = "passthrough"
-
         # ContentRouter is the single proxy routing surface. Provider handlers
         # normalize their request shapes into messages or CompressionUnits, and
         # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
@@ -1062,6 +1210,10 @@ class HeadroomProxy(
         # Runs BEFORE the disable_kompress override below so that flag stays
         # authoritative for turning Kompress off.
         _apply_compressor_selection(router_config, config.compressors)
+        # The proxy is long-lived: keep compression results it has no memory
+        # budget for in a SQLite file instead of compressing them again
+        # (headroom.cache.result_store; off in stateless mode).
+        router_config.result_cache_disk = True
         # External (non-built-in) `headroom.compressor` selections are ignored by
         # `_apply_compressor_selection` (they have no enable_* flag). Thread them
         # to the router here so it can route matching blocks through them; None
@@ -1225,6 +1377,14 @@ class HeadroomProxy(
                 session_ttl_seconds=config.prefix_freeze_session_ttl,
             )
         )
+        # Session-aware /v1/compress state in Redis, so any replica serves any
+        # turn (HEADROOM_COMPRESS_SESSION_STORE); None keeps it in memory.
+        from headroom.cache.shared_sessions import open_shared_sessions
+
+        self.shared_compress_sessions = open_shared_sessions()
+        # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
+        self._prefix_state_file: str | None = None
+        self._undo_exit_signal_save: Callable[[], None] | None = None
 
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
@@ -1313,9 +1473,10 @@ class HeadroomProxy(
         #      sharing the loop's default executor (file IO, etc.).
         #   2. Tasks that exceed ``COMPRESSION_TIMEOUT_SECONDS`` and complete
         #      *after* the asyncio future was cancelled are counted in the
-        #      ``compression_leaked_threads`` gauge — Python cannot preempt
-        #      the worker, so this is the only signal that some pool slots
-        #      are sitting on stuck work.
+        #      ``compression_timed_out_workers_total`` counter — Python cannot
+        #      preempt the worker, so this is the only signal that some pool
+        #      slots sat on work past its deadline. Cumulative: it counts
+        #      workers that finished late, not threads still stuck (#3653).
         _compression_max_cfg = config.compression_max_workers
         if _compression_max_cfg is None:
             _compression_max = max(1, os.cpu_count() or 1)
@@ -1361,9 +1522,12 @@ class HeadroomProxy(
         self._compression_in_flight_max: int = 0
         self._compression_run_seconds_total: float = 0.0
         self._compression_run_seconds_max: float = 0.0
-        # Counter: threads that finished AFTER their asyncio future hit the
-        # timeout. Stuck-thread leak indicator.
-        self._compression_leaked_threads: int = 0
+        # Counter: workers that finished AFTER their asyncio future hit the
+        # timeout. Cumulative total, never decremented: a late-finishing
+        # worker is counted once when it exits. It does NOT report live
+        # stuck threads — a steady value means past timeouts, not a
+        # growing leak (#3653).
+        self._compression_timed_out_workers_total: int = 0
         # Timeout-debt quarantine. Python cannot preempt a worker after its
         # asyncio waiter times out, so accepting more compression while those
         # workers are still running can multiply slow calls into a saturated
@@ -1396,6 +1560,9 @@ class HeadroomProxy(
         )
         self._compression_quarantine_releases: int = 0
         self._compression_metrics_lock = threading.Lock()
+        # Daemon thread that warms the Kompress model after startup when the
+        # eager preload deferred the native load (GH #2730). None until started.
+        self._kompress_warm_thread: threading.Thread | None = None
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
         # Supports: "anthropic" (direct), "bedrock", "vertex", "litellm-<provider>", or "anyllm"
@@ -1415,18 +1582,6 @@ class HeadroomProxy(
         self._request_counter_lock = asyncio.Lock()
         self._active_requests = 0
         self._activity_generation = 0
-
-        # CCR tool injectors (one per provider)
-        self.anthropic_tool_injector = CCRToolInjector(
-            provider="anthropic",
-            inject_tool=config.ccr_inject_tool,
-            inject_system_instructions=config.ccr_inject_system_instructions,
-        )
-        self.openai_tool_injector = CCRToolInjector(
-            provider="openai",
-            inject_tool=config.ccr_inject_tool,
-            inject_system_instructions=config.ccr_inject_system_instructions,
-        )
 
         # CCR Response Handler (handles CCR tool calls automatically)
         self.ccr_response_handler = (
@@ -1627,7 +1782,7 @@ class HeadroomProxy(
         preempt running CPython bytecode or in-flight Rust calls. The
         worker keeps running to completion, ignored. We detect this by
         marking the call timed out on the asyncio side and incrementing
-        ``_compression_leaked_threads`` from the worker's ``finally``
+        ``_compression_timed_out_workers_total`` from the worker's ``finally``
         block after it eventually finishes. While such workers hold half the
         pool (``_compression_quarantine_threshold``), new calls raise
         :class:`CompressionQuarantinedError` immediately so callers apply the
@@ -1641,11 +1796,11 @@ class HeadroomProxy(
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
                 raise asyncio Cancellation; if it does, the wrapper still
-                decrements the in-flight gauge but the leaked-thread
+                decrements the in-flight gauge but the timed-out-worker
                 counter may double-count.
             timeout: Wall-clock timeout for the asyncio side. The
-                executor worker keeps running past this (Python limitation
-                — see above), but at least the awaiter unblocks.
+            executor worker keeps running past this (Python limitation
+            — see above), but at least the awaiter unblocks.
 
         Returns:
             Whatever ``fn()`` returns.
@@ -1776,7 +1931,7 @@ class HeadroomProxy(
                     if elapsed > self._compression_run_seconds_max:
                         self._compression_run_seconds_max = elapsed
                     if state["timed_out"]:
-                        self._compression_leaked_threads += 1
+                        self._compression_timed_out_workers_total += 1
                     if state["timeout_debt_recorded"]:
                         self._compression_timed_out_in_flight -= 1
                         state["timeout_debt_recorded"] = False
@@ -1790,7 +1945,12 @@ class HeadroomProxy(
                         remaining,
                     )
 
-        future = loop.run_in_executor(self._compression_executor, _wrapped)
+        # run_in_executor doesn't copy contextvars into the worker thread
+        # (unlike asyncio.to_thread) -- without this, get_registered_cwd()
+        # etc. would silently see the ContextVar default, not what the
+        # request middleware bound.
+        ctx = contextvars.copy_context()
+        future = loop.run_in_executor(self._compression_executor, ctx.run, _wrapped)
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
@@ -1815,7 +1975,9 @@ class HeadroomProxy(
         Runs on the dedicated single-thread background executor.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._background_compression_executor, fn)
+        # Same context-propagation fix as _run_compression_in_executor above.
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(self._background_compression_executor, ctx.run, fn)
 
     # How often the lazy TTL sweep in `_get_compression_cache` may run.
     _COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS = 60.0
@@ -1936,39 +2098,6 @@ class HeadroomProxy(
             self._compression_cache_last_seen[session_id] = now
             return cache
 
-    def _setup_code_aware(self, config: ProxyConfig, transforms: list) -> str:
-        """Set up code-aware compression if enabled.
-
-        Args:
-            config: Proxy configuration
-            transforms: Transform list to append to
-
-        Returns:
-            Status string for logging: 'enabled', 'disabled', 'available', 'unavailable'
-        """
-        if config.code_aware_enabled:
-            if is_tree_sitter_available():
-                code_config = CodeCompressorConfig(
-                    preserve_imports=True,
-                    preserve_signatures=True,
-                    preserve_type_annotations=True,
-                )
-                # CodeAware runs after the content/structure transforms.
-                # Phase B PR-B1 retired the trailing context_manager so we
-                # append rather than insert(-1).
-                transforms.append(CodeAwareCompressor(code_config))
-                return "enabled"
-            else:
-                logger.warning(
-                    "Code-aware compression requested but tree-sitter not installed. "
-                    "Install with: pip install headroom-ai[code]"
-                )
-                return "unavailable"
-        else:
-            if is_tree_sitter_available():
-                return "available"  # Available but not enabled
-            return "disabled"
-
     def _eager_preload_transforms(self) -> tuple[dict[str, str], list[dict[str, str]]]:
         """Eagerly load every compressor/parser/detector once (dedup by ``id()``).
 
@@ -2043,6 +2172,13 @@ class HeadroomProxy(
         cost off the request path. Skipped on glibc older than 2.28 (the
         affected host family) and when ``HEADROOM_KOMPRESS_WARMUP`` is ``0``;
         ``1`` forces it. Returns ``True`` when a warm-up thread was started.
+
+        The thread also promotes ``warmup.kompress``. The eager preload
+        deliberately skips ``preload()`` so a native load can never block the
+        port bind (GH #790), which left the slot at ``status="null"``, and
+        ``_reconcile_kompress_health`` only promotes it once a compressor
+        reports ``is_ready()`` — so an idle proxy reported
+        ``kompress: unhealthy, backend: null`` forever (GH #2730).
         """
         raw = os.environ.get("HEADROOM_KOMPRESS_WARMUP", "").strip().lower()
         if raw in ("0", "false", "no", "off"):
@@ -2053,7 +2189,12 @@ class HeadroomProxy(
         if raw not in ("1", "true", "yes", "on"):
             import platform
 
-            libc, version = platform.libc_ver()
+            try:
+                libc, version = platform.libc_ver()
+            except OSError:
+                # libc_ver() reads sys.executable; Microsoft Store Python's
+                # python.exe is an app-execution alias that can't be opened.
+                libc, version = "", ""
             if libc == "glibc":
                 try:
                     major, minor = (int(part) for part in version.split(".")[:2])
@@ -2084,26 +2225,67 @@ class HeadroomProxy(
         except ValueError:
             delay = 2.0
 
+        slot = self.warmup.kompress
+
         def _warm() -> None:
             time.sleep(max(0.0, delay))
             started = time.monotonic()
             try:
+                from headroom.transforms.kompress_compressor import KompressModelNotCached
+
+                not_cached: tuple[type[BaseException], ...] = (KompressModelNotCached,)
+            except Exception:  # ML extras absent; every failure is just "failed"
+                not_cached = ()
+            try:
                 backend = compressor.preload(allow_download=True)
-            except Exception as exc:  # the lazy request path still loads on first use
-                logger.warning("Kompress background warm-up failed: %s", exc)
+            except not_cached:
+                # The local loader only raises this when downloads are off, so
+                # with allow_download=True a cold cache downloads instead. This
+                # covers compressors that report a cache miss on their own.
+                slot.info["detail"] = KOMPRESS_DETAIL_NOT_CACHED
+                logger.debug("Kompress background warm-up: model not cached")
                 return
+            except Exception:
+                # The detail lands on the auth-exempt /health payload, so it
+                # stays a bounded token; loader failures embed paths, model
+                # ids and URLs. The real cause goes to the log only.
+                slot.info["detail"] = KOMPRESS_DETAIL_WARM_FAILED
+                logger.warning("Kompress background warm-up failed", exc_info=True)
+                return
+            if not backend:
+                return
+            slot.info.pop("detail", None)
+            slot.mark_loaded(handle=compressor, backend=backend, source_status="background")
             logger.info(
                 "Kompress: warmed in the background in %.0f ms (backend %s)",
                 (time.monotonic() - started) * 1000,
                 backend,
             )
 
-        threading.Thread(target=_warm, name="kompress-warmup", daemon=True).start()
+        from headroom.transforms.kompress_compressor import start_kompress_warmup_thread
+
+        # Registered as the model's loader, so a request during the warm-up
+        # doesn't start a second load thread.
+        self._kompress_warm_thread = start_kompress_warmup_thread(compressor.config.model_id, _warm)
         return True
 
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
+        # Opt-in: resume the prefix trackers the previous process saved on its
+        # graceful shutdown, so warm conversations replay their cached prefix.
+        from headroom.cache.prefix_tracker import PREFIX_STATE_FILE_ENV, prefix_state_file
+
+        self._prefix_state_file = prefix_state_file()
+        if self._prefix_state_file and _MULTI_WORKER_CONFIG_ENV in os.environ:
+            # Each worker holds its own trackers; one file cannot hold them all.
+            logger.warning("%s ignored: not supported with multiple workers", PREFIX_STATE_FILE_ENV)
+            self._prefix_state_file = None
+        if self._prefix_state_file:
+            self.session_tracker_store.load_state(self._prefix_state_file)
+            self._undo_exit_signal_save = _save_prefix_state_on_exit_signal(
+                self.session_tracker_store, self._prefix_state_file
+            )
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -2153,6 +2335,25 @@ class HeadroomProxy(
         if self.config.mode == PROXY_MODE_CACHE:
             logger.info("  Prefix freeze: strict (all prior turns immutable)")
             logger.info("  Mutations: latest turn only")
+        if self.config.read_maturation:
+            _inert = read_maturation_inert_reason(
+                self.config.mode,
+                quiesce_turns=self.config.read_maturation_quiesce_turns,
+                max_hold_turns=self.config.read_maturation_max_hold_turns,
+            )
+            if _inert:
+                logger.warning(
+                    "Read maturation: INERT (%s); use --mode token or disable read_maturation",
+                    _inert,
+                )
+            else:
+                logger.info(
+                    "Read maturation: ENABLED (quiesce_turns=%d max_hold_turns=%d "
+                    "min_size_bytes=%d)",
+                    self.config.read_maturation_quiesce_turns,
+                    self.config.read_maturation_max_hold_turns,
+                    self.config.read_maturation_min_size_bytes,
+                )
         # Effective compression posture, resolved (not merely requested). The
         # savings profile reaches the router through two paths — the config
         # object and the seeded process env — and `setdefault` semantics mean a
@@ -2257,15 +2458,31 @@ class HeadroomProxy(
             self._kompress_status = eager_status["kompress"]
         if eager_status.get("code_aware") == "enabled":
             self._code_aware_status = "enabled"
+        kompress_enabled = any(
+            transform.config.enable_kompress
+            for pipeline in (self.anthropic_pipeline, self.openai_pipeline)
+            for transform in pipeline.transforms
+            if isinstance(transform, ContentRouter)
+        )
 
         # Log component status
         if self._kompress_status == "enabled":
-            logger.info("Kompress: ENABLED (ModernBERT token compressor)")
+            if eager_status.get("kompress_backend") == "remote":
+                logger.info("Kompress: ENABLED (remote endpoint; no local model)")
+            else:
+                logger.info("Kompress: ENABLED (ModernBERT token compressor)")
         elif self._kompress_status == "deferred":
             if self._start_kompress_background_warmup():
                 logger.info("Kompress: DEFERRED (warming in the background after startup)")
             else:
                 logger.info("Kompress: DEFERRED (model loads on first request)")
+        elif not kompress_enabled and (
+            self.config.optimize
+            or self.config.disable_kompress
+            or self.config.disable_kompress_anthropic is True
+            or self.config.disable_kompress_openai is True
+        ):
+            logger.info("Kompress: DISABLED")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -2397,10 +2614,11 @@ class HeadroomProxy(
         if is_beacon_enabled():
             logger.info(
                 "Anonymous upload beacon: ENABLED (default — session summaries are sent to "
-                "Headroom Labs). Opt out: HEADROOM_BEACON=off or DO_NOT_TRACK=1"
+                "Headroom Labs). Opt out: HEADROOM_BEACON=off, HEADROOM_TELEMETRY=off or "
+                "DO_NOT_TRACK=1"
             )
         else:
-            logger.info("Anonymous upload beacon: DISABLED")
+            logger.info("Anonymous upload beacon: DISABLED (%s)", beacon_off_reason())
 
         self.pipeline_extensions.emit(
             PipelineStage.POST_START,
@@ -2415,6 +2633,12 @@ class HeadroomProxy(
     async def shutdown(self):
         """Cleanup async resources."""
         self._get_shutdown_event().set()
+        # First, before any await can hit the shutdown step timeout.
+        if self._prefix_state_file:
+            self.session_tracker_store.save_state(self._prefix_state_file)
+        if self._undo_exit_signal_save is not None:
+            self._undo_exit_signal_save()
+            self._undo_exit_signal_save = None
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -2424,6 +2648,11 @@ class HeadroomProxy(
 
         if self.memory_handler and hasattr(self.memory_handler, "close"):
             await self.memory_handler.close()
+
+        if self.shared_compress_sessions is not None:
+            with contextlib.suppress(Exception):
+                self.shared_compress_sessions.close()
+            self.shared_compress_sessions = None
 
         with contextlib.suppress(Exception):
             from headroom.models.ml_models import MLModelRegistry
@@ -2638,15 +2867,23 @@ class HeadroomProxy(
         if timeout is not None:
             post_kwargs["timeout"] = timeout
 
+        from headroom.proxy.handlers.openai import prefers_http1_passthrough
+
+        req_client = (
+            getattr(self, "http_client_h1", None) or self.http_client
+            if prefers_http1_passthrough(url)
+            else self.http_client
+        )
+
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
-                    return await self.http_client.post(  # type: ignore[union-attr]
+                    return await req_client.post(  # type: ignore[union-attr]
                         url, **post_kwargs
                     )
                 else:
-                    response = await self.http_client.post(  # type: ignore[union-attr]
+                    response = await req_client.post(  # type: ignore[union-attr]
                         url, **post_kwargs
                     )
 
@@ -2658,6 +2895,11 @@ class HeadroomProxy(
                         if (
                             not self.config.retry_enabled
                             or attempt >= self.config.retry_max_attempts - 1
+                            or overload_retry_is_futile(
+                                response,
+                                self.config.retry_max_delay_ms,
+                                retries_left=self.config.retry_max_attempts - attempt - 1,
+                            )
                         ):
                             return response
                         delay_ms = retry_after_ms(
@@ -2805,7 +3047,7 @@ def _register_memory_components(proxy: HeadroomProxy, tracker: MemoryTracker) ->
     # registered when the memory system is initialized with specific backends.
 
 
-def _request_is_loopback(request: Request) -> bool:
+def _request_is_loopback(request: Request, *, allow_gateway_peer: bool = True) -> bool:
     """Return True iff the caller is on loopback by *both* peer IP and Host header.
 
     Mirrors the two-gate check in :func:`loopback_guard.require_loopback`
@@ -2814,6 +3056,9 @@ def _request_is_loopback(request: Request) -> bool:
     payload — serving sensitive sub-blocks (upstream URLs, per-request logs)
     only to loopback callers — rather than 404ing network callers that still
     have a legitimate use for the non-sensitive aggregate fields.
+
+    ``allow_gateway_peer=False`` drops the trusted-gateway-CIDR equivalence
+    below, for callers (settings writes) that need a genuine loopback peer.
     """
     from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 
@@ -2831,6 +3076,8 @@ def _request_is_loopback(request: Request) -> bool:
     # Genuine loopback peer (native run, or curl inside the container).
     if is_loopback_host(client_host):
         return True
+    if not allow_gateway_peer:
+        return False
 
     # Containerized dashboards: when Headroom runs in a bridge-network
     # container, a browser on the host reaches it via the container's
@@ -2851,9 +3098,11 @@ def _request_is_loopback(request: Request) -> bool:
 def _request_can_view_dashboard_metadata(
     request: Request,
     trusted_dashboard_client_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+    *,
+    allow_gateway_peer: bool = True,
 ) -> bool:
     """Authorize sensitive ``/stats`` metadata without widening admin access."""
-    if _request_is_loopback(request):
+    if _request_is_loopback(request, allow_gateway_peer=allow_gateway_peer):
         return True
 
     from headroom.proxy.forwarded_headers import peer_is_trusted_gateway, resolve_client_ip
@@ -2880,6 +3129,29 @@ def _request_can_view_dashboard_metadata(
         resolve_client_ip(request),
         trusted_dashboard_client_cidrs,
     )
+
+
+def _request_can_view_stats_metadata(
+    request: Request,
+    trusted_dashboard_client_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+) -> bool:
+    """Authorize per-request ``/stats`` metadata (ids, providers, models, errors).
+
+    Everything :func:`_request_can_view_dashboard_metadata` allows, plus callers
+    that proved they hold ``HEADROOM_PROXY_TOKEN``: the security gate sets
+    ``request.state.proxy_authenticated`` only after a constant-time token match.
+    That is what a dashboard fronted by an authenticating reverse proxy sends
+    (the proxy adds the token after its own sign-in). Such a caller reaches
+    ``/stats`` with a domain ``Host`` and a peer outside any trusted CIDR, so
+    the Host/CIDR rule above can never admit it, and the dashboard's
+    "Recent Requests" table stays empty. This widens what the token grants:
+    every holder sees the request metadata of every caller on this proxy
+    (docs/content/docs/security-model.mdx, "What the proxy token unlocks").
+    The settings routes and the loopback-only routes keep their own guards.
+    """
+    if getattr(request.state, "proxy_authenticated", False) is True:
+        return True
+    return _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
 
 
 def _request_has_same_origin_or_no_provenance(request: Request, host_header: str) -> bool:
@@ -2972,6 +3244,75 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip() or None
     return None
+
+
+# Generic HTTP clients a ``proxy_auth_rejected`` line may name by their
+# User-Agent product token, after the agent harnesses in CLIENT_UA_MAP. Any
+# other User-Agent logs as ``other``: the header is caller-controlled text.
+_AUTH_REJECTION_CLIENTS = frozenset(
+    {
+        "anthropic",
+        "axios",
+        "codex_cli_rs",
+        "curl",
+        "go-http-client",
+        "mozilla",
+        "node",
+        "okhttp",
+        "openai",
+        "python-httpx",
+        "python-requests",
+        "python-urllib",
+        "wget",
+    }
+)
+
+
+def _auth_rejection_context(headers: Mapping[str, str]) -> tuple[str, str]:
+    """``(ua, xff)`` for a rejection log line, drawn from a fixed vocabulary.
+
+    Both headers are caller-controlled, so neither is logged as received.
+    ``ua`` is the harness name ``CLIENT_UA_MAP`` gives the User-Agent (the
+    same names the rest of the proxy uses, e.g. ``claude-code``, ``codex``),
+    else its product token when ``_AUTH_REJECTION_CLIENTS`` lists it, else
+    ``other``. ``X-Client`` is deliberately not consulted: unlike
+    ``classify_client``, nothing here may echo free text. ``xff`` is the leftmost
+    ``X-Forwarded-For`` hop when it is a plain IP address, else ``invalid``.
+    Either is ``none`` when its header is absent. ``xff`` is unverified, so it
+    only helps attribute rejected callers behind a gateway whose peer address
+    is all the gate sees. It is never used for any decision. Credentials are
+    never read here.
+    """
+    from headroom.proxy.forwarded_policy import header_first
+
+    ua_lower = str(headers.get("user-agent") or "").lower()
+    product = ua_lower.partition("/")[0].strip()
+    harness = next((name for needle, name in CLIENT_UA_MAP if needle in ua_lower), None)
+    if not ua_lower:
+        ua = "none"
+    elif harness is not None:
+        ua = harness
+    else:
+        ua = product if product in _AUTH_REJECTION_CLIENTS else "other"
+
+    hop = header_first(str(headers.get("x-forwarded-for") or ""))
+    try:
+        address = ipaddress.ip_address(hop)
+    except ValueError:
+        return ua, "invalid" if hop else "none"
+    # An IPv6 zone index (fe80::1%<zone>) is free text, so refuse it too.
+    return ua, "invalid" if getattr(address, "scope_id", None) else str(address)
+
+
+def _auth_rejection_path(path: object) -> str:
+    """The request path for a rejection log line, with control characters escaped.
+
+    The ASGI server percent-decodes the path, so an unauthenticated caller can
+    put raw CR/LF, NUL or terminal escapes in it (``%0A``, ``%1B``) and forge or
+    garble log lines. ``unicode_escape`` renders every non-printable or
+    non-ASCII character (and the backslash itself) as an escape sequence.
+    """
+    return str(path).encode("unicode_escape").decode("ascii")
 
 
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
@@ -3098,11 +3439,15 @@ class WebSocketAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        user_agent, forwarded_for = _auth_rejection_context(headers)
         logger.warning(
-            "event=proxy_auth_rejected transport=websocket path=%s client=%s reason=%s",
-            scope.get("path"),
+            "event=proxy_auth_rejected transport=websocket path=%s client=%s reason=%s "
+            "ua=%s xff=%s",
+            _auth_rejection_path(scope.get("path")),
             client_host,
             "missing_token" if provided is None else "bad_token",
+            user_agent,
+            forwarded_for,
         )
         # Receive the handshake before refusing it: ASGI servers send
         # ``websocket.connect`` and wait for the application to answer, and
@@ -3150,6 +3495,31 @@ class ActivityMiddleware:
             self.proxy._activity_generation += 1
 
 
+def _kompress_routers(proxy: HeadroomProxy) -> list[ContentRouter]:
+    """Kompress-enabled ContentRouters across both pipelines, deduped by identity."""
+    routers: list[ContentRouter] = []
+    for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+        for transform in getattr(pipeline, "transforms", ()):
+            if (
+                isinstance(transform, ContentRouter)
+                and transform.config.enable_kompress
+                and all(transform is not item for item in routers)
+            ):
+                routers.append(transform)
+    return routers
+
+
+def _kompress_compressors(proxy: HeadroomProxy) -> list[Any]:
+    """Compressor instances held by the kompress-enabled routers, deduped."""
+    compressors: list[Any] = []
+    for router in _kompress_routers(proxy):
+        for name in ("_kompress", "_kompress_remote"):
+            compressor = getattr(router, name, None)
+            if compressor is not None and all(compressor is not item for item in compressors):
+                compressors.append(compressor)
+    return compressors
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -3170,26 +3540,44 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # to 8787), so this is accepted.
     config = config or ProxyConfig()
 
+    # Every process that serves the app (each --workers N worker builds its
+    # own) keeps query values out of uvicorn's access log.
+    install_access_log_query_filter()
+
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy log. Multi-worker processes add their PID so
-    # same-port workers never share a RotatingFileHandler target.
-    _setup_file_logging(
-        config.port,
-        process_id=os.getpid() if config.worker_processes > 1 else None,
-    )
+    # same-port workers never share a RotatingFileHandler target. Stateless
+    # mode must not create a log directory or file.
+    if not config.stateless:
+        _setup_file_logging(
+            config.port,
+            process_id=os.getpid() if config.worker_processes > 1 else None,
+        )
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
     # (which already applies them before Click parsing). setdefault keeps
     # explicit env exports authoritative; fail-open so it never blocks startup.
+    # settings_store.load() already reports an unreadable or corrupt file; this
+    # catches anything else that goes wrong while applying it.
+    settings_file: object = "the saved settings file"
     try:
+        from headroom import paths as _hr_paths
         from headroom import settings_store
 
+        settings_file = _hr_paths.settings_path()
         settings_store.apply_to_environ(settings_store.load())
-    except Exception:  # noqa: BLE001 — settings load must never break startup
-        pass
+    except Exception as exc:  # noqa: BLE001 — settings load must never break startup
+        # Settings values can hold credentials, so the exception is described by
+        # type and code location only, never its message.
+        logger.warning(
+            "Could not apply saved settings from %s (%s); continuing with env and "
+            "defaults. Fix or remove that file and restart the proxy.",
+            settings_file,
+            describe_exception(exc),
+        )
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -3535,30 +3923,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return result
 
     def _kompress_health_routers() -> list[ContentRouter]:
-        routers: list[ContentRouter] = []
-        for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
-            for transform in getattr(pipeline, "transforms", ()):
-                if (
-                    isinstance(transform, ContentRouter)
-                    and transform.config.enable_kompress
-                    and all(transform is not item for item in routers)
-                ):
-                    routers.append(transform)
-        return routers
+        return _kompress_routers(proxy)
 
     def _reconcile_kompress_health() -> bool:
-        routers = _kompress_health_routers()
-        if not routers:
+        if not _kompress_health_routers():
             return False
 
-        compressors: list[Any] = []
-        for router in routers:
-            for name in ("_kompress", "_kompress_remote"):
-                compressor = getattr(router, name, None)
-                if compressor is not None and all(compressor is not item for item in compressors):
-                    compressors.append(compressor)
-
-        for compressor in compressors:
+        for compressor in _kompress_compressors(proxy):
             try:
                 if not compressor.is_ready():
                     continue
@@ -3592,7 +3963,39 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     )
         return True
 
+    def _kompress_detail() -> str:
+        """Human-readable reason behind the kompress readiness bit.
+
+        ``ready=false`` on its own is ambiguous — the model may be warming in
+        the background, missing from the local cache, or the extras may not be
+        installed at all (GH #2730).
+
+        This value is served by the auth-exempt ``/health`` and ``/readyz``, so
+        every candidate goes through :func:`public_detail` and anything outside
+        ``KOMPRESS_HEALTH_DETAILS`` collapses to ``unavailable``. That matters
+        most for ``slot.error``, which carries raw loader exception text.
+        ``/debug/warmup`` and the proxy log still hold the precise cause.
+        """
+        slot = proxy.warmup.kompress
+        if slot.status == "loaded":
+            return KOMPRESS_DETAIL_LOADED
+        detail = slot.info.get("detail")
+        if isinstance(detail, str) and detail:
+            return public_detail(detail)
+        if slot.error:
+            return public_detail(slot.error)
+        warm_thread = getattr(proxy, "_kompress_warm_thread", None)
+        if warm_thread is not None and warm_thread.is_alive():
+            return KOMPRESS_DETAIL_WARMING
+        source_status = slot.info.get("source_status")
+        if isinstance(source_status, str) and source_status:
+            return public_detail(source_status)
+        return KOMPRESS_DETAIL_NOT_INSTALLED
+
     def _health_checks() -> dict[str, dict[str, Any]]:
+        from headroom.cache.redis_client import states as _redis_states
+
+        features = _redis_states()
         kompress_enabled = _reconcile_kompress_health()
         memory_status = (
             proxy.memory_handler.health_status()
@@ -3607,6 +4010,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         memory_enabled = bool(memory_status.get("enabled", False))
         memory_initialized = bool(memory_status.get("initialized", False))
+        session_store_enabled = bool(features)
+        session_store_ready = session_store_enabled and all(
+            v == "available" for v in features.values()
+        )
         return {
             "startup": _component_health(
                 enabled=True,
@@ -3644,6 +4051,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ready=proxy.warmup.kompress.status == "loaded",
                 optional=True,
                 backend=proxy.warmup.kompress.info.get("backend", None),
+                detail=_kompress_detail(),
+            ),
+            "session_store": _component_health(
+                enabled=session_store_enabled,
+                ready=session_store_ready,
+                optional=True,
+                features=features,
             ),
         }
 
@@ -3665,7 +4079,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_in_flight_max = proxy._compression_in_flight_max
             _comp_run_total = proxy._compression_run_seconds_total
             _comp_run_max = proxy._compression_run_seconds_max
-            _comp_leaked = proxy._compression_leaked_threads
+            _comp_leaked = proxy._compression_timed_out_workers_total
             _comp_timed_out_in_flight = proxy._compression_timed_out_in_flight
             _comp_quarantine_active = (
                 _comp_timed_out_in_flight >= proxy._compression_quarantine_threshold
@@ -3701,6 +4115,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
+                # Canonical name: this is a cumulative count of workers that
+                # finished after their deadline, not live stuck threads.
+                # `leaked_threads_total` is kept as a deprecated alias so
+                # existing dashboards and watchdogs keep working (#3653).
+                "timed_out_workers_total": _comp_leaked,
                 "quarantine_active": _comp_quarantine_active,
                 "timed_out_workers": _comp_timed_out_in_flight,
                 "timed_out_workers_max": _comp_timed_out_in_flight_max,
@@ -3756,9 +4175,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
-        # Kompress is an optional soft component: model downloads lazily on
-        # first use, so "not ready" (cold cache) must not degrade overall health.
-        ready = all(check["ready"] for name, check in checks.items() if name != "kompress")
+        # Optional soft components (kompress, session_store) must not degrade
+        # overall health: a cold model cache or a Redis backoff is not a failure.
+        ready = all(
+            check["ready"]
+            for name, check in checks.items()
+            if name not in ("kompress", "session_store")
+        )
         payload: dict[str, Any] = {
             "service": "headroom-proxy",
             "status": "healthy" if ready else "unhealthy",
@@ -3813,7 +4236,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
+                "factory_api_url": config.factory_api_url,
                 "savings_profile": config.savings_profile,
+                # Enabled extension names only (no plugin state): `headroom
+                # wrap` carries them over when it has to start a dedicated
+                # proxy beside this one, so an enterprise sink is not lost.
+                "proxy_extensions": sorted(config.proxy_extensions or []),
                 "target_ratio": effective_target_ratio,
                 "target_savings_percent": (
                     round(max(0.0, min(1.0, 1.0 - float(effective_target_ratio))) * 100, 1)
@@ -3840,6 +4268,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "min_tokens_to_crush": profile_kwargs.get(
                     "min_tokens_to_compress",
                     config.min_tokens_to_crush,
+                ),
+                "exclude_tools": sorted(
+                    {
+                        *DEFAULT_EXCLUDE_TOOLS,
+                        *(config.exclude_tools or ()),
+                        *(config.protect_tool_results or ()),
+                    }
                 ),
                 "max_items_after_crush": profile_kwargs.get(
                     "max_items_after_crush",
@@ -3970,6 +4405,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         query = request.url.query
         headers = dict(request.headers.items())
         set_current_project(classify_project(headers) or prefix_project)
+        # Non-None only if a live wrap session registered this exact token
+        # (workspace_registry.py) -- the caller-supplied x-headroom-cwd
+        # header is never itself sufficient authority.
+        set_registered_cwd(
+            resolve_registered_cwd(config.port, headers.get("x-headroom-session-token"))
+        )
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
@@ -3996,13 +4437,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             safe_headers = redact_for_wire_debug(headers)
         except Exception:
             safe_headers = {"redaction_error": True}
-        logger.info(
+        # A desktop or orchestrator polls these every few seconds; at INFO they
+        # filled half of an idle proxy log and cut a busy one's history to hours.
+        line_level = (
+            logging.DEBUG if method == "GET" and path in _HEALTH_PROBE_PATHS else logging.INFO
+        )
+        logger.log(
+            line_level,
             "event=proxy_inbound_request id=%s method=%s path=%s query=%s client=%s "
             "content_length=%s headers=%s",
             inbound_id,
             method,
             path,
-            query,
+            redact_query_string_for_log(query),
             client_addr,
             request.headers.get("content-length", ""),
             json.dumps(safe_headers, ensure_ascii=False, default=str),
@@ -4050,7 +4497,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             proxy.metrics.record_inbound_response(status_code=response.status_code)
         except Exception:
             logger.debug("record_inbound_response failed", exc_info=True)
-        logger.info(
+        logger.log(
+            line_level,
             "event=proxy_inbound_response id=%s method=%s path=%s status=%s "
             "duration_ms=%.2f response_content_length=%s",
             inbound_id,
@@ -4094,7 +4542,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Anything else on these paths falls through to the catch-all passthrough
     # relay (FastAPI's @app.get does not register HEAD), so exempting it would
     # let an unauthenticated caller relay arbitrary requests upstream.
-    _AUTH_EXEMPT_PATHS = frozenset({"/health", "/livez", "/readyz"})
+    _AUTH_EXEMPT_PATHS = _HEALTH_PROBE_PATHS
 
     # A non-loopback bind with no token is the exact shape (``--host 0.0.0.0``
     # from any launcher) that exposes the unauthenticated /v1/* relay to the
@@ -4126,6 +4574,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # whose licence gate raises is absent, not fatal — the feature fails closed,
     # the process does not.
     #
+    # The exception is an extension that marks its install() `fail_closed`
+    # (e.g. one that mints the upstream credential): running without it would
+    # relay the client's own Authorization upstream, so `install_all` re-raises
+    # and create_app fails instead of serving mis-authenticated. See #4737.
+    #
     # Installed HERE, before the body limit and the security gate are
     # registered, so any middleware an extension adds sits INSIDE both (see the
     # ordering contract above). Routes an extension registers are unaffected
@@ -4147,6 +4600,26 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def _security_gate(request, call_next):
+        # 0) Browser provenance. Runs before the token check because loopback
+        #    callers skip that check, and a page in the user's browser reaches
+        #    the proxy as a loopback caller.
+        if _is_refused_browser_request(request):
+            logger.warning(
+                "event=proxy_browser_origin_rejected method=%s path=%s origin=%s",
+                request.method,
+                _auth_rejection_path(request.url.path),
+                _auth_rejection_path(request.headers.get("origin") or "-"),
+            )
+            rejection = JSONResponse(
+                status_code=403,
+                content={
+                    "error": "cross-origin request rejected",
+                    "hint": "add this page's origin to HEADROOM_WS_ORIGINS to allow it",
+                },
+            )
+            _apply_security_headers(rejection)
+            return rejection
+
         # 1) Optional inbound auth. When a token is configured, require it on
         #    non-loopback requests; loopback callers and health probes are
         #    exempt. Loopback is the same trust boundary the admin/debug
@@ -4155,17 +4628,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             path = request.url.path
             client = getattr(request, "client", None)
             client_host = getattr(client, "host", None) if client is not None else None
-            exempt = request.method == "GET" and path in _AUTH_EXEMPT_PATHS
+            # Anthropic SDK clients (Claude Code among them) probe reachability
+            # with an unauthenticated GET/HEAD /api/hello that never carries
+            # custom headers, so it cannot hold the proxy token. Let it past
+            # the token check, marked so its passthrough route answers it
+            # locally and empty instead of relaying an anonymous request
+            # upstream. It still runs through extension middleware, which sits
+            # inside this gate and may refuse it. The path is matched as
+            # routed: a /p/<project> prefix is only stripped further in.
+            hello_probe = (
+                request.method in ("GET", "HEAD") and split_project_path(path)[1] == "/api/hello"
+            )
+            if hello_probe:
+                request.state.headroom_local_hello_probe = True
+            exempt = hello_probe or (request.method == "GET" and path in _AUTH_EXEMPT_PATHS)
             if not exempt and not is_loopback_host(client_host):
                 provided = _extract_proxy_token(request.headers)
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8", "replace"), _proxy_token_bytes
                 ):
+                    user_agent, forwarded_for = _auth_rejection_context(request.headers)
                     logger.warning(
-                        "event=proxy_auth_rejected path=%s client=%s reason=%s",
-                        path,
+                        "event=proxy_auth_rejected method=%s path=%s client=%s reason=%s "
+                        "ua=%s xff=%s",
+                        request.method,
+                        _auth_rejection_path(path),
                         client_host,
                         "missing_token" if provided is None else "bad_token",
+                        user_agent,
+                        forwarded_for,
                     )
                     rejection = JSONResponse(status_code=401, content={"error": "unauthorized"})
                     _apply_security_headers(rejection)
@@ -4190,8 +4681,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     action="admin_request",
                     status_code=response.status_code,
                 )
-        except Exception:
-            logger.debug("admin audit emission failed", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "Admin audit record not written for %s %s (%s); this request is missing "
+                "from the headroom.audit trail. Please report this as a bug.",
+                request.method,
+                safe_id(request.url.path),
+                describe_exception(exc),
+            )
         return response
 
     # The gate above is http-only (BaseHTTPMiddleware ignores every other
@@ -4261,6 +4758,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         the same way behind a reverse-proxy/gateway (issue #2466).
         """
         if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
+            raise HTTPException(status_code=404)
+
+    def _require_loopback_or_trusted_dashboard_client_for_write(request: Request) -> None:
+        """Like the read guard, but a trusted-gateway peer is not loopback.
+
+        The gateway-CIDR equivalence exists for read-only dashboard views; it
+        must not confer settings writes (nor /settings/apply's restart).
+        """
+        if not _request_can_view_dashboard_metadata(
+            request, trusted_dashboard_client_cidrs, allow_gateway_peer=False
+        ):
             raise HTTPException(status_code=404)
 
     def _authenticated_at_gate(request: Request) -> bool:
@@ -4354,7 +4862,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         already an IP-literal-Host, CIDR-trusted dashboard client. Loopback
         callers keep the stricter loopback-only origin check unchanged.
         """
-        if not _request_is_loopback(request):
+        if not _request_is_loopback(request, allow_gateway_peer=False):
             origin = request.headers.get("origin")
             host_header = request.headers.get("host")
             if (
@@ -4362,7 +4870,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 and origin != "null"
                 and host_header
                 and _request_has_same_origin_or_no_provenance(request, host_header)
-                and _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
+                and _request_can_view_dashboard_metadata(
+                    request, trusted_dashboard_client_cidrs, allow_gateway_peer=False
+                )
             ):
                 return
         _require_same_origin(request)
@@ -4531,11 +5041,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # published on host loopback, whose peer is the bridge gateway, still loads.
     _dashboard_gate = [Depends(_require_operator_read_client)]
 
+    # Effective licence state of THIS proxy, resolved once: an explicit
+    # ProxyConfig.license_key, else HEADROOM_LICENSE or its deprecated alias.
+    from headroom.license_env import resolve_license_token
+
+    _dashboard_licensed = bool(config.license_key) or bool(resolve_license_token())
+
     @app.get("/dashboard", response_class=HTMLResponse)
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
-        return get_dashboard_html()
+        return get_dashboard_html(licensed=_dashboard_licensed)
 
     # --- Dashboard settings API (loopback-gated, registry-validated) ---------
     # Read/write the curated HEADROOM_* knobs the settings GUI manages. Writes
@@ -4575,7 +5091,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
@@ -4625,7 +5141,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings/apply",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
@@ -4771,6 +5287,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "total_latency_ms": _recent_request_optional_number(log, "total_latency_ms"),
                     "has_exact_tokens": token_accounting_status == "complete",
                     "token_accounting_status": token_accounting_status,
+                    # Best-effort list-price estimate; null means unavailable,
+                    # never fabricated zero. ``turn_id`` lets a consumer group
+                    # every priced row by turn, not only the raw log tail.
+                    "cost_usd": request_cost_usd(proxy.cost_tracker, log),
+                    "turn_id": log.get("turn_id"),
                     "transforms_applied": log.get("transforms_applied", []),
                     "savings_breakdown": log.get("savings_breakdown", []),
                     "waste_signals": log.get("waste_signals"),
@@ -4862,7 +5383,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         feedback_stats = feedback.get_stats()
 
         # Build prefix cache stats once (used in both prefix_cache and cost)
-        prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
+        prefix_cache_stats = build_prefix_cache_stats(m, proxy.cost_tracker)
 
         # Calculate total tokens before Headroom-side reduction.
         proxy_compression_tokens = m.tokens_saved_total
@@ -4904,7 +5425,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         new_input_saved_tokens = int(_pc_totals.get("new_input_saved_tokens", 0) or 0)
 
         # Build human-readable summary
-        summary = _build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
+        summary = build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
         # DEBUG: log the summary payload for external upsert consumers
         try:
             logger.debug("/stats summary data: %r", summary)
@@ -5030,8 +5551,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             _oest = get_recorder().estimate(_olevel)
             output_reduction = _output_reduction_payload(_shaper_active, _oest)
-        except Exception:  # pragma: no cover - defensive
-            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("/stats output_reduction section failed: %s", describe_exception(exc))
 
         # Model-routing section: populated only when an extension registered a
         # routing-stats provider (headroom.proxy.routing_stats); None otherwise.
@@ -5114,6 +5635,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "tokens": {
                 "input": m.tokens_input_total,
+                # Provenance of "input": the provider's own billed count versus
+                # Headroom's tokenizer estimate. Only the first reconciles with
+                # the provider console (input + cache read + cache write).
+                "input_provider_reported": m.tokens_input_provider_reported_total,
+                "input_estimated": m.tokens_input_estimated_total,
+                "input_provider_reported_percent": round(
+                    (m.tokens_input_provider_reported_total / m.tokens_input_total * 100)
+                    if m.tokens_input_total > 0
+                    else 0,
+                    2,
+                ),
+                "requests_input_provider_reported": m.requests_input_provider_reported,
+                "requests_input_estimated": m.requests_input_estimated,
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),
                 "output_reduction_percent": output_reduction.get("reduction_percent", 0),
@@ -5235,7 +5769,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             else {},
             "compressions_by_strategy": dict(m.compressions_by_strategy),
             "tokens_saved_by_strategy": dict(m.tokens_saved_by_strategy),
-            "extension_savings": dict(m.extension_savings),
+            "extension_savings": m.extension_savings_by_source(),
             "codex_ws": {
                 "units_total": m.codex_ws_units_total,
                 "units_modified_total": m.codex_ws_units_modified_total,
@@ -5311,7 +5845,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,
-            "cost": _merge_cost_stats(
+            "cost": merge_cost_stats(
                 proxy.cost_tracker.stats() if proxy.cost_tracker else None,
                 prefix_cache_stats,
             ),
@@ -5321,6 +5855,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "original_tokens_cached": compression_stats.get("total_original_tokens", 0),
                 "compressed_tokens_cached": compression_stats.get("total_compressed_tokens", 0),
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
+                # "this_replica" with a shared store: the token and retrieval
+                # counts are this process's since it started, not the store's.
+                "totals_scope": compression_stats.get("totals_scope", "store"),
             },
             "compression_cache": compression_cache_stats,
             # Per-language AST compression pauses. Empty on a healthy install;
@@ -5374,6 +5911,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # Effective state from the running process. This is the supported
             # black-box provenance surface for benchmark/qualification tools.
             "rollout": proxy.config.rollout.to_dict() if proxy.config.rollout else None,
+            "read_maturation": _read_maturation_status(proxy.config),
+        }
+
+    def _read_maturation_status(cfg: ProxyConfig) -> dict[str, Any]:
+        # The rollout snapshot says whether the feature is enabled, not whether
+        # it can act; cache mode leaves it enabled but unable to fire.
+        inert = (
+            read_maturation_inert_reason(
+                cfg.mode,
+                quiesce_turns=cfg.read_maturation_quiesce_turns,
+                max_hold_turns=cfg.read_maturation_max_hold_turns,
+            )
+            if cfg.read_maturation
+            else None
+        )
+        return {
+            "enabled": cfg.read_maturation,
+            "effective": cfg.read_maturation and inert is None,
+            "inert_reason": inert,
         }
 
     def _dashboard_config_payload() -> dict[str, Any]:
@@ -5443,11 +5999,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         snapshot to avoid rebuilding the full payload on every UI poll.
 
         ``recent_requests`` / ``request_logs`` (per-request ids, providers,
-        models, errors) and ``config`` (backend + savings profile) are embedded
-        only for loopback callers — the local dashboard. Network callers still
-        get the aggregate counters but never the per-request metadata.
+        models, errors), ``config`` (backend + savings profile), per-project
+        savings and the provider quota sections are embedded only for callers
+        :func:`_request_can_view_stats_metadata` admits: loopback (the local
+        dashboard), a trusted dashboard CIDR peer, or a caller that passed the
+        proxy token check. Other network callers still get the aggregate
+        counters but never the per-request metadata.
         """
-        include_sensitive = _request_can_view_dashboard_metadata(
+        include_sensitive = _request_can_view_stats_metadata(
             request,
             trusted_dashboard_client_cidrs,
         )
@@ -5465,13 +6024,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
+            # Same fields /stats-lifetime and /quota withhold from this caller.
+            # Rebuild the nested dicts: the cached snapshot is shared.
+            for tracker in get_quota_registry().trackers:
+                payload.pop(tracker.key, None)
+            for section, key in (("savings", "per_project"), ("persistent_savings", "projects")):
+                nested = payload.get(section)
+                if isinstance(nested, dict):
+                    payload[section] = {k: v for k, v in nested.items() if k != key}
         return payload
 
     @app.get("/stats-lifetime")
     async def stats_lifetime(request: Request):
         """Return persisted lifetime aggregates with sensitive fields gated."""
         payload = dict(proxy.metrics.savings_tracker.lifetime_response())
-        include_sensitive = _request_can_view_dashboard_metadata(
+        include_sensitive = _request_can_view_stats_metadata(
             request,
             trusted_dashboard_client_cidrs,
         )
@@ -5612,7 +6179,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     # Debug endpoints
-    @app.get("/debug/memory", dependencies=[Depends(_require_loopback)])
+    @app.get("/debug/memory", dependencies=[Depends(_require_loopback_or_container_gateway)])
     async def debug_memory():
         """Get detailed memory usage statistics.
 
@@ -5923,7 +6490,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             limit: Maximum number of patterns to return (default 20)
 
         Response includes for each pattern:
-        - hash: Truncated tool signature hash (12 chars)
+        - hash: Full aggregation key identifying one scoped tool pattern
         - compressions: Total compression events
         - retrievals: Total retrieval events
         - retrieval_rate: Percentage of compressions that triggered retrieval
@@ -5947,7 +6514,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             patterns_list.append(
                 {
-                    "hash": sig_hash[:12],
+                    "hash": sig_hash,
                     "compressions": total_compressions,
                     "retrievals": total_retrievals,
                     "retrieval_rate": f"{retrieval_rate:.1%}",
@@ -5967,36 +6534,41 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return patterns_list[:limit]
 
-    @app.get("/v1/toin/pattern/{hash_prefix}", dependencies=[Depends(_require_loopback)])
+    @app.get("/v1/toin/pattern/{hash_prefix:path}", dependencies=[Depends(_require_loopback)])
     async def toin_pattern_detail(hash_prefix: str):
-        """Get detailed TOIN pattern info by hash prefix.
+        """Get detailed TOIN pattern info by the listed identifier or a unique prefix.
 
-        Searches for a pattern where the tool signature hash starts with
-        the provided prefix. Returns full pattern details if found.
+        Pass the ``hash`` returned by ``/v1/toin/patterns`` for an exact
+        lookup. A shorter aggregation-key prefix is accepted only when it
+        identifies one pattern; ambiguous prefixes return 409.
 
-        Path params:
-            hash_prefix: Beginning of the tool signature hash (min 4 chars recommended)
-
-        Response: Full pattern.to_dict() with all learned statistics and recommendations.
+        Response: Learned statistics without query text or field semantics.
         """
         toin = get_toin()
         exported = toin.export_patterns()
         patterns_data = exported.get("patterns", {})
 
-        # Search for pattern with matching hash prefix
-        for sig_hash, pattern_dict in patterns_data.items():
-            if sig_hash.startswith(hash_prefix):
-                # Keep this response aligned with /v1/toin/patterns while
-                # excluding query text, field semantics, and other internal
-                # learning state from the detail endpoint.
-                return {
-                    "compressions": pattern_dict.get("total_compressions", 0),
-                    "retrievals": pattern_dict.get("total_retrievals", 0),
-                    "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
-                    "confidence": pattern_dict.get("confidence", 0.0),
-                    "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
-                    "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
-                }
+        pattern_dict = patterns_data.get(hash_prefix)
+        if pattern_dict is None:
+            matches = (
+                pattern for key, pattern in patterns_data.items() if key.startswith(hash_prefix)
+            )
+            pattern_dict = next(matches, None)
+            if next(matches, None) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Ambiguous TOIN pattern prefix; use a full hash from /v1/toin/patterns",
+                )
+        if pattern_dict is not None:
+            # Keep query text, field semantics, and internal learning state private.
+            return {
+                "compressions": pattern_dict.get("total_compressions", 0),
+                "retrievals": pattern_dict.get("total_retrievals", 0),
+                "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
+                "confidence": pattern_dict.get("confidence", 0.0),
+                "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
+                "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
+            }
 
         raise HTTPException(
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"
@@ -6262,13 +6834,55 @@ def _settings_runtime_values(config: ProxyConfig) -> dict[str, Any]:
     return values
 
 
+def _write_worker_secrets(payload: dict[str, Any]) -> Path | None:
+    """Move the credential fields out of ``payload`` into an owner-only file.
+
+    Returns the file's path, or None when the config holds no credential.
+    """
+    secrets = {name: payload.pop(name) for name in PROXY_CONFIG_SECRET_FIELDS if payload.get(name)}
+    if not secrets:
+        return None
+    # mkstemp creates the file with mode 0600.
+    fd, raw_path = tempfile.mkstemp(prefix="headroom-proxy-config-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(secrets, fh)
+    return Path(raw_path)
+
+
+def _read_worker_secrets() -> dict[str, Any]:
+    """Read the credentials the parent wrote for this worker.
+
+    Raises instead of returning nothing when the file is named but unreadable:
+    a worker that fell back to env defaults would come up without the proxy
+    token while still bound to the parent's host.
+    """
+    path = os.environ.get(_MULTI_WORKER_SECRETS_ENV)
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError(
+            f"Worker cannot read its credentials file {path!r} ({type(exc).__name__}). "
+            "The parent proxy writes it at startup and removes it on exit; restart the proxy."
+        ) from exc
+    if not isinstance(values, dict):
+        raise ConfigurationError(
+            f"Worker credentials file {path!r} does not hold a JSON object; restart the proxy."
+        )
+    return values
+
+
 def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
+        worker_secrets = _read_worker_secrets()
         try:
             values = json.loads(raw_config)
             if not isinstance(values, dict):
                 raise TypeError("proxy config JSON must be an object")
+            values.update(worker_secrets)
             if "_rollout_snapshot" in values:
                 rollout_value = values.pop("_rollout_snapshot")
                 from headroom.rollout import RolloutSnapshot
@@ -6310,11 +6924,21 @@ def _proxy_config_from_env() -> ProxyConfig:
             "HEADROOM_BUFFERED_CCR_GRACE_SECONDS",
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
+        ccr_buffered_chat_streaming=_get_env_bool("HEADROOM_CCR_BUFFERED_CHAT_STREAMING", False),
+        ccr_inject_system_instructions=(
+            False
+            if (
+                _get_env_bool("HEADROOM_NO_CCR", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
+            )
+            else _get_env_bool("HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS", False)
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
+        omlx_target_api_url=resolve_omlx_target_api_url(environ=os.environ),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
+        factory_api_url=os.environ.get("FACTORY_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
@@ -6352,6 +6976,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         model_router=ModelRouterConfig.from_env(
             os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
             os.environ.get("HEADROOM_MODEL_ROUTES"),
+            os.environ.get("HEADROOM_MODEL_ROUTER_LOG_ONLY"),
         ),
     )
 
@@ -6427,7 +7052,7 @@ def run_server(
         sys.exit(1)
 
     # Seed the request-time coding-profile toggles (tool-search, dedupe, read
-    # protection, lossless→lossy, effort-router, block-char floor) into the
+    # protection, lossless→lossy, block-char floor) into the
     # process env before serving, so downstream per-request readers pick them up.
     # Done here (not in the CLI command) so unit tests that mock run_server never
     # mutate os.environ. setdefault → explicit env still wins. MODE / profile are
@@ -6538,67 +7163,82 @@ def run_server(
 
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
+    worker_secrets_path: Path | None = None
+    # Worker hand-off variables as they were before this run, restored on exit
+    # so a later run in the same process starts from the same state.
+    prior_worker_env = {
+        name: os.environ.get(name) for name in (_MULTI_WORKER_CONFIG_ENV, _MULTI_WORKER_SECRETS_ENV)
+    }
     if sys.platform == "win32":
         _configure_windows_uvicorn_loop(uvicorn_kwargs)
-    if workers > 1:
-        # CompressionCache and PrefixTracker are always per-worker instance vars.
-        # Python CompressionStore defaults to InMemoryBackend (per-process), so
-        # CCR markers written on worker A are invisible to worker B unless a
-        # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
-        # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
-        if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
-            logger.warning(
-                "Headroom is running with workers=%d. Compression cache, "
-                "prefix tracker, TOIN state, and CostTracker are all per-process; "
-                "multi-worker deployments produce avoidable cache busts and an "
-                "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
-                "hits a different worker's partial total) when sessions land on "
-                "different workers. Run --workers 1 or place a sticky-session load "
-                "balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        else:
-            logger.warning(
-                "Headroom is running with workers=%d. The in-memory CCR store, "
-                "compression cache (incl. off-path background compression), prefix "
-                "tracker, TOIN state, and CostTracker are all "
-                "per-process; multi-worker deployments produce silent CCR retrieval "
-                "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
-                "hero tile (each /stats poll hits a different worker's partial total) when "
-                "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
-                "persistent cross-worker CCR store, run --workers 1, or place a "
-                "sticky-session load balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
-        app_target = "headroom.proxy.server:create_app_from_env"
-        uvicorn_kwargs["factory"] = True
-    else:
-        app_target = create_app(config)
-
-    # "warning" keeps the default terminal quiet (uvicorn's access log is one line
-    # per request). It was previously hardcoded, which left deployed proxies with
-    # no way to turn request logging on: operators diagnosing a production
-    # incident could not see uvicorn's view of the traffic at all, with no env var
-    # and no CLI flag to change it. Overridable now; the default is unchanged.
-    uvicorn_log_level = _resolve_uvicorn_log_level()
-
-    # Bind target: a Unix socket when one is configured, otherwise host:port.
-    # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
-    # here rather than passed together.
-    bind_kwargs: dict[str, Any]
     uds_path: Path | None = None
-    if config.uds:
-        from headroom.proxy.uds import prepare_uds_path
-
-        uds_path = prepare_uds_path(config.uds)
-        bind_kwargs = {"uds": str(uds_path)}
-    else:
-        bind_kwargs = {"host": config.host, "port": config.port}
-
+    # Everything from here runs under the cleanup below: once the worker
+    # secrets file exists, any startup failure (a bad --uds path, for
+    # example) must still delete it and restore the hand-off variables.
     try:
+        if workers > 1:
+            # CompressionCache and PrefixTracker are always per-worker instance vars.
+            # Python CompressionStore defaults to InMemoryBackend (per-process), so
+            # CCR markers written on worker A are invisible to worker B unless a
+            # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
+            # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
+            if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
+                logger.warning(
+                    "Headroom is running with workers=%d. Compression cache, "
+                    "prefix tracker, TOIN state, and CostTracker are all per-process; "
+                    "multi-worker deployments produce avoidable cache busts and an "
+                    "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
+                    "hits a different worker's partial total) when sessions land on "
+                    "different workers. Run --workers 1 or place a sticky-session load "
+                    "balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            else:
+                logger.warning(
+                    "Headroom is running with workers=%d. The in-memory CCR store, "
+                    "compression cache (incl. off-path background compression), prefix "
+                    "tracker, TOIN state, and CostTracker are all "
+                    "per-process; multi-worker deployments produce silent CCR retrieval "
+                    "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
+                    "hero tile (each /stats poll hits a different worker's partial total) when "
+                    "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
+                    "persistent cross-worker CCR store, run --workers 1, or place a "
+                    "sticky-session load balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            worker_config = _proxy_config_payload(config)
+            worker_secrets_path = _write_worker_secrets(worker_config)
+            # A path left by an earlier run in this process names a deleted file.
+            os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
+            if worker_secrets_path is not None:
+                os.environ[_MULTI_WORKER_SECRETS_ENV] = str(worker_secrets_path)
+            os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(worker_config)
+            app_target = "headroom.proxy.server:create_app_from_env"
+            uvicorn_kwargs["factory"] = True
+        else:
+            app_target = create_app(config)
+
+        # "warning" keeps the default terminal quiet (uvicorn's access log is one line
+        # per request). It was previously hardcoded, which left deployed proxies with
+        # no way to turn request logging on: operators diagnosing a production
+        # incident could not see uvicorn's view of the traffic at all, with no env var
+        # and no CLI flag to change it. Overridable now; the default is unchanged.
+        uvicorn_log_level = _resolve_uvicorn_log_level()
+
+        # Bind target: a Unix socket when one is configured, otherwise host:port.
+        # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
+        # here rather than passed together.
+        bind_kwargs: dict[str, Any]
+        if config.uds:
+            from headroom.proxy.uds import prepare_uds_path
+
+            uds_path = prepare_uds_path(config.uds)
+            bind_kwargs = {"uds": str(uds_path)}
+        else:
+            bind_kwargs = {"host": config.host, "port": config.port}
+
         _run_uvicorn(
             app_target,
             bind_kwargs,
@@ -6612,6 +7252,14 @@ def run_server(
             from headroom.proxy.uds import remove_uds_path
 
             remove_uds_path(uds_path)
+        if worker_secrets_path is not None:
+            worker_secrets_path.unlink(missing_ok=True)
+        if workers > 1:
+            for name, value in prior_worker_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _run_uvicorn(
@@ -6815,6 +7463,10 @@ if __name__ == "__main__":
         "--vertex-api-url",
         help=f"Custom Vertex AI regional API URL (default: {DEFAULT_VERTEX_API_URL})",
     )
+    parser.add_argument(
+        "--omlx-api-url",
+        help="Custom local oMLX API URL (env: HEADROOM_OMLX_BASE_URL or OMLX_TARGET_API_URL)",
+    )
 
     # Backend (anthropic direct, bedrock, openrouter, anyllm, or litellm-<provider>)
     parser.add_argument(
@@ -6840,6 +7492,14 @@ if __name__ == "__main__":
             "Custom Bedrock InvokeModel upstream for the /model/{id}/invoke "
             "passthrough routes — point at a re-signing gateway, not raw AWS "
             "(env: BEDROCK_TARGET_API_URL)"
+        ),
+    )
+    parser.add_argument(
+        "--factory-api-url",
+        help=(
+            "Factory Droid upstream for /api/* — /api/llm/a/v1/messages is "
+            "compressed, other /api/* paths pass through "
+            "(env: FACTORY_TARGET_API_URL)"
         ),
     )
     parser.add_argument(
@@ -7136,11 +7796,15 @@ if __name__ == "__main__":
             min_value=0,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        omlx_target_api_url=resolve_omlx_target_api_url(
+            getattr(args, "omlx_api_url", None), os.environ
+        ),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
         bedrock_profile=args.bedrock_profile or os.environ.get("AWS_PROFILE"),
         bedrock_api_url=_get_env_str("BEDROCK_TARGET_API_URL", args.bedrock_api_url),
+        factory_api_url=_get_env_str("FACTORY_TARGET_API_URL", args.factory_api_url),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", args.anyllm_provider),
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),

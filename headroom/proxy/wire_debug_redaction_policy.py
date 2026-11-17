@@ -13,9 +13,12 @@ WIRE_DEBUG_SECRET_KEYS = (
     "cookie",
     "set-cookie",
     "api-key",
+    "apikey",
     "x-api-key",
     "openai-api-key",
     "anthropic-api-key",
+    # Codex's signed device attestation, sent with every request.
+    "x-oai-attestation",
     "access_token",
     "refresh_token",
     "id_token",
@@ -39,6 +42,9 @@ _SECRET_KEY_SUFFIXES = (
     "_token",
     "_credential",
     "_credentials",
+    # Any ``*-key`` header carries a key: Ocp-Apim-Subscription-Key,
+    # X-Functions-Key, x-goog-api-key.
+    "_key",
 )
 
 

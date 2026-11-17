@@ -25,6 +25,7 @@ import time
 import typing
 
 from headroom._subprocess import Popen, run
+from headroom.offline import pin_litellm_cost_map_local
 
 from .loops import LoopPattern, apply_loop_weighting, detect_loops, format_loops_for_digest
 from .models import (
@@ -336,8 +337,9 @@ def _is_prompt_too_long(exc: Exception) -> bool:
 
     Matches the known phrasings across backends: claude CLI ("Prompt is too
     long"), Anthropic via LiteLLM ("prompt is too long: N tokens > M maximum"),
-    OpenAI ("context_length_exceeded" / "maximum context length"), and Gemini
-    ("input token count exceeds the maximum").
+    OpenAI ("context_length_exceeded" / "maximum context length"), Gemini
+    ("input token count exceeds the maximum"), and the codex CLI ("Input exceeds
+    the maximum length of 1048576 characters").
     """
     msg = str(exc).lower()
     return any(
@@ -348,6 +350,7 @@ def _is_prompt_too_long(exc: Exception) -> bool:
             "maximum context length",
             "context window",
             "token count exceeds",
+            "input exceeds the maximum length",
         )
     )
 
@@ -392,30 +395,42 @@ def _build_digest(
         lines.append(f"Tokens used: {total_tokens_in:,} in / {total_tokens_out:,} out")
     lines.append("")
 
-    # Detected loops first — the most expensive waste pattern, so the LLM sees
-    # it before the (budget-truncatable) per-session event stream.
-    loop_section = format_loops_for_digest(loops)
-    if loop_section:
-        lines.append(loop_section)
-
-    # Prior learned patterns (if any) — gives the LLM the current baseline so
-    # it can produce complete updated sections instead of condensed deltas.
-    prior_section = _build_prior_patterns_section(project)
-    if prior_section:
-        lines.append(prior_section)
-
     # Budget tracking — stop adding events when we approach the limit
     # Rough estimate: 4 chars per token
     char_budget = max_tokens * 4
-    chars_used = sum(len(ln) for ln in lines)
+    # Every line costs its length plus the newline joining it, and goes in only
+    # if it leaves this room for the truncation markers that can follow it (an
+    # events line, a blank, a sessions line), so the digest stays inside
+    # char_budget. Only a prior-patterns section that leaves no such room on
+    # its own (never cut, see below) can push it past.
+    room = char_budget - 100
+
+    # Prior learned patterns (if any) — gives the LLM the current baseline so
+    # it can produce complete updated sections instead of condensed deltas.
+    # Never cut: a re-emitted section replaces its prior one wholesale, so a
+    # partial baseline would drop the missing bullets from the written file.
+    prior_section = _build_prior_patterns_section(project)
+
+    # Detected loops first — the most expensive waste pattern, so the LLM sees
+    # it before the (budget-truncatable) per-session event stream. The event
+    # stream cannot trim a section placed ahead of it, so the loops get their
+    # own cap: a quarter of the budget, less whatever the header and prior
+    # patterns leave short. Rendered whole, every loop with every index, the
+    # section alone outgrew the digest on a machine with years of Codex
+    # sessions, which learn scans as one project.
+    pre_event_chars = sum(len(ln) + 1 for ln in lines) + len(prior_section) + 2
+    loop_section = format_loops_for_digest(
+        loops, max_chars=min(char_budget // 4, room - pre_event_chars)
+    )
+    if loop_section:
+        lines.append(loop_section)
+    if prior_section:
+        lines.append(prior_section)
+
+    chars_used = sum(len(ln) + 1 for ln in lines)
+    full = False
 
     for session in sessions:
-        if chars_used > char_budget:
-            lines.append(
-                f"... (remaining {len(sessions) - sessions.index(session)} sessions truncated)"
-            )
-            break
-
         session_header = (
             f"=== Session {session.session_id[:12]} "
             f"({len(session.tool_calls)} calls, {session.failure_count} failures"
@@ -423,29 +438,38 @@ def _build_digest(
         if session.total_input_tokens:
             session_header += f", {session.total_input_tokens:,} input tokens"
         session_header += ") ==="
+        if full or chars_used + len(session_header) + 1 > room:
+            lines.append(
+                f"... (remaining {len(sessions) - sessions.index(session)} sessions truncated)"
+            )
+            break
         lines.append(session_header)
-        chars_used += len(session_header)
+        chars_used += len(session_header) + 1
 
         # Use events if available (richer context), fall back to tool_calls
         if session.events:
             for event in session.events:
-                if chars_used > char_budget:
-                    lines.append("  ... (remaining events truncated)")
-                    break
                 event_line = _format_event(event)
-                if event_line:
-                    lines.append(event_line)
-                    chars_used += len(event_line)
+                if not event_line:
+                    continue
+                if chars_used + len(event_line) + 1 > room:
+                    lines.append("  ... (remaining events truncated)")
+                    full = True
+                    break
+                lines.append(event_line)
+                chars_used += len(event_line) + 1
         else:
             for tc in session.tool_calls:
-                if chars_used > char_budget:
-                    lines.append("  ... (remaining calls truncated)")
-                    break
                 tc_line = _format_tool_call(tc)
+                if chars_used + len(tc_line) + 1 > room:
+                    lines.append("  ... (remaining calls truncated)")
+                    full = True
+                    break
                 lines.append(tc_line)
-                chars_used += len(tc_line)
+                chars_used += len(tc_line) + 1
 
         lines.append("")
+        chars_used += 1
 
     return "\n".join(lines)
 
@@ -637,7 +661,12 @@ def _strip_fenced_json(raw: str) -> dict:
 
     # Nothing parsed as an object: re-raise the natural error on the raw text
     # so callers see a JSONDecodeError, preserving the documented contract.
-    result: dict = json.loads(text)
+    # json.loads raises for invalid JSON, but valid JSON that is not an object
+    # (e.g. a bare array the model emitted) would otherwise be returned as a
+    # non-dict and crash callers that do `.get(...)`, so reject it explicitly.
+    result = json.loads(text)
+    if not isinstance(result, dict):
+        raise json.JSONDecodeError("Expected a JSON object", text, 0)
     return result
 
 
@@ -1069,9 +1098,15 @@ def _call_llm(
     the provider: "claude-*" → Anthropic, "gpt-*" → OpenAI, "gemini/*" → Google, etc.
     For CLI-based models (ending in "-cli"), delegates to ``_call_cli_llm``.
     """
+    from headroom.offline import guard_egress
+
     if model in _CLI_MODEL_IDS:
+        # The provider CLI sends the digest to its own API, so refuse before
+        # spawning it rather than letting the subprocess reach the network.
+        guard_egress(f"{model} provider CLI for headroom learn session analysis")
         return _call_cli_llm(digest, model, on_progress=on_progress)
 
+    pin_litellm_cost_map_local()
     import litellm
 
     # Suppress LiteLLM's verbose logging
@@ -1083,6 +1118,7 @@ def _call_llm(
     if model.startswith("claude"):
         api_base = "https://api.anthropic.com"
 
+    guard_egress(f"{model} API for headroom learn session analysis", api_base)
     response = litellm.completion(
         model=model,
         messages=[
@@ -1110,11 +1146,16 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     """Convert LLM structured output into Recommendation objects."""
     recommendations: list[Recommendation] = []
 
-    for rule in raw.get("context_file_rules", []):
+    # `.get(key, [])` / `.get(key, "")` only fall back when the key is absent;
+    # the model controls this JSON, so a present-but-null `*_file_rules` list or
+    # a non-string `section`/`content` would crash the iteration / `.strip()`.
+    # `_as_str` coerces any non-string (null, number, list, object) to "" so a
+    # malformed field is treated like an absent one instead of raising.
+    for rule in raw.get("context_file_rules") or []:
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
-        content = rule.get("content", "").strip()
+        section = _as_str(rule.get("section")).strip()
+        content = _as_str(rule.get("content")).strip()
         if not section or not content:
             continue
         recommendations.append(
@@ -1128,11 +1169,11 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
             )
         )
 
-    for rule in raw.get("memory_file_rules", []):
+    for rule in raw.get("memory_file_rules") or []:
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
-        content = rule.get("content", "").strip()
+        section = _as_str(rule.get("section")).strip()
+        content = _as_str(rule.get("content")).strip()
         if not section or not content:
             continue
         recommendations.append(
@@ -1152,6 +1193,17 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     return recommendations
 
 
+def _as_str(val: object) -> str:
+    """Return ``val`` if it is a string, else ``""``.
+
+    Fields like ``section``/``content`` come straight from model-controlled JSON,
+    where a number/list/object is as possible as a string. Coercing a non-string
+    to empty keeps ``.strip()`` from raising and lets the caller's emptiness check
+    drop the malformed rule.
+    """
+    return val if isinstance(val, str) else ""
+
+
 def _safe_int(val: object) -> int:
     """Safely convert a value to int."""
     if isinstance(val, int):
@@ -1162,18 +1214,3 @@ def _safe_int(val: object) -> int:
         except (ValueError, TypeError):
             return 0
     return 0
-
-
-# =============================================================================
-# Legacy compatibility alias
-# =============================================================================
-
-
-class FailureAnalyzer:
-    """Legacy alias for SessionAnalyzer — used by existing CLI code."""
-
-    def __init__(self) -> None:
-        self._analyzer = SessionAnalyzer()
-
-    def analyze(self, project: ProjectInfo, sessions: list[SessionData]) -> AnalysisResult:
-        return self._analyzer.analyze(project, sessions)

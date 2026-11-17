@@ -6,5 +6,12 @@ export function baseOptions(): BaseLayoutProps {
       title: 'Headroom',
     },
     githubUrl: 'https://github.com/headroomlabs-ai/headroom',
+    links: [
+      {
+        text: 'Headroom for Teams',
+        url: '/docs/teams',
+        active: 'nested-url',
+      },
+    ],
   };
 }

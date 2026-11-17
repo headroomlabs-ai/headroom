@@ -58,9 +58,7 @@ class TestLearnNoLearnConflict:
         )
         assert result.exit_code == 0, result.output
         # Warning must go to stderr via click.secho(err=True)
-        assert "both --learn and --no-learn" in result.output or (result.output is not None), (
-            result.output
-        )
+        assert "both --learn and --no-learn" in result.output, result.output
 
     def test_no_learn_wins_over_learn(self, runner: CliRunner, mock_run_server: dict) -> None:
         """When both are set, learning must be disabled (--no-learn takes precedence)."""
@@ -303,22 +301,16 @@ class TestMissingProxyDepsError:
     def test_proxy_command_exits_when_mcp_missing(
         self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import builtins
+        from importlib.util import find_spec
 
-        real_import = builtins.__import__
+        def fake_find_spec(name: str) -> object:
+            return None if name == "mcp" else find_spec(name)
 
-        def fake_import(
-            name: str,
-            globals: dict | None = None,
-            locals: dict | None = None,
-            fromlist: tuple = (),
-            level: int = 0,
-        ):
-            if name == "mcp":
-                raise ImportError("No module named 'mcp'")
-            return real_import(name, globals, locals, fromlist, level)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr("headroom.cli.proxy.find_spec", fake_find_spec)
+        monkeypatch.setattr(
+            "uvicorn.run",
+            lambda *args, **kwargs: pytest.fail("missing dependencies must not start a server"),
+        )
         result = runner.invoke(main, ["proxy"])
         assert result.exit_code == 1, result.output
         assert "pip install headroom-ai[proxy]" in result.output
@@ -328,24 +320,12 @@ class TestMissingProxyDepsError:
     def test_ensure_proxy_dependencies_exits_when_fastapi_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import builtins
-
         from headroom.cli.proxy import ensure_proxy_dependencies
 
-        real_import = builtins.__import__
-
-        def fake_import(
-            name: str,
-            globals: dict | None = None,
-            locals: dict | None = None,
-            fromlist: tuple = (),
-            level: int = 0,
-        ):
-            if name == "fastapi":
-                raise ImportError("No module named 'fastapi'")
-            return real_import(name, globals, locals, fromlist, level)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr(
+            "headroom.cli.proxy.find_spec",
+            lambda name: None if name == "fastapi" else object(),
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             ensure_proxy_dependencies()

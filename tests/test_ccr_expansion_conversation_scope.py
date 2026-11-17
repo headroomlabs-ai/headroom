@@ -87,7 +87,7 @@ def _track_lead_compression(proxy, cwd: str) -> str:  # noqa: ANN001
     return hash_key
 
 
-def _forwarded_last_user_text(client: TestClient, cwd: str, messages: list[dict]) -> str:
+def _forwarded_request(client: TestClient, cwd: str, messages: list[dict]) -> dict:
     proxy = client.app.state.proxy
     captured: dict = {}
 
@@ -100,7 +100,12 @@ def _forwarded_last_user_text(client: TestClient, cwd: str, messages: list[dict]
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 20,
+                },
             },
         )
 
@@ -115,8 +120,34 @@ def _forwarded_last_user_text(client: TestClient, cwd: str, messages: list[dict]
         json={"model": "claude-sonnet-4-6", "max_tokens": 16, "messages": messages},
     )
     assert response.status_code == 200, response.text
-    content = captured["body"]["messages"][-1]["content"]
-    return content if isinstance(content, str) else content[0]["text"]
+    return captured["body"]
+
+
+def _message_blob(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", "") if isinstance(block, dict) else str(block) for block in content
+        )
+    return ""
+
+
+def _system_blob(system: object) -> str:
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        return "\n".join(
+            block.get("text", "") if isinstance(block, dict) else str(block) for block in system
+        )
+    return ""
+
+
+def _forwarded_blob(body: dict) -> str:
+    parts = [_system_blob(body.get("system"))]
+    parts.extend(_message_blob(message) for message in body.get("messages") or [])
+    return "\n".join(parts)
 
 
 def test_teammate_does_not_receive_lead_tool_output(tmp_path) -> None:  # noqa: ANN001
@@ -124,12 +155,14 @@ def test_teammate_does_not_receive_lead_tool_output(tmp_path) -> None:  # noqa: 
     with _client() as client:
         _track_lead_compression(client.app.state.proxy, cwd)
 
-        forwarded = _forwarded_last_user_text(
-            client, cwd, [{"role": "user", "content": _TEAMMATE_QUERY}]
-        )
+        body = _forwarded_request(client, cwd, [{"role": "user", "content": _TEAMMATE_QUERY}])
+        forwarded = _forwarded_blob(body)
 
     assert _EXPANSION_TAG not in forwarded
-    assert forwarded == _TEAMMATE_QUERY
+    last_user = next(
+        message for message in reversed(body["messages"]) if message.get("role") == "user"
+    )
+    assert last_user["content"] == _TEAMMATE_QUERY
 
 
 def test_conversation_holding_the_marker_still_expands(tmp_path) -> None:  # noqa: ANN001
@@ -137,32 +170,118 @@ def test_conversation_holding_the_marker_still_expands(tmp_path) -> None:  # noq
     with _client() as client:
         hash_key = _track_lead_compression(client.app.state.proxy, cwd)
 
-        forwarded = _forwarded_last_user_text(
-            client,
-            cwd,
-            [
-                {"role": "user", "content": _LEAD_QUERY},
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "t1",
-                            "content": f"[40 items compressed to 4. Retrieve more: hash={hash_key}]",
-                        }
-                    ],
-                },
-                {"role": "assistant", "content": "Listed them."},
-                {"role": "user", "content": _TEAMMATE_QUERY},
-            ],
+        forwarded = _forwarded_blob(
+            _forwarded_request(
+                client,
+                cwd,
+                [
+                    {"role": "user", "content": _LEAD_QUERY},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Bash",
+                                "input": {"command": "ls"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": (
+                                    f"[40 items compressed to 4. Retrieve more: hash={hash_key}]"
+                                ),
+                            }
+                        ],
+                    },
+                    {"role": "assistant", "content": "Listed them."},
+                    {"role": "user", "content": _TEAMMATE_QUERY},
+                ],
+            )
         )
 
     assert _EXPANSION_TAG in forwarded
     # Line 39 is only in the original, never in the compressed preview.
     assert "src/auth/middleware_39.py" in forwarded
+
+
+def test_expansion_stays_out_of_the_cached_prefix_and_tracker_snapshot(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    """#4287: expansion after the last cache breakpoint, omitted from overlay state."""
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    cwd = str(tmp_path)
+    trailing_system = {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}
+        ],
+    }
+    history = [
+        {"role": "user", "content": _LEAD_QUERY},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": "[40 items compressed to 4. Retrieve more: hash=pending]",
+                }
+            ],
+        },
+        {"role": "assistant", "content": "Listed them."},
+        {"role": "user", "content": _TEAMMATE_QUERY},
+        trailing_system,
+    ]
+
+    with _client() as client:
+        hash_key = _track_lead_compression(client.app.state.proxy, cwd)
+        history[2]["content"][0]["content"] = (
+            f"[40 items compressed to 4. Retrieve more: hash={hash_key}]"
+        )
+        turn1 = _forwarded_request(client, cwd, history)
+
+        forwarded = turn1["messages"]
+        assert _EXPANSION_TAG in _forwarded_blob(turn1)
+        # The client user turn stays unexpanded; expansion rides after the
+        # trailing system's cache_control (relocated to top-level `system`
+        # for this model, issue #765).
+        assert _EXPANSION_TAG not in _message_blob(forwarded[0])
+        last_user = next(
+            message for message in reversed(forwarded) if message.get("role") == "user"
+        )
+        assert last_user["content"] == _TEAMMATE_QUERY
+        assert _EXPANSION_TAG in _system_blob(turn1.get("system"))
+        assert history[4]["content"] == _TEAMMATE_QUERY
+        assert history[5]["content"][0]["text"] == "# Environment"
+
+        trackers = list(client.app.state.proxy.session_tracker_store._trackers.values())
+        assert trackers
+        snapshot = trackers[0].get_last_forwarded_messages()
+        assert snapshot
+        assert all(_EXPANSION_TAG not in _message_blob(message) for message in snapshot)
+        assert len(snapshot) == len(history) + 1  # client messages plus assistant reply
+
+        next_original = history + [{"role": "user", "content": "follow up"}]
+        next_optimized = list(next_original)
+        replayed = overlay_cached_prefix(
+            next_optimized,
+            next_original,
+            history,
+            snapshot[:-1],
+            confirmed_frozen_count=0,
+        )
+        assert replayed[: len(history)] == snapshot[:-1]
+        assert all(_EXPANSION_TAG not in _message_blob(message) for message in replayed)

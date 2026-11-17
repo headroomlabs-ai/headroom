@@ -34,6 +34,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.offline import pin_litellm_cost_map_local
+
 log = logging.getLogger(__name__)
 
 STATE_ATTR = "headroom_route"
@@ -202,6 +204,7 @@ def resolver_for(handler: Any) -> BackendResolver:
 def _known_provider(provider: str) -> bool:
     """Is this a provider litellm actually knows about?"""
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         names = {getattr(p, "value", None) or str(p) for p in getattr(litellm, "provider_list", [])}
@@ -215,6 +218,7 @@ def _provider_of(model: str) -> str:
     if "/" in model:
         return model.split("/", 1)[0]
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         entry = litellm.model_cost.get(model) or {}

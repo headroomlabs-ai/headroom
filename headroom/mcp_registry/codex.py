@@ -6,7 +6,8 @@ Codex stores MCP server config in ``$CODEX_HOME/config.toml`` when
 sub-tables). There is no general-purpose CLI for adding entries, so we
 edit the file in place — using marker-delimited blocks so we can
 idempotently inject, replace, and remove our entry without disturbing
-anything else the user has configured.
+anything else the user has configured. The Grok registrar reuses the
+same marker-block logic.
 """
 
 from __future__ import annotations
@@ -17,8 +18,17 @@ from pathlib import Path
 from typing import Any
 
 from headroom import fsutil
+from headroom.providers.codex.config_toml import loads_codex_config, split_toml_lines
 
-from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
+from .base import (
+    MCPRegistrar,
+    RegisterResult,
+    RegisterStatus,
+    ServerSpec,
+    _diff_specs,
+    _entry_to_spec,
+    _specs_equivalent,
+)
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -75,7 +85,7 @@ def _evict_foreign_tables(content: str, server_name: str, start: str, end: str) 
     move, so a header-like line inside a multi-line string can split a table
     wrongly; callers must check the final result with ``_only_server_changed``.
     """
-    lines = content.splitlines(keepends=True)
+    lines = split_toml_lines(content, keepends=True)
     try:
         i = next(n for n, line in enumerate(lines) if line.rstrip("\r\n") == start)
         j = next(n for n in range(i + 1, len(lines)) if lines[n].rstrip("\r\n") == end)
@@ -112,33 +122,29 @@ def _only_server_changed(old: str, new: str, server_name: str) -> bool:
     makes this False and the rewrite is refused instead of written.
     """
     try:
-        before, after = tomllib.loads(old), tomllib.loads(new)
+        before, after = loads_codex_config(old), loads_codex_config(new)
     except tomllib.TOMLDecodeError:
         return False
     return _without_server(before, server_name) == _without_server(after, server_name)
 
 
-class CodexRegistrar(MCPRegistrar):
-    """Register MCP servers with the OpenAI Codex CLI."""
+class _TomlMarkerRegistrar(MCPRegistrar):
+    """Marker-block registrar for ``<config_dir>/config.toml``.
 
-    name = "codex"
-    display_name = "OpenAI Codex CLI"
+    Codex and Grok both keep ``[mcp_servers.<name>]`` tables in a
+    ``config.toml`` and differ only in where the config directory lives.
+    """
 
-    def __init__(self, *, home_dir: Path | None = None) -> None:
-        if home_dir is not None:
-            self._codex_dir = home_dir / ".codex"
-        else:
-            from headroom.install.paths import codex_home_dir
-
-            self._codex_dir = codex_home_dir()
-        self._config_file = self._codex_dir / "config.toml"
+    def __init__(self, config_dir: Path) -> None:
+        self._config_dir = config_dir
+        self._config_file = config_dir / "config.toml"
 
     # ------------------------------------------------------------------
     # MCPRegistrar interface
     # ------------------------------------------------------------------
 
     def detect(self) -> bool:
-        return self._codex_dir.is_dir()
+        return self._config_dir.is_dir()
 
     def get_server(self, server_name: str) -> ServerSpec | None:
         data = self._load_toml()
@@ -189,7 +195,7 @@ class CodexRegistrar(MCPRegistrar):
         # _write_block appends a `[mcp_servers.<name>]` table, so appending into
         # an unparseable file corrupts it further, and appending alongside a
         # non-table entry creates a duplicate `[mcp_servers.<name>]` key that
-        # tomllib/codex then reject — destroying a previously-valid user config.
+        # tomllib and the CLI then reject — destroying a previously-valid user config.
         # Refuse rather than clobber, mirroring the claude (#1660) / opencode
         # (#1661) guards.
         if existing is None:
@@ -234,7 +240,8 @@ class CodexRegistrar(MCPRegistrar):
             return False
         try:
             fsutil.write_text(self._config_file, new_content)
-        except OSError:
+        except OSError as exc:
+            logger.warning("could not remove %r from %s: %s", server_name, self._config_file, exc)
             return False
         return True
 
@@ -249,7 +256,7 @@ class CodexRegistrar(MCPRegistrar):
             # Read via fsutil (UTF-8 with locale fallback) so a config that a
             # tool wrote in the system locale (e.g. GBK) still parses instead
             # of failing tomllib's UTF-8 requirement. See #733.
-            data = tomllib.loads(fsutil.read_text(self._config_file))
+            data = loads_codex_config(fsutil.read_text(self._config_file))
         except (tomllib.TOMLDecodeError, OSError):
             return {}
         return data if isinstance(data, dict) else {}
@@ -270,7 +277,7 @@ class CodexRegistrar(MCPRegistrar):
         if not raw.strip():
             return None
         try:
-            data = tomllib.loads(fsutil.read_text(self._config_file))
+            data = loads_codex_config(fsutil.read_text(self._config_file))
         except (tomllib.TOMLDecodeError, OSError) as exc:
             return f"{self._config_file} is not valid TOML ({exc})"
         if not isinstance(data, dict):
@@ -290,7 +297,7 @@ class CodexRegistrar(MCPRegistrar):
     def _write_block(self, spec: ServerSpec) -> RegisterResult:
         block = _render_block(spec)
         try:
-            self._codex_dir.mkdir(parents=True, exist_ok=True)
+            self._config_dir.mkdir(parents=True, exist_ok=True)
             marker_start = _marker_start(spec.name)
             marker_end = _marker_end(spec.name)
             original = self._read_text()
@@ -321,6 +328,22 @@ class CodexRegistrar(MCPRegistrar):
                 RegisterStatus.FAILED, f"could not write {self._config_file}: {exc}"
             )
         return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {self._config_file}")
+
+
+class CodexRegistrar(_TomlMarkerRegistrar):
+    """Register MCP servers with the OpenAI Codex CLI."""
+
+    name = "codex"
+    display_name = "OpenAI Codex CLI"
+
+    def __init__(self, *, home_dir: Path | None = None) -> None:
+        if home_dir is not None:
+            config_dir = home_dir / ".codex"
+        else:
+            from headroom.install.paths import codex_home_dir
+
+            config_dir = codex_home_dir()
+        super().__init__(config_dir)
 
 
 # ----------------------------------------------------------------------
@@ -378,43 +401,3 @@ def _toml_str(s: str) -> str:
         else:
             out.append(ch)
     return '"' + "".join(out) + '"'
-
-
-def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
-    args_value = entry.get("args", [])
-    if isinstance(args_value, list):
-        args = tuple(str(x) for x in args_value)
-    else:
-        args = ()
-    env_value = entry.get("env", {})
-    env: dict[str, str] = {}
-    if isinstance(env_value, dict):
-        env = {str(k): str(v) for k, v in env_value.items()}
-    return ServerSpec(
-        name=name,
-        command=str(entry.get("command", "")),
-        args=args,
-        env=env,
-    )
-
-
-def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
-    return (
-        a.name == b.name
-        and a.command == b.command
-        and tuple(a.args) == tuple(b.args)
-        and dict(a.env) == dict(b.env)
-    )
-
-
-def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
-    parts: list[str] = []
-    if existing.command != requested.command:
-        parts.append(f"command {existing.command!r} -> {requested.command!r}")
-    if tuple(existing.args) != tuple(requested.args):
-        parts.append(f"args {list(existing.args)} -> {list(requested.args)}")
-    if dict(existing.env) != dict(requested.env):
-        parts.append(f"env {dict(existing.env)} -> {dict(requested.env)}")
-    if not parts:
-        return "spec differs in unidentified field(s)"
-    return "; ".join(parts)
