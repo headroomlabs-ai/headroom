@@ -368,6 +368,9 @@ def test_anthropic_memory_continuation_uses_buffered_timeout() -> None:
             self.initialized = False
             self.backend = None
 
+        def is_project_unresolved(self, _request_ctx: object) -> bool:
+            return False
+
         def get_beta_headers(self) -> dict[str, str]:
             return {}
 

@@ -204,23 +204,32 @@ reads this header for routing and then strips it before forwarding upstream.
 secrets. Because `x-headroom-base-url` is chosen by the *client*, those headers
 are only attached when the destination is one the operator designated:
 
-- a host in the configured provider targets (`ANTHROPIC_TARGET_API_URL`,
-  `OPENAI_TARGET_API_URL`, and the Gemini/Vertex/Cloud Code equivalents), or
-- a host listed in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (comma-separated).
+- the origin (scheme, host and port) of that provider's own target: for
+  `OPENAI_TARGET_API_HEADERS`, `OPENAI_TARGET_API_URL` or `https://api.openai.com`;
+  for `ANTHROPIC_TARGET_API_HEADERS`, `ANTHROPIC_TARGET_API_URL`, the oMLX target
+  or `https://api.anthropic.com` (the OpenAI headers never go to Anthropic's API,
+  and the reverse), or
+- an entry in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (comma-separated). A bare host
+  means `https` on port 443; write `host:port` for https on another port, or a
+  full URL such as `http://gateway.internal:4000` for plain http.
 
 A request to any other upstream is **still proxied** — it just does not carry
 your configured headers, and the proxy logs
-`upstream_extra_headers_withheld host=<host>` once per host. If you route to a
+`upstream_extra_headers_withheld host=<scheme>://<host>:<port>` once per origin. If you route to a
 gateway via this header and need your configured headers to reach it, add its
 host to `HEADROOM_UPSTREAM_ALLOWED_HOSTS`:
 
 ```bash
-export HEADROOM_UPSTREAM_ALLOWED_HOSTS="gateway.internal,api.example-gateway.ai"
+export HEADROOM_UPSTREAM_ALLOWED_HOSTS="api.example-gateway.ai,http://gateway.internal:4000"
 ```
 
-Matching is on the parsed hostname and is exact — no wildcards — so
+Matching is on the parsed origin and is exact — no wildcards — so
 `api.anthropic.com.evil.example` and `https://api.anthropic.com@evil.example`
-do not match `api.anthropic.com`.
+do not match `api.anthropic.com`, and neither do `http://api.anthropic.com` or
+`https://api.anthropic.com:8443`. If you listed a bare host and reach that
+gateway over plain http or on a non-default port, list it with that scheme and
+port instead (for example `http://gateway.internal:4000`), or your configured
+headers are no longer sent to it.
 
 #### `x-headroom-base-url` is refused when an outbound proxy is in the way
 

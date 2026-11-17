@@ -19,6 +19,7 @@ from headroom.proxy.body_forwarding import OutboundBody
 from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
+    _path_for_log,
     jitter_delay_ms,
     overload_retry_is_futile,
     parse_sse_events_from_byte_buffer,
@@ -182,36 +183,6 @@ def _upstream_error_frame(error_bytes: bytes, request_id: str) -> bytes:
 def _sse_dict(value: Any) -> dict[str, Any]:
     """Return an upstream SSE object, or an empty object for a wrong-shaped value."""
     return value if isinstance(value, dict) else {}
-
-
-def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
-    """Extract `usage.completion_tokens` from a single SSE chunk if present.
-
-    Returns the integer count when the chunk carries a usage frame (LiteLLM
-    emits this only when the request included
-    ``stream_options.include_usage=true``), or None when no usage data is
-    present (the typical content-only chunk path) or when the chunk fails
-    to parse. Used by the OpenAI-via-backend stream path to track
-    completion tokens online instead of buffering the entire response.
-    """
-    try:
-        decoded = chunk_bytes.decode("utf-8", errors="replace")
-    except (UnicodeDecodeError, AttributeError):
-        return None
-    for line in decoded.split("\n"):
-        line = line.strip()
-        if not line.startswith("data: ") or line == "data: [DONE]":
-            continue
-        try:
-            data = json.loads(line[6:])
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        chunk_usage = data.get("usage")
-        if isinstance(chunk_usage, dict):
-            return int(chunk_usage.get("completion_tokens", 0) or 0)
-    return None
 
 
 class StreamingMixin:
@@ -422,21 +393,27 @@ class StreamingMixin:
                     # response.usage on response.completed.
                     input_tokens = chunk_usage.get("prompt_tokens")
                     if input_tokens is None:
-                        input_tokens = chunk_usage.get("input_tokens", 0)
+                        input_tokens = chunk_usage.get("input_tokens")
                     output_tokens = chunk_usage.get("completion_tokens")
                     if output_tokens is None:
-                        output_tokens = chunk_usage.get("output_tokens", 0)
-                    usage_found["input_tokens"] = usage_int(input_tokens)
-                    usage_found["output_tokens"] = usage_int(output_tokens)
+                        output_tokens = chunk_usage.get("output_tokens")
+                    # Only report fields this frame actually carries: an
+                    # absent counter must leave the caller's last known
+                    # value alone, while an explicit zero replaces it.
+                    if input_tokens is not None:
+                        usage_found["input_tokens"] = usage_int(input_tokens)
+                    if output_tokens is not None:
+                        usage_found["output_tokens"] = usage_int(output_tokens)
                     details = (
                         chunk_usage.get("prompt_tokens_details")
                         or chunk_usage.get("input_tokens_details")
                         or {}
                     )
                     if isinstance(details, dict):
-                        usage_found["cache_read_input_tokens"] = usage_int(
-                            details.get("cached_tokens")
-                        )
+                        if details.get("cached_tokens") is not None:
+                            usage_found["cache_read_input_tokens"] = usage_int(
+                                details["cached_tokens"]
+                            )
                         # Responses reports billed cache writes itself; the
                         # Anthropic-shape key routes them down the real-write
                         # branch instead of inferring them from uncached.
@@ -637,6 +614,7 @@ class StreamingMixin:
                     memory_user_id,
                     "anthropic",
                     request_context=memory_request_ctx,
+                    tool_names=server_memory_tool_names,
                 )
                 logger.info(
                     f"[{request_id}] Memory: Executed {len(tool_results)}/"
@@ -1470,11 +1448,12 @@ class StreamingMixin:
             ),
         }
 
-        # Track if we need to handle memory tools
+        # Track if we need to handle memory tools: only those the proxy injected.
         memory_enabled = (
             memory_user_id is not None
             and self.memory_handler is not None
             and provider == "anthropic"
+            and bool(server_memory_tool_names)
         )
         # Withholding headroom_retrieve needs the Anthropic SSE shape the
         # filter and the continuation round are written for.
@@ -1623,7 +1602,7 @@ class StreamingMixin:
                 "[%s] Upstream provider returned an error; forwarding it to the client status=%s url=%s",
                 request_id,
                 upstream_response.status_code,
-                url,
+                _path_for_log(url),
             )
             # Diagnostic dump of the erroring request — parity with the
             # non-streaming handlers, which dump on >=400 but never fire for a
@@ -1659,7 +1638,7 @@ class StreamingMixin:
                     "[%s] Failed reading upstream error body status=%s url=%s error=%s",
                     request_id,
                     upstream_response.status_code,
-                    url,
+                    _path_for_log(url),
                     read_error,
                 )
                 error_content = json.dumps(
@@ -2013,30 +1992,6 @@ class StreamingMixin:
                         parsed_response = (
                             stream_state.pop("memory_client_message", None) or parsed_response
                         )
-                    elif (
-                        memory_enabled
-                        and parsed_response
-                        and self.memory_handler.has_memory_tool_calls(parsed_response, provider)
-                    ):
-                        logger.info(
-                            f"[{request_id}] Memory: Detected tool calls in streaming response"
-                        )
-
-                        # The client declared these memory tools itself, so the
-                        # tool_use already reached it and the client continues
-                        # the turn; only the server-side save happens here.
-                        tool_results = await self.memory_handler.handle_memory_tool_calls(
-                            parsed_response,
-                            memory_user_id,
-                            provider,
-                            request_context=memory_request_ctx,
-                        )
-                        if tool_results:
-                            logger.info(
-                                f"[{request_id}] Memory: Tool calls executed "
-                                f"({len(tool_results)} results saved, SSE streaming — "
-                                "continuation handled by client)"
-                            )
 
                 if memory_filter is not None:
                     # Memory detection was skipped (empty stream or buffer cap):
@@ -2608,6 +2563,9 @@ class StreamingMixin:
             completed_normally = False
             stream_failed = False
 
+            # Usage frames are cumulative snapshots of the same turn: each one
+            # supersedes the last, so an absent field keeps its earlier value
+            # and an explicit zero replaces it.
             def _absorb(usage: dict[str, int] | None) -> None:
                 if not usage:
                     return
@@ -2617,7 +2575,7 @@ class StreamingMixin:
                     "cache_read_input_tokens",
                     "cache_creation_input_tokens",
                 ):
-                    if key in usage and not stream_state.get(key):
+                    if key in usage:
                         stream_state[key] = usage[key]
 
             try:
@@ -2626,11 +2584,6 @@ class StreamingMixin:
                     stream_state["sse_buffer"].extend(chunk_bytes)
                     full_sse_bytes.extend(chunk_bytes)
                     _absorb(self._parse_sse_usage_from_buffer(stream_state, "openai"))
-                    # Per-chunk fallback for upstreams that emit only
-                    # ``completion_tokens`` and not a full usage frame.
-                    parsed = _parse_completion_tokens_from_sse_chunk(chunk_bytes)
-                    if parsed is not None and not stream_state["output_tokens"]:
-                        stream_state["output_tokens"] = parsed
                     yield chunk_bytes
                 stream_failed = stream_state.get("stream_failed", False)
                 completed_normally = (
