@@ -159,6 +159,8 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 
 If you need Streamable HTTP instead of stdio, run `headroom mcp serve --transport http` and point your MCP host at that endpoint. The default path is `/mcp`, and the default port is `8788`.
 
+The HTTP transport only answers requests whose `Host` header names the address it is bound to (`127.0.0.1`, `localhost` or `[::1]` with the bound port for a loopback or `0.0.0.0` bind), and refuses browser requests from any other origin. If clients reach it through another name, such as a hostname or a reverse proxy, list them in `HEADROOM_MCP_ALLOWED_HOSTS` (comma-separated) exactly as clients send them in `Host`: `name:port`, or just `name` when the port is the scheme default (80 or 443, e.g. behind a TLS reverse proxy).
+
 Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. The proxy serves its own API; it does not automatically provide the MCP HTTP transport.
 
 ### `command: "headroom"` fails to start
@@ -187,7 +189,7 @@ Install Headroom so it's globally on PATH — `uv tool install "headroom-ai[mcp]
 
 ## Architecture
 
-For user-managed Serena drift, run `headroom mcp reconcile` to inspect the current recommendation. Add `--adopt` only when you want Headroom to replace the Serena entry.
+For user-managed Serena drift, run `headroom mcp reconcile` to inspect the current recommendation. Add `--adopt` only when you want Headroom to replace the Serena entry. If an enabled Claude Code plugin (such as `serena` from the `claude-plugins-official` marketplace) also bundles a Serena server, `reconcile` reports it and prints the `claude plugin disable` command; Headroom never edits third-party plugins.
 
 ### MCP only (no proxy)
 
@@ -205,7 +207,7 @@ The proxy compresses all traffic at the HTTP level (before the LLM sees content)
 
 **"Proxy not running"** -- Start the proxy with `headroom proxy` in another terminal. Only needed for proxy-backed retrieval.
 
-**"Entry not found or expired"** -- Local content expires after 1 hour, proxy content after 5 minutes.
+**"Entry not found or expired"** -- Local content expires after 1 hour, proxy content after 30 minutes (configurable via `HEADROOM_CCR_TTL_SECONDS`).
 
 **Claude doesn't see headroom tools** -- Run `headroom mcp status`, restart Claude Code, and verify with `/mcp` inside Claude Code.
 

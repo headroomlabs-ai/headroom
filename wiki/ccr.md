@@ -130,11 +130,11 @@ The older conversation turns, system prompt, and tool definitions — the provid
 # Proxy with CCR enabled (default)
 headroom proxy --port 8787
 
-# Disable CCR response handling
-headroom proxy --no-ccr-responses
+# Disable CCR entirely: no retrieval markers, no headroom_retrieve tool
+headroom proxy --no-ccr
 
-# Disable proactive expansion
-headroom proxy --no-ccr-expansion
+# Disable proactive expansion of previously-compressed content
+headroom proxy --no-ccr-proactive-expansion
 ```
 
 ## Why This Matters
@@ -149,30 +149,27 @@ CCR gives you the savings of aggressive compression with zero risk — the LLM c
 
 ## Demo
 
-Run the CCR demonstration to see it in action:
+`examples/ccr_demo.py` no longer exists in this repo. The closest working example is `examples/test_ccr.py`, which compresses a tool result and checks that key content survives compression:
 
 ```bash
-python examples/ccr_demo.py
+python examples/test_ccr.py
 ```
 
-Output:
+Verified output (`.venv/bin/python examples/test_ccr.py`):
 ```
-1. COMPRESSION STORE
-   Original: 100 items (7,059 chars)
-   Compressed: 8 items (633 chars)
-   Reduction: 91.0%
+Tokens: 2904 -> 2703 (201 saved)
+Transforms: ['router:protected:user_message', 'router:mixed:0.97']
 
-3. RESPONSE HANDLER
-   Detected CCR tool call: True
-   Retrieved 100 items automatically
+No CCR markers
 
-4. CONTEXT TRACKER
-   Turn 5: User asks "show authentication middleware"
-   Tracker found 1 relevant context
-   → relevance=0.73
-   Proactively expanded: 100 items
+  reward tampering: FOUND
+  sycophancy: FOUND
+  ...
+6/6 key concepts preserved in compressed output
 ```
+
+Note this run shows "No CCR markers" — `examples/test_ccr.py` calls the SDK `compress()` function directly, and this particular payload doesn't cross the size threshold that triggers a CCR marker. The full compress-cache-retrieve tool-call loop (`headroom_retrieve`, proactive expansion) only runs inside `headroom proxy`, not the standalone SDK call.
 
 ## Architecture
 
-For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md#ccr-compress-cache-retrieve).
+For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md#ccr-architecture-compress-cache-retrieve).

@@ -211,7 +211,7 @@ For translated backends, the Copilot wrapper can switch to Headroom's OpenAI-com
 headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
 ```
 
-For Copilot's **hosted** API (`--subscription` and the implicit OAuth path), Headroom routes to the generic host `https://api.githubcopilot.com`, which serves the full model set. **Enterprise / data-residency** tenants on a dedicated Copilot host pin it with `GITHUB_COPILOT_API_URL` (e.g. `export GITHUB_COPILOT_API_URL=https://api.<your-host>.githubcopilot.com`); the override flows through to the upstream request. See [`TESTING-copilot-subscription.md`](https://github.com/chopratejas/headroom/blob/main/TESTING-copilot-subscription.md).
+For Copilot's **hosted** API (`--subscription` and the implicit OAuth path), Headroom routes to the generic host `https://api.githubcopilot.com`, which serves the full model set. **Enterprise / data-residency** tenants on a dedicated Copilot host pin it with `GITHUB_COPILOT_API_URL` (e.g. `export GITHUB_COPILOT_API_URL=https://api.<your-host>.githubcopilot.com`); the override flows through to the upstream request. See [`TESTING-copilot-subscription.md`](https://github.com/headroomlabs-ai/headroom/blob/main/TESTING-copilot-subscription.md).
 
 ### With Cloud Providers
 
@@ -303,7 +303,7 @@ openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
 
 The plugin auto-detects a running Headroom proxy or starts one. Compression happens in `assemble()` — zero changes to the agent's behavior.
 
-See the [OpenClaw plugin documentation](https://github.com/chopratejas/headroom/tree/main/plugins/openclaw) for full setup.
+See the [OpenClaw plugin documentation](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/openclaw) for full setup.
 
 ---
 

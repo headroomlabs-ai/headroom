@@ -434,6 +434,117 @@ async def test_streaming_handler_process_stream_pass_through_and_ccr(
 
 
 @pytest.mark.asyncio
+async def test_streaming_ccr_keeps_classifier_frames_through_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_handler = CCRResponseHandler()
+    handler = StreamingCCRHandler(response_handler, provider="anthropic")
+
+    async def fake_handle_response(response, messages, tools, api_call_fn, provider):  # noqa: ANN001
+        return {
+            "id": "msg_continuation",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": "retrieval complete"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 4},
+        }
+
+    monkeypatch.setattr(response_handler, "handle_response", fake_handle_response)
+    initial = b"""event: message_start
+data: {"type":"message_start","message":{"id":"msg_initial","type":"message","role":"assistant","model":"claude-test","content":[],"safeguard_results":{"decision":"allow","tool_use_id":"toolu_auto_001"}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_auto_001","name":"headroom_retrieve","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"hash\\":\\"abc\\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: safeguard_results
+data: {"type":"safeguard_results","result":{"decision":"allow","tool_use_id":"toolu_auto_001"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"""
+
+    streamed = [
+        chunk
+        async for chunk in handler.process_stream(
+            _async_iter([initial]), [], None, lambda m, t: None
+        )
+    ]
+    rendered = b"".join(streamed)
+
+    assert b"safeguard_results" in rendered
+    assert b"toolu_auto_001" in rendered
+    assert b"msg_continuation" in rendered
+
+
+@pytest.mark.asyncio
+async def test_streaming_ccr_replays_malformed_known_frame_through_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_handler = CCRResponseHandler()
+    handler = StreamingCCRHandler(response_handler, provider="anthropic")
+
+    async def fake_handle_response(response, messages, tools, api_call_fn, provider):  # noqa: ANN001
+        return {
+            "id": "msg_continuation",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": "retrieval complete"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 4},
+        }
+
+    monkeypatch.setattr(response_handler, "handle_response", fake_handle_response)
+    malformed = b"event: message_delta\ndata: {not-json\n\n"
+    initial = (
+        b"""event: message_start
+data: {"type":"message_start","message":{"id":"msg_initial","type":"message","role":"assistant","model":"claude-test","content":[]}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_auto_001","name":"headroom_retrieve","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"hash\\":\\"abc\\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+"""
+        + malformed
+        + b"""event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"""
+    )
+
+    streamed = [
+        chunk
+        async for chunk in handler.process_stream(
+            _async_iter([initial]), [], None, lambda m, t: None
+        )
+    ]
+    rendered = b"".join(streamed)
+
+    assert b"msg_continuation" in rendered
+    assert rendered.count(malformed) == 1
+
+
+@pytest.mark.asyncio
 async def test_streaming_handler_falls_back_to_buffer_on_processing_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

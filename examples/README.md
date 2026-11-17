@@ -88,6 +88,19 @@ PYTHONPATH=. python -m examples.langchain_demo.run_comparison
 
 See [langchain_demo/README.md](langchain_demo/README.md) for details.
 
+### claude_code_remote_control/
+
+Keep Claude Code's Remote Control while routing through Headroom: `ANTHROPIC_BASE_URL`
+stays unset and a local mitmproxy addon hands `/v1/messages` to Headroom via `HTTPS_PROXY`:
+
+```bash
+mitmdump --listen-host 127.0.0.1 --listen-port 8790 \
+  --allow-hosts '^api\.anthropic\.com(:443)?$' \
+  -s examples/claude_code_remote_control/route_to_headroom.py
+```
+
+See [claude_code_remote_control/README.md](claude_code_remote_control/README.md) for the Claude Code settings.
+
 ### mcp_demo/
 
 MCP (Model Context Protocol) integration demo:
@@ -96,6 +109,21 @@ MCP (Model Context Protocol) integration demo:
 export OPENAI_API_KEY='your-key'
 PYTHONPATH=. python -m examples.mcp_demo.run_agent_eval
 ```
+
+### vertex_gemini_benchmark/
+
+Gemini 3.8 Flash on Google Cloud Vertex AI (Gemini Enterprise Agent Platform) benchmark:
+
+```bash
+# Ensure Google Cloud ADC is active
+gcloud auth application-default login
+export GCP_PROJECT_ID="your-project-id"
+
+# Run comparative benchmark (Direct vs Headroom Proxied)
+python examples/vertex_gemini_benchmark/benchmark.py --model gemini-3.8-flash
+```
+
+See [vertex_gemini_benchmark/README.md](vertex_gemini_benchmark/README.md) for full benchmark scenarios and methodology.
 
 ### strands_bedrock_demo.py
 

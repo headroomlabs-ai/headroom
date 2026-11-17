@@ -137,7 +137,7 @@ config = HeadroomConfig(
 
 model = HeadroomAgnoModel(
     wrapped_model=OpenAIChat(id="gpt-4o"),
-    config=config,
+    headroom_config=config,
 )
 ```
 
@@ -362,7 +362,7 @@ We're tracking these potential enhancements:
 - **Tool schema deduplication** — Cache and reference repeated tool definitions
 - **Team-level optimization** — Shared context compression across agent teams
 
-Contributions welcome! See [CONTRIBUTING.md](https://github.com/chopratejas/headroom/blob/main/CONTRIBUTING.md).
+Contributions welcome! See [CONTRIBUTING.md](https://github.com/headroomlabs-ai/headroom/blob/main/CONTRIBUTING.md).
 
 ---
 
@@ -373,7 +373,7 @@ Contributions welcome! See [CONTRIBUTING.md](https://github.com/chopratejas/head
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `wrapped_model` | Any | Required | The Agno model to wrap |
-| `config` | `HeadroomConfig` | `None` | Custom configuration |
+| `headroom_config` | `HeadroomConfig` | `None` | Custom configuration |
 | `auto_detect_provider` | `bool` | `True` | Auto-detect provider for token counting |
 
 **Properties:**

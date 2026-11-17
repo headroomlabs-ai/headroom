@@ -390,7 +390,7 @@ describe("plugin dirs", () => {
     );
   });
 
-  for (const bad of ["", "foo/bar", "foo\\bar"]) {
+  for (const bad of ["", "foo/bar", "foo\\bar", ".", "..", "a\0b"]) {
     it(`rejects invalid plugin name ${JSON.stringify(bad)}`, () => {
       expect(() => pluginConfigDir(bad)).toThrow();
       expect(() => pluginWorkspaceDir(bad)).toThrow();

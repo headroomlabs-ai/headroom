@@ -202,7 +202,7 @@ The `headroom-ai` package has no runtime dependencies. Framework SDKs (Vercel AI
 
 ## OpenClaw Plugin
 
-The TypeScript SDK powers the [`headroom-openclaw`](https://www.npmjs.com/package/headroom-openclaw) plugin for [OpenClaw](https://github.com/openclaw/openclaw) agents. The plugin uses `HeadroomClient` internally to compress context during the `assemble()` lifecycle hook. The preferred install flow is `headroom wrap openclaw`; the direct plugin command is `openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw`. See the [plugin source](https://github.com/chopratejas/headroom/tree/main/plugins/openclaw) for details.
+The TypeScript SDK powers the [`headroom-openclaw`](https://www.npmjs.com/package/headroom-openclaw) plugin for [OpenClaw](https://github.com/openclaw/openclaw) agents. The plugin uses `HeadroomClient` internally to compress context during the `assemble()` lifecycle hook. The preferred install flow is `headroom wrap openclaw`; the direct plugin command is `openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw`. See the [plugin source](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/openclaw) for details.
 
 ## Comparison with Python SDK
 

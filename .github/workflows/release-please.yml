@@ -54,12 +54,22 @@ jobs:
         id: app-token
         if: ${{ vars.RELEASE_APP_ID != '' }}
         continue-on-error: true
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - uses: googleapis/release-please-action@v5
+      # A Windows body edit can introduce CRCRLF. release-please strips one CR,
+      # then cannot find its exact `---` delimiters and silently skips release
+      # creation. Repair only merged, pending release PR envelopes before the
+      # action reads them; do not infer versions or rewrite generated notes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Normalize pending release PR body line endings
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python scripts/normalize_release_pr_bodies.py --repo "${{ github.repository }}" --apply
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           # Neither an app token nor a PAT is GITHUB_TOKEN, and that matters: a
           # release/tag created by GITHUB_TOKEN does NOT emit events that trigger

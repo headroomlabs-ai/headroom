@@ -17,7 +17,7 @@ compressor half (``compress`` stores ``ccr_original`` rather than the protected
 from __future__ import annotations
 
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.kompress_compressor import KompressCompressor
+from headroom.transforms.kompress_compressor import KompressCompressor, KompressConfig
 
 
 def _kompress_router() -> ContentRouter:
@@ -142,8 +142,9 @@ def test_compress_batch_validates_ccr_originals_length():
 # it keeps the first two words of each chunk so the compression ratio clears the
 # ``< 0.8`` CCR-store threshold.
 
-_RAW = "<system-reminder>CRITICAL: invoke the skill</system-reminder> " + " ".join(["filler"] * 40)
-_PLACEHOLDER = "{{HEADROOM_TAG_0}} " + " ".join(["filler"] * 40)
+# 100 filler words: keeping two saves ~99, well past the marker cost gate.
+_RAW = "<system-reminder>CRITICAL: invoke the skill</system-reminder> " + " ".join(["filler"] * 100)
+_PLACEHOLDER = "{{HEADROOM_TAG_0}} " + " ".join(["filler"] * 100)
 
 
 class _FakeEncoding:
@@ -193,7 +194,7 @@ def _capture_store(compressor, monkeypatch):
 def test_compress_inline_stores_ccr_original_not_placeholder(monkeypatch):
     """The inline ``compress()`` CCR-store stores the raw original, not the
     placeholdered ``content`` the model compressed."""
-    compressor = KompressCompressor()
+    compressor = KompressCompressor(KompressConfig(min_input_words=10))
     captured = _capture_store(compressor, monkeypatch)
 
     compressor.compress(_PLACEHOLDER, ccr_original=_RAW)
@@ -206,7 +207,7 @@ def test_compress_batch_batched_path_stores_ccr_original(monkeypatch):
     """The batched (GPU) ``compress_batch()`` CCR-store path stores the raw
     per-item original. Force the batched branch (ONNX defaults to the sequential
     fallback, which routes through ``compress()`` covered above)."""
-    compressor = KompressCompressor()
+    compressor = KompressCompressor(KompressConfig(min_input_words=10))
     captured = _capture_store(compressor, monkeypatch)
     monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
 

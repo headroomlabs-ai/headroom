@@ -27,7 +27,7 @@
 //! [`backends::from_config`] selects one at startup and surfaces every
 //! init error to the caller (per `feedback_no_silent_fallbacks.md`).
 //!
-//! [`CompressionStore`]: https://github.com/chopratejas/headroom/blob/main/headroom/cache/compression_store.py
+//! [`CompressionStore`]: https://github.com/headroomlabs-ai/headroom/blob/main/headroom/cache/compression_store.py
 
 pub mod backends;
 
@@ -77,6 +77,12 @@ pub const DEFAULT_MAX_LIFETIME_MULTIPLIER: u32 = 8;
 /// Absolute max lifetime for an entry with idle window `idle_ttl`.
 pub fn max_lifetime_for(idle_ttl: Duration) -> Duration {
     idle_ttl.saturating_mul(DEFAULT_MAX_LIFETIME_MULTIPLIER)
+}
+
+/// `u64` seconds -> `i64` for SQLite/Redis. Saturates: `u64::MAX` ("never
+/// expire") must not wrap to -1 and expire at once.
+pub(crate) fn secs_i64(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 /// Compute the canonical CCR key for `payload`. BLAKE3 → first 24 hex

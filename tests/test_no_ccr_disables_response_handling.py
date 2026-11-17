@@ -156,9 +156,10 @@ def _upstream_stream_field(*, ccr_handle_responses: bool) -> object:
 
 def test_client_offered_tool_still_buffers_when_handling_is_on(_store) -> None:  # noqa: ANN001
     """The behaviour being switched off — pinned so the switch is meaningful."""
-    assert _upstream_stream_field(ccr_handle_responses=True) is False
+    # Only the buffered path sends through `_retry_request`, and its request streams.
+    assert _upstream_stream_field(ccr_handle_responses=True) is True
 
 
 def test_client_offered_tool_does_not_buffer_under_no_ccr(_store) -> None:  # noqa: ANN001
     """With the switch honoured, the turn keeps streaming despite the tool."""
-    assert _upstream_stream_field(ccr_handle_responses=False) is not False
+    assert _upstream_stream_field(ccr_handle_responses=False) is None

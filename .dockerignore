@@ -18,6 +18,13 @@ __pycache__
 dist/
 build/
 
+# Rust artifacts. The Dockerfile runs its own `cargo build` inside the
+# builder stage, so the host's target/ is never needed — and after a
+# local `cargo build` it is 100GB+, which the daemon dutifully copies
+# on every `docker build`. CI never noticed because a fresh checkout
+# has no target/; it only ever bites local builds.
+target/
+
 # Dev/test tooling
 .pytest_cache
 .coverage

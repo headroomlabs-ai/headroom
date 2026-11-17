@@ -16,15 +16,16 @@ Run with:
 
 import json
 import os
+from unittest.mock import AsyncMock
 
 import pytest
 
+httpx = pytest.importorskip("httpx")
 pytest.importorskip("fastapi")
-pytest.importorskip("httpx")
 
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient  # noqa: E402
 
-from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 # =============================================================================
 # Fixtures
@@ -520,3 +521,134 @@ class TestBatchErrorHandling:
             content=b"not valid json",
         )
         assert response.status_code == 400
+
+
+@pytest.fixture
+def copilot_anthropic_batch_client():
+    """Create a client whose resolved Anthropic target is public Copilot."""
+    from headroom.proxy.server import HeadroomProxy
+
+    original_anthropic_api_url = HeadroomProxy.ANTHROPIC_API_URL
+    original_openai_api_url = HeadroomProxy.OPENAI_API_URL
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        openai_api_url="https://api.githubcopilot.com",
+    )
+    app = create_app(config)
+    with TestClient(app) as client:
+        proxy = app.state.proxy
+        proxy.http_client = AsyncMock()
+        proxy.http_client.request.return_value = httpx.Response(
+            404,
+            json={
+                "type": "error",
+                "error": {
+                    "type": "not_found_error",
+                    "message": "Batch endpoint not found",
+                },
+            },
+        )
+        try:
+            yield client, proxy.http_client
+        finally:
+            HeadroomProxy.ANTHROPIC_API_URL = original_anthropic_api_url
+            HeadroomProxy.OPENAI_API_URL = original_openai_api_url
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs"),
+    [
+        (
+            "post",
+            "/v1/messages/batches",
+            {
+                "json": {
+                    "requests": [
+                        {
+                            "custom_id": "req-1",
+                            "params": {
+                                "model": "claude-3-5-sonnet-20241022",
+                                "max_tokens": 1024,
+                                "messages": [{"role": "user", "content": "Hello"}],
+                            },
+                        }
+                    ]
+                }
+            },
+        ),
+        ("get", "/v1/messages/batches", {}),
+        ("get", "/v1/messages/batches/batch_123", {}),
+        ("post", "/v1/messages/batches/batch_123/cancel", {}),
+        ("get", "/v1/messages/batches/batch_123/results", {}),
+    ],
+)
+def test_copilot_anthropic_batch_routes_are_rejected_before_upstream(
+    copilot_anthropic_batch_client, method, path, kwargs
+):
+    """Every registered batch route returns one stable capability response."""
+    client, http_client = copilot_anthropic_batch_client
+
+    response = getattr(client, method)(path, **kwargs)
+
+    assert response.status_code == 501
+    assert response.json() == {
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": "Anthropic batch operations are not supported for Copilot targets.",
+        },
+    }
+    http_client.request.assert_not_called()
+    http_client.get.assert_not_called()
+    if method == "post":
+        http_client.post.assert_not_called()
+
+
+def test_copilot_anthropic_batch_rejection_precedes_body_parsing(copilot_anthropic_batch_client):
+    """Capability rejection wins even when the batch body is invalid."""
+    client, http_client = copilot_anthropic_batch_client
+
+    response = client.post("/v1/messages/batches", content=b"not json")
+
+    assert response.status_code == 501
+    assert response.json()["error"]["type"] == "api_error"
+    http_client.request.assert_not_called()
+    http_client.post.assert_not_called()
+
+
+def test_explicit_non_copilot_anthropic_target_forwards():
+    """An explicit Anthropic target remains outside the Copilot guard."""
+    from headroom.proxy.server import HeadroomProxy
+
+    original_anthropic_api_url = HeadroomProxy.ANTHROPIC_API_URL
+    original_openai_api_url = HeadroomProxy.OPENAI_API_URL
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        openai_api_url="https://api.githubcopilot.com",
+        anthropic_api_url="https://api.anthropic.com",
+    )
+    app = create_app(config)
+    try:
+        with TestClient(app) as client:
+            proxy = app.state.proxy
+            proxy.http_client = AsyncMock()
+            proxy.http_client.request.return_value = httpx.Response(200, json={"data": []})
+            http_client = proxy.http_client
+
+            response = client.get("/v1/messages/batches")
+    finally:
+        HeadroomProxy.ANTHROPIC_API_URL = original_anthropic_api_url
+        HeadroomProxy.OPENAI_API_URL = original_openai_api_url
+
+    assert response.status_code == 200
+    http_client.request.assert_called_once()
+    assert http_client.request.call_args.kwargs["url"] == (
+        "https://api.anthropic.com/v1/messages/batches"
+    )
+    http_client.post.assert_not_called()
