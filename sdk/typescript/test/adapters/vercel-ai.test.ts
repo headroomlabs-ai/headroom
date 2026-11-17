@@ -596,3 +596,52 @@ describe("headroomMiddleware keeps provider-executed tool calls in place", () =>
     expect(out.prompt).toEqual(prompt);
   });
 });
+
+describe("headroomMiddleware keeps tool-result output kinds", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("returns denied, multi-part and error results exactly as the AI SDK sent them", async () => {
+    const prompt: LanguageModelV4Prompt = [
+      { role: "user", content: [{ type: "text", text: "Deploy, then screenshot the dashboard." }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "call_1", toolName: "deploy", input: { env: "prod" } },
+          { type: "tool-call", toolCallId: "call_2", toolName: "screenshot", input: {} },
+          { type: "tool-call", toolCallId: "call_3", toolName: "fetch_gateway_metrics", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "call_1", toolName: "deploy", output: { type: "execution-denied", reason: "Not from CI." } },
+          {
+            type: "tool-result",
+            toolCallId: "call_2",
+            toolName: "screenshot",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "Dashboard at 12:00." },
+                { type: "file", data: { type: "data", data: "iVBORw0KGgo=" }, mediaType: "image/png", filename: "dashboard.png" },
+              ],
+            },
+          },
+          { type: "tool-result", toolCallId: "call_3", toolName: "fetch_gateway_metrics", output: { type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" } },
+        ],
+      },
+    ];
+    // The proxy passes this prompt through unchanged.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => mockCompressResponse(JSON.parse(init.body).messages));
+
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v4" }, type: "generate" });
+
+    expect(out.prompt.slice(0, 2)).toEqual(prompt.slice(0, 2));
+    // One OpenAI tool message per result, so a multi-result tool message comes back as one
+    // message per result; the results themselves are the AI SDK's own.
+    expect(out.prompt.slice(2).flatMap((m: any) => m.content)).toEqual(prompt[2].content);
+  });
+});

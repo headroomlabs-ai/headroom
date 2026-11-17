@@ -132,6 +132,23 @@ class CCRResponseHandler:
         self._retrieval_count = 0
         self._retrieval_count_lock = __import__("threading").Lock()
 
+    def serve_withheld_retrievals(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Run Anthropic ``headroom_retrieve`` calls withheld from a stream.
+
+        Returns one ``tool_result`` block per call that names a hash, in call
+        order, for the continuation round the streaming path sends upstream.
+        A call without a parsable hash gets no result, so the caller can tell
+        the round cannot be replayed.
+        """
+        ccr_calls, _ = self._parse_ccr_tool_calls({"content": tool_calls}, "anthropic")
+        if not ccr_calls:
+            return []
+        with self._retrieval_count_lock:
+            self._retrieval_count += len(ccr_calls)
+        results = [self._execute_retrieval(call) for call in ccr_calls]
+        message = self._create_tool_result_message(results, "anthropic")
+        return list(message.get("content", []))
+
     def has_ccr_tool_calls(
         self,
         response: dict[str, Any],

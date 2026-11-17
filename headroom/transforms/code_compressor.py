@@ -643,6 +643,10 @@ class CodeStructure:
     comments: list[str] = field(default_factory=list)
     top_level_code: list[str] = field(default_factory=list)
     other: list[str] = field(default_factory=list)
+    # Set when the fixed assembly order (declarations before top-level code)
+    # moves a definition across executable code, changing class bases,
+    # decorators, or default expressions evaluated at definition time.
+    reorder_unsafe: bool = False
 
 
 @dataclass
@@ -1611,6 +1615,14 @@ class CodeAwareCompressor(Transform):
         else:
             structure = self._extract_generic_structure(root, code)
 
+        # Declarations are assembled before the top-level code bucket, so
+        # executable code that precedes a definition would be moved after it.
+        # That changes definition-time behavior (class bases, decorators,
+        # default expressions), so keep the original instead of returning a
+        # semantically reordered result.
+        if structure.reorder_unsafe:
+            return code, structure, {}
+
         # Assemble compressed code
         compressed = self._assemble_compressed(structure, language)
 
@@ -1645,6 +1657,11 @@ class CodeAwareCompressor(Transform):
         """
         structure = CodeStructure()
         captured_byte_ranges: list[tuple[int, int]] = []
+        # Import text keyed by start byte, so a root-level import that turns
+        # out to follow executable code can later be moved back out of
+        # ``structure.imports`` (which is emitted first) unchanged.
+        import_entries: dict[int, str] = {}
+        demoted_import_starts: set[int] = set()
 
         def _validated_candidate(node: Any, compressed: str) -> str:
             if candidate_validator is None:
@@ -1664,7 +1681,9 @@ class CodeAwareCompressor(Transform):
             # Import statements
             if node_type in lang_config.import_nodes:
                 leading = _get_leading_comment_text(node, code, captured_byte_ranges)
-                structure.imports.append(leading + _get_node_text(node, code))
+                entry = leading + _get_node_text(node, code)
+                structure.imports.append(entry)
+                import_entries[node.start_byte] = entry
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1816,15 +1835,62 @@ class CodeAwareCompressor(Transform):
         # e.g. tree-sitter-c-sharp rejects top-level `#region` after a type
         # declaration, which would fail validation and forfeit compression.
         first_captured = min((r[0] for r in captured_byte_ranges), default=None)
+        declaration_nodes = (
+            lang_config.function_nodes
+            | lang_config.class_nodes
+            | lang_config.type_nodes
+            | (lang_config.container_node_types or frozenset())
+        )
+        if lang_config.decorator_node:
+            declaration_nodes = declaration_nodes | {lang_config.decorator_node}
+        saw_top_level_code = False
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
-            if child_range not in captured_byte_ranges:
-                text = _get_node_text(child, code).strip()
-                if text:
-                    if first_captured is not None and child.end_byte <= first_captured:
-                        structure.header_code.append(text)
-                    else:
-                        structure.top_level_code.append(text)
+            if child_range in captured_byte_ranges:
+                # Python runs top-level statements in source order. An import
+                # that follows executable code cannot be hoisted above it:
+                # `import sys; sys.path.insert(0, 'vendor'); import plugin`
+                # would import the plugin before the path update. Emit such
+                # imports in place with the rest of the top-level code.
+                if (
+                    language == CodeLanguage.PYTHON
+                    and saw_top_level_code
+                    and child.type in lang_config.import_nodes
+                ):
+                    entry = import_entries.get(child.start_byte)
+                    if entry is not None:
+                        structure.top_level_code.append(entry)
+                        demoted_import_starts.add(child.start_byte)
+                # Declarations are emitted before the top-level code bucket,
+                # so a definition after executable code would run before it.
+                if (
+                    language == CodeLanguage.PYTHON
+                    and saw_top_level_code
+                    and child.type in declaration_nodes
+                ):
+                    structure.reorder_unsafe = True
+                continue
+            # In Python a `;` between two statements on one physical line
+            # is a root-level anonymous token. Emitted as its own fragment
+            # it becomes a bare `;` line and invalidates the output.
+            if not child.is_named and child.type in (";", ","):
+                continue
+            text = _get_node_text(child, code).strip()
+            if text:
+                if first_captured is not None and child.end_byte <= first_captured:
+                    structure.header_code.append(text)
+                else:
+                    structure.top_level_code.append(text)
+                    saw_top_level_code = True
+
+        if demoted_import_starts:
+            # Python only: the import branch above is the sole producer of
+            # ``structure.imports`` entries for this language.
+            structure.imports = [
+                entry
+                for start, entry in import_entries.items()
+                if start not in demoted_import_starts
+            ]
 
         return structure
 
@@ -2043,6 +2109,21 @@ class CodeAwareCompressor(Transform):
                 continue
             body_stmts.append((child.start_point[0], child.end_point[0]))
 
+        # Statements can share a physical line (`a = 1; b = 2`). Lines are kept
+        # whole, so merge overlapping ranges into one entry: keeping both would
+        # duplicate the shared line, and dropping the later range would lose
+        # continuation lines of a multi-line statement after the `;`.
+        merged_stmts: list[tuple[int, int]] = []
+        for start_row, end_row in body_stmts:
+            if merged_stmts and start_row <= merged_stmts[-1][1]:
+                merged_stmts[-1] = (
+                    merged_stmts[-1][0],
+                    max(merged_stmts[-1][1], end_row),
+                )
+            else:
+                merged_stmts.append((start_row, end_row))
+        body_stmts = merged_stmts
+
         # Calculate lines per statement and keep whole statements until budget
         kept_lines: list[str] = []
         kept_line_count = 0
@@ -2160,6 +2241,7 @@ class CodeAwareCompressor(Transform):
         # Process each child of the class body individually
         body_parts: list[str] = []
         processed_ranges: list[tuple[int, int]] = []
+        last_processed_end = -1
 
         for child in body_node.children:
             if not child.is_named:
@@ -2170,6 +2252,14 @@ class CodeAwareCompressor(Transform):
             child_end = child.end_point[0]
             if child.end_point[1] == 0 and child_end > child_start:
                 child_end -= 1
+            # Statements can share a physical line (`x = 1; y = 2`). The line
+            # slice already carries all of them; skip only rows already
+            # emitted, keeping any continuation lines of this node.
+            if child_start <= last_processed_end:
+                child_start = last_processed_end + 1
+                if child_start > child_end:
+                    continue
+            last_processed_end = child_end
             child_text = "\n".join(code_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually

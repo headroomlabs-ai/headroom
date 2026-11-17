@@ -85,6 +85,14 @@ with `--memory-db-path` for a custom location.
 > memory store should pass `--memory-db-path` explicitly. See the
 > [Filesystem Contract](filesystem-contract.md) for the rationale.
 
+### Traffic Learning Recovery
+
+The live traffic learner retains sightings received while a save is queued or
+running. If SQLite commits but indexing fails, a later attempt reuses the same
+row and adds only the missing observations. The pattern and its save-attempt
+token stay pending if index repair fails again; the learner marks it saved only
+after that repair succeeds.
+
 ### User Identity
 
 User ID is auto-detected from `$USER` (your OS username). Override per-request with the `x-headroom-user-id` header. All memories are scoped to the user — multiple developers on the same project have separate memory stores.

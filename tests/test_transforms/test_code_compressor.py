@@ -9,6 +9,8 @@ Comprehensive tests covering:
 - Edge cases: Empty content, unavailable dependency, fallbacks
 """
 
+import decimal
+import sys
 import textwrap
 from unittest.mock import patch
 
@@ -2426,3 +2428,146 @@ class TestRustAttributeAttachment:
         assert result.syntax_valid is True
         assert "#[inline]\npub fn record" in result.compressed
         assert not result.compressed.rstrip().endswith("#[inline]")
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter-languages not installed")
+class TestSemicolonSeparatedStatements:
+    """``a = 1; b = 2`` must not corrupt or duplicate the compressed output."""
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=5,
+                enable_ccr=False,
+            )
+        )
+
+    def test_top_level_separator_does_not_become_a_bare_line(self):
+        """Python exposes the ``;`` as a root-level token; emitting it as a
+        standalone fragment puts a bare ``;`` on its own line and makes the
+        whole result invalid, so compression falls back to the original."""
+        code = (
+            "import json\n"
+            "B='/tmp/'\n"
+            "v=json.load(open(B+'v.json')); m=json.load(open(B+'m.json'))\n"
+            "print('oe', m['order_expire']); print('pay', m['pay_url'])\n"
+        )
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed != code
+        assert [line for line in result.compressed.splitlines() if line.strip() == ";"] == []
+        assert "v=json.load(open(B+'v.json'))" in result.compressed
+        assert "m=json.load(open(B+'m.json'))" in result.compressed
+
+    def test_class_body_statement_is_not_duplicated(self):
+        code = "class C:\n    x=1; y=2\n    z=3\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed.count("x=1; y=2") == 1
+
+    def test_class_body_statement_continuation_is_kept(self):
+        """The second statement starts on the already-emitted row and
+        continues on the next one; trimming the shared row must not drop
+        the continuation line."""
+        code = "class C:\n    x=1; y=(2 +\n            3)\n    z=4\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed.count("x=1; y=(2 +") == 1
+        assert result.compressed.count("            3)") == 1
+        assert result.compressed.count("z=4") == 1
+
+    def test_import_after_statement_keeps_source_order(self, tmp_path):
+        """Imports are hoisted to the top of the output, but an import that
+        follows executable code must not jump above it: importing the plugin
+        before the path update fails at runtime."""
+        vendor = tmp_path / "vendor"
+        vendor.mkdir()
+        module_name = "semicolon_order_plugin"
+        (vendor / f"{module_name}.py").write_text("VALUE = 42\n")
+        code = f"import sys; sys.path.insert(0, {str(vendor)!r}); import {module_name}\n"
+
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed != code
+        assert (
+            result.compressed.index("import sys")
+            < result.compressed.index("sys.path.insert")
+            < result.compressed.index(f"import {module_name}")
+        )
+
+        saved_path = list(sys.path)
+        saved_modules = set(sys.modules)
+        try:
+            exec(result.compressed, {})
+            assert module_name in sys.modules
+        finally:
+            sys.path[:] = saved_path
+            for name in set(sys.modules) - saved_modules:
+                del sys.modules[name]
+
+    def test_declaration_after_top_level_code_keeps_source_order(self):
+        """Declarations are assembled before the top-level code bucket, so a
+        class defined after executable code would move ahead of it. Safe
+        reassembly cannot be guaranteed, so the original snippet is kept."""
+        code = "import sys; marker = 1; import decimal\nclass Money(decimal.Decimal):\n    pass\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed == code
+        namespace: dict[str, object] = {}
+        exec(result.compressed, namespace)
+        assert issubclass(namespace["Money"], decimal.Decimal)
+
+    def test_decorator_default_after_top_level_code_keeps_source_order(self):
+        """A decorator and a default expression are evaluated when the
+        function is defined, so they cannot move ahead of the import they
+        use."""
+        code = (
+            "import sys; marker = 1; import functools\n"
+            "@functools.lru_cache(maxsize=None)\n"
+            "def compute(value=marker):\n"
+            "    return value\n"
+        )
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed == code
+        namespace: dict[str, object] = {}
+        exec(result.compressed, namespace)
+        assert namespace["compute"]() == 1
+
+    def test_function_body_keeps_each_line_once(self):
+        """Both statements share one physical line. The line slice already
+        carries the whole line, so adding the second statement's range again
+        duplicates it; dropping it instead would lose a continuation line."""
+        code = (
+            "def f():\n"
+            "    x=1; y=(2 +\n"
+            "            3)\n"
+            "    a=3\n"
+            "    b=4\n"
+            "    c=5\n"
+            "    d=6\n"
+            "    e=7\n"
+            "    return x+y\n"
+        )
+        compressor = self._compressor()
+        parser = cc._get_parser("python")
+        root = parser.parse(code.encode("utf-8")).root_node
+        analysis = compressor._analyze_symbol_importance(root, code, CodeLanguage.PYTHON, "")
+        compressed = compressor._compress_function_ast(
+            root.children[0],
+            code,
+            CodeLanguage.PYTHON,
+            cc._LANG_CONFIGS[CodeLanguage.PYTHON],
+            {},
+            analysis,
+        )
+
+        assert compressed.count("x=1; y=(2 +") == 1
+        assert compressed.count("            3)") == 1
