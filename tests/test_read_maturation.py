@@ -194,8 +194,15 @@ class TestActivityDecision:
         assert res.newly_matured == 0
         assert res.messages is msgs
 
-    def test_respects_lifecycle_markers(self):
-        marker = "[Read content stale: /x/foo.py ... Retrieve original: hash=abc123]" + " " * 2048
+    @pytest.mark.parametrize(
+        "notice",
+        [
+            "[Read content stale: /x/foo.py ... Retrieve original: hash=abc123]",
+            "[Read content stale: /x/foo.py was modified after this read]",
+        ],
+    )
+    def test_respects_lifecycle_markers(self, notice):
+        marker = notice + " " * 2048
         msgs = [
             {"role": "user", "content": "look"},
             *anthropic_read("r1", "/x/foo.py", marker),
