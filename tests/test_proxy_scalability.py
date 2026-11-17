@@ -265,6 +265,9 @@ class TestWorkerConfiguration:
         def fake_run(app, **kwargs):
             captured["app"] = app
             captured["kwargs"] = kwargs
+            # Read while the workers would: run_server restores the variable
+            # to its pre-run state when it returns.
+            captured["config_json"] = os.environ[_MULTI_WORKER_CONFIG_ENV]
 
         monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
 
@@ -276,12 +279,13 @@ class TestWorkerConfiguration:
             assert captured["kwargs"]["workers"] == 4
             assert captured["kwargs"]["limit_concurrency"] == 250
             assert captured["kwargs"]["factory"] is True
-            payload = json.loads(os.environ[_MULTI_WORKER_CONFIG_ENV])
+            payload = json.loads(captured["config_json"])
             assert payload["host"] == "0.0.0.0"
             assert payload["port"] == 8787
             assert payload["worker_processes"] == 4
             assert payload["max_connections"] == 200
             assert payload["http_proxy"] == "http://proxy.local:8080"
+            assert _MULTI_WORKER_CONFIG_ENV not in os.environ
         finally:
             # run_server sets this via raw os.environ. Pop it directly rather
             # than via monkeypatch.delenv: delenv records the current (JSON)
