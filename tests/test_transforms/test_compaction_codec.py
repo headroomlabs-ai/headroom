@@ -266,3 +266,14 @@ def test_factoring_counts_multibyte_values_in_bytes() -> None:
     factored = factor_values(block)
     assert len(factored.encode()) < len(block.encode())
     assert expand_compacted(factored) == expand_compacted(block)
+
+
+def test_container_shaped_string_cells_round_trip() -> None:
+    # A string whose text is a JSON container (`"[]"`, `"{}"`, `"[1,2]"`) must come back as
+    # that string, not as the value it spells. #4053 fixed the scalar-looking case; containers
+    # were still un-escaped by the classifier, which made both render byte-identically.
+    values = [[], "[]", [1, 2], "[1,2]", {}, "{}"]
+    records = [{"id": i, "v": v} for i, v in enumerate(values * 10)]
+    block = _crush(records)
+    assert block, "expected the table to compact"
+    assert expand_compacted(block) == records
