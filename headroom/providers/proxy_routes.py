@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import Response
 
+from headroom.log_safety import redact_url
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
 from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
@@ -19,6 +21,7 @@ from headroom.providers.codex.live import (
 )
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
 from headroom.providers.codex.runtime import resolve_codex_routing
+from headroom.providers.hermes import SCOPED_PATH_PREFIXES as HERMES_SCOPED_PATH_PREFIXES
 from headroom.providers.model_metadata import (
     MODEL_METADATA_LIST_ENDPOINT,
     handle_model_metadata_endpoint,
@@ -66,6 +69,7 @@ from headroom.providers.vertex import (
     is_vertex_google_publisher,
     vertex_anthropic_target,
     vertex_publisher_provider_name,
+    with_vertex_diagnostics,
 )
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
@@ -108,6 +112,30 @@ def _register_provider_passthrough_route(
     spec: ProviderPassthroughRoute,
 ) -> None:
     async def provider_passthrough(request: Request):
+        # A reachability probe the token gate let through without a credential
+        # (/api/hello): answer it here, never relay it upstream anonymously.
+        if getattr(request.state, "headroom_local_hello_probe", False):
+            return Response(status_code=200)
+
+        # Honor the per-request upstream override like /v1/messages and the
+        # catch-all do. Clients that speak one wire format but authenticate
+        # against a custom OpenAI-compatible gateway must reach that gateway
+        # for embeddings/audio/metadata too, not the default provider target
+        # (the same gap as the model-metadata routes, #4302). Telemetry keeps
+        # the route spec labels: they are bounded by this module, so the
+        # request-controlled host never becomes a stats label (#3759), while
+        # `handle_passthrough` still records the outcome for these known routes.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            return await proxy.handle_passthrough(
+                request,
+                custom_base.rstrip("/"),
+                spec.sub_path,
+                spec.provider_name,
+            )
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, spec.provider_name),
@@ -187,9 +215,9 @@ def _register_openai_responses_subpath_route(
     spec: OpenAIResponsesSubpathRoute,
 ) -> None:
     async def openai_responses_subpath(request: Request, sub_path: str):
-        assert proxy.http_client is not None
+        codex_subpath_client = getattr(proxy, "http_client_h1", None) or proxy.http_client
         chatgpt_response = await handle_chatgpt_codex_responses_subpath(
-            proxy.http_client,
+            codex_subpath_client,
             request,
             sub_path,
         )
@@ -281,6 +309,46 @@ def _register_openai_image_routes(app: FastAPI, proxy: Any) -> None:
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
+    async def _default_passthrough(request: Request, path: str):
+        """Catch-all forwarding for paths no provider route claims.
+
+        ``path`` is the request path without its leading slash, as the
+        ``/{path:path}`` catch-all captures it.
+        """
+        custom_base = request.headers.get("x-headroom-base-url")
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            base_url = custom_base.rstrip("/")
+            endpoint_name, provider_name = _custom_base_passthrough_telemetry(
+                request.method,
+                path,
+                base_url,
+            )
+            return await proxy.handle_passthrough(
+                request,
+                base_url,
+                endpoint_name,
+                provider_name,
+            )
+
+        normalized_cloudcode_path = normalize_cloudcode_passthrough_path(path)
+        if normalized_cloudcode_path is not None:
+            normalize_request_path(request, normalized_cloudcode_path)
+
+            return await proxy.handle_passthrough(
+                request,
+                _api_target(proxy, "cloudcode"),
+            )
+
+        return await proxy.handle_passthrough(
+            request,
+            # The path matters here: this is where unrouted paths land, and
+            # Copilot's inline completions are one of them (#3076).
+            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
+        )
+
     async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
         return await proxy.handle_passthrough(
             request,
@@ -305,6 +373,19 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             )
         return await proxy.handle_anthropic_messages(request)
 
+    @app.post("/omlx/v1/messages")
+    async def omlx_messages(request: Request):
+        from headroom.config import resolve_omlx_target_api_url
+
+        omlx_target = (
+            getattr(proxy.config, "omlx_target_api_url", None)
+            or resolve_omlx_target_api_url(environ=os.environ)
+            or "http://127.0.0.1:8888"
+        )
+        return await proxy.handle_anthropic_messages(
+            request, upstream_base_url=omlx_target.rstrip("/")
+        )
+
     @app.post("/anthropic/v1/messages")
     async def foundry_anthropic_messages(request: Request):
         normalize_request_path(request, "/v1/messages")
@@ -327,6 +408,48 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         async def bedrock_invoke_stream(request: Request, model_id: str):
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
+    # Factory Droid. Registered ONLY when an upstream is configured
+    # (`--factory-api-url` / FACTORY_TARGET_API_URL, set by `headroom wrap
+    # droid`). Droid sends everything under `/api/`; nothing outside `/api/`
+    # ever goes to Factory, so another tool still pointed at this port (a
+    # leftover Codex/Claude config) keeps its usual upstream and its
+    # credentials never reach Factory.
+    factory_api_url = getattr(proxy.config, "factory_api_url", None)
+    if factory_api_url:
+        factory_base = factory_api_url.rstrip("/")
+
+        @app.post("/api/llm/a/v1/messages")
+        async def factory_anthropic_messages(request: Request):
+            # Anthropic-shaped inference: compressed, then forwarded to
+            # `{factory}/api/llm/a/v1/messages`. A client-sent
+            # `x-headroom-base-url` is deliberately ignored (the handler strips
+            # `x-headroom-*`), and Factory is not a trusted host, so operator
+            # Anthropic extra headers are withheld. `force_direct` keeps a
+            # configured translating backend or route advice from taking it.
+            return await proxy.handle_anthropic_messages(
+                request,
+                upstream_base_url=factory_base,
+                provider_name="factory",
+                force_direct=True,
+            )
+
+        @app.api_route(
+            "/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
+        )
+        async def factory_passthrough(request: Request, path: str):
+            # Hermes Studio's scoped proxies and callers that name their own
+            # upstream are not Droid traffic: keep the catch-all behaviour.
+            if request.headers.get(
+                "x-headroom-base-url", ""
+            ).strip() or request.url.path.startswith(HERMES_SCOPED_PATH_PREFIXES):
+                return await _default_passthrough(request, request.url.path[1:])
+            # Factory REST (and, for now, OpenAI-shaped `/api/llm/o/*`):
+            # verbatim and buffered, even with `compress_passthrough` on. No
+            # endpoint name, so no LLM telemetry.
+            return await proxy.handle_passthrough(
+                request, factory_base, None, "factory", verbatim=True
+            )
+
     _register_openai_responses_routes(app, proxy)
 
     _register_provider_handler_routes(app, proxy)
@@ -334,6 +457,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:generateContent"
     )
+    @with_vertex_diagnostics
     async def vertex_generate_content(
         request: Request,
         api_version: str,
@@ -355,6 +479,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamGenerateContent"
     )
+    @with_vertex_diagnostics
     async def vertex_stream_generate_content(
         request: Request,
         api_version: str,
@@ -380,6 +505,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:countTokens"
     )
+    @with_vertex_diagnostics
     async def vertex_count_tokens(
         request: Request,
         api_version: str,
@@ -401,6 +527,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_raw_predict(
         request: Request,
         api_version: str,
@@ -422,6 +549,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_raw_predict_no_version(
         request: Request,
         project: str,
@@ -446,6 +574,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_stream_raw_predict(
         request: Request,
         api_version: str,
@@ -472,6 +601,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_stream_raw_predict_no_version(
         request: Request,
         project: str,
@@ -498,8 +628,19 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             VERTEX_STREAM_RAW_PREDICT.name,
         )
 
-    @app.get("/v1/models")
-    async def list_models(request: Request):
+    async def _model_metadata_route(request: Request) -> tuple[str, str]:
+        # A caller-named upstream wins, as in the catch-all and the chat
+        # handlers: model discovery must reach the same gateway as inference.
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %s", redact_url(custom_base))
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            # Only the destination is overridden: keep the provider the request's
+            # auth selects, so Anthropic-auth requests still get model-id
+            # sanitization in handle_passthrough.
+            provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+            return provider_name, custom_base.rstrip("/")
         headers = dict(request.headers)
         provider_name = proxy.provider_runtime.model_metadata_provider(headers)
         base_url = (
@@ -507,6 +648,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             if provider_name == "openai"
             else _api_target(proxy, provider_name)
         )
+        return provider_name, base_url
+
+    @app.get("/v1/models")
+    async def list_models(request: Request):
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -517,13 +663,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
-        headers = dict(request.headers)
-        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
-        base_url = (
-            _openai_compatible_base_url(proxy, headers)
-            if provider_name == "openai"
-            else _api_target(proxy, provider_name)
-        )
+        provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -558,36 +698,4 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
     async def passthrough(request: Request, path: str):
-        custom_base = request.headers.get("x-headroom-base-url")
-        if custom_base:
-            if not await is_safe_upstream_url_async(custom_base):
-                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
-                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
-            base_url = custom_base.rstrip("/")
-            endpoint_name, provider_name = _custom_base_passthrough_telemetry(
-                request.method,
-                path,
-                base_url,
-            )
-            return await proxy.handle_passthrough(
-                request,
-                base_url,
-                endpoint_name,
-                provider_name,
-            )
-
-        normalized_cloudcode_path = normalize_cloudcode_passthrough_path(path)
-        if normalized_cloudcode_path is not None:
-            normalize_request_path(request, normalized_cloudcode_path)
-
-            return await proxy.handle_passthrough(
-                request,
-                _api_target(proxy, "cloudcode"),
-            )
-
-        return await proxy.handle_passthrough(
-            request,
-            # The path matters here: this is where unrouted paths land, and
-            # Copilot's inline completions are one of them (#3076).
-            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
-        )
+        return await _default_passthrough(request, path)

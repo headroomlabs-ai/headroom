@@ -604,13 +604,9 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         pass
     for _ in range(_STOP_POLL_ATTEMPTS):
         if not pid_alive(pid):
-            if not pid_alive(pid):
-                _clear_pid(manifest.profile, expected_pid=pid)
-                return
-            raise RuntimeError(
-                f"Cannot stop deployment '{manifest.profile}': runtime identity changed"
-            )
-        if _process_identity(pid, manifest) is not True:
+            _clear_pid(manifest.profile, expected_pid=pid)
+            return
+        if _process_identity(pid, manifest) is False:
             raise RuntimeError(
                 f"Cannot stop deployment '{manifest.profile}': runtime identity changed"
             )

@@ -47,6 +47,7 @@ _OPENAI_STANDARD_PARAMS = (
     # reasoning request routed cross-protocol to a Claude model fails.
     "reasoning_effort",
     "max_completion_tokens",
+    "service_tier",
 )
 
 _OPENAI_CONSUMED_BODY_KEYS = frozenset(
@@ -825,6 +826,18 @@ class LiteLLMBackend(Backend):
     To add a new provider, just add an entry to PROVIDER_REGISTRY above.
     """
 
+    def _public_error_message(self, exc: BaseException, raw_text: str) -> str:
+        """Client-safe error text (public_errors contract).
+
+        For Vertex, a fixed setup hint is appended when the raw text shows a
+        missing SDK or ADC; the raw text itself only ever reaches the log.
+        """
+        if self.provider in ("vertex_ai", "vertex_ai_beta"):
+            from headroom.providers.vertex import public_backend_error_message
+
+            return public_backend_error_message(exc, raw_text)
+        return client_message(exc, raw_text)
+
     def __init__(
         self,
         provider: str = "bedrock",
@@ -1302,6 +1315,9 @@ class LiteLLMBackend(Backend):
                 kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            # Standard provider param — forward it instead of silently dropping.
+            if "service_tier" in body:
+                kwargs["service_tier"] = body["service_tier"]
 
             # System prompt (Anthropic puts it in body, OpenAI in messages)
             if "system" in body:
@@ -1349,7 +1365,7 @@ class LiteLLMBackend(Backend):
             logger.error(f"LiteLLM error: {error_message}")
             # Provider API errors keep their text; transport failures are
             # reduced to the public vocabulary (see proxy/public_errors).
-            error_message = client_message(e, error_message)
+            error_message = self._public_error_message(e, error_message)
 
             # Map to Anthropic error format
             error_type = "api_error"
@@ -1404,6 +1420,8 @@ class LiteLLMBackend(Backend):
                 "stream": True,
             }
 
+            if "service_tier" in body:
+                kwargs["service_tier"] = body["service_tier"]
             if "max_tokens" in body:
                 kwargs["max_tokens"] = body["max_tokens"]
             if "temperature" in body:
@@ -1784,7 +1802,10 @@ class LiteLLMBackend(Backend):
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": client_message(e, error_message)},
+                    "error": {
+                        "type": "api_error",
+                        "message": self._public_error_message(e, error_message),
+                    },
                 },
             )
 
@@ -1976,7 +1997,7 @@ class LiteLLMBackend(Backend):
         except Exception as e:
             error_message = format_exception_message(e)
             logger.error(f"LiteLLM OpenAI error: {error_message}")
-            error_message = client_message(e, error_message)
+            error_message = self._public_error_message(e, error_message)
 
             # Map to OpenAI error format
             error_type = "api_error"
@@ -2086,7 +2107,7 @@ class LiteLLMBackend(Backend):
             logger.error(f"LiteLLM OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": client_message(e, error_message),
+                    "message": self._public_error_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }

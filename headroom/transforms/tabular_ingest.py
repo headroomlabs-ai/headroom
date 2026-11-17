@@ -74,11 +74,21 @@ def parse_csv(content: str, delimiter: str = ",") -> tuple[list[str], list[list[
     """
     reader = csv.reader(io.StringIO(content), delimiter=delimiter)
     try:
-        parsed = [row for row in reader if any(cell.strip() for cell in row)]
+        parsed = [row for row in reader if row and not (len(row) == 1 and not row[0].strip())]
     except csv.Error:
         return [], []
-    if not parsed:
+    # Trim all-blank rows at both ends, but keep interior ones so the row
+    # count survives, like spreadsheet_ingest._rows_to_csv. One pass and one
+    # slice: popping index 0 per leading blank row is quadratic. An interior
+    # all-blank row is normalized to empty cells, so a whitespace-only row and
+    # an empty row compress the same.
+    filled = [i for i, row in enumerate(parsed) if any(cell.strip() for cell in row)]
+    if not filled:
         return [], []
+    parsed = [
+        row if any(cell.strip() for cell in row) else [""] * len(row)
+        for row in parsed[filled[0] : filled[-1] + 1]
+    ]
     headers = [h.strip() for h in parsed[0]]
     return headers, parsed[1:]
 
@@ -97,19 +107,62 @@ def parse_markdown_table(content: str) -> tuple[list[str], list[list[str]]]:
     if len(lines) < 2:
         return [], []
     headers = split_row(lines[0])
-    rows = [split_row(ln) for ln in lines[1:] if not is_separator(ln)]
+    body_lines = lines[1:]
+    if body_lines and is_separator(body_lines[0]):
+        body_lines = body_lines[1:]
+    rows = [split_row(ln) for ln in body_lines]
     return headers, rows
 
 
 def parse_fixed_width(content: str) -> tuple[list[str], list[list[str]]]:
-    """Parse whitespace-aligned columns (best-effort, ≥ 2 spaces as a gap)."""
-    lines = [ln for ln in content.split("\n") if ln.strip()]
-    if len(lines) < 2:
+    """Parse whitespace-aligned columns by character position.
+
+    A gutter is a run of two or more positions that are blank on every line,
+    so a column is a run of positions where some line has text, and a single
+    space inside it (``First Name``, ``Alice Brown``) stays inside the cell.
+    Splitting on runs of spaces instead would let a narrow gutter merge two
+    cells while a double space inside another cell splits it, leaving the cell
+    count right and the values under the wrong columns. Returns no rows when
+    the text does not fit that grid: a header cell that is empty or holds a 2+
+    space gap means two columns were only one space apart somewhere, so the
+    caller passes the text through.
+
+    The occupied positions are collected from the characters actually present,
+    so the cost is the input length, not rows x longest row.
+    """
+    lines = [ln.rstrip() for ln in content.split("\n") if ln.strip()]
+    if len(lines) < 2 or any("\t" in ln for ln in lines):
         return [], []
-    splitter = re.compile(r"\s{2,}")
-    headers = splitter.split(lines[0].strip())
-    rows = [splitter.split(ln.strip()) for ln in lines[1:]]
-    return headers, rows
+    width = max(len(ln) for ln in lines)
+    occupied = bytearray(width)
+    for ln in lines:
+        for i, ch in enumerate(ln):
+            if ch != " ":
+                occupied[i] = 1
+    spans: list[tuple[int, int]] = []
+    start = -1
+    blank_run = 0
+    for i in range(width + 2):
+        filled = i < width and occupied[i]
+        if filled:
+            if start < 0:
+                start = i
+            blank_run = 0
+            continue
+        blank_run += 1
+        if start >= 0 and blank_run == 2:
+            spans.append((start, i - 1))
+            start = -1
+    if start >= 0:
+        spans.append((start, width))
+
+    def cells(ln: str) -> list[str]:
+        return [ln[a:b].strip() for a, b in spans]
+
+    headers = cells(lines[0])
+    if any(not h or "  " in h for h in headers):
+        return [], []
+    return headers, [cells(ln) for ln in lines[1:]]
 
 
 def to_records(headers: list[str], rows: list[list[str]]) -> list[dict[str, str]]:
@@ -162,8 +215,7 @@ def parse_tabular(
     # column of each name, and the others are dropped. Pass through verbatim.
     if len(set(headers)) != width:
         return None
-    # The detector finds fixed-width columns by single-space gutters, but the
-    # parser splits on 2+ spaces, so a table like GNU `ls -l` can come back as
+    # A table like GNU `ls -l` has no usable column grid and can come back as
     # one cell per line. That is not a table; leave it verbatim.
     if fmt == "fixed_width" and width < 2:
         return None

@@ -113,8 +113,10 @@ host, and what the local admin surface does and does not allow. The summary:
   are plaintext and are not encrypted at rest. Set `HEADROOM_CCR_BACKEND=memory` if your
   deployment cannot accept disk persistence.
 - **Anonymous session summaries are uploaded by default.** The `HEADROOM_BEACON` telemetry
-  beacon is opt-*out*: it POSTs content-free session counters, a random per-install UUID,
-  version, OS, and architecture to Headroom Labs. No prompts, completions, file contents,
+  beacon is opt-*out*: it POSTs content-free session counters and distributions, a random per-install
+  UUID, version, OS, and architecture to Headroom Labs, plus the values of 15 allow-listed
+  `HEADROOM_*` settings and a bucketed structural descriptor of tool outputs (field count,
+  depth, shape flags). `headroom telemetry --show` prints the exact payload. No prompts, completions, file contents,
   or paths are included. Disable with `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or
   `HEADROOM_OFFLINE=1`. This is separate from `HEADROOM_TELEMETRY`, which is opt-in and
   stays on the machine.
@@ -128,7 +130,9 @@ host, and what the local admin surface does and does not allow. The summary:
   loopback client address *and* a loopback `Host:` header, plus a same-origin check on
   the mutating ones. This is a local-trust model: any process on the same host is
   trusted. Setting `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` deliberately widens
-  the settings and stats surface beyond loopback.
+  the settings and stats surface beyond loopback. Setting `HEADROOM_PROXY_TOKEN` also
+  shows every token holder the per-request `/stats` metadata of all callers, but opens
+  none of these routes.
 
 Thank you for helping keep Headroom and its users safe!
 
