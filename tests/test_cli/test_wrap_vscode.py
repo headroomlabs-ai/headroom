@@ -44,6 +44,11 @@ def test_wrap_vscode_configures_actual_port_and_seeds_subscription(tmp_path: Pat
     assert "http://127.0.0.1:9999/" in settings
     assert "model" not in settings.lower()
     assert "normal model picker" in result.output
+    # Chats on the Copilot harness never reach the proxy, and a chat keeps the
+    # engine it started with, so the user has to be told to start a new one.
+    assert "Local harness" in result.output
+    assert "start a new chat" in result.output
+    assert "Warning" not in result.output
     assert captured["openai_api_url"] == "https://api.githubcopilot.com"
     assert captured["copilot_api_token"] == "copilot-token"
 
@@ -120,6 +125,20 @@ def test_wrap_vscode_checks_the_profiles_of_the_user_dir_it_configures(
     assert "Work" not in output
 
 
+def test_wrap_vscode_warns_when_the_user_opted_into_the_copilot_harness(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{\n  "chat.editor.preferCopilotHarness": true\n}\n', encoding="utf-8")
+
+    output = _run_wrap_vscode("--settings-file", str(path))
+
+    # The wrap still succeeds and keeps the user's choice, but says what it costs.
+    assert '"chat.editor.preferCopilotHarness": true' in output
+    assert "bypass Headroom" in output
+    assert "chat.defaultToCopilotHarness" not in output
+    assert "stay on VS Code's Local harness" not in output
+    assert path.read_text(encoding="utf-8").count("preferCopilotHarness") == 1
+
+
 def test_wrap_vscode_no_configure_prints_transparent_settings(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
 
@@ -141,6 +160,8 @@ def test_wrap_vscode_no_configure_prints_transparent_settings(tmp_path: Path) ->
     assert not path.exists()
     assert "overrideProxyUrl" in result.output
     assert "overrideCapiUrl" in result.output
+    assert '"chat.defaultToCopilotHarness": false' in result.output
+    assert '"chat.editor.preferCopilotHarness": false' in result.output
     # No `overrideAuthType`: the setting does not exist in the modern Copilot
     # Chat extension, so printing it told users to add a key VS Code flags as
     # unknown and which does nothing (#3076).
