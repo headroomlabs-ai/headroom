@@ -457,6 +457,71 @@ class TestCompressionCacheFrozenCount:
 class TestCompressionCacheApplyAndUpdate:
     @pytest.mark.parametrize(
         "metadata",
+        [{"cache_control": {"type": "ephemeral", "ttl": "1h"}}, {"custom": {"nested": [1, 2]}}],
+    )
+    def test_anthropic_cached_text_block_preserves_metadata(self, metadata: dict) -> None:
+        import copy
+
+        cache = CompressionCache()
+        cache.store_compressed(cache.content_hash("original"), "short", tokens_saved=1)
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "is_error": True,
+                    "content": [{"type": "text", "text": "original", **metadata}],
+                }
+            ],
+        }
+        snapshot = copy.deepcopy(message)
+        expected = copy.deepcopy(message)
+        expected["content"][0]["content"][0]["text"] = "short"
+
+        assert cache.apply_cached([message]) == [expected]
+        assert message == snapshot
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AA=="},
+            },
+            {"type": "tool_reference", "tool_name": "search"},
+            {"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}},
+            {"type": "unknown", "value": "keep"},
+        ],
+    )
+    def test_anthropic_cached_multiblock_content_is_not_collapsed(self, extra: dict) -> None:
+        import copy
+
+        cache = CompressionCache()
+        joined = "first\nsecond" if extra["type"] == "text" else "first"
+        cache.store_compressed(cache.content_hash(joined), "short", tokens_saved=1)
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [
+                        {"type": "text", "text": "first"},
+                        extra,
+                    ],
+                }
+            ],
+        }
+        snapshot = copy.deepcopy(message)
+
+        assert cache.apply_cached([message]) == [snapshot]
+        assert cache.compute_frozen_count([message, {"role": "user", "content": "next"}]) == 0
+        assert message == snapshot
+        assert cache.get_stats()["hits"] == 0
+
+    @pytest.mark.parametrize(
+        "metadata",
         [{}, {"cache_control": {"type": "ephemeral", "ttl": "1h"}}, {"custom": {"nested": [1, 2]}}],
     )
     def test_openai_cached_text_block_preserves_shape_and_metadata(self, metadata: dict) -> None:
