@@ -845,13 +845,13 @@ class LocalBackend:
     async def get_user_memories(
         self,
         user_id: str,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[Memory]:
         """Get all memories for a user.
 
         Args:
             user_id: User identifier.
-            limit: Maximum number of memories to return.
+            limit: Maximum number of memories to return, or None for all memories.
 
         Returns:
             List of memories for the user.
@@ -861,6 +861,21 @@ class LocalBackend:
 
         return await self._hierarchical_memory.get_user_memories(
             user_id=user_id,
+            limit=limit,
+        )
+
+    async def get_session_memories(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 100,
+    ) -> list[Memory]:
+        """List recent memories filtered by both user and session before limiting."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.get_session_memories(
+            user_id=user_id,
+            session_id=session_id,
             limit=limit,
         )
 
