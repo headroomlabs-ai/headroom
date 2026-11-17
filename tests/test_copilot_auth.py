@@ -1175,6 +1175,68 @@ def test_is_copilot_api_url_trusts_configured_enterprise_api_url(
     assert not copilot_auth.is_copilot_api_url("https://copilot-api.other.example.com/v1/responses")
 
 
+def test_is_copilot_upstream_url_rejects_insecure_schemes_and_non_default_ports() -> None:
+    # Implicit or explicit default port 443 over HTTPS/WSS is accepted.
+    assert copilot_auth.is_copilot_upstream_url("https://api.githubcopilot.com:443/v1/messages")
+    assert copilot_auth.is_copilot_upstream_url("wss://api.githubcopilot.com:443/v1/responses")
+    assert copilot_auth.is_copilot_completions_host("https://copilot-proxy.githubusercontent.com:443")
+
+    # Plaintext or non-TLS schemes and non-443 ports must be rejected.
+    for bad_url in (
+        "http://api.githubcopilot.com/v1/messages",
+        "http://api.githubcopilot.com:80/v1/messages",
+        "http://api.githubcopilot.com:8080/v1/messages",
+        "https://api.githubcopilot.com:8080/v1/messages",
+        "ws://api.githubcopilot.com/v1/responses",
+        "wss://api.githubcopilot.com:8443/v1/responses",
+        "ftp://api.githubcopilot.com/x",
+        "mailto:api.githubcopilot.com",
+        "api.githubcopilot.com:8080/v1/messages",
+        "http://copilot-api.acme.ghe.com/v1/responses",
+        "https://copilot-api.acme.ghe.com:8443/v1/responses",
+        "http://copilot-proxy.githubusercontent.com/v1/completions",
+        "https://proxy.individual.githubcopilot.com:8080/v1/completions",
+    ):
+        assert not copilot_auth.is_copilot_upstream_url(bad_url), bad_url
+
+
+def test_is_copilot_url_respects_configured_origin_scheme_and_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "http://127.0.0.1:8080")
+    assert copilot_auth.is_copilot_api_url("http://127.0.0.1:8080/v1/messages")
+    assert not copilot_auth.is_copilot_api_url("https://127.0.0.1:8080/v1/messages")
+    assert not copilot_auth.is_copilot_api_url("http://127.0.0.1:9090/v1/messages")
+
+    monkeypatch.setenv("GITHUB_COPILOT_PROXY_URL", "https://gw.corp.internal:8443")
+    assert copilot_auth.is_copilot_completions_host("https://gw.corp.internal:8443/completions")
+    assert not copilot_auth.is_copilot_completions_host("http://gw.corp.internal:8443/completions")
+    assert not copilot_auth.is_copilot_completions_host("https://gw.corp.internal/completions")
+
+
+@pytest.mark.asyncio
+async def test_apply_copilot_api_auth_skips_http_and_non_default_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def _fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("Copilot credential lookup must not run for non-TLS/non-443 URL")
+
+    monkeypatch.setattr(copilot_auth, "resolve_copilot_integration_id", _fail_if_called)
+
+    original = {"authorization": "Bearer client-token", "content-type": "application/json"}
+    for bad_url in (
+        "http://api.githubcopilot.com/v1/messages",
+        "https://api.githubcopilot.com:8080/v1/messages",
+    ):
+        out = await copilot_auth.apply_copilot_api_auth(dict(original), url=bad_url)
+        assert out == original
+        assert not called
+
+
 def test_build_copilot_upstream_url_strips_v1_only_for_copilot_hosts() -> None:
     assert (
         copilot_auth.build_copilot_upstream_url(
