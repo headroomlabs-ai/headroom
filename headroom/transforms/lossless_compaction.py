@@ -75,8 +75,16 @@ _HEADING_ROW_RE = re.compile(r"^(?P<line>\d+):(?P<content>.*)$")
 _TIMESTAMP_ROW_RE = re.compile(
     r"^\s*\[?(?:"
     r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}"  # 2026-09-02 14:30 / ISO 8601 'T'
+    r"|\d{4}/\d{2}/\d{2}[ T]\d{1,2}:\d{2}"  # Go log, nginx error log: 2026/09/02 14:30
     r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
     r"|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2}"  # syslog: Aug 16 11:02
+    r"|[IWEF]\d{4}\s+\d{1,2}:\d{2}"  # klog/glog: E0902 14:30
+    # Common/combined access log: 10.0.0.7 - - [02/Sep/2026:14:30:00. The
+    # fields hold no ':', so a `grep -n` row (`path:12:10.0.0.7 - - [...`) is
+    # not claimed. The host takes name/IPv4 characters only, capped at 255
+    # (DNS names are at most 253), so a grep row's path or a long unbroken
+    # line is not scanned to its end.
+    r"|[\w.-]{1,255} [^\s:]+ [^\s:]+ \[\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}"
     r"|\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|$)"  # bare 15:03:53 / [15:03:53]
     r")"
 )
