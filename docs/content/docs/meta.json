@@ -26,6 +26,7 @@
     "---Proxy Server---",
     "proxy",
     "detached-mode",
+    "system-tray",
     "corporate-networks",
     "local-llm-prefill",
     "---Integrations---",
