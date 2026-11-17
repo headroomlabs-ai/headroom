@@ -226,6 +226,7 @@ class RemoteKompressCompressor:
         *,
         allow_download: bool = True,
         ccr_original: str | None = None,
+        record_toin: bool = True,
         _time_budget_cap_seconds: float | None = None,
     ) -> KompressResult:
         """Compress via the remote endpoint.
@@ -253,6 +254,9 @@ class RemoteKompressCompressor:
         which ContentRouter caught with a broad ``except Exception`` and logged
         as ``Kompress failed: ...``. Compression silently degraded to zero on the
         whole deployment while the proxy kept reporting success.
+
+        ``record_toin`` mirrors the local compressor: False keeps the CCR
+        store write but skips the TOIN observation for this call.
         """
         n_words = len(content.split())
         # Same floor contract as the in-process compressor: lossy
@@ -321,7 +325,14 @@ class RemoteKompressCompressor:
             # the real block — the exact loss ``ccr_original`` exists to prevent.
             # Same resolution order as KompressCompressor.compress.
             ccr_source = ccr_original if ccr_original is not None else content
-            cache_key = store_kompress_in_ccr(ccr_source, compressed)
+            # The endpoint's ``original_tokens`` describes ``content``, so it does
+            # not describe a different ``ccr_source`` — and in either case the
+            # local CCR bookkeeping measures the source locally so the stored
+            # count is one consistent unit (payload_tokens, tiktoken) rather
+            # than the endpoint's own measure.
+            ccr_source_tokens = payload_tokens(ccr_source)
+            gate: dict[str, bool] = {} if record_toin else {"record_toin": False}
+            cache_key = store_kompress_in_ccr(ccr_source, compressed, ccr_source_tokens, **gate)
             if cache_key:
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
