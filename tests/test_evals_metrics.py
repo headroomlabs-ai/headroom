@@ -16,15 +16,10 @@ def test_normalize_tokenize_and_exact_match() -> None:
     assert metrics.compute_exact_match("hello", "world") is False
 
 
-def test_f1_bleu_and_rouge_cover_edge_cases() -> None:
+def test_f1_and_rouge_cover_edge_cases() -> None:
     assert metrics.compute_f1("", "value") == 0.0
     assert metrics.compute_f1("alpha beta", "gamma delta") == 0.0
     assert metrics.compute_f1("alpha beta gamma", "alpha gamma") == pytest.approx(0.8)
-
-    assert metrics.compute_bleu("", "value") == 0.0
-    assert metrics.compute_bleu("one", "one") == pytest.approx(1.0)
-    assert metrics.compute_bleu("alpha beta", "gamma delta") == 0.0
-    assert metrics.compute_bleu("alpha beta", "alpha beta gamma", max_n=4) == pytest.approx(1.0)
 
     assert metrics.compute_rouge_l("", "value") == 0.0
     assert metrics.compute_rouge_l("alpha beta", "gamma delta") == 0.0

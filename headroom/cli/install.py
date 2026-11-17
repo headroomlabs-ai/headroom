@@ -604,7 +604,8 @@ def _build_deployment_manifest(
         region=region,
         proxy_mode=proxy_mode,
         memory_enabled=memory,
-        telemetry_enabled=telemetry and not no_telemetry,
+        # --no-telemetry wins when both are given; neither leaves it unset.
+        telemetry_enabled=False if no_telemetry else (True if telemetry else None),
         no_rate_limit=no_rate_limit,
         image=image,
         no_http2=no_http2,
@@ -875,7 +876,7 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous telemetry off in the runtime (already the default).",
+    help="Turn off local stats and the anonymous upload beacon in the runtime.",
 )
 @click.option(
     "--no-rate-limit",
@@ -907,7 +908,7 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     help=(
         "Enable/disable AST-based code compression in the persistent runtime. "
         "Requires the optional tree-sitter dependency: pip install headroom-ai[code]. "
-        "Default: disabled, matching `headroom proxy`."
+        "Default: enabled, matching `headroom proxy`."
     ),
 )
 @click.option(
@@ -942,7 +943,10 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
         "--env HEADROOM_WORKSPACE_DIR=/path. Supervisors (launchd, systemd, cron) "
         "start with a bare environment and do not inherit the interactive shell's "
         "exports, so anything the runtime needs beyond the flags above must be set "
-        "here. Repeatable."
+        "here. Repeatable. Values are stored in cleartext in the profile's "
+        "manifest and runner scripts under ~/.headroom/deploy/<profile>/ "
+        "(owner-only, not encrypted); see SECURITY.md before passing a provider "
+        "API key this way."
     ),
 )
 def install_apply(
@@ -1092,7 +1096,7 @@ def install_apply(
 @click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Force anonymous telemetry off in the runtime (already the default).",
+    help="Turn off local stats and the anonymous upload beacon in the runtime.",
 )
 @click.option(
     "--image",
@@ -1162,14 +1166,20 @@ def install_status(profile: str) -> None:
 
     manifest = _require_manifest(profile)
     payload = probe_json(manifest.health_url.replace("/readyz", "/health"))
+    healthy = probe_ready(manifest.health_url)
+    # The health endpoint is the authoritative process signal. Detached runtimes
+    # can outlive a missing/stale PID file (for example after cleanup or a
+    # supervisor restart), while Docker's local CLI view can also be temporarily
+    # unavailable. Never report a reachable, ready proxy as "stopped" (#3072).
+    status = "running" if healthy else runtime_status(manifest)
     click.echo(f"Profile:    {manifest.profile}")
     click.echo(f"Preset:     {manifest.preset}")
     click.echo(f"Runtime:    {manifest.runtime_kind}")
     click.echo(f"Supervisor: {manifest.supervisor_kind}")
     click.echo(f"Scope:      {manifest.scope}")
     click.echo(f"Port:       {manifest.port}")
-    click.echo(f"Status:     {runtime_status(manifest)}")
-    click.echo(f"Healthy:    {'yes' if probe_ready(manifest.health_url) else 'no'}")
+    click.echo(f"Status:     {status}")
+    click.echo(f"Healthy:    {'yes' if healthy else 'no'}")
     if payload and isinstance(payload, dict):
         click.echo(f"Health URL: {manifest.health_url.replace('/readyz', '/health')}")
         # `config` may be a non-dict (null / string / list) if a different or
@@ -1178,9 +1188,23 @@ def install_status(profile: str) -> None:
         # reach `.get('backend', ...)` and crash with AttributeError. Guard on
         # isinstance, mirroring wrap.py's _proxy_health_config.
         config = payload.get("config")
-        if not isinstance(config, dict):
+        anthropic_target = openai_target = "unknown"
+        if isinstance(config, dict):
+            anthropic_url = config.get("anthropic_api_url")
+            if "anthropic_api_url" in config and (
+                anthropic_url is None or isinstance(anthropic_url, str)
+            ):
+                anthropic_target = "configured" if anthropic_url else "default"
+            openai_url = config.get("openai_api_url")
+            if "openai_api_url" in config and (openai_url is None or isinstance(openai_url, str)):
+                openai_target = "configured" if openai_url else "default"
+        else:
+            # Network health probes may intentionally omit credential-bearing
+            # config. Missing information does not mean a target is unset.
             config = {}
-        click.echo(f"Backend:    {config.get('backend', manifest.backend)}")
+        click.echo(f"Default backend:  {config.get('backend', manifest.backend)}")
+        click.echo(f"Anthropic target: {anthropic_target}")
+        click.echo(f"OpenAI target:    {openai_target}")
 
 
 @install.command("start")

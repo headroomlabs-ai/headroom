@@ -24,8 +24,14 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy import project_name_policy
-from headroom.proxy.persistent_metrics import PersistentMetricsState
+from headroom.proxy.persistent_metrics import (
+    MAX_LABEL_LENGTH,
+    PersistentMetricsState,
+    bounded_model_key,
+)
 
 PROJECT_NAME_MAX_LENGTH = project_name_policy.PROJECT_NAME_MAX_LENGTH
 sanitize_project_name = project_name_policy.sanitize_project_name
@@ -151,6 +157,7 @@ def _get_litellm_module() -> Any | None:
         return litellm
 
     try:
+        pin_litellm_cost_map_local()
         import litellm as imported_litellm
     except ImportError:
         return None
@@ -265,6 +272,23 @@ def _normalize_provider(value: Any) -> str:
     return cleaned or PROVIDER_UNKNOWN
 
 
+AGENT_UNKNOWN = "unknown"
+
+
+def _normalize_agent(value: Any) -> str:
+    """Normalize a client/agent label, falling back to a stable sentinel.
+
+    The agent is the harness classified from User-Agent / X-Client
+    (claude-code, codex, opencode, grok_build, ...). Checkpoints persisted
+    before per-agent attribution existed have no agent field and collapse
+    into ``AGENT_UNKNOWN``.
+    """
+    if not isinstance(value, str):
+        return AGENT_UNKNOWN
+    cleaned = value.strip()
+    return cleaned or AGENT_UNKNOWN
+
+
 MODEL_UNKNOWN = "unknown"
 
 
@@ -338,14 +362,23 @@ def _resolve_litellm_model(model: str) -> str:
         info = litellm.model_cost.get(resolved)
         if info and info.get("input_cost_per_token") is not None:
             return resolved
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(
+            "Shared litellm model resolution failed for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
 
+    # litellm raises a bare Exception for a model it has not mapped, so this is
+    # the narrowest catch that works. A miss means "not this spelling, try the
+    # provider prefixes next". Runs once per model (lru_cache above).
     try:
         litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
         return model
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(
+            "litellm cannot price model=%s as given: %s", safe_id(model), describe_exception(exc)
+        )
 
     prefixes = {
         "claude-": "anthropic/",
@@ -371,6 +404,25 @@ def _resolve_litellm_model(model: str) -> str:
     return model
 
 
+# An unpriced model (a local model, a gateway alias, a model newer than the
+# bundled litellm) is an expected case, and the estimators below run on every
+# request, so each model is logged once. Debug, not warning: proxy/cost.py
+# already warns once per unpriceable model on the live path. Model names come
+# from clients, so the guard is bounded like _resolve_litellm_model's cache.
+_unpriced_models_logged = WarnOnce(_MODEL_RESOLUTION_CACHE_MAXSIZE, "unpriced models")
+
+
+def _log_unpriced_model_once(model: str, field: str) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    if _unpriced_models_logged.first(model, logger):
+        logger.debug(
+            "No litellm %s for model=%s; savings and cost use the fallback rate",
+            field,
+            safe_id(model),
+        )
+
+
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
     litellm = _get_litellm_module()
@@ -388,9 +440,15 @@ def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
         # a real 0.0 as unavailable and billed the $3/M fallback — phantom savings
         # for a model that costs nothing.
         if input_cost_per_token is None:
-            raise RuntimeError("input cost unavailable")
+            _log_unpriced_model_once(model, "input_cost_per_token")
+            return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
         return float(tokens_saved) * float(input_cost_per_token)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Compression savings priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
@@ -415,9 +473,15 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
         # rate -> phantom output savings for a model that costs nothing. Mirrors
         # the fix already applied to `_estimate_compression_savings_usd`.
         if output_cost_per_token is None:
-            raise RuntimeError("output cost unavailable")
+            _log_unpriced_model_once(model, "output_cost_per_token")
+            return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
         return float(tokens_saved) * float(output_cost_per_token)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Output savings priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
 
 
@@ -464,7 +528,12 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         if discount <= 0:
             return 0.0
         return float(cache_read_tokens) * discount
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Cache savings pricing failed for model=%s; booking 0: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return 0.0
 
 
@@ -474,6 +543,7 @@ def estimate_request_savings_usd(
     compression_tokens_saved: int = 0,
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
+    output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     cache_write_5m_tokens: int = 0,
@@ -519,6 +589,8 @@ def estimate_request_savings_usd(
         CacheMix,
         PricedSavings,
         Region,
+        long_context_premium_avoided_usd,
+        long_context_threshold,
         price_savings,
         weakest_basis,
     )
@@ -531,26 +603,45 @@ def estimate_request_savings_usd(
         uncached_input_tokens=uncached_input_tokens,
         cache_inferred=cache_inferred,
     )
-    long_context = mix.is_long_context(local_tokens=local_input_tokens)
+    threshold = long_context_threshold(model)
+    long_context = mix.is_long_context(local_tokens=local_input_tokens, threshold=threshold)
+    # Compression that kept the prompt under the threshold avoided the long
+    # card on the whole request: the removed tokens are priced at that card,
+    # and the forwarded input and generated output premiums are added on top.
+    forwarded = max(mix.billed, max(_coerce_int(local_input_tokens), 0))
+    crossed = (
+        not long_context and forwarded + max(_coerce_int(compression_tokens_saved), 0) > threshold
+    )
 
-    def _price(tokens: Any, region: Region) -> PricedSavings:
+    def _price(tokens: Any, region: Region, *, long_tier: bool) -> PricedSavings:
         return price_savings(
             max(_coerce_int(tokens), 0),
             model=model,
             mix=mix,
             region=region,
-            long_context=long_context,
+            long_context=long_tier,
             provider=provider,
             # Matches the blended rate the flat estimators fall back to, so an
             # unpriceable model reports the same dollars it always has.
             fallback_rate_per_token=DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
         )
 
-    compression = _price(compression_tokens_saved, Region.LIVE_ZONE)
-    tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX)
+    compression = _price(
+        compression_tokens_saved, Region.LIVE_ZONE, long_tier=long_context or crossed
+    )
+    tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX, long_tier=long_context)
+    compression_usd = compression.usd
+    if crossed:
+        compression_usd += long_context_premium_avoided_usd(
+            model,
+            mix,
+            local_tokens=local_input_tokens,
+            output_tokens=output_tokens,
+            provider=provider,
+        )
 
     return {
-        "compression": compression.usd,
+        "compression": compression_usd,
         "compression_list": compression.usd_list,
         "tool_schema": tool_schema.usd,
         "tool_schema_list": tool_schema.usd_list,
@@ -611,7 +702,8 @@ def _estimate_input_cost_usd(
         # A missing key means the model is unknown → fall back to a blended rate.
         # A present 0.0 means the model is free and must cost $0, not the fallback.
         if input_cost_per_token is None:
-            raise RuntimeError("input cost unavailable")
+            _log_unpriced_model_once(model, "input_cost_per_token")
+            return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
         if use_breakdown:
             cache_read_cost = info.get(
@@ -629,7 +721,12 @@ def _estimate_input_cost_usd(
             )
 
         return float(total_input_tokens) * float(input_cost_per_token)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Input cost priced at the fallback rate for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
@@ -643,17 +740,19 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     total_input_tokens = 0
     total_input_cost_usd = 0.0
     output_tokens_saved = 0
+    output_tokens = 0
     output_savings_usd = 0.0
     tool_tokens_saved = 0
     tool_schema_savings_usd = 0.0
     total_output_cost_usd = 0.0
     provider = PROVIDER_UNKNOWN
     model = MODEL_UNKNOWN
+    agent = AGENT_UNKNOWN
 
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
         total_tokens_saved = _coerce_int(entry.get("total_tokens_saved"))
-        compression_savings_usd = _coerce_float(entry.get("compression_savings_usd"))
+        compression_savings_usd = _coerce_signed_float(entry.get("compression_savings_usd"))
         # Older history points predate cache-savings tracking and omit these
         # keys entirely; default to 0/0.0 rather than raising or dropping the
         # entry, matching how every other field here handles legacy shapes.
@@ -662,17 +761,19 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         total_input_tokens = _coerce_int(entry.get("total_input_tokens"))
         total_input_cost_usd = _coerce_float(entry.get("total_input_cost_usd"))
         output_tokens_saved = _coerce_int(entry.get("output_tokens_saved"))
+        output_tokens = _coerce_int(entry.get("output_tokens"))
         output_savings_usd = _coerce_float(entry.get("output_savings_usd"))
         tool_tokens_saved = _coerce_int(entry.get("tool_tokens_saved"))
         tool_schema_savings_usd = _coerce_float(entry.get("tool_schema_savings_usd"))
         total_output_cost_usd = _coerce_float(entry.get("total_output_cost_usd"))
         provider = _normalize_provider(entry.get("provider"))
         model = _normalize_model(entry.get("model"))
+        agent = _normalize_agent(entry.get("agent"))
     elif isinstance(entry, list | tuple) and len(entry) >= 2:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
         if len(entry) >= 3:
-            compression_savings_usd = _coerce_float(entry[2])
+            compression_savings_usd = _coerce_signed_float(entry[2])
         if len(entry) >= 4:
             total_input_tokens = _coerce_int(entry[3])
         if len(entry) >= 5:
@@ -687,6 +788,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "timestamp": _to_utc_iso(timestamp),
         "provider": provider,
         "model": model,
+        "agent": agent,
         "total_tokens_saved": total_tokens_saved,
         "compression_savings_usd": round(compression_savings_usd, 6),
         "cache_read_tokens": cache_read_tokens,
@@ -694,6 +796,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "total_input_tokens": total_input_tokens,
         "total_input_cost_usd": round(total_input_cost_usd, 6),
         "output_tokens_saved": output_tokens_saved,
+        "output_tokens": output_tokens,
         "output_savings_usd": round(output_savings_usd, 6),
         "tool_tokens_saved": tool_tokens_saved,
         "tool_schema_savings_usd": round(tool_schema_savings_usd, 6),
@@ -914,6 +1017,9 @@ class SavingsTracker:
         self._needs_schema_save = False
         self._state = self._load_state()
         self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
+        if self._needs_schema_save and not self._stateless:
+            with self._lock:
+                self._save_locked()
         # Negative-savings warning state. A deployment that loses money loses it
         # on most turns, not one, so warning per turn would bury the signal in
         # its own repetition. Accumulate instead and emit a summary no more than
@@ -971,6 +1077,7 @@ class SavingsTracker:
         model: str,
         tokens_saved: int,
         provider: str | None = None,
+        agent: str | None = None,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
         timestamp: datetime | str | None = None,
@@ -1023,7 +1130,8 @@ class SavingsTracker:
                 {
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "provider": _normalize_provider(provider),
-                    "model": _normalize_model(model),
+                    "agent": _normalize_agent(agent),
+                    "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
                     "total_input_tokens": lifetime["total_input_tokens"],
@@ -1047,11 +1155,16 @@ class SavingsTracker:
         # message-only while per-model dollars did not.
         tool_search_saved: int = 0,
         output_tokens_saved: int = 0,
+        # High end of a modelled output-savings range (benchmark factors give a
+        # band, not a point); ``None`` means the saving is a point estimate and
+        # the high end equals ``output_tokens_saved``. Lifetime-only.
+        output_tokens_saved_high: int | None = None,
         # Tokens the model actually emitted, DISJOINT from
         # ``output_tokens_saved`` (which counts the ones it did not). Priced
         # into ``lifetime["total_output_cost_usd"]``; see the delta below.
         output_tokens: int = 0,
         provider: str | None = None,
+        agent: str | None = None,
         project: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
@@ -1079,6 +1192,12 @@ class SavingsTracker:
         delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
+        delta_output_tokens_saved_high = (
+            delta_output_tokens_saved
+            if output_tokens_saved_high is None
+            else max(_coerce_int(output_tokens_saved_high), delta_output_tokens_saved)
+        )
+        delta_output_tokens = max(_coerce_int(output_tokens), 0)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
         priced = estimated_savings_usd
         # ``estimate_request_savings_usd`` prices FOUR buckets, but this method
@@ -1141,6 +1260,10 @@ class SavingsTracker:
             max(_coerce_float(priced.get("output_shaping")), 0.0)
             if priced is not None
             else _estimate_output_savings_usd(model, delta_output_tokens_saved)
+        )
+        # Same per-token rate table that priced the low end.
+        delta_output_savings_usd_high = _estimate_output_savings_usd(
+            model, delta_output_tokens_saved_high
         )
         # Completion spend. ``total_input_cost_usd`` has never had an output
         # counterpart, so anything answering "what share of my bill did
@@ -1233,11 +1356,24 @@ class SavingsTracker:
                 lifetime.get("output_savings_usd", 0.0) + delta_output_savings_usd,
                 6,
             )
+            # High end of the output-savings range; equals the low end for
+            # point estimates. Both state builders always write these keys.
+            lifetime["output_tokens_saved_high"] += delta_output_tokens_saved_high
+            lifetime["output_savings_usd_high"] = round(
+                lifetime["output_savings_usd_high"] + delta_output_savings_usd_high,
+                6,
+            )
             lifetime["tool_tokens_saved"] += delta_tool_tokens_saved
             lifetime["tool_schema_savings_usd"] = round(
                 lifetime["tool_schema_savings_usd"] + delta_tool_savings_usd,
                 6,
             )
+            # Actual output tokens emitted (not saved): the cumulative the
+            # history checkpoints need so a per-bucket output-reduction rate
+            # (saved / (saved + actual)) can be diffed out of consecutive
+            # checkpoints, exactly like cache_read_tokens. Lazy key, same
+            # legacy-tolerant shape as output_tokens_saved above.
+            lifetime["output_tokens"] = lifetime.get("output_tokens", 0) + delta_output_tokens
             lifetime["total_output_cost_usd"] = round(
                 lifetime.get("total_output_cost_usd", 0.0) + delta_output_cost_usd,
                 6,
@@ -1314,18 +1450,25 @@ class SavingsTracker:
             # not lossy-compressed, to keep Bedrock's prompt cache warm. Gating
             # on tokens_saved alone silently dropped every history point on
             # those requests even though real cache-read savings occurred.
-            # Append whenever any savings mechanism produced a saving.
+            # Append whenever any savings mechanism produced a saving. Actual
+            # output activity must also emit: consumers derive per-bucket
+            # output-reduction rates by diffing consecutive checkpoints, so an
+            # output-only request that only bumped lifetime["output_tokens"]
+            # would otherwise be invisible to the window it lands in and
+            # overstate the reduction rate.
             if (
                 delta_tokens_saved > 0
                 or delta_cache_read_tokens > 0
                 or delta_output_tokens_saved > 0
                 or delta_tool_tokens_saved > 0
+                or delta_output_tokens > 0
             ):
                 self._state["history"].append(
                     {
                         "timestamp": _to_utc_iso(timestamp_dt),
                         "provider": _normalize_provider(provider),
-                        "model": _normalize_model(model),
+                        "agent": _normalize_agent(agent),
+                        "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
                         "cache_read_tokens": lifetime["cache_read_tokens"],
@@ -1333,6 +1476,7 @@ class SavingsTracker:
                         "total_input_tokens": lifetime["total_input_tokens"],
                         "total_input_cost_usd": lifetime["total_input_cost_usd"],
                         "output_tokens_saved": lifetime.get("output_tokens_saved", 0),
+                        "output_tokens": lifetime.get("output_tokens", 0),
                         "output_savings_usd": lifetime.get("output_savings_usd", 0.0),
                         "tool_tokens_saved": lifetime["tool_tokens_saved"],
                         "tool_schema_savings_usd": lifetime["tool_schema_savings_usd"],
@@ -1379,6 +1523,7 @@ class SavingsTracker:
             priced = estimate_request_savings_usd(
                 model,
                 compression_tokens_saved=_coerce_int(metrics.get("tokens_saved")),
+                output_tokens=_coerce_int(metrics.get("output_tokens")),
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 cache_write_5m_tokens=_coerce_int(metrics.get("cache_write_5m_tokens")),
@@ -1502,7 +1647,7 @@ class SavingsTracker:
         without migration.
         """
         by_model: dict[str, dict[str, Any]] = self._state.setdefault("by_model", {})
-        key = _normalize_model(model)
+        key = bounded_model_key(_normalize_model(model), by_model)
         entry = by_model.setdefault(key, _empty_by_model_entry())
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
@@ -1726,6 +1871,9 @@ class SavingsTracker:
                 "total_input_cost_usd": 0.0,
                 "output_tokens_saved": 0,
                 "output_savings_usd": 0.0,
+                "output_tokens_saved_high": 0,
+                "output_savings_usd_high": 0.0,
+                "output_tokens": 0,
                 "total_output_cost_usd": 0.0,
             },
             "display_session": _empty_display_session(),
@@ -1797,11 +1945,14 @@ class SavingsTracker:
         is_v6_lifetime = False
         lifetime_output_tokens_saved = 0
         lifetime_output_savings_usd = 0.0
+        lifetime_output_tokens_saved_high: int | None = None
+        lifetime_output_savings_usd_high: float | None = None
+        lifetime_output_tokens = 0
         lifetime_output_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
-            lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
+            lifetime_savings_usd = _coerce_signed_float(lifetime_raw.get("compression_savings_usd"))
             lifetime_tool_tokens_saved = _coerce_int(lifetime_raw.get("tool_tokens_saved"))
             lifetime_tool_savings_usd = _coerce_float(lifetime_raw.get("tool_schema_savings_usd"))
             lifetime_cache_read_tokens = _coerce_int(lifetime_raw.get("cache_read_tokens"))
@@ -1811,24 +1962,46 @@ class SavingsTracker:
             migrated_at = lifetime_raw.get("savings_basis_migrated_at")
             is_v6_lifetime = "compression_savings_list_usd" in lifetime_raw
             if is_v6_lifetime:
-                lifetime_savings_list_usd = _coerce_float(
+                lifetime_savings_list_usd = _coerce_signed_float(
                     lifetime_raw.get("compression_savings_list_usd")
                 )
                 lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
             lifetime_output_tokens_saved = _coerce_int(lifetime_raw.get("output_tokens_saved"))
             lifetime_output_savings_usd = _coerce_float(lifetime_raw.get("output_savings_usd"))
+            if "output_tokens_saved_high" in lifetime_raw:
+                lifetime_output_tokens_saved_high = _coerce_int(
+                    lifetime_raw.get("output_tokens_saved_high")
+                )
+            if "output_savings_usd_high" in lifetime_raw:
+                lifetime_output_savings_usd_high = _coerce_float(
+                    lifetime_raw.get("output_savings_usd_high")
+                )
+            lifetime_output_tokens = _coerce_int(lifetime_raw.get("output_tokens"))
             lifetime_output_cost_usd = _coerce_float(lifetime_raw.get("total_output_cost_usd"))
 
         if normalized_history:
             last = normalized_history[-1]
+            # A losing request that saves no tokens and reads no cache appends
+            # no checkpoint, so the saved total can legitimately sit BELOW the
+            # last checkpoint. Only trust the checkpoint for dollars when the
+            # saved counters show the lifetime block is behind it.
+            history_ahead = (
+                lifetime_tokens_saved < last["total_tokens_saved"]
+                or lifetime_cache_read_tokens < _coerce_int(last.get("cache_read_tokens"))
+                or lifetime_output_tokens_saved < _coerce_int(last.get("output_tokens_saved"))
+                or lifetime_tool_tokens_saved < _coerce_int(last.get("tool_tokens_saved"))
+                or not (
+                    isinstance(lifetime_raw, dict) and "compression_savings_usd" in lifetime_raw
+                )
+            )
             lifetime_tokens_saved = max(
                 lifetime_tokens_saved,
                 last["total_tokens_saved"],
             )
-            lifetime_savings_usd = max(
-                lifetime_savings_usd,
-                _coerce_float(last["compression_savings_usd"]),
-            )
+            if history_ahead:
+                # The checkpoint is the newer source here; a numeric max() would
+                # discard a newer negative total in favour of an older higher one.
+                lifetime_savings_usd = _coerce_signed_float(last["compression_savings_usd"])
             lifetime_tool_tokens_saved = max(
                 lifetime_tool_tokens_saved,
                 _coerce_int(last.get("tool_tokens_saved")),
@@ -1856,6 +2029,10 @@ class SavingsTracker:
             lifetime_output_savings_usd = max(
                 lifetime_output_savings_usd,
                 _coerce_float(last.get("output_savings_usd")),
+            )
+            lifetime_output_tokens = max(
+                lifetime_output_tokens,
+                _coerce_int(last.get("output_tokens")),
             )
             lifetime_output_cost_usd = max(
                 lifetime_output_cost_usd,
@@ -1899,6 +2076,15 @@ class SavingsTracker:
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
                 "output_tokens_saved": lifetime_output_tokens_saved,
                 "output_savings_usd": round(lifetime_output_savings_usd, 6),
+                # A high end below the low end can only come from the history
+                # repair above raising the low end; never let the band invert.
+                "output_tokens_saved_high": max(
+                    lifetime_output_tokens_saved_high or 0, lifetime_output_tokens_saved
+                ),
+                "output_savings_usd_high": round(
+                    max(lifetime_output_savings_usd_high or 0.0, lifetime_output_savings_usd), 6
+                ),
+                "output_tokens": lifetime_output_tokens,
                 "total_output_cost_usd": round(lifetime_output_cost_usd, 6),
             },
             "display_session": _normalize_display_session(raw.get("display_session")),
@@ -2145,7 +2331,7 @@ class SavingsTracker:
             2,
         )
         session["compression_savings_usd"] = round(
-            _coerce_float(session.get("compression_savings_usd")),
+            _coerce_signed_float(session.get("compression_savings_usd")),
             6,
         )
         session["total_input_cost_usd"] = round(
@@ -2294,6 +2480,7 @@ class SavingsTracker:
                     "total_output_cost_usd": total_output_cost_usd,
                     **_empty_cache_delta(),
                     "by_provider": {},
+                    "by_agent": {},
                     "by_model": {},
                 },
             )
@@ -2368,6 +2555,39 @@ class SavingsTracker:
                 prov["total_input_tokens_delta"] += delta_input_tokens
                 prov["total_input_cost_usd_delta"] = round(
                     prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                    6,
+                )
+
+                # Same single-owner attribution by agent. Providers cannot
+                # separate clients that share an upstream (Claude Code vs
+                # OpenCode both hit anthropic; Codex vs OpenCode both hit
+                # openai), so dashboards need this dimension for honest
+                # per-connector rows.
+                agent = _normalize_agent(point.get("agent"))
+                agent_entry = entry["by_agent"].setdefault(
+                    agent,
+                    {
+                        "tokens_saved": 0,
+                        "compression_savings_usd_delta": 0.0,
+                        "total_input_tokens_delta": 0,
+                        "total_input_cost_usd_delta": 0.0,
+                        **_empty_cache_delta(),
+                    },
+                )
+                _add_cache(
+                    agent_entry,
+                    delta_cache_read_tokens,
+                    delta_cache_savings_usd,
+                    delta_cache_read_cost_usd,
+                )
+                agent_entry["tokens_saved"] += delta_tokens
+                agent_entry["compression_savings_usd_delta"] = round(
+                    agent_entry["compression_savings_usd_delta"] + delta_usd,
+                    6,
+                )
+                agent_entry["total_input_tokens_delta"] += delta_input_tokens
+                agent_entry["total_input_cost_usd_delta"] = round(
+                    agent_entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
                     6,
                 )
 

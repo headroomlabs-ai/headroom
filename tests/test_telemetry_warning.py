@@ -8,6 +8,7 @@ Covers:
 - /stats endpoint exposes anon_telemetry_shipping flag
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +18,7 @@ from click.testing import CliRunner  # noqa: E402
 
 from headroom.telemetry.beacon import (  # noqa: E402
     format_telemetry_notice,
+    is_beacon_enabled,
     is_telemetry_warn_enabled,
 )
 
@@ -41,6 +43,53 @@ class TestIsTelemetryWarnEnabled:
     def test_enabled_by_truthy_env_var(self, monkeypatch, value):
         monkeypatch.setenv("HEADROOM_TELEMETRY_WARN", value)
         assert is_telemetry_warn_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", "false", "0", "no", "disable", "disabled"])
+def test_telemetry_off_turns_the_beacon_off_and_says_so(monkeypatch, value):
+    """``HEADROOM_TELEMETRY=off`` means "send nothing": it used to leave the
+    upload beacon on, and only ``HEADROOM_BEACON=off`` stopped it."""
+    from headroom.cli.main import main
+
+    for var in ("HEADROOM_BEACON", "DO_NOT_TRACK", "HEADROOM_OFFLINE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_TELEMETRY", value)
+
+    assert is_beacon_enabled() is False
+    output = CliRunner().invoke(main, ["telemetry"]).output
+    assert f"Upload beacon:   OFF (HEADROOM_TELEMETRY={value.lower()})" in output
+
+
+def test_buffered_session_is_not_sent_after_telemetry_off(monkeypatch):
+    """A session recorded while the beacon was on must not upload once the
+    operator opts out, at heartbeat/idle close or at exit."""
+    from headroom.telemetry import session as S
+
+    for var in ("HEADROOM_BEACON", "DO_NOT_TRACK", "HEADROOM_OFFLINE"):
+        monkeypatch.delenv(var, raising=False)
+    sent: list[dict] = []
+    monkeypatch.setattr(S, "_post_blocking", lambda payload, **kwargs: sent.append(payload))
+    aggregator = S.SessionAggregator(S.post_session_event, idle_s=900.0, flush_s=100.0)
+    monkeypatch.setattr(S, "_aggregator", aggregator)
+    outcome = SimpleNamespace(provider="openai", model="gpt-5.4", tokens_saved=10, tags={})
+    aggregator.record(outcome, now=1_000.0)
+    monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+
+    aggregator.record(outcome, now=1_150.0)  # past flush_s: heartbeat
+    aggregator.record(outcome, now=3_000.0)  # past idle_s: idle close
+    S._flush_at_exit()
+
+    assert sent == []
+
+
+def test_beacon_on_overrides_telemetry_off(monkeypatch):
+    """HEADROOM_BEACON is the beacon's own switch and still wins."""
+    for var in ("DO_NOT_TRACK", "HEADROOM_OFFLINE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+    monkeypatch.setenv("HEADROOM_BEACON", "on")
+
+    assert is_beacon_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -228,28 +277,19 @@ class TestProxyCLITelemetryBanner:
         assert "HEADROOM_TELEMETRY=off" in result.output or "--no-telemetry" in result.output
 
     def test_banner_beacon_default_on_is_surfaced(self, runner, monkeypatch):
-        """The actual bug: HEADROOM_TELEMETRY=off / --no-telemetry alone used
-        to make the banner print a bare "Telemetry: DISABLED" even though the
-        anonymous upload beacon (a separate, on-by-default switch) was still
-        active and never mentioned. After the fix, an operator who sets only
-        --no-telemetry still sees the beacon disclosed."""
-        monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
-        monkeypatch.delenv("HEADROOM_BEACON", raising=False)
-        monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+        """With no switch set the banner discloses the opt-out beacon rather than
+        printing a bare "Telemetry: DISABLED" for the local-stats switch alone."""
+        for var in ("HEADROOM_TELEMETRY", "HEADROOM_BEACON", "DO_NOT_TRACK"):
+            monkeypatch.delenv(var, raising=False)
 
         from headroom.cli.main import main
 
         with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
-            result = runner.invoke(main, ["proxy", "--no-telemetry"])
+            result = runner.invoke(main, ["proxy"])
 
         assert "Telemetry:" in result.output
         assert "usage counters" in result.output
         assert "HEADROOM_BEACON=off" in result.output
-        # The old banner's bare "DISABLED" claim must not appear on the
-        # Telemetry line specifically (the banner has an unrelated
-        # "Memory: DISABLED" line that must not make this assertion a
-        # false pass) -- that combination is exactly the false assurance
-        # this fix removes.
         telemetry_line = next(
             line for line in result.output.splitlines() if line.strip().startswith("Telemetry:")
         )

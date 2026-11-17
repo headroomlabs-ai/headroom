@@ -144,6 +144,26 @@ def begin_pin_scope() -> dict[str, UpstreamPin]:
     return scope
 
 
+def _connect_name(host: str) -> str | None:
+    """Return ``host`` as the connection will name it: lower-case IDNA A-label.
+
+    httpx IDNA-encodes a non-ASCII request host (IDNA 2008) and httpcore hands
+    that A-label to ``connect_tcp``, so the check has to resolve and pin the
+    same name. ``socket.getaddrinfo`` would encode a Unicode name itself, with
+    IDNA 2003, which spells some names differently (``faß.de`` vs
+    ``xn--fa-hia.de``). ``None`` when the host cannot be encoded at all.
+    """
+    key = (host or "").strip().lower()
+    if key.isascii():
+        return key
+    import httpx  # local: this module otherwise needs only the standard library
+
+    try:
+        return httpx.URL(scheme="https", host=key).raw_host.decode("ascii").lower()
+    except (httpx.InvalidURL, UnicodeError):
+        return None
+
+
 def _record_validated_addresses(
     host: str,
     addresses: tuple[str, ...],
@@ -181,7 +201,7 @@ def guarded_pin(host: str) -> UpstreamPin | None:
     scope = _PIN_SCOPE.get()
     if not scope:
         return None
-    key = (host or "").strip().lower()
+    key = _connect_name(host)
     if not key:
         return None
     return scope.get(key)
@@ -256,19 +276,21 @@ def destination_listed(
     return (scheme, host.lower(), port) in origins
 
 
-# RFC 6052 / RFC 8215: these IPv6 prefixes embed an IPv4 address in their low
-# 32 bits, and `ipaddress` reports the well-known one as globally routable. On a
-# NAT64 network `64:ff9b::7f00:1` reaches 127.0.0.1, so the embedded address is
-# what has to be judged. 6to4, Teredo and IPv4-mapped forms are already caught
-# by the `is_global` test below.
-_NAT64_PREFIXES = (
-    ipaddress.IPv6Network("64:ff9b::/96"),
-    ipaddress.IPv6Network("64:ff9b:1::/48"),
-)
+# RFC 6052 well-known prefix. A DNS64 resolver answers a host that has only an
+# A record with `64:ff9b::<its IPv4>`, and the NAT64 translator delivers that to
+# the IPv4 address in the low 32 bits, so the embedded address is what has to
+# be judged: `64:ff9b::7f00:1` reaches 127.0.0.1. It has to be judged *before*
+# the category checks, because `ipaddress` calls the whole prefix reserved (it
+# sits in ::/8) -- judging the IPv6 form rejected every IPv4-only upstream on a
+# DNS64 network. The local-use prefix (RFC 8215, 64:ff9b:1::/48) is not
+# unwrapped: where its IPv4 bits sit depends on the operator's prefix length,
+# so it stays rejected as non-global. 6to4, Teredo and IPv4-mapped forms are
+# already caught by the `is_global` test below.
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
 
 
 def _nat64_embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
-    if not any(addr in prefix for prefix in _NAT64_PREFIXES):
+    if addr not in _NAT64_WELL_KNOWN_PREFIX:
         return None
     try:
         return ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
@@ -281,6 +303,10 @@ def _is_internal_address(ip: str) -> bool:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return True  # unparseable (e.g. scoped link-local) -> treat as unsafe
+    if isinstance(addr, ipaddress.IPv6Address):
+        embedded = _nat64_embedded_ipv4(addr)
+        if embedded is not None:
+            return _is_internal_address(str(embedded))
     if (
         addr.is_private
         or addr.is_loopback
@@ -298,10 +324,6 @@ def _is_internal_address(ip: str) -> bool:
     # learns about.
     if not addr.is_global:
         return True
-    if isinstance(addr, ipaddress.IPv6Address):
-        embedded = _nat64_embedded_ipv4(addr)
-        if embedded is not None and _is_internal_address(str(embedded)):
-            return True
     return False
 
 
@@ -338,9 +360,15 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
             port = -1  # matches no origin; a listed bare host still passes, as before
         return destination_listed(allow, parsed.scheme, host, port)
 
+    # Resolve and pin the name the connection will dial, not the spelling the
+    # client sent, or a non-ASCII host would be checked under one name and
+    # connected under another.
+    connect_host = _connect_name(host)
+    if not connect_host:
+        return False
     try:
         infos = _RESOLVER_POOL.submit(
-            socket.getaddrinfo, host, None, 0, 0, socket.IPPROTO_TCP
+            socket.getaddrinfo, connect_host, None, 0, 0, socket.IPPROTO_TCP
         ).result(timeout=_resolve_timeout_seconds())
     except (OSError, _FutureTimeout):
         # Resolution and connection are separate operations, so allowing a DNS
@@ -361,7 +389,7 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
     # A destination that cannot be pinned is rejected rather than allowed
     # through unpinned: an unpinned client-supplied host is one the connection
     # would have to resolve for itself, which is the hole this closes.
-    return _record_validated_addresses(host.lower(), addresses, scope)
+    return _record_validated_addresses(connect_host, addresses, scope)
 
 
 async def is_safe_upstream_url_async(url: str) -> bool:

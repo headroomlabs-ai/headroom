@@ -7,7 +7,7 @@ This guide gets you from zero to compressed LLM calls in under 5 minutes.
 
 ## 1. Install
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['Python', 'TypeScript']}>
 <Tab value="TypeScript">
 ```bash
 npm install headroom-ai
@@ -15,12 +15,15 @@ npm install headroom-ai
 </Tab>
 <Tab value="Python">
 ```bash
-# CLI/proxy/wrap on your machine
-uv tool install --python 3.13 "headroom-ai[all]"
+# Python project or virtualenv: enough for compress(), no API key, no model download
+pip install headroom-ai
 
-# Python project or virtualenv
-pip install "headroom-ai[all]"
+# CLI, proxy and `headroom wrap` on your machine
+uv tool install --python 3.13 "headroom-ai[all]"
 ```
+
+`[all]` adds the proxy, the MCP server, the Kompress model and more; `compress()`
+needs only the base package.
 </Tab>
 </Tabs>
 
@@ -38,7 +41,7 @@ The proxy runs the compression pipeline (Python) and exposes an HTTP API that th
 
 ## 2. Compress messages
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['Python', 'TypeScript']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from 'headroom-ai';
@@ -110,11 +113,22 @@ result = compress(messages, model="gpt-4o")
 </Tab>
 </Tabs>
 
+<Callout type="info" title="No provider key needed to try it">
+The Python call runs in-process. `HEADROOM_OFFLINE=1` makes it zero-network as
+well (no update check, no model or pricing-table downloads):
+
+```bash
+HEADROOM_OFFLINE=1 python -c "from headroom import compress; log='\n'.join(f'INFO step {i} ok' for i in range(3000))+'\nFATAL disk full'; r=compress([{'role':'user','content':'What failed?'},{'role':'assistant','content':None,'tool_calls':[{'id':'c1','type':'function','function':{'name':'logs','arguments':'{}'}}]},{'role':'tool','tool_call_id':'c1','content':log}], model='gpt-4o'); print(r.tokens_before, '->', r.tokens_after, 'FATAL kept:', 'FATAL' in str(r.messages))"
+```
+
+A [FastAPI endpoint](/docs/fastapi) built on the same call is one page away.
+</Callout>
+
 ## 3. Send to your LLM
 
 Use the compressed messages exactly like the originals:
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['Python', 'TypeScript']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import OpenAI from 'openai';
@@ -149,7 +163,7 @@ print(response.choices[0].message.content)
 
 ## 4. Check your savings
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['Python', 'TypeScript']}>
 <Tab value="TypeScript">
 ```ts twoslash
 const result = {

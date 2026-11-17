@@ -42,7 +42,16 @@ def test_blocks_internal_and_invalid(url: str) -> None:
     assert is_safe_upstream_url(url) is False
 
 
-@pytest.mark.parametrize("url", ["https://8.8.8.8/v1", "https://1.1.1.1/", "wss://9.9.9.9/rt"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://8.8.8.8/v1",
+        "https://1.1.1.1/",
+        "wss://9.9.9.9/rt",
+        # NAT64 well-known prefix embedding 8.8.8.8: the translator delivers it there.
+        "https://[64:ff9b::808:808]/v1",
+    ],
+)
 def test_allows_public(url: str) -> None:
     assert is_safe_upstream_url(url) is True
 
@@ -63,7 +72,12 @@ def test_allows_public(url: str) -> None:
         ("6to4 embedding loopback", "http://[2002:7f00:1::]/"),
         ("6to4 embedding RFC1918", "http://[2002:a00:1::]/"),
         ("NAT64 embedding loopback", "http://[64:ff9b::7f00:1]/"),
+        ("NAT64 embedding RFC1918", "http://[64:ff9b::a00:1]/"),
+        ("NAT64 embedding metadata", "http://[64:ff9b::a9fe:a9fe]/"),
         ("NAT64 local-use prefix", "http://[64:ff9b:1::7f00:1]/"),
+        # Local-use embedding depends on the operator's prefix length, so the
+        # low 32 bits are not reliably the destination: never unwrapped.
+        ("NAT64 local-use prefix embedding a public IPv4", "http://[64:ff9b:1::808:808]/"),
         ("teredo", "http://[2001:0::7f00:1]/"),
         ("IPv4-mapped metadata", "http://[::ffff:169.254.169.254]/"),
         ("IPv4-mapped loopback", "http://[::ffff:127.0.0.1]/"),
@@ -582,6 +596,33 @@ def test_a_check_pins_every_address_it_accepted(monkeypatch: pytest.MonkeyPatch)
     assert upstream_guard.validated_addresses("multi.homed.example") == ("8.8.8.8", "1.1.1.1")
 
 
+def test_a_dns64_answer_for_a_public_host_is_accepted_and_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a DNS64 network an IPv4-only host also gets a synthesized `64:ff9b::` AAAA.
+
+    Judging that AAAA as reserved rejected every IPv4-only upstream there, and
+    the OpenAI handler then sent the request -- key included -- to the
+    configured upstream instead.
+    """
+    from headroom.proxy import upstream_guard
+
+    def dns64_answer(*args: object, **kwargs: object) -> list[object]:
+        return [
+            (None, None, None, None, ("8.8.8.8", 443)),
+            (None, None, None, None, ("64:ff9b::808:808", 443, 0, 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", dns64_answer)
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://ipv4-only.example/v1") is True
+    assert upstream_guard.validated_addresses("ipv4-only.example") == (
+        "8.8.8.8",
+        "64:ff9b::808:808",
+    )
+
+
 def test_a_rejected_or_allowlisted_destination_pins_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1007,3 +1048,74 @@ async def test_a_proxied_client_still_pins_its_direct_transport(
         assert isinstance(proxied, GuardedUpstreamRefusingTransport)
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+def test_openai_routes_refuse_a_private_override_instead_of_using_the_default(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected ``x-headroom-base-url`` is a 400, like on the other routes.
+
+    Dropping the header and continuing sent the prompt and the client's
+    Authorization, meant for its own gateway, to the configured OpenAI target.
+    """
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    with (
+        _InternalService() as configured,
+        TestClient(_app(openai_api_url=configured.url)) as client,
+    ):
+        response = client.post(
+            path,
+            headers={
+                "Authorization": "Bearer client-gateway-key",
+                "x-headroom-base-url": "http://192.168.1.50:8000/v1",
+            },
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "input": "hi",
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    assert configured.hits == [], "the request went to the configured upstream instead"
+
+
+# ---------------------------------------------------------------------------
+# A non-ASCII host is checked and pinned under the name httpcore connects with
+# ---------------------------------------------------------------------------
+
+
+async def test_a_non_ascii_host_is_resolved_and_pinned_under_its_connect_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx IDNA-encodes the host, so httpcore asks ``connect_tcp`` for the A-label.
+
+    The check used to resolve and pin the Unicode spelling. The connection's
+    lookup by A-label then found no pin, treated the host as never checked, and
+    resolved it again. ``ß`` also shows the check must resolve the A-label
+    itself: the resolver's own encoding would have looked up ``strasse.example``.
+    """
+    from headroom.proxy import upstream_guard
+
+    looked_up: list[str] = []
+
+    def public_answer(host: str, *args: object, **kwargs: object) -> list[object]:
+        looked_up.append(host)
+        return [(None, None, None, None, ("8.8.8.8", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", public_answer)
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    upstream_guard.clear_validated_addresses()
+    url = "https://Straße.example/v1"
+    assert is_safe_upstream_url(url) is True
+
+    connect_name = httpx.URL(url).raw_host.decode("ascii")
+    assert connect_name == "xn--strae-oqa.example"
+    assert looked_up == [connect_name]
+    assert upstream_guard.guarded_pin(connect_name) is not None
+    assert upstream_guard.guarded_pin("straße.example") is not None
+
+    inner, stream, error = await _connect(connect_name)
+    assert error is None and stream is not None
+    assert inner.targets == ["8.8.8.8"], f"the name was resolved again: {inner.targets}"

@@ -1,9 +1,9 @@
 """A buffered-CCR turn is a billed call and its usage must reach accounting.
 
 When a ``stream:true`` request carries the ``headroom_retrieve`` tool, the
-Anthropic handler rewrites it to ``stream:false`` upstream so it can resolve
-retrievals server-side, then re-synthesizes SSE for the client. That buffered
-response carries the same ``usage`` block any non-stream reply does, so the
+Anthropic handler buffers the whole reply (upstream streams it, the proxy folds
+the stream into one Message) so it can resolve retrievals server-side, then
+re-synthesizes SSE for the client. That buffered response carries the same ``usage`` block any non-stream reply does, so the
 provider's cache-read / cache-write / output counts must land on the outcome.
 
 If they don't, every cached token on the dominant Claude Code path is invisible:
@@ -15,6 +15,7 @@ compression savings on the buffered turns still count in full.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -25,6 +26,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.proxy.anthropic_wire import render_anthropic_sse_response  # noqa: E402
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
@@ -139,15 +141,19 @@ def test_buffered_ccr_turn_records_provider_usage(monkeypatch, ccr_marker: str) 
     """A stream:true + headroom_retrieve turn must book the same usage block."""
     app, outcomes = _app_and_outcomes(monkeypatch)
     route = respx.post("https://api.anthropic.com/v1/messages").mock(
-        return_value=httpx.Response(200, json=_RESPONSE)
+        return_value=httpx.Response(
+            200,
+            content=b"".join(render_anthropic_sse_response(_RESPONSE)),
+            headers={"content-type": "text/event-stream"},
+        )
     )
 
     r = _post(app, stream=True, tools=[_RETRIEVE_TOOL], marker=ccr_marker)
 
     assert r.status_code == 200
-    # The handler must have buffered it: upstream saw stream:false.
+    # The handler buffered it: upstream was asked for the stream it then folded.
     sent = route.calls.last.request
-    assert b'"stream": false' in sent.content or b'"stream":false' in sent.content
+    assert json.loads(sent.content)["stream"] is True
 
     assert outcomes, "an outcome must be recorded"
     o = outcomes[-1]

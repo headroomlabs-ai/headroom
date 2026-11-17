@@ -104,6 +104,25 @@ class TestSanitizeForwardedResponseHeaders:
         )
         assert cleaned == {"Request-Id": "req_abc"}
 
+    def test_drops_headers_named_by_connection_and_hop_by_hop_fields(self):
+        """Connection-local headers must not leak past the ``Connection`` header (#4265)."""
+        headers = httpx.Headers(
+            [
+                ("Connection", "X-Upstream-Hop, upgrade"),
+                ("Connection", "X-Second-Hop, Keep-Alive"),
+                ("X-Upstream-Hop", "1"),
+                ("X-Second-Hop", "2"),
+                ("Upgrade", "h2c"),
+                ("TE", "trailers"),
+                ("Trailer", "Digest"),
+                ("X-Request-ID", "req_abc"),
+            ]
+        )
+        snapshot = list(headers.multi_items())
+
+        assert sanitize_forwarded_response_headers(headers) == {"x-request-id": "req_abc"}
+        assert list(headers.multi_items()) == snapshot
+
     def test_extra_names_are_dropped_too(self):
         cleaned = sanitize_forwarded_response_headers(
             {"content-type": "text/event-stream", "request-id": "req_abc"},
@@ -295,7 +314,8 @@ def test_buffered_ccr_turn_does_not_write_the_response_cache():
 
     assert resp.status_code == 200, resp.text
     # The conversion really happened — otherwise this test proves nothing.
-    assert forwarded_bodies and forwarded_bodies[0]["stream"] is False
+    # Buffered: the request streams upstream and the proxy folds the reply.
+    assert forwarded_bodies and forwarded_bodies[0]["stream"] is True
     # ...and nothing was written to the response cache.
     proxy.cache.set.assert_not_awaited()
     reset_compression_store()

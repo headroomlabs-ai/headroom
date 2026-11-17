@@ -14,7 +14,9 @@ import asyncio
 import logging
 import os
 import warnings
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -26,6 +28,8 @@ from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_lo
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
+    from tokenizers import Tokenizer
+    from transformers import PreTrainedTokenizerBase
 
 # Suppress HuggingFace Hub warnings about missing tokens and rate limits.
 # These appear whenever hf_hub_download is called without HF_TOKEN set.
@@ -172,6 +176,48 @@ def _normalize_embeddings_batch(embeddings: np.ndarray) -> np.ndarray:
     return result
 
 
+def _fit_query_to_window(
+    user_text: str,
+    context: str,
+    max_tokens: int,
+    count_tokens: Callable[[str], int],
+) -> str:
+    """Reserve token space for both sources, retaining their recent tails."""
+
+    def tail(text: str, budget: int) -> str:
+        if budget <= 0:
+            return ""
+        if count_tokens(text) <= budget:
+            return text
+        low, high = 0, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if count_tokens(text[-middle:]) <= budget:
+                low = middle
+            else:
+                high = middle - 1
+        return text[-low:] if low else ""
+
+    user_tokens, context_tokens = count_tokens(user_text), count_tokens(context)
+    available = max(0, max_tokens - (count_tokens("\n") if user_tokens and context_tokens else 0))
+    user_budget = min(user_tokens, (available + 1) // 2 if context_tokens else available)
+    context_budget = min(context_tokens, available - user_budget)
+    user_budget = min(user_tokens, available - context_budget)
+    while True:
+        rendered = "\n".join(
+            part for part in (tail(user_text, user_budget), tail(context, context_budget)) if part
+        )
+        excess = count_tokens(rendered) - max_tokens
+        if excess <= 0:
+            return rendered
+        # Retokenizing a suffix can change its first subword. Enforce the final
+        # joined window too, rather than assuming token counts are additive.
+        if user_budget >= context_budget and user_budget:
+            user_budget = max(0, user_budget - excess)
+        else:
+            context_budget = max(0, context_budget - excess)
+
+
 # =============================================================================
 # LocalEmbedder - sentence-transformers
 # =============================================================================
@@ -219,6 +265,7 @@ class LocalEmbedder:
         self._model_name = model_name or ML_MODEL_DEFAULTS.sentence_transformer
         self._requested_device = device
         self._model: SentenceTransformer | None = None
+        self._query_tokenizer: PreTrainedTokenizerBase | None = None
         self._device: str | None = None
         self._dimension: int | None = None
         self._lock = asyncio.Lock()
@@ -328,6 +375,30 @@ class LocalEmbedder:
 
         return _normalize_embedding(embedding)
 
+    async def prepare_query(self, user_text: str, context: str) -> str:
+        """Fit both query sources with the configured model's tokenizer."""
+        async with self._lock:
+            if self._model is None:
+                await asyncio.get_event_loop().run_in_executor(None, self._load_model)
+            assert self._model is not None
+            if self._query_tokenizer is None:
+                self._query_tokenizer = deepcopy(self._model.tokenizer)
+                # Configure the private copy before concurrent query encodes.
+                self._query_tokenizer.encode("", add_special_tokens=False, truncation=False)
+            tokenizer = self._query_tokenizer
+            available = max(0, self._model.max_seq_length - tokenizer.num_special_tokens_to_add())
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            lambda: _fit_query_to_window(
+                user_text,
+                context,
+                available,
+                lambda text: len(
+                    tokenizer.encode(text, add_special_tokens=False, truncation=False)
+                ),
+            ),
+        )
+
     async def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
         """Generate embeddings for multiple texts.
 
@@ -407,6 +478,7 @@ class LocalEmbedder:
             self._executor.shutdown(wait=False)
             self._executor = None
         self._model = None
+        self._query_tokenizer = None
 
 
 # =============================================================================
@@ -437,6 +509,7 @@ class OnnxLocalEmbedder:
         self._max_length = max_length
         self._session: Any = None
         self._tokenizer: Any = None
+        self._query_tokenizer: Tokenizer | None = None
         self._input_names: list[str] = []
         self._lock = asyncio.Lock()
 
@@ -543,6 +616,29 @@ class OnnxLocalEmbedder:
         embedding = await loop.run_in_executor(None, self._embed_single, text)
         return cast(np.ndarray, embedding)
 
+    async def prepare_query(self, user_text: str, context: str) -> str:
+        """Fit both query sources without mutating the inference tokenizer."""
+        from tokenizers import Tokenizer
+
+        async with self._lock:
+            if self._session is None:
+                await asyncio.get_event_loop().run_in_executor(None, self._load_model)
+            if self._query_tokenizer is None:
+                self._query_tokenizer = Tokenizer.from_str(self._tokenizer.to_str())
+                self._query_tokenizer.no_truncation()
+                self._query_tokenizer.no_padding()
+            tokenizer = self._query_tokenizer
+            available = max(0, self._max_length - tokenizer.num_special_tokens_to_add(False))
+        return await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _fit_query_to_window(
+                user_text,
+                context,
+                available,
+                lambda text: len(tokenizer.encode(text, add_special_tokens=False).ids),
+            ),
+        )
+
     async def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
         """Generate embeddings for multiple texts."""
         if not texts:
@@ -591,6 +687,7 @@ class OnnxLocalEmbedder:
         """Close resources."""
         self._session = None
         self._tokenizer = None
+        self._query_tokenizer = None
 
 
 # =============================================================================

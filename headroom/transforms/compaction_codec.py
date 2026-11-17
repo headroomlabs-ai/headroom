@@ -362,8 +362,9 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
     """Reconstruct the original array of objects from densified ``text``.
 
     Returns the list of dicts, or ``None`` if ``text`` is not a parseable
-    densified block or carries an irreversible removal marker (CCR / dropped
-    rows) — callers treat ``None`` as "cannot losslessly reverse".
+    densified block, its row count differs from the header, or it carries an
+    irreversible removal marker (CCR / dropped rows). Callers treat ``None``
+    as "cannot losslessly reverse".
     """
     if not is_compacted(text) or contains_removal_marker(text):
         return None
@@ -383,12 +384,19 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
         if not eq or not name.startswith("@"):
             return None
         try:
-            legends[name[1:]] = json.loads(payload)
+            result = json.loads(payload)
         except (ValueError, TypeError):
             return None
+        if not isinstance(result, list):
+            return None
+        legends[name[1:]] = result
+
+    rows = _split_data_rows(rest, declared)
+    if len(rows) != declared:
+        return None
 
     out: list[dict[str, Any]] = []
-    for cells in _split_data_rows(rest, declared):
+    for cells in rows:
         if not cells:
             continue
         record: dict[str, Any] = {}
@@ -404,7 +412,10 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
                     _assign(record, col.path, None)
                     continue
                 try:
-                    _assign(record, col.path, legends[col.name][int(value)])
+                    idx_val = int(value)
+                    if idx_val < 0:
+                        return None
+                    _assign(record, col.path, legends[col.name][idx_val])
                 except (ValueError, IndexError):
                     return None
                 continue

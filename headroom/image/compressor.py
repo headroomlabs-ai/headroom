@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 # Import the enum from the dependency-free module so importing the compressor
 # does not eagerly import trained_router (and thus torch/transformers) — that
 # eager import crashed on Python 3.13+ (#2513).
+from .decoder_guard import pillow_is_safe
 from .image_types import ImageMemo, Technique
 
 logger = logging.getLogger(__name__)
@@ -333,13 +334,11 @@ class ImageCompressor:
         # Resize
         resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-        # Convert to RGB if needed (for JPEG)
-        if resized.mode in ("RGBA", "P"):
-            resized = resized.convert("RGB")
-
         # Save as JPEG for best compression
+        from .tile_optimizer import _jpeg_ready
+
         buf = io.BytesIO()
-        resized.save(buf, format="JPEG", quality=quality, optimize=True)
+        _jpeg_ready(resized).save(buf, format="JPEG", quality=quality, optimize=True)
         return buf.getvalue(), "image/jpeg"
 
     def _estimate_tokens(self, image_data: bytes, detail: str = "high") -> int:
@@ -702,7 +701,12 @@ class ImageCompressor:
         Returns:
             Messages with compressed images
         """
-        if not self.has_images(messages):
+        # Reset first: the per-worker singleton (proxy/image_isolation.py) keeps
+        # one ImageCompressor for every request and reports last_result whenever
+        # it is not None, so a request we return early on below must not inherit
+        # the previous request's technique and token numbers.
+        self.last_result = None
+        if not self.has_images(messages) or not pillow_is_safe():
             return messages
 
         # Step 1: Tile-boundary optimization (always safe, pure math)

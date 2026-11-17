@@ -307,6 +307,9 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # it here is what lets the dashboard's per-model table count the layer
         # its own headline counts. Zero for this outcome (no deferral tags).
         "tool_schema_saved": 0,
+        # Whether the positional tokens_sent is the provider's billed count.
+        # This outcome carries no provider_input_tokens, so it is an estimate.
+        "provider_reported": False,
         # Price provenance, resolved per lookup from the handler's provider
         # (#3732). This harness has no provider object, so the funnel passes
         # the degrade path: no provider price, measured stamp, and the cost
@@ -727,3 +730,40 @@ def test_tokens_inflated_does_not_disturb_derived_sizes() -> None:
     assert o.attempted_input_tokens == 57845
     assert o.savings_pct == 0.0
     assert o.tokens_inflated == 2684
+
+
+@pytest.mark.asyncio
+async def test_funnel_books_the_modelled_output_range_on_the_lifetime(
+    tmp_path, monkeypatch
+) -> None:
+    """Registered factors reach the tracker's lifetime totals end to end:
+    outcome -> PrometheusMetrics.record_request -> SavingsTracker."""
+    from headroom.proxy import output_savings
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.savings_tracker import SavingsTracker
+
+    monkeypatch.setattr(output_savings, "MODELLED_REDUCTION", {4: (0.2, 0.5)})
+    monkeypatch.setattr(
+        output_savings, "_RECORDER", output_savings.SavingsRecorder(str(tmp_path / "o.json"))
+    )
+    tracker = SavingsTracker(path=str(tmp_path / "s.json"))
+    h = _FunnelHarness()
+    h.metrics = PrometheusMetrics(savings_tracker=tracker)
+    key = output_savings.stratum_key(
+        turn_kind="code", input_tokens=8000, model="claude-sonnet-4", has_tools=True
+    )
+
+    await h._record_request_outcome(
+        _outcome(
+            output_tokens=800,
+            transforms_applied=[
+                output_savings.stratum_label("treatment", key),
+                "output_shaper:verbosity:L4",
+            ],
+        )
+    )
+
+    lifetime = tracker.snapshot()["lifetime"]
+    assert lifetime["output_tokens_saved"] == 200
+    assert lifetime["output_tokens_saved_high"] == 800
+    assert lifetime["output_savings_usd_high"] > lifetime["output_savings_usd"] > 0

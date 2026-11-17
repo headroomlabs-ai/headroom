@@ -167,6 +167,29 @@ def find_optimal_anthropic_dimensions(width: int, height: int) -> tuple[int, int
 # ---------------------------------------------------------------------------
 
 
+def _jpeg_ready(img: Any) -> Any:
+    """Return ``img`` in a mode JPEG can store.
+
+    JPEG has no alpha, and ``convert("RGB")`` simply drops it, so transparent
+    pixels show their hidden colour (usually black). Composite them onto
+    white instead: alpha bands, palette transparency and PNG ``tRNS`` on RGB
+    or grayscale images alike. Palette, bilevel and CMYK/YCbCr images convert
+    to RGB. High-bit-depth modes (``I;16``, ``I``, ``F``) have no faithful
+    8-bit form, so they are returned as-is and the JPEG save fails as before,
+    which makes callers keep the original image.
+    """
+    from PIL import Image
+
+    if img.has_transparency_data:
+        rgba = img.convert("RGBA")
+        flat = Image.new("RGB", rgba.size, (255, 255, 255))
+        flat.paste(rgba, mask=rgba.getchannel("A"))
+        return flat
+    if img.mode in ("1", "P", "CMYK", "YCbCr"):
+        return img.convert("RGB")
+    return img
+
+
 def _resize_image_bytes(
     image_data: bytes, target_width: int, target_height: int
 ) -> tuple[bytes, str]:
@@ -182,12 +205,8 @@ def _resize_image_bytes(
 
     resized = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
-    # Convert RGBA to RGB for JPEG
-    if resized.mode in ("RGBA", "P"):
-        resized = resized.convert("RGB")
-
     buf = io.BytesIO()
-    resized.save(buf, format="JPEG", quality=85, optimize=True)
+    _jpeg_ready(resized).save(buf, format="JPEG", quality=85, optimize=True)
     return buf.getvalue(), "image/jpeg"
 
 

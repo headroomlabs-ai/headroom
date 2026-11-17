@@ -34,15 +34,15 @@ RUN python -m pip install --no-cache-dir uv==${UV_VERSION}
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:${PATH}
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
+COPY scripts/install-rustup.sh /tmp/install-rustup.sh
+RUN sh /tmp/install-rustup.sh -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
 
 WORKDIR /build
 
 # Copy the full set of files maturin needs to build the wheel: the root
 # pyproject.toml + Cargo workspace + Rust crates + Python source. The
 # uv install builds + installs the wheel in one shot.
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/
@@ -50,12 +50,18 @@ COPY headroom/ headroom/
 # The standalone Dockerfile must support every backend advertised by
 # `headroom proxy --backend`, including Bedrock temporary/SSO credentials.
 # Those credentials require botocore (GH #1551), supplied by [bedrock].
-ARG HEADROOM_EXTRAS=proxy,code,bedrock
+# [redis] backs the replica-shared stores: without it HEADROOM_COMPRESS_SESSION_STORE
+# stops startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store.
+ARG HEADROOM_EXTRAS=proxy,code,bedrock,redis
+# `uv pip install` ignores [tool.uv] override-dependencies (uv.lock only), so
+# pass them explicitly: the image gets the security overrides the lock has
+# (pillow 13 over fastembed's <13 cap).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    uv pip install --system ".[${HEADROOM_EXTRAS}]"
+    python -c "exec('try: import tomllib\\nexcept ImportError: from pip._vendor import tomli as tomllib'); print('\\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['uv']['override-dependencies']))" > /tmp/overrides.txt && \
+    uv pip install --system --overrides /tmp/overrides.txt ".[${HEADROOM_EXTRAS}]"
 
 RUN --mount=type=bind,source=.,target=/context,readonly \
     HEADROOM_BUILD_VERSION="${HEADROOM_BUILD_VERSION}" PYTHON_SITE_PACKAGES="${PYTHON_SITE_PACKAGES}" python - <<'PY'
@@ -97,6 +103,7 @@ def source_digest(root: Path) -> str:
         "pyproject.toml",
         "uv.lock",
         "README.md",
+        "README-pypi.md",
         "Cargo.toml",
         "Cargo.lock",
         "rust-toolchain.toml",
@@ -208,14 +215,23 @@ ENTRYPOINT ["headroom", "proxy"]
 # Keep host and port defaults in the CLI so HEADROOM_HOST and HEADROOM_PORT
 # remain authoritative for the published image.
 
+# Distroless has no shell, so the ~/.headroom state directory cannot be made
+# with RUN there. Build it here and COPY it in with the right owner (#4443).
+FROM python:${PYTHON_VERSION}-slim AS runtime-slim-state
+RUN mkdir -p /state/.headroom
+
 FROM ${DISTROLESS_IMAGE} AS runtime-slim
 
 ARG RUNTIME_USER=nonroot
+ARG RUNTIME_HOME=/home/nonroot
 ARG PYTHON_SITE_PACKAGES
 
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
+# Owned by the runtime user so the volume below is writable (user and group
+# are both named after RUNTIME_USER in the distroless image).
+COPY --from=runtime-slim-state --chown=${RUNTIME_USER}:${RUNTIME_USER} /state/ ${RUNTIME_HOME}/
 
 USER ${RUNTIME_USER}
 WORKDIR /app
@@ -224,6 +240,10 @@ ENV HEADROOM_HOST=127.0.0.1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=${PYTHON_SITE_PACKAGES}
+
+# Same persistent-state volume as the python-slim stage; pass
+# --build-arg RUNTIME_HOME=/root when building with RUNTIME_USER=root.
+VOLUME ${RUNTIME_HOME}/.headroom
 
 EXPOSE 8787
 

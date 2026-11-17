@@ -660,25 +660,44 @@ impl Ledger {
         let usd = if ev.failed {
             EventUsd::default()
         } else {
-            match pricing::lookup(&ev.model) {
-                Some(p) => EventUsd {
-                    compression: p.compression_savings_usd(ev.tokens_saved()),
-                    cache: p
-                        .cache_savings_usd(ev.usage.cache_read_tokens, ev.usage.cache_write_tokens),
-                    input_cost: p.input_cost_usd(
-                        // When the response carried no usage block,
-                        // bill the post-compression estimate instead
-                        // so passthrough lanes still show spend.
-                        if ev.usage.total_input() > 0 {
-                            ev.usage.input_tokens
-                        } else {
-                            ev.tokens_after
-                        },
-                        ev.usage.cache_read_tokens,
-                        ev.usage.cache_write_tokens,
-                    ),
-                    output_cost: p.output_cost_usd(ev.usage.output_tokens),
-                },
+            match pricing::lookup_card(&ev.model) {
+                Some(card) => {
+                    // When the response carried no usage block, bill
+                    // the post-compression estimate instead so
+                    // passthrough lanes still show spend.
+                    let uncached = if ev.usage.total_input() > 0 {
+                        ev.usage.input_tokens
+                    } else {
+                        ev.tokens_after
+                    };
+                    // The billed prompt picks the rate card: past a
+                    // model's long-context threshold every rate below
+                    // switches to the higher tier.
+                    let p = card.for_prompt(
+                        uncached
+                            .saturating_add(ev.usage.cache_read_tokens)
+                            .saturating_add(ev.usage.cache_write_tokens),
+                    );
+                    EventUsd {
+                        compression: card.compression_savings_usd(
+                            uncached,
+                            ev.usage.cache_read_tokens,
+                            ev.usage.cache_write_tokens,
+                            ev.usage.output_tokens,
+                            ev.tokens_saved(),
+                        ),
+                        cache: p.cache_savings_usd(
+                            ev.usage.cache_read_tokens,
+                            ev.usage.cache_write_tokens,
+                        ),
+                        input_cost: p.input_cost_usd(
+                            uncached,
+                            ev.usage.cache_read_tokens,
+                            ev.usage.cache_write_tokens,
+                        ),
+                        output_cost: p.output_cost_usd(ev.usage.output_tokens),
+                    }
+                }
                 None => EventUsd::default(),
             }
         };
@@ -1275,6 +1294,66 @@ mod tests {
         // sonnet-4-5: $15/M out vs $3/M in — 50 out vs 600 in.
         assert!((total - (input + output)).abs() < f64::EPSILON);
         assert!(total > input, "total spend must exceed input-only spend");
+    }
+
+    /// A Haiku 5.5 prompt over 100K bills every rate at the 5x card:
+    /// 150K uncached in + 5K out is $0.075 + $0.0125, not the base
+    /// card's $0.015 + $0.0025.
+    #[test]
+    fn long_prompt_bills_at_the_models_long_context_card() {
+        let ledger = Ledger::in_memory();
+        let mut ev = event("claude-haiku-5-5");
+        ev.usage = Usage {
+            input_tokens: 150_000,
+            output_tokens: 5_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        ledger.record(ev);
+        let v = ledger.stats_payload(true);
+        let input = v["session"]["input_cost_usd"].as_f64().unwrap();
+        let output = v["session"]["output_cost_usd"].as_f64().unwrap();
+        assert!((input - 0.075).abs() < 1e-9, "input: {input}");
+        assert!((output - 0.0125).abs() < 1e-9, "output: {output}");
+    }
+
+    /// Devin's example on #4037: 110K uncached compressed to 90K saves
+    /// $0.055 - $0.009 = $0.046 of input, not 20K x $0.10/M = $0.002.
+    #[test]
+    fn compression_below_the_threshold_credits_the_avoided_long_card() {
+        let ledger = Ledger::in_memory();
+        let mut ev = event("claude-haiku-5-5");
+        ev.tokens_before = 110_000;
+        ev.tokens_after = 90_000;
+        ev.usage = Usage {
+            input_tokens: 90_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        ledger.record(ev);
+        let v = ledger.stats_payload(true);
+        let saved = v["session"]["compression_savings_usd"].as_f64().unwrap();
+        assert!((saved - 0.046).abs() < 1e-9, "saved: {saved}");
+    }
+
+    /// Cache reads count toward the threshold: 60K uncached + 60K
+    /// read is a 120K prompt, so it bills at the long card too.
+    #[test]
+    fn cached_tokens_count_toward_the_long_context_threshold() {
+        let ledger = Ledger::in_memory();
+        let mut ev = event("claude-haiku-5-5");
+        ev.usage = Usage {
+            input_tokens: 60_000,
+            output_tokens: 0,
+            cache_read_tokens: 60_000,
+            cache_write_tokens: 0,
+        };
+        ledger.record(ev);
+        let v = ledger.stats_payload(true);
+        let input = v["session"]["input_cost_usd"].as_f64().unwrap();
+        // 60K x $0.50/M + 60K x $0.05/M.
+        assert!((input - 0.033).abs() < 1e-9, "input: {input}");
     }
 
     #[test]

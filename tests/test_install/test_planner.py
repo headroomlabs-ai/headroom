@@ -56,6 +56,44 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     assert "HEADROOM_KOMPRESS_BACKEND" not in manifest.base_env
 
 
+@pytest.mark.parametrize(
+    ("telemetry", "no_telemetry", "env", "flag"),
+    [
+        (False, False, None, None),
+        (True, False, "on", "--telemetry"),
+        (False, True, "off", "--no-telemetry"),
+        (True, True, "off", "--no-telemetry"),
+    ],
+)
+def test_install_writes_telemetry_only_when_chosen(telemetry, no_telemetry, env, flag) -> None:
+    """``HEADROOM_TELEMETRY=off`` now stops the upload beacon, so an install with
+    no telemetry flag must not write it (or ``--no-telemetry``) by default."""
+    from headroom.cli.install import _build_deployment_manifest
+
+    manifest = _build_deployment_manifest(
+        preset=InstallPreset.PERSISTENT_DOCKER.value,
+        runtime="docker",
+        scope="user",
+        provider_mode="manual",
+        targets=(),
+        profile="default",
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory=False,
+        telemetry=telemetry,
+        no_telemetry=no_telemetry,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        no_http2=False,
+    )
+
+    assert manifest.base_env.get("HEADROOM_TELEMETRY") == env
+    flags = {"--telemetry", "--no-telemetry"} & set(manifest.proxy_args)
+    assert flags == ({flag} if flag else set())
+
+
 def test_build_manifest_docker_runtime_never_installs_native_supervisor() -> None:
     manifest = build_manifest(
         profile="default",
