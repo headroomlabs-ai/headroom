@@ -7,6 +7,77 @@ import pytest
 from headroom.cache.compression_cache import CompressionCache
 
 
+def _parallel_results(*contents):
+    return {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": f"tool-{i}", "content": content}
+            for i, content in enumerate(contents)
+        ],
+    }
+
+
+def test_parallel_results_are_all_cached_and_replayed():
+    import copy
+
+    cache = CompressionCache()
+    original = _parallel_results(
+        "first original " * 20,
+        [{"type": "text", "text": "second original " * 20, "cache_control": {"type": "ephemeral"}}],
+    )
+    compressed = _parallel_results(
+        "first compressed",
+        [{"type": "text", "text": "second compressed", "cache_control": {"type": "ephemeral"}}],
+    )
+    untouched = copy.deepcopy(original)
+    cache.update_from_result([original], [compressed])
+
+    assert cache.apply_cached([original]) == [compressed]
+    assert original == untouched
+    assert cache.compute_frozen_count([original, {"role": "user", "content": "next"}]) == 1
+
+
+@pytest.mark.parametrize("first", ["cached", [{"type": "tool_reference", "tool_name": "Read"}]])
+def test_a_later_parallel_cache_miss_stops_freezing(first):
+    cache = CompressionCache()
+    cache.mark_stable(cache.content_hash("cached"))
+    original = _parallel_results(first, "not cached")
+    assert cache.compute_frozen_count([original, {"role": "user", "content": "next"}]) == 0
+
+
+def test_parallel_results_preserve_textless_blocks_and_cache_later_text():
+    cache = CompressionCache()
+    references = [{"type": "tool_reference", "tool_name": "Read"}]
+    original = _parallel_results(references, "original " * 20)
+    compressed = _parallel_results(references, "compressed")
+    cache.update_from_result([original], [compressed])
+
+    assert cache.apply_cached([original]) == [compressed]
+    assert cache.compute_frozen_count([original, {"role": "user", "content": "next"}]) == 1
+
+
+def test_parallel_replay_does_not_flatten_an_unsupported_later_result():
+    cache = CompressionCache()
+    blocks = [{"type": "text", "text": "part one"}, {"type": "text", "text": "part two"}]
+    original = _parallel_results("original " * 20, blocks)
+    compressed = _parallel_results("compressed", "part one\npart two")
+    cache.update_from_result([original], [compressed])
+
+    replay = cache.apply_cached([original])[0]
+    assert replay["content"][0]["content"] == "compressed"
+    assert replay["content"][1]["content"] == blocks
+    assert cache.compute_frozen_count([original, {"role": "user", "content": "next"}]) == 0
+
+
+def test_changed_parallel_result_ids_do_not_seed_the_wrong_result():
+    cache = CompressionCache()
+    original = _parallel_results("alpha original", "beta original")
+    compressed = _parallel_results("alpha compressed", "beta compressed")
+    compressed["content"].reverse()
+    cache.update_from_result([original], [compressed])
+    assert cache.apply_cached([original]) == [original]
+
+
 @pytest.fixture
 def cache() -> CompressionCache:
     return CompressionCache()
