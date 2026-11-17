@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import ClassVar
 from urllib.error import HTTPError
 
 import pytest
@@ -171,7 +172,7 @@ def test_error_body_drain_failure_is_sanitized(monkeypatch, caplog):
     def fail(*_args, **_kwargs):
         raise _UnreadableHTTPError("https://idp.example/token", 503, "unavailable", {}, None)
 
-    monkeypatch.setattr("urllib.request.urlopen", fail)
+    monkeypatch.setattr("headroom_oauth2.provider._open", fail)
     caplog.set_level(logging.DEBUG, logger="headroom_oauth2")
     p = OAuth2ClientCredentials(
         token_url="https://idp.example/token", client_id="c", client_secret="s"
@@ -570,3 +571,60 @@ def test_install_handles_invalid_litellm_headers(monkeypatch, caplog):
 
     install(App(), _cfg("litellm-openai"))
     assert "could not set litellm.headers" in caplog.text
+
+
+class _Sink(BaseHTTPRequestHandler):
+    seen: ClassVar[list] = []
+
+    def do_POST(self):
+        _Sink.seen.append((self.path, self.headers.get("authorization")))
+        body = json.dumps({"access_token": "FROM-REDIRECT", "expires_in": 3600}).encode()
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST
+
+    def log_message(self, *a):
+        pass
+
+
+def _serve(handler):
+    srv = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("style", ["basic", "post"])
+def test_token_endpoint_redirect_is_not_followed(code, style):
+    _Sink.seen = []
+    sink = _serve(_Sink)
+    target = f"http://127.0.0.1:{sink.server_address[1]}/elsewhere"
+
+    class _Redirecting(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(code)
+            self.send_header("location", target)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    token_endpoint = _serve(_Redirecting)
+    try:
+        p = OAuth2ClientCredentials(
+            token_url=f"http://127.0.0.1:{token_endpoint.server_address[1]}/token",
+            client_id="cid",
+            client_secret="csec",
+            auth_style=style,
+        )
+        with pytest.raises(OAuth2Error, match=f"HTTP {code}"):
+            p.token()
+        assert _Sink.seen == []  # the redirect target was never contacted
+        assert p.cached() is None
+    finally:
+        token_endpoint.shutdown()
+        sink.shutdown()
