@@ -132,6 +132,7 @@ from headroom.providers.copilot import (
 )
 from headroom.providers.copilot import (
     configure_vscode_proxy_settings,
+    copilot_harness_settings_enabled,
     remove_vscode_proxy_settings,
     unrouted_vscode_profiles,
     vscode_proxy_url,
@@ -7405,14 +7406,27 @@ def vscode_copilot(
             click.echo(
                 "  Keep using Copilot's normal model picker; the selected model is preserved."
             )
+            user_enabled = copilot_harness_settings_enabled(target_settings)
+            for key in user_enabled:
+                click.echo(
+                    f'  Warning: {target_settings} sets "{key}": true, so chats on the '
+                    "Copilot harness bypass Headroom. Set it to false to route them."
+                )
+            if not user_enabled:
+                click.echo(
+                    "  New chats stay on VS Code's Local harness; a chat keeps the engine it "
+                    "started with, so start a new chat."
+                )
             return
         click.echo("  Add these user settings to VS Code:")
         click.echo(
             f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
         )
         click.echo(
-            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}"'
+            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
         )
+        click.echo('  "chat.defaultToCopilotHarness": false,')
+        click.echo('  "chat.editor.preferCopilotHarness": false')
 
     _run_proxy_only_watcher(
         agent_label="VS CODE COPILOT",
