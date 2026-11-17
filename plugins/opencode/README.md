@@ -73,6 +73,9 @@ The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `s
 - add `HEADROOM_ACTIVE`, `HEADROOM_PROXY_URL`, `HEADROOM_PROJECT` (and `HEADROOM_BACKEND` when set) to shell command environments.
 - default to `HEADROOM_PROXY_URL`, then `http://127.0.0.1:8787`, when no `proxyUrl` option is supplied.
 - skip routing for hosts listed in `excludeHosts` (or `HEADROOM_OPENCODE_EXCLUDE_HOSTS`); those requests go straight upstream with no compression or telemetry.
+- route the provider base URLs configured in OpenCode, so a compatible gateway with an arbitrary path prefix is still compressed. Only wire endpoints (`/chat/completions`, `/responses`, `/messages`) under a configured base route; other paths on that host pass through.
+
+Routing is decided by method, path shape, and configured bases, never by host identity. A `POST` routes when its path ends in a wire endpoint *and* the segment before that endpoint is a version (`/v1`, `/v1beta`, `/v4`), `api`, or a recognised root (`backend-api`, `codex`, `openai`, `anthropic`, `zen`) — or when it sits under one of OpenCode's configured provider base URLs. Everything else goes direct, including a bare `/messages` on an unknown host: that is the same shape as a messaging API, so becoming the bare path is not evidence of a provider. Two shapes still route without a configured base, because no path can tell them from a gateway: `/api/v2/messages` and `/v2/responses`. List the host in `excludeHosts` if one of your own services has that shape.
 
 On 2.x, setup returns a cleanup that releases the transport, so hot reloads do not stack interceptors.
 
@@ -140,6 +143,7 @@ The provider config exposes these as `headroom/<model>` and defaults to `headroo
 |---|---|---|
 | `HEADROOM_PROXY_URL` | Native plugin | Proxy URL used by `HeadroomPlugin` |
 | `HEADROOM_OPENCODE_EXCLUDE_HOSTS` | Native plugin | Comma-separated hosts (and their subdomains) that bypass the proxy; the `excludeHosts` plugin option takes precedence |
+| `HEADROOM_OPENCODE_WIRE_ROOTS` | Native plugin | Set from OpenCode's configured provider base URLs so spawned Node processes route the same bases; rarely set by hand |
 | `OPENCODE_CONFIG_CONTENT` | OpenCode wrapper | Generated OpenCode provider, model, and MCP config |
 
 ## License
