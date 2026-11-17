@@ -33,6 +33,8 @@ import time
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
+from headroom.log_safety import safe_id
+
 if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import Response, StreamingResponse
@@ -229,7 +231,7 @@ class BedrockHandlerMixin:
                         result.tokens_before,
                         result.tokens_after,
                         tokens_saved,
-                        model_id,
+                        safe_id(model_id),
                     )
             except Exception as err:
                 # Fail open: never break a request because compression failed.
