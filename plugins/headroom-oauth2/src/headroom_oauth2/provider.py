@@ -15,6 +15,8 @@ import time
 import urllib.parse
 import urllib.request
 from contextlib import suppress
+from http.client import HTTPMessage
+from typing import IO, Any
 from urllib.error import HTTPError, URLError
 
 log = logging.getLogger("headroom_oauth2")
@@ -30,6 +32,30 @@ def _https_or_local(url: str) -> bool:
 
 class OAuth2Error(RuntimeError):
     """Raised when a token cannot be minted."""
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Turn a token-endpoint redirect into an HTTPError instead of following it.
+
+    For a POST, urllib follows 301/302/303 as a GET to whatever ``Location`` names,
+    re-sending the Basic ``Authorization`` (client id and secret), and then takes the
+    token from that response. The https/loopback check only covers ``token_url``.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _open(req: urllib.request.Request, timeout: float) -> Any:
+    return urllib.request.build_opener(_RefuseRedirect).open(req, timeout=timeout)
 
 
 class OAuth2ClientCredentials:
@@ -126,7 +152,7 @@ class OAuth2ClientCredentials:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _open(req, self.timeout) as resp:
                 payload = json.load(resp)
         except HTTPError as e:
             with suppress(Exception):
