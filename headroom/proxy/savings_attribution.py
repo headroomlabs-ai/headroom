@@ -58,8 +58,9 @@ MAX_STAGE_MS = 3_600_000.0
 MAX_NAMED_ROWS = 256
 OVERFLOW_SOURCE = "other"
 # Core-booked sources never fold: ``tool_schema_savings_policy`` finds the
-# deferral's row by name to lower it when hooks un-defer tools.
-_UNFOLDED_SOURCES = frozenset({"tool_search"})
+# deferral's row by name to lower it when hooks un-defer tools, and the
+# metrics headline query selects ``source="tool_search"``.
+UNFOLDED_SOURCES = frozenset({"tool_search"})
 
 # A row's sums saturate here instead of overflowing to ``inf`` (see
 # MAX_STAGE_MS for what a non-finite value does downstream). Both are far
@@ -232,16 +233,12 @@ def accumulate(rows: list[dict[str, Any]], items: Iterable[dict[str, Any]]) -> N
     ``tokens``, ``usd`` and ``events``; ``details`` stay only while every
     summed row agrees. Once ``rows`` holds ``MAX_NAMED_ROWS`` rows, a new
     source folds into ``OVERFLOW_SOURCE`` (which also takes unnamed savings),
-    so the list grows by at most the overflow and ``_UNFOLDED_SOURCES`` keys.
+    so the list grows by at most the overflow and ``UNFOLDED_SOURCES`` keys.
     """
     for item in items:
         key = _key(item)
         target = _row_for(rows, key)
-        if (
-            target is None
-            and key[0] not in _UNFOLDED_SOURCES
-            and _row_count(rows) >= MAX_NAMED_ROWS
-        ):
+        if target is None and key[0] not in UNFOLDED_SOURCES and _row_count(rows) >= MAX_NAMED_ROWS:
             if key[0] != OVERFLOW_SOURCE:
                 # Details describe one source; the overflow row mixes several.
                 item = {k: v for k, v in item.items() if k != "details"}
