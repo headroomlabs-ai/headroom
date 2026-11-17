@@ -376,6 +376,27 @@ def test_dedup_folds_user_string_read_observation():
     assert out[1]["content"] == span
 
 
+def test_dedup_never_rewrites_nested_cache_control_tool_result():
+    # Anthropic list-form tool_result whose text sub-block carries the client's
+    # cache_control marker: the block may already be cached under that key, so
+    # it is a reference target only. Control: the same block unmarked folds.
+    span = _readspan()
+
+    def tr(tid, text, marked):
+        sub = {"type": "text", "text": text}
+        if marked:
+            sub["cache_control"] = {"type": "ephemeral"}
+        block = {"type": "tool_result", "tool_use_id": tid, "content": [sub]}
+        return {"role": "user", "content": [block]}
+
+    for marked in (False, True):
+        msgs = [tr("t1", f"a\n{span}", False), tr("t2", f"b\n{span}", marked)]
+        later = _dedup_only(msgs)[1]["content"][0]["content"][0]
+        assert ("[↑" in later["text"]) is not marked
+        if marked:
+            assert later == msgs[1]["content"][0]["content"][0]
+
+
 def test_dedup_does_not_fold_plain_user_prose():
     # A duplicated ORDINARY user message (no preceding read command) must stay
     # verbatim — user intent is never folded.
