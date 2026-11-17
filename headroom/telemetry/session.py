@@ -1,7 +1,8 @@
 """Session aggregation for the anonymous telemetry beacon.
 
 One wide event per session, emitted when the session goes idle. Everything here
-is off unless ``HEADROOM_TELEMETRY`` is explicitly on — see
+is on by default and off when the beacon is disabled (``HEADROOM_BEACON=off``,
+``HEADROOM_TELEMETRY=off``, ``DO_NOT_TRACK=1`` or offline mode) — see
 :mod:`headroom.telemetry.beacon`.
 
 # What counts as a session
@@ -90,6 +91,23 @@ type and its arithmetic, and the folding for the new signals is isolated in
   counted in ``errors`` and deliberately NOT folded into ``failures``, which
   has been 5xx-only in every row of the corpus and must stay that way.
 
+Later additions, same version (they are additive too, and a reader tells
+them apart by presence):
+
+* ``client_usage`` / ``model_usage`` — the session's tokens split by harness
+  and by model. ``clients`` and ``models`` only say who took part; a session
+  that mixed two harnesses, or Haiku with Opus, could not be divided or priced.
+  ``client_usage`` covers every turn, so traffic with no identified harness is
+  a visible row instead of a silent gap.
+* ``client_versions`` — the harness's own release (``claude-code 2.1.311``).
+  Harness releases change request shape far more often than Headroom does.
+* ``install`` — how old this install id is, and whether it lives in a
+  container or CI job. Separates a returning user from an id that is minted
+  fresh on every run.
+* A session that is at least half a day old is closed by the first request on
+  a later UTC day (``ended: "rollover"``), so an always-on proxy reports about
+  one row per day instead of a single total that grows for weeks.
+
 Everything added is a counter, a ratio, or a slug from a vocabulary that is
 closed in code. Two things are still refused on principle: anything derived
 from prompt or file content (which is why ``turn_id`` and TOIN's
@@ -119,6 +137,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.utils import remember_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +364,80 @@ _WASTE_KEYS = (
 _STRATUM_TREATMENT = "output_shaper:stratum:"
 _STRATUM_CONTROL = "output_shaper:control:"
 
+# Per-turn token columns of `client_usage` and `model_usage`, in order. `n` is
+# turns. Every column is the raw per-turn counter, so each sums to its session
+# total.
+#
+# To price a row, do what `CostTracker.record` does: where a provider reports
+# no write count, Headroom infers one as input minus cached, and those are the
+# same tokens as `uncached`, never billed as a write. `cache_write_inferred`
+# is that part, so billed input is
+#     uncached + cache_read + (cache_write - cache_write_inferred)
+# and `cache_write_5m` / `cache_write_1h` split the billed writes by TTL, which
+# changes their rate.
+_USAGE_FIELDS = (
+    "n",
+    "original",
+    "saved",
+    "tool_saved",
+    "output",
+    "cache_read",
+    "cache_write",
+    "cache_write_inferred",
+    "cache_write_5m",
+    "cache_write_1h",
+    "uncached",
+)
+# Rows per usage table before the rest pool into "other". A session rarely
+# sees more than three harnesses or five models; every row is eleven numbers on
+# a payload that is re-sent every five minutes, and `_fit_to_wire` cannot shed
+# these rows, so the cap is what bounds them.
+MAX_USAGE_ROWS = 8
+MAX_CLIENT_VERSIONS = 16
+# Every harness name `client_usage` and `client_versions` may carry. The value
+# comes from `classify_client`, which returns the caller's own `X-Client`
+# header when one is sent, so a shape check alone would put whatever a caller
+# typed there on the wire with token volumes attached. Names outside this set
+# pool into "other". Mirrors `CLIENT_UA_MAP` in headroom/proxy/auth_policy.py
+# and `_KNOWN_WRAP_AGENTS` in context.py; duplicated because this package does
+# not import `headroom.proxy` (see `record_stack`), and a test holds them equal.
+_KNOWN_CLIENTS = frozenset(
+    {
+        "aider",
+        "anthropic_cli",
+        "antigravity",
+        "claude",
+        "claude_code",
+        "claude_vscode",
+        "codex",
+        "copilot",
+        "cursor",
+        "droid",
+        "grok_build",
+        "omp",
+        "openclaw",
+        "opencode",
+        "strands",
+        "zed",
+    }
+)
+# Labels for turns no harness claimed, so `client_usage` sums to
+# `session.turns`. Measured on the corpus: a quarter of sessions carried no
+# harness at all, and most of those turns came through /v1/compress.
+_CLIENT_VIA_MCP = "via_mcp"
+_CLIENT_VIA_COMPRESS = "via_compress_api"
+_CLIENT_UNIDENTIFIED = "unidentified"
+# A harness release as it appears in a User-Agent: up to three numeric parts.
+# Anything else (a build hash, a hostname) is not a version and is not sent.
+_VERSION_RE = re.compile(r"^\d{1,4}(?:\.\d{1,4}){0,2}$")
+# A session at least this old is closed by the first request on a later UTC
+# day. Long enough that an afternoon of work running past midnight UTC stays
+# one session; short enough that the pieces of an always-on proxy, which start
+# a few seconds after midnight, are old enough to close at the next one. The
+# first piece can therefore span two dates; every later one is a single day.
+ROLLOVER_MIN_AGE_S = 12 * 3600.0
+_INSTALL_AGE_CAP_DAYS = 9999
+
 # Environment variables whose values may be reported, by name. An allowlist,
 # never a dump of the environment: a variable absent from this tuple cannot
 # reach the wire whatever it holds, and every value that does is put through
@@ -410,6 +503,10 @@ _staged_shapes: dict[tuple[str, str], list[int]] = {}
 # tool-output shape slug -> [events, tokens_in, tokens_out]. The structural
 # descriptor only — never TOIN's `structure_hash`. See `record_tool_shape`.
 _staged_tool_shapes: dict[str, list[int]] = {}
+# (harness, version) -> requests. Staged because only the HTTP middleware sees
+# the User-Agent, and it runs before any outcome exists. See
+# `record_client_version`.
+_staged_client_versions: dict[tuple[str, str], int] = {}
 
 
 def _pct(numerator: float, denominator: float) -> float:
@@ -469,6 +566,76 @@ def _bump(counter: dict[str, int], key: str, *, cap: int = MAX_SHAPES) -> None:
     counter[key] = counter.get(key, 0) + 1
 
 
+def _tool_saved(tags: Any) -> int:
+    """Tool-schema tokens saved on one turn. These live only in tags — see the
+    same arithmetic in emit_request_outcome, which feeds the local dashboard."""
+    total = 0
+    if isinstance(tags, dict):
+        for tag in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
+            try:
+                total += int(tags.get(tag, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def _add_usage(table: dict[str, list[int]], key: str, values: tuple[int, ...]) -> None:
+    """Add one turn to a usage table. Past the cap, new keys pool into "other".
+
+    Pooled rather than dropped, unlike `_bump`: these tables exist to split the
+    session's totals, and a split that silently loses turns stops adding up.
+    """
+    if key not in table and len(table) >= MAX_USAGE_ROWS:
+        key = "other"
+    row = table.setdefault(key, [0] * len(values))
+    for index, value in enumerate(values):
+        row[index] += value
+
+
+def _known_client(value: Any) -> str:
+    """A harness name from `_KNOWN_CLIENTS`, else "other"."""
+    slug = _client_slug(value)
+    return slug if slug in _KNOWN_CLIENTS else "other"
+
+
+def _usage_rows(label: str, table: dict[str, list[int]]) -> list[dict[str, Any]]:
+    return [
+        {label: key, **dict(zip(_USAGE_FIELDS, row, strict=True))}
+        for key, row in sorted(table.items())
+    ]
+
+
+def _install_facts() -> dict[str, Any]:
+    """Age of this install id and where it is running. Three closed values.
+
+    The corpus could not tell a user who came back from an id minted fresh on
+    every container start: Linux proxies showed five times the installs of
+    macOS for the same traffic. `age_days` is how long ago the id file was
+    written, so it needs no new state and resets with the id. It is 0 when no
+    id is kept on disk (stateless mode, or a file that could not be written),
+    which is what an id minted per run looks like.
+    """
+    from headroom import paths
+
+    age_days = 0
+    if not paths.process_is_stateless():
+        try:
+            written = _install_id_path().stat().st_mtime
+        except OSError:
+            pass  # no id file: age stays 0
+        else:
+            age_days = min(max(int((time.time() - written) // 86400), 0), _INSTALL_AGE_CAP_DAYS)
+    return {
+        "age_days": age_days,
+        "container": bool(
+            os.environ.get("KUBERNETES_SERVICE_HOST")
+            or os.path.exists("/.dockerenv")
+            or os.path.exists("/run/.containerenv")
+        ),
+        "ci": os.environ.get("CI", "").strip().lower() in ("1", "true", "yes"),
+    }
+
+
 def _turn_kind(*, cached: bool, status: int, passthrough: bool, attempted: int, saved: int) -> str:
     """Classify one turn into the closed `_TURN_KINDS` alphabet.
 
@@ -510,7 +677,11 @@ def _config_snapshot() -> dict[str, str]:
     return out
 
 
+# Least-recently-used first. ``model`` comes from the request body, so the
+# entry count is capped (#4479); a model that falls out is simply looked up
+# again the next time it is seen.
 _model_cache: dict[str, str | None] = {}
+_MODEL_CACHE_MAXSIZE = 256
 
 
 def _public_model(model: str) -> str | None:
@@ -529,8 +700,13 @@ def _public_model(model: str) -> str | None:
     """
     if not model:
         return None
-    if model in _model_cache:
-        return _model_cache[model]
+    try:
+        cached = _model_cache[model]
+    except KeyError:
+        pass
+    else:
+        remember_bounded(_model_cache, model, cached, _MODEL_CACHE_MAXSIZE)
+        return cached
 
     resolved: str | None = None
     try:
@@ -545,9 +721,7 @@ def _public_model(model: str) -> str | None:
     except Exception:
         resolved = None
 
-    # ponytail: unbounded dict, but it is keyed by distinct model ids seen in
-    # one process — a handful. Cap it if a router ever fans out over hundreds.
-    _model_cache[model] = resolved
+    remember_bounded(_model_cache, model, resolved, _MODEL_CACHE_MAXSIZE)
     return resolved
 
 
@@ -760,6 +934,10 @@ class _Session:
     strata_turn_kind: dict[str, int] = field(default_factory=dict)
     strata_input_bucket: dict[str, int] = field(default_factory=dict)
     strata_tools: dict[str, int] = field(default_factory=dict)
+    # label -> one count per `_USAGE_FIELDS` column.
+    client_usage: dict[str, list[int]] = field(default_factory=dict)
+    model_usage: dict[str, list[int]] = field(default_factory=dict)
+    client_versions: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def observe(self, name: str, value: float) -> None:
         """Record one sample into a named histogram."""
@@ -1175,6 +1353,23 @@ class _Session:
             "config": [
                 {"key": key, "value": value} for key, value in sorted(_config_snapshot().items())
             ],
+            # The session's tokens split by harness and by model. Each table's
+            # `n` sums to `session.turns` and each token column to its total in
+            # `tokens`, so either one divides the session without residue.
+            # `clients` and `models` above are left exactly as they were.
+            "client_usage": _usage_rows("client", self.client_usage),
+            "model_usage": _usage_rows("model", self.model_usage),
+            # Requests by harness release. Counted at the HTTP layer, so `n` is
+            # requests, not turns: it includes ones that never became a turn,
+            # and a request that lands just before a session closes is counted
+            # in whichever session folds next. WebSocket sessions never pass
+            # that layer and are absent. Read it as "which releases, roughly
+            # how much", not as a split of the session.
+            "client_versions": [
+                {"client": client, "version": version, "n": count}
+                for (client, version), count in sorted(self.client_versions.items())
+            ],
+            "install": _install_facts(),
         }
 
 
@@ -1213,6 +1408,17 @@ class SessionAggregator:
                 # snapshots are cumulative.
                 if live is not None and now - live.last_seen >= self._idle_s:
                     pending.append(live.payload("idle"))
+                    live = None
+                # An always-on proxy never goes idle, so its one session grew
+                # for weeks and a day's activity could only be recovered by
+                # differencing heartbeats. Closing at the day boundary makes
+                # each row one day's work.
+                if (
+                    live is not None
+                    and now - live.started >= ROLLOVER_MIN_AGE_S
+                    and now // 86400 != live.started // 86400
+                ):
+                    pending.append(live.payload("rollover"))
                     live = None
                 if live is None:
                     live = _Session(
@@ -1336,14 +1542,9 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     # problem, not a compression problem, and the two are indistinguishable
     # from the token counts alone.
     tags = get("tags", None) or {}
+    tool_saved = _tool_saved(tags)
     if isinstance(tags, dict):
-        # Tool-schema savings live only in tags — see the same arithmetic in
-        # emit_request_outcome, which feeds the local dashboard.
-        for tag in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
-            try:
-                sess.tool_saved_tokens += int(tags.get(tag, 0) or 0)
-            except (TypeError, ValueError):
-                pass
+        sess.tool_saved_tokens += tool_saved
         for tag in _REASON_TAGS:
             if tag in tags:
                 key = f"{tag.removesuffix('_reason')}:{_safe_slug(tags[tag])}"
@@ -1368,7 +1569,7 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     # `_fold` before the caller's heartbeat check and costs a whole emission,
     # which is a v1 consequence for a v2 fault.
     try:
-        _fold_extra(sess, get, now, prev_seen, tags, status)
+        _fold_extra(sess, get, now, prev_seen, tags, status, source, tool_saved)
     except Exception:
         logger.debug("telemetry: v2 fold failed", exc_info=True)
 
@@ -1380,6 +1581,8 @@ def _fold_extra(
     prev_seen: float | None,
     tags: Any,
     status: int,
+    source: str = "proxy",
+    tool_saved: int = 0,
 ) -> None:
     """Fold the schema-v2 signals. Additive by construction.
 
@@ -1399,6 +1602,42 @@ def _fold_extra(
     is_dict_tags = isinstance(tags, dict)
     passthrough = is_dict_tags and "passthrough_reason" in tags
     cached = bool(get("from_response_cache", False))
+
+    # -- usage by harness and by model --------------------------------------
+    # The same per-turn quantities `_fold` adds to the session totals, so each
+    # table sums back to them. First in this function for that reason: a fault
+    # in a section below must not leave a turn counted in `tokens` and missing
+    # here.
+    cache_write = int(get("cache_write_tokens") or 0)
+    turn = (
+        1,
+        original,
+        saved,
+        tool_saved,
+        int(get("output_tokens") or 0),
+        int(get("cache_read_tokens") or 0),
+        cache_write,
+        cache_write if get("cache_inferred", False) else 0,
+        int(get("cache_write_5m_tokens") or 0),
+        int(get("cache_write_1h_tokens") or 0),
+        int(get("uncached_input_tokens") or 0),
+    )
+    client = get("client", None)
+    if client:
+        label = _known_client(client)
+    elif source == "mcp":
+        label = _CLIENT_VIA_MCP
+    elif get("provider", "") == "compress":
+        label = _CLIENT_VIA_COMPRESS
+    else:
+        label = _CLIENT_UNIDENTIFIED
+    _add_usage(sess.client_usage, label, turn)
+    # A model id no public registry vouches for can carry an org name (see
+    # `_public_model`), so it is pooled, never sent.
+    _add_usage(sess.model_usage, _public_model(str(get("model", "") or "")) or "other", turn)
+    for version_key, count in _drain_staged_client_versions().items():
+        if version_key in sess.client_versions or len(sess.client_versions) < MAX_CLIENT_VERSIONS:
+            sess.client_versions[version_key] = sess.client_versions.get(version_key, 0) + count
 
     # -- distributions ------------------------------------------------------
     sess.observe("turn_tokens", original)
@@ -1905,8 +2144,8 @@ def record_compression(strategy: str, original_tokens: int, compressed_tokens: i
     (``PrometheusMetrics.tokens_saved_by_strategy``); they just never left the
     process.
 
-    Same discipline as the rest of this module: off by default and cheap when
-    off, never raises. This runs once per routing decision, so it must not do
+    Same discipline as the rest of this module: cheap when the beacon is
+    disabled, never raises. This runs once per routing decision, so it must not do
     anything a request would notice.
     """
     from headroom.telemetry.beacon import is_beacon_enabled
@@ -2022,7 +2261,7 @@ def record_content_shape(
 
     Single-observation form of :func:`record_content_shapes`, which is what the
     router actually calls. Same discipline as everything else in this module:
-    off by default, cheap when off, never raises, and never touches the
+    cheap when the beacon is disabled, never raises, and never touches the
     aggregator lock.
     """
     record_content_shapes(((content_type, strategy, original_tokens, compressed_tokens),))
@@ -2167,6 +2406,37 @@ class BeaconCompressionObserver:
         record_compression(strategy, original_tokens, compressed_tokens)
 
 
+def record_client_version(client: Any, version: Any) -> None:
+    """Beacon entry point for one request's harness release.
+
+    Called from the proxy's HTTP middleware, the only place that sees the
+    User-Agent. Both parts are validated here rather than trusted: the harness
+    must slug cleanly and the version must be numeric, so a User-Agent that
+    carries anything else contributes nothing.
+    """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
+    if not is_beacon_enabled():
+        return
+    slug, text = _known_client(client), str(version or "")
+    if slug == "other" or not _VERSION_RE.match(text):
+        return
+    key = (slug, text)
+    with _staged_lock:
+        if key in _staged_client_versions or len(_staged_client_versions) < MAX_CLIENT_VERSIONS:
+            _staged_client_versions[key] = _staged_client_versions.get(key, 0) + 1
+
+
+def _drain_staged_client_versions() -> dict[tuple[str, str], int]:
+    """Take every staged (harness, version) request count."""
+    with _staged_lock:
+        if not _staged_client_versions:
+            return {}
+        drained = dict(_staged_client_versions)
+        _staged_client_versions.clear()
+        return drained
+
+
 def _drain_staged_strategies() -> dict[str, list[int]]:
     """Take everything staged since the last drain. Caller merges it."""
     with _staged_lock:
@@ -2200,8 +2470,8 @@ def _drain_staged_tool_shapes() -> dict[str, list[int]]:
 def record_outcome(outcome: Any) -> None:
     """Beacon entry point, called from the proxy's outcome funnel.
 
-    Off by default and cheap when off: the enabled check short-circuits before
-    the aggregator is ever constructed, so a user who never opted in pays one
+    Cheap when the beacon is disabled: the enabled check short-circuits before
+    the aggregator is ever constructed, so a user who has opted out pays one
     env lookup per request and allocates nothing.
     """
     from headroom.telemetry.beacon import is_beacon_enabled

@@ -14,6 +14,9 @@ var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 var PROJECT_HEADER = "x-headroom-project";
 var SESSION_TOKEN_HEADER = "x-headroom-session-token";
+function projectHeaderValue(project) {
+  return encodeURIComponent(project);
+}
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 var TOOL_POLICY_ENV = "HEADROOM_TOOL_POLICY_JSON";
@@ -28,6 +31,7 @@ var DEFAULT_REFRESH_SECONDS = 300;
 var MAX_REFRESH_SECONDS = 3600;
 var REMOTE_TIMEOUT_MS = 5e3;
 var MAX_REMOTE_POLICY_BYTES = 1024 * 1024;
+var WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 var ToolPolicyEnforcementError = class extends Error {
   decision;
@@ -494,13 +498,20 @@ async function refreshHeadroomToolPolicy(now = Date.now() / 1e3) {
       now
     );
     state.policyUnavailable = void 0;
-    installProcessEnv(state.proxyUrl, state.excludeHosts, state.toolPolicy);
+    installProcessEnv(state.proxyUrl, state.excludeHosts, state.toolPolicy, state.wireRoots);
   } catch (error) {
     state.toolPolicy = void 0;
     state.policyUnavailable = error instanceof Error ? error.message : String(error);
   }
 }
-function withShimEnv(env, proxyUrl2, excludeHosts, toolPolicy) {
+function withWireRootsEnv(env, wireRoots) {
+  if (wireRoots.length > 0) {
+    env[WIRE_ROOTS_ENV] = wireRoots.map((root) => `${root.origin}${root.path}`).join(",");
+  } else {
+    delete env[WIRE_ROOTS_ENV];
+  }
+}
+function withShimEnv(env, proxyUrl2, excludeHosts, toolPolicy, wireRoots) {
   const nextEnv = { ...env ?? process.env };
   delete nextEnv[TOOL_POLICY_TOKEN_ENV];
   delete nextEnv[TOOL_POLICY_URL_ENV];
@@ -517,6 +528,7 @@ function withShimEnv(env, proxyUrl2, excludeHosts, toolPolicy) {
     delete nextEnv[TOOL_POLICY_ENV];
     delete nextEnv[TOOL_POLICY_VALID_UNTIL_ENV];
   }
+  withWireRootsEnv(nextEnv, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
@@ -530,7 +542,7 @@ function withExcludeHostsEnv(env, excludeHosts) {
     delete env[EXCLUDE_HOSTS_ENV];
   }
 }
-var PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, "NODE_OPTIONS"];
+var PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, WIRE_ROOTS_ENV, "NODE_OPTIONS"];
 function snapshotProcessEnv() {
   return Object.fromEntries(PROCESS_ENV_KEYS.map((key) => [key, process.env[key]]));
 }
@@ -543,7 +555,7 @@ function restoreProcessEnv(saved) {
     }
   }
 }
-function installProcessEnv(proxyUrl2, excludeHosts, toolPolicy) {
+function installProcessEnv(proxyUrl2, excludeHosts, toolPolicy, wireRoots) {
   process.env[PROXY_ENV] = proxyUrl2;
   withExcludeHostsEnv(process.env, excludeHosts);
   if (toolPolicy) {
@@ -557,6 +569,7 @@ function installProcessEnv(proxyUrl2, excludeHosts, toolPolicy) {
     delete process.env[TOOL_POLICY_ENV];
     delete process.env[TOOL_POLICY_VALID_UNTIL_ENV];
   }
+  withWireRootsEnv(process.env, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
@@ -565,21 +578,21 @@ function installProcessEnv(proxyUrl2, excludeHosts, toolPolicy) {
 function isOptions(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
 }
-function injectOptionsEnv(args, optionIndex, proxyUrl2) {
-  const state = getState();
+function injectOptionsEnv(args, optionIndex, state) {
   const nextArgs = [...args];
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
   existing.env = withShimEnv(
     existing.env,
-    proxyUrl2,
-    state?.excludeHosts ?? [],
-    state?.toolPolicy
+    state.proxyUrl,
+    state.excludeHosts,
+    state.toolPolicy,
+    state.wireRoots
   );
   if (process.platform === "win32" && existing.windowsHide === void 0) {
     existing.windowsHide = true;
   }
-  if (isOptions(nextArgs[optionIndex])) {
+  if (isOptions(nextArgs[optionIndex]) || nextArgs[optionIndex] == null && optionIndex < nextArgs.length) {
     nextArgs[optionIndex] = existing;
   } else {
     nextArgs.splice(optionIndex, 0, existing);
@@ -1121,6 +1134,10 @@ function effectiveChildCwd(value) {
   }
   return process.cwd();
 }
+function optionsIndexAfterArgs(args) {
+  const params = typeof args.at(-1) === "function" ? args.slice(0, -1) : args;
+  return Array.isArray(params[1]) || params.length > 2 && params[1] == null ? 2 : 1;
+}
 function wrapSpawn(originalSpawn) {
   return function headroomSpawn(...args) {
     const state = getState();
@@ -1130,7 +1147,8 @@ function wrapSpawn(originalSpawn) {
     const command = String(args[0] ?? "");
     const commandArgs = Array.isArray(args[1]) ? args[1].map((entry) => String(entry)) : [];
     const resource = [command, ...commandArgs].join(" ").trim() || command;
-    const options = isOptions(args[Array.isArray(args[1]) ? 2 : 1]) ? args[Array.isArray(args[1]) ? 2 : 1] : void 0;
+    const optionIndex = optionsIndexAfterArgs(args);
+    const options = isOptions(args[optionIndex]) ? args[optionIndex] : void 0;
     enforcePolicy(state.toolPolicy, {
       scope: "shell",
       resource,
@@ -1140,8 +1158,7 @@ function wrapSpawn(originalSpawn) {
       env: options?.env,
       atomicCommand: options?.shell !== true && typeof options?.shell !== "string"
     });
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function wrapExec(originalExec) {
@@ -1160,7 +1177,7 @@ function wrapExec(originalExec) {
       cwd: effectiveChildCwd(options?.cwd),
       env: options?.env
     });
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state.proxyUrl));
+    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state));
   };
 }
 function wrapExecFile(originalExecFile) {
@@ -1172,7 +1189,8 @@ function wrapExecFile(originalExecFile) {
     const command = String(args[0] ?? "");
     const commandArgs = Array.isArray(args[1]) ? args[1].map((entry) => String(entry)) : [];
     const resource = [command, ...commandArgs].join(" ").trim() || command;
-    const options = isOptions(args[Array.isArray(args[1]) ? 2 : 1]) ? args[Array.isArray(args[1]) ? 2 : 1] : void 0;
+    const optionIndex = optionsIndexAfterArgs(args);
+    const options = isOptions(args[optionIndex]) ? args[optionIndex] : void 0;
     enforcePolicy(state.toolPolicy, {
       scope: "shell",
       resource,
@@ -1182,8 +1200,7 @@ function wrapExecFile(originalExecFile) {
       env: options?.env,
       atomicCommand: options?.shell !== true && typeof options?.shell !== "string"
     });
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function wrapFork(originalFork) {
@@ -1195,7 +1212,8 @@ function wrapFork(originalFork) {
     const command = String(args[0] ?? "");
     const commandArgs = Array.isArray(args[1]) ? args[1].map((entry) => String(entry)) : [];
     const resource = [command, ...commandArgs].join(" ").trim() || command;
-    const options = isOptions(args[Array.isArray(args[1]) ? 2 : 1]) ? args[Array.isArray(args[1]) ? 2 : 1] : void 0;
+    const optionIndex = optionsIndexAfterArgs(args);
+    const options = isOptions(args[optionIndex]) ? args[optionIndex] : void 0;
     enforcePolicy(state.toolPolicy, {
       scope: "shell",
       resource,
@@ -1205,21 +1223,58 @@ function wrapFork(originalFork) {
       env: options?.env,
       atomicCommand: true
     });
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function normalizeProxyUrl(proxyUrl2) {
   return new URL(proxyUrl2);
 }
+var reportedProxyUrls = /* @__PURE__ */ new Set();
+function usableProxyUrl(proxyUrl2) {
+  try {
+    const proxy = normalizeProxyUrl(proxyUrl2);
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl2)) {
+      reportedProxyUrls.add(proxyUrl2);
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl2 === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
+    }
+    return void 0;
+  }
+}
+function canonicalHostname(hostname) {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
 function isLoopback(hostname) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+  const normalized = canonicalHostname(hostname);
+  if (normalized === "localhost" || normalized === "::1" || normalized === "0.0.0.0") {
+    return true;
+  }
+  if (isLoopbackIpv4(normalized)) {
+    return true;
+  }
+  const mapped = /^::ffff:(.+)$/.exec(normalized)?.[1];
+  if (!mapped) {
+    return false;
+  }
+  if (isLoopbackIpv4(mapped)) {
+    return true;
+  }
+  const groups = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(mapped);
+  if (!groups) {
+    return false;
+  }
+  const address = parseInt(groups[1], 16) << 16 | parseInt(groups[2], 16);
+  return address >>> 24 === 127;
+}
+function isLoopbackIpv4(host) {
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 function normalizeExcludeHosts(entries) {
   const hosts = /* @__PURE__ */ new Set();
   for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
-    const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
+    const host = canonicalHostname(String(entry).trim()).replace(/^(?:\*\.|\.)/, "");
     if (host) {
       hosts.add(host);
     }
@@ -1227,11 +1282,57 @@ function normalizeExcludeHosts(entries) {
   return [...hosts];
 }
 function isExcludedHost(hostname, excludeHosts) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const normalized = canonicalHostname(hostname);
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
-function isLlmEndpointPath(pathname) {
-  return pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages") || pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent");
+function normalizeWireRoots(entries) {
+  const roots = /* @__PURE__ */ new Map();
+  for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
+    const raw = String(entry).trim();
+    if (!raw) {
+      continue;
+    }
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        continue;
+      }
+      const path2 = url.pathname.replace(/\/+$/, "");
+      roots.set(`${url.origin}${path2}`, { origin: url.origin, path: path2 });
+    } catch {
+    }
+  }
+  return [...roots.values()];
+}
+function isConfiguredWireRoot(origin, pathname, wireRoots) {
+  return wireRoots.some(
+    (root) => root.origin === origin && (root.path === "" ? pathname.startsWith("/") : pathname === root.path || pathname.startsWith(`${root.path}/`))
+  );
+}
+var NAMED_WIRE_ROOTS = /* @__PURE__ */ new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
+var IMMEDIATE_WIRE_ROOTS = /* @__PURE__ */ new Set(["api"]);
+function isVersionSegment(segment) {
+  return /^v\d+[a-z0-9]*$/i.test(segment);
+}
+function hasWireRootBefore(body) {
+  const segments = body.split("/").filter(Boolean);
+  const last = segments.at(-1);
+  return last !== void 0 && (isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s)));
+}
+function isLlmEndpointPath(pathname, origin = "", wireRoots = []) {
+  if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
+    return true;
+  }
+  for (const suffix of ["/chat/completions", "/responses", "/messages"]) {
+    if (!pathname.endsWith(suffix)) {
+      continue;
+    }
+    if (isConfiguredWireRoot(origin, pathname, wireRoots)) {
+      return true;
+    }
+    return hasWireRootBefore(pathname.slice(0, -suffix.length));
+  }
+  return false;
 }
 function isRoutableUpstream(url, proxy, excludeHosts) {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -1248,8 +1349,14 @@ function isRoutableUpstream(url, proxy, excludeHosts) {
   }
   return true;
 }
-function shouldRoute(url, proxy, excludeHosts) {
-  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+function isLlmMethod(method) {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+function shouldRoute(url, proxy, excludeHosts, method, wireRoots = []) {
+  if (!isLlmMethod(method) || !isRoutableUpstream(url, proxy, excludeHosts)) {
+    return false;
+  }
+  return isLlmEndpointPath(url.pathname, url.origin, wireRoots);
 }
 function routedUrl(upstream, proxy) {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
@@ -1298,16 +1405,17 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
   }
   return headers;
 }
-function withRoutedFetchInput(input, init, proxy, project, excludeHosts, sessionToken) {
+function withRoutedFetchInput(input, init, proxy, project, excludeHosts, sessionToken, wireRoots = []) {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy, excludeHosts)) {
+  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method, wireRoots)) {
     return [input, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
@@ -1320,7 +1428,7 @@ function withRoutedFetchInput(input, init, proxy, project, excludeHosts, session
   }
   return [nextUrl, nextInit];
 }
-function splitNodeArgs(args) {
+function splitNodeArgs(args, defaultProtocol) {
   const callback = typeof args.at(-1) === "function" ? args.at(-1) : void 0;
   const withoutCallback = callback ? args.slice(0, -1) : args;
   const [first, second] = withoutCallback;
@@ -1337,12 +1445,12 @@ function splitNodeArgs(args) {
   }
   if (typeof first === "object" && first !== null) {
     const requestOptions = { ...first, ...options };
-    return { url: urlFromRequestOptions(requestOptions), options: requestOptions, callback };
+    return { url: urlFromRequestOptions(requestOptions, defaultProtocol), options: requestOptions, callback };
   }
   return { options, callback };
 }
-function urlFromRequestOptions(options) {
-  const protocol = String(options.protocol ?? "http:");
+function urlFromRequestOptions(options, defaultProtocol) {
+  const protocol = String(options.protocol ?? defaultProtocol);
   if (protocol !== "http:" && protocol !== "https:") {
     return void 0;
   }
@@ -1366,7 +1474,7 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
@@ -1378,8 +1486,8 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
   });
   return result;
 }
-function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
-  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
+function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken, wireRoots = []) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET", wireRoots)) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -1418,8 +1526,11 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     if (!state) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const proxy = normalizeProxyUrl(state.proxyUrl);
-    const parts = splitNodeArgs(args);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
+    const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
     if (parts.url) {
       enforcePolicy(state.toolPolicy, {
         scope: "http",
@@ -1432,7 +1543,8 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
       proxy,
       state.project,
       state.excludeHosts,
-      state.sessionToken
+      state.sessionToken,
+      state.wireRoots
     );
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
@@ -1464,9 +1576,8 @@ function wrapHttp2Connect(originalConnect) {
   };
 }
 function installHeadroomTransport(options) {
-  const excludeHosts = normalizeExcludeHosts(
-    options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? ""
-  );
+  const excludeHosts = normalizeExcludeHosts(options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+  const wireRoots = normalizeWireRoots(options.wireRoots ?? process.env[WIRE_ROOTS_ENV] ?? "");
   const existing = getState();
   const selectedSource = resolveToolPolicySource(options, existing);
   let toolPolicy;
@@ -1504,9 +1615,10 @@ function installHeadroomTransport(options) {
     existing.proxyUrl = options.proxyUrl;
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
+    existing.wireRoots = wireRoots;
     existing.debug = Boolean(options.debug);
     existing.sessionToken = options.sessionToken;
-    installProcessEnv(options.proxyUrl, excludeHosts, existing.toolPolicy);
+    installProcessEnv(options.proxyUrl, excludeHosts, existing.toolPolicy, wireRoots);
     return () => uninstallHeadroomTransport();
   }
   const state = {
@@ -1515,6 +1627,7 @@ function installHeadroomTransport(options) {
     proxyUrl: options.proxyUrl,
     project: options.project,
     excludeHosts,
+    wireRoots,
     debug: Boolean(options.debug),
     toolPolicy,
     toolPolicyInput: options.toolPolicy,
@@ -1541,7 +1654,7 @@ function installHeadroomTransport(options) {
     originalEnv: snapshotProcessEnv()
   };
   setState(state);
-  installProcessEnv(options.proxyUrl, excludeHosts, toolPolicy);
+  installProcessEnv(options.proxyUrl, excludeHosts, toolPolicy, wireRoots);
   globalThis.fetch = async (...args) => {
     const current = getState();
     if (!current) {
@@ -1554,14 +1667,18 @@ function installHeadroomTransport(options) {
       resource: upstream.href,
       url: upstream
     });
-    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
     const [nextInput, nextInit] = withRoutedFetchInput(
       args[0],
       args[1],
       proxy,
       current.project,
       current.excludeHosts,
-      current.sessionToken
+      current.sessionToken,
+      current.wireRoots
     );
     return state.originalFetch(nextInput, nextInit);
   };

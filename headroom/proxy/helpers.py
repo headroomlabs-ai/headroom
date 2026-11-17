@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import ssl
 import threading
 import time
 import warnings
@@ -338,6 +339,9 @@ FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
     "transfer-encoding",
     "connection",
     "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
     "server",
 )
 
@@ -351,11 +355,18 @@ def sanitize_forwarded_response_headers(
     Pass any additional header names to strip as ``extra_names`` (for
     example ``"content-type"`` when the caller sets its own media type).
 
+    Header names listed in the ``Connection`` value are connection-local
+    (RFC 9110 section 7.6.1) and are dropped too.
+
     Matching is case-insensitive, but the casing of the headers that
     survive is left untouched.
     """
+    items = dict(headers)
     drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
-    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+    for key, value in items.items():
+        if key.lower() == "connection":
+            drop.update(token.strip().lower() for token in str(value).split(",") if token.strip())
+    return {key: value for key, value in items.items() if key.lower() not in drop}
 
 
 def _path_for_log(path: str) -> str:
@@ -458,6 +469,12 @@ def count_cache_breakpoints(
             if not isinstance(msg, dict):
                 continue
             found = 1 if "cache_control" in msg else 0
+            # OpenAI chat shape: markers on an assistant's tool_calls entries.
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                found += sum(
+                    1 for tc in tool_calls if isinstance(tc, dict) and "cache_control" in tc
+                )
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
@@ -847,6 +864,16 @@ def enforce_cache_breakpoint_budget(
                                 budget["left"] -= 1
                         new_blocks.append(block)
                     msg = {**msg, "content": new_blocks}
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and budget["left"] > 0:
+                    new_calls = []
+                    for tc in tool_calls:
+                        if budget["left"] > 0 and isinstance(tc, dict) and "cache_control" in tc:
+                            tc = {k: v for k, v in tc.items() if k != "cache_control"}
+                            budget["left"] -= 1
+                        new_calls.append(tc)
+                    if new_calls != tool_calls:
+                        msg = {**msg, "tool_calls": new_calls}
                 if budget["left"] > 0 and "cache_control" in msg:
                     msg = {k: v for k, v in msg.items() if k != "cache_control"}
                     budget["left"] -= 1
@@ -1069,10 +1096,24 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     return []
 
 
+def is_third_party_model(model: str | None, *, third_party_upstream: bool) -> bool:
+    """Whether a request is for a non-Claude model on an upstream Headroom does not own.
+
+    Headroom has no wire contract for such a model (a vLLM or GLM endpoint
+    speaking the Anthropic Messages format), and the client already sends its
+    mid-conversation system sections there directly. A Claude-named model
+    behind a gateway may still reach a provider without that feature, so it is
+    not one.
+    """
+    return third_party_upstream and "claude" not in str(model or "").lower()
+
+
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
     model: str | None = None,
+    *,
+    third_party_model: bool = False,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
     """Relocate only system messages invalid for the selected Anthropic model.
 
@@ -1081,6 +1122,12 @@ def relocate_system_messages_to_top_level(
     placed at the end. Hoisting those changes semantics and invalidates the
     cached prefix. The initial/invalid forms are still moved to the top-level
     field as the issue-765 last-line wire-contract guard.
+
+    ``third_party_model`` (see :func:`is_third_party_model`) treats the model as
+    supported: the client's sections stay where it put them. Hoisting them
+    there would append to the top-level ``system`` whenever a turn adds a
+    section, so the upstream's prefix cache would miss the whole conversation
+    on every such turn.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved. Only
@@ -1095,7 +1142,7 @@ def relocate_system_messages_to_top_level(
     the common path is untouched.
     """
     model_id = str(model or "").lower()
-    supports_mid_conversation = any(
+    supports_mid_conversation = third_party_model or any(
         family in model_id
         for family in (
             "claude-fable-5",
@@ -1291,8 +1338,11 @@ def append_text_to_latest_user_input_item(
     return body_input, 0
 
 
-# Maximum request body size (100MB - increased to support image-heavy requests)
-MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+# Bound the entire history before JSON parsing or compression. Larger image-heavy
+# bodies can amplify far beyond their wire size during preprocessing (#4139).
+MAX_REQUEST_BODY_SIZE = request_limit_policy.resolve_request_body_max_bytes(
+    os.environ.get(request_limit_policy.REQUEST_BODY_MAX_BYTES_ENV)
+)
 
 # A *decompressed* body obeys the same ceiling as an uncompressed one. The
 # Content-Length gate at the handlers only ever saw the compressed wire size, so
@@ -1718,6 +1768,30 @@ def overload_retry_is_futile(response: httpx.Response, max_ms: int, retries_left
 RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
 
 
+class RequestWriteTrace:
+    """httpcore ``trace`` extension that records a failed request write.
+
+    httpcore maps an ``ssl.SSLError`` to ``ConnectError`` only during the
+    handshake. Later, a corrupt TLS record surfaces as a raw ``ssl.SSLError``
+    that says nothing about whether upstream received the request. It is safe
+    to retry only when it was raised while the request was still being written
+    (``send_request_headers`` / ``send_request_body`` failed): upstream then
+    never had a complete request to run. Raised after the write, upstream may
+    already have accepted, and billed, the POST, so it is not replayed.
+    """
+
+    def __init__(self) -> None:
+        self.write_failed = False
+
+    async def __call__(self, event: str, info: dict[str, Any]) -> None:
+        if event.endswith((".send_request_headers.failed", ".send_request_body.failed")):
+            self.write_failed = True
+
+    def forbids_retry(self, exc: BaseException) -> bool:
+        """True for a raw TLS error raised after the request was fully written."""
+        return isinstance(exc, ssl.SSLError) and not self.write_failed
+
+
 async def request_with_transient_retry(
     client: httpx.AsyncClient,
     *,
@@ -2134,6 +2208,7 @@ def merge_extra_headers(
     *,
     upstream_url: str | None,
     config: Any = None,
+    provider: str | None = None,
 ) -> dict[str, str]:
     """Merge configured extra headers into ``headers``, overriding same-named keys.
 
@@ -2152,14 +2227,16 @@ def merge_extra_headers(
     Pass ``None`` when the caller is going to its configured target with no
     per-request override. Anything else is checked against
     ``upstream_trust.is_trusted_upstream``; an undesignated host still gets its
-    request proxied, just without these headers.
+    request proxied, just without these headers. ``provider`` (``"openai"`` or
+    ``"anthropic"``) limits the designated origins to that provider's own, so
+    one provider's extras never go to the other's API.
     """
     if not extra:
         return headers
     if upstream_url is not None:
         from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
 
-        if not is_trusted_upstream(upstream_url, config):
+        if not is_trusted_upstream(upstream_url, config, provider):
             warn_untrusted_once(upstream_url)
             return headers
     # HTTP header names are case-insensitive: drop any existing key that
@@ -3175,7 +3252,7 @@ def _zstd_bounded(raw: bytes) -> bytes:
 
 
 def _brotli_bounded(raw: bytes) -> bytes:
-    """Feed brotli input in slices, checking the cap after each one."""
+    """Feed brotli input in slices, pulling at most one chunk of output per step."""
     import brotli
 
     decompressor_cls = getattr(brotli, "Decompressor", None)
@@ -3188,16 +3265,36 @@ def _brotli_bounded(raw: bytes) -> bytes:
         )
 
     decompressor = decompressor_cls()
+    can_accept_more = getattr(decompressor, "can_accept_more_data", None)
+    if can_accept_more is None:
+        # Before brotli 1.2.0, process() has no output limit: one small input
+        # slice can expand without bound before the size check runs.
+        raise ValueError(
+            "Installed 'brotli' cannot bound decompressed output "
+            "(needs brotli>=1.2.0); upgrade it to accept br request bodies."
+        )
     out = bytearray()
-    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
-        out += decompressor.process(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+
+    def pull(data: bytes) -> bytes:
+        chunk: bytes = decompressor.process(data, output_buffer_limit=_DECOMPRESS_CHUNK_SIZE)
+        out.extend(chunk)
         if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
             raise RequestBodyTooLarge(
                 f"Decompressed brotli request body exceeds "
                 f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
             )
-    is_finished = getattr(decompressor, "is_finished", None)
-    if is_finished is not None and not is_finished():
+        return chunk
+
+    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
+        pull(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+        # While the decompressor holds unprocessed input it accepts only empty
+        # input; drain its output before feeding the next slice.
+        while not can_accept_more() and pull(b""):
+            pass
+    # All input is in, but output beyond the per-call limit is still pending.
+    while not decompressor.is_finished() and pull(b""):
+        pass
+    if not decompressor.is_finished():
         raise ValueError("Failed to decompress brotli request body: truncated stream")
     return bytes(out)
 
@@ -3470,6 +3567,11 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
         raise RequestBodyNotObject(
             "Request body must be a JSON object, not " + type(result).__name__
         )
+
+    # Large histories are routed from their envelope only. Leave their content
+    # untouched for the soft-limit passthrough, before any normalization/copies.
+    if len(raw) > request_limit_policy.COMPRESSION_BODY_MAX_BYTES:
+        return result, raw
 
     # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
     # any downstream deepcopy / compression / 400-retry path. This is the shared
@@ -4103,20 +4205,29 @@ def _warn_deferred_without_search_tool(tools: Any) -> None:
     )
 
 
-#: Non-Anthropic upstreams that accept the first-party deferred tool shape.
-#: These bill deferred schemas compactly, so downgrading deferral for them
-#: inlines the whole catalog and multiplies billed prompt tokens.
-_DEFERRAL_CAPABLE_HOSTS: frozenset[str] = frozenset({"api.githubcopilot.com"})
-
-
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
-    """Return whether Anthropic server-side tool search is valid for this upstream."""
+    """Return whether Anthropic server-side tool search is valid for this upstream.
+
+    GitHub's Copilot API also accepts the first-party deferred shape and bills
+    deferred schemas compactly, so downgrading deferral there inlines the whole
+    catalog and multiplies billed prompt tokens (#4356). That holds for the
+    generic host and for the plan hosts Business/Enterprise/Individual seats
+    are routed to (``api.<plan>.githubcopilot.com``, #4155), so any public
+    ``*.githubcopilot.com`` host qualifies. GHE data-residency hosts
+    (``copilot-api.<tenant>.ghe.com``) still downgrade: nobody has verified
+    that they accept the shape.
+    """
+    from headroom.copilot_auth import is_copilot_completions_host, is_public_copilot_api_host
     from headroom.providers.claude.runtime import (
         _gate_view_host,
         is_custom_anthropic_base_url,
     )
 
-    if _gate_view_host((api_base_url or "").strip()) in _DEFERRAL_CAPABLE_HOSTS:
+    # The ``proxy.*`` hosts are the inline-completions surface: nobody has measured
+    # the deferred shape there.
+    if is_public_copilot_api_host(
+        _gate_view_host((api_base_url or "").strip())
+    ) and not is_copilot_completions_host(api_base_url):
         return True
 
     return not is_custom_anthropic_base_url(api_base_url)
@@ -4664,7 +4775,16 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
 
 _OPENAI_TOOL_SEARCH_TYPE = _RESPONSES_TOOL_SEARCH_TYPE
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
-_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset(
+    {
+        "terminal",
+        "file_search",
+        "web_search",
+        "code_interpreter",
+        "computer",
+        "image_generation",
+    }
+)
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in

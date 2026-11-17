@@ -96,6 +96,13 @@ class CompressTurn(Protocol):
     # Likewise optional: ``message_growth_tokens`` (message tokens it added)
     # and ``hook_tool_saved_tokens`` (tool tokens it removed and booked), so
     # the handler can net the two before clamping the saving.
+    # And ``compaction_tokens_before``/``compaction_tokens_after``, the tool
+    # definitions before and after the schema compaction ``transform`` ran,
+    # which the handler folds into both endpoints as the chat handlers do.
+    # In the other direction: a turn with a writable ``conversation: str |
+    # None`` attribute has it set before ``prepare`` to an opaque key for the
+    # request's session (None without one), for its hooks'
+    # ``TurnContext.conversation``.
 
     def finish(
         self,

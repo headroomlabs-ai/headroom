@@ -224,6 +224,24 @@ pub(crate) async fn forward_vertex_request(
     }
 
     // ─── 4. RESOLVE BEARER TOKEN ───────────────────────────────────────
+    // The ADC bearer is this host's Google identity: only send it to a
+    // Google API host unless the operator explicitly allowed otherwise.
+    if !state.config.vertex_allow_non_google_upstream && !is_google_api_host(&state.config.upstream)
+    {
+        tracing::error!(
+            event = "vertex_upstream_not_google",
+            request_id = %request_id,
+            upstream_host = state.config.upstream.host_str().unwrap_or(""),
+            "native Vertex route needs --upstream on https://*.googleapis.com \
+             (or --vertex-allow-non-google-upstream=true); refusing to attach \
+             the ADC bearer"
+        );
+        capture::finalize_rejected(pending_stats.take());
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "vertex upstream is not a Google API host",
+        );
+    }
     let bearer = match state.vertex_token_source.bearer().await {
         Ok(t) => t,
         Err(e) => {
@@ -471,6 +489,14 @@ pub(crate) async fn forward_vertex_request(
     response
 }
 
+/// `https://` plus a host under `googleapis.com` (regional
+/// `{region}-aiplatform.googleapis.com`, global, and Private Service
+/// Connect `*.p.googleapis.com` endpoints).
+fn is_google_api_host(upstream: &url::Url) -> bool {
+    upstream.scheme() == "https"
+        && matches!(upstream.host(), Some(url::Host::Domain(h)) if h.ends_with(".googleapis.com"))
+}
+
 fn error_response(status: StatusCode, msg: &'static str) -> Response {
     Response::builder()
         .status(status)
@@ -532,5 +558,30 @@ async fn run_anthropic_sse_state_machine(
             p.mark_failed();
         }
         p.finalize(capture::usage_from_anthropic_state(&state));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_google_api_host;
+
+    #[test]
+    fn google_api_host_check() {
+        for ok in [
+            "https://us-central1-aiplatform.googleapis.com",
+            "https://aiplatform.googleapis.com/",
+            "https://aiplatform-x.p.googleapis.com",
+        ] {
+            assert!(is_google_api_host(&ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "http://us-central1-aiplatform.googleapis.com",
+            "https://googleapis.com.example.net",
+            "https://example-googleapis.com",
+            "https://127.0.0.1:8788",
+            "http://127.0.0.1:8788",
+        ] {
+            assert!(!is_google_api_host(&bad.parse().unwrap()), "{bad}");
+        }
     }
 }

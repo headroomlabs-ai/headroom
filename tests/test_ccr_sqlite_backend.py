@@ -16,6 +16,7 @@ import pytest
 
 from headroom.cache.backends.sqlite import SQLiteBackend
 from headroom.cache.compression_store import CompressionEntry, CompressionStore
+from headroom.exceptions import StorageError
 
 
 def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 1800) -> CompressionEntry:
@@ -383,6 +384,14 @@ class TestSQLiteBackend:
         assert got.retrieval_count == 1
 
 
+def _close(backend: SQLiteBackend) -> None:
+    """Close a backend's connection, if any (tests only; there is no public close)."""
+    conn = backend._conn
+    backend._conn = None
+    if conn is not None:
+        conn.close()
+
+
 class TestMultiWorkerSafety:
     def test_busy_error_does_not_delete_database(self, db_path):
         """SQLITE_BUSY (OperationalError, a DatabaseError subclass) under
@@ -416,14 +425,206 @@ class TestMultiWorkerSafety:
         assert db_path.exists()
         assert b.get("h1") is not None
 
-    def test_corruption_message_triggers_reset(self, db_path):
+    def test_corruption_fails_closed_and_siblings_keep_the_data(self, db_path):
+        """Corruption recovery must not destroy anything online: a sibling
+        worker may still hold live handles, so deleting the main file or its
+        -wal/-shm sidecars would split-brain the sibling or discard committed
+        originals. Fail closed instead — this instance goes offline, the file
+        survives for offline repair, and siblings are unaffected."""
+        b = SQLiteBackend(db_path)
+        assert b.set("h1", make_entry()) is True
+        sibling = SQLiteBackend(db_path)
+        assert sibling.set("h2", make_entry("h2")) is True
+
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        # Same monotonic clock monkey as the recover tests below use; the
+        # reconnect retry follows the shared bounded backoff.
+        clock = [1000.0]
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+        try:
+            b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+            # Nothing was deleted: main file and every sidecar survive.
+            assert db_path.exists()
+            for suffix in ("-wal", "-shm"):
+                sidecar = db_path.parent / f"{db_path.name}{suffix}"
+                assert sidecar.exists()
+            # This instance is down: reads miss, writes are refused loudly.
+            assert b.get("h1") is None
+            assert b.set("h3", make_entry("h3")) is False
+            # The sibling, still connected to the preserved file, keeps serving
+            # the originals that were stored before the recovery boundary.
+            assert sibling.get("h1") is not None
+            assert sibling.get("h2") is not None
+
+            # Offline repair happens with every worker stopped: close the
+            # sibling's handle first (Windows refuses to unlink an open file),
+            # then the operator removes the corrupt file and its sidecars.
+            _close(sibling)
+            for suffix in ("", "-wal", "-shm"):
+                p = db_path if not suffix else db_path.parent / f"{db_path.name}{suffix}"
+                p.unlink(missing_ok=True)
+            # Once the retry is due, this instance reconnects to a fresh database.
+            clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+            assert b.set("h4", make_entry("h4")) is True
+            assert b.get("h4") is not None
+        finally:
+            monkeypatch.undo()
+            _close(sibling)
+            _close(b)
+
+    def test_corruption_recovery_never_unlinks_the_store(self, db_path, monkeypatch):
+        """The recovery path must not delete the main file or any sidecar:
+        sibling workers may still hold live handles, and the survivors are
+        needed for offline repair."""
+        b = SQLiteBackend(db_path)
+        # A live sibling keeps the real WAL-mode -wal/-shm sidecars in place;
+        # they are checked as-is rather than overwritten, because the -shm file
+        # is memory-mapped while a connection is open (Windows rejects writes).
+        sibling = SQLiteBackend(db_path)
+        try:
+            assert b.set("h1", make_entry()) is True
+            sidecars = [db_path.parent / f"{db_path.name}{suffix}" for suffix in ("-wal", "-shm")]
+            for sidecar in sidecars:
+                assert sidecar.exists()
+
+            real_unlink = type(db_path).unlink
+
+            def refuse(self, *args, **kwargs):
+                if self.parent == db_path.parent and self.name.startswith(db_path.name):
+                    raise AssertionError(
+                        "corruption recovery must not unlink the store or its sidecars"
+                    )
+                return real_unlink(self, *args, **kwargs)
+
+            monkeypatch.setattr(type(db_path), "unlink", refuse)
+            b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
+            monkeypatch.undo()
+
+            assert db_path.exists()
+            for sidecar in sidecars:
+                assert sidecar.exists()
+            assert sibling.get("h1") is not None
+        finally:
+            _close(sibling)
+            _close(b)
+
+    def test_failed_reopen_after_recovery_recovers_later(self, db_path, monkeypatch, caplog):
+        """A reopen that fails while the store is offline must not leave the
+        store dead for the process lifetime: once the retry is due and the
+        open succeeds, writes persist and reads hit again."""
+        import headroom.cache.backends.sqlite as sqlite_mod
+
         b = SQLiteBackend(db_path)
         b.set("h1", make_entry())
+        real_open = b._open
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+
+        def broken_open():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(b, "_open", broken_open)
+        with caplog.at_level(logging.WARNING):
+            b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+            # Down and the retry is not due yet: a miss, and the refused
+            # write reports False rather than succeeding silently.
+            assert b.get("h1") is None
+            assert b.set("h2", make_entry("h2")) is False
+            assert "nothing was read or persisted" in caplog.text
+
+            # The retry is due but the open still fails: still a miss, and
+            # the next retry is pushed further out.
+            clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+            assert b.get("h1") is None
+
+        # The filesystem problem clears and the backoff elapses.
+        monkeypatch.setattr(b, "_open", real_open)
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+        assert b.set("h3", make_entry("h3")) is True
+        got = b.get("h3")
+        assert got is not None
+        assert got.hash == "h3"
+
+    def test_reopen_retry_backs_off_while_open_keeps_failing(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        b = SQLiteBackend(db_path)
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+        attempts = []
+
+        def broken_open():
+            attempts.append(clock[0])
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(b, "_open", broken_open)
+        b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
+        assert len(attempts) == 0  # recovery only schedules; no open yet
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None
+        assert len(attempts) == 1
+        for _ in range(5):
+            assert b.get("h1") is None  # not due: no extra open attempts
+        assert len(attempts) == 1
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None  # the wait doubled: not due yet
+        assert len(attempts) == 1
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None
+        assert len(attempts) == 2
+        # The wait doubled again, so one more initial interval is not enough.
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None
+        assert len(attempts) == 2
+
+    def test_reopen_failure_recovery_ends_the_offline_state(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        real_open = b._open
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+
+        def broken_open():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(b, "_open", broken_open)
         b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
-        # Database recreated: empty but functional.
-        assert b.count() == 0
-        b.set("h2", make_entry("h2"))
+        assert b.get("h1") is None
+
+        monkeypatch.setattr(b, "_open", real_open)
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+        assert b.set("h2", make_entry("h2")) is True
         assert b.exists("h2")
+
+    def test_transient_write_failure_returns_false_and_keeps_the_database(self, db_path):
+        """A write lost to a transient error (busy/locked) is still lost:
+        set() must report it, and must not reset the database."""
+        b = SQLiteBackend(db_path)
+        assert b.set("h1", make_entry()) is True
+
+        class LockedInsertConn:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, *args, **kwargs):
+                if args and "INSERT" in args[0]:
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real = b._conn
+        b._conn = LockedInsertConn(real)  # type: ignore[assignment]
+        assert b.set("h2", make_entry("h2")) is False
+        b._conn = real
+        assert db_path.exists()
+        assert b.get("h1") is not None
+        assert b.get("h2") is None
 
     def test_busy_timeout_configured(self, db_path):
         b = SQLiteBackend(db_path)
@@ -527,6 +728,96 @@ class TestDefaults:
 
         assert "re-read" in CCR_MISS_MESSAGE
         assert "re-run" in CCR_MISS_MESSAGE
+
+
+COMMENTED_TOML = (
+    "".join(f"# note {i}: keep this setting in sync with the deploy runbook\n" for i in range(30))
+    + '[package]\nname = "demo"\nversion = "0.1.0"\n\n[dependencies]\nserde = "1.0"\n'
+)
+
+
+class TestProducerDuringOutage:
+    """The producer-facing contract while the backend is down after a failed
+    corruption-recovery reopen: writes fail loudly so producers keep the
+    original, reads stay fail-open, and both work again after recovery."""
+
+    @pytest.fixture
+    def outage(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        backend = SQLiteBackend(db_path)
+        real_open = backend._open
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+
+        def broken_open():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(backend, "_open", broken_open)
+        backend._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+
+        def recover():
+            monkeypatch.setattr(backend, "_open", real_open)
+            clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+
+        return backend, recover
+
+    def test_compression_store_raises_and_recovers(self, outage):
+        backend, recover = outage
+        store = CompressionStore(backend=backend, enable_feedback=False)
+
+        with pytest.raises(StorageError):
+            store.store("original " * 100, "compressed")
+        # Reads stay fail-open: a miss, not an exception.
+        assert store.retrieve("0" * 24) is None
+
+        recover()
+        hash_key = store.store("original " * 100, "compressed")
+        entry = store.retrieve(hash_key)
+        assert entry is not None
+        assert entry.original_content == "original " * 100
+
+    def test_retrieve_survives_failed_access_count_write(self, db_path):
+        backend = SQLiteBackend(db_path)
+        store = CompressionStore(backend=backend, enable_feedback=False)
+        hash_key = store.store("original " * 100, "compressed")
+
+        def failing_set(k, entry):
+            return False
+
+        backend.set = failing_set  # type: ignore[method-assign]
+        entry = store.retrieve(hash_key)
+        assert entry is not None
+        assert entry.original_content == "original " * 100
+
+    def test_config_compressor_keeps_original_during_outage(self, outage, monkeypatch):
+        from headroom.parser import CCR_RETRIEVAL_MARKER_RE
+        from headroom.transforms.config_compressor import (
+            ConfigCompressor,
+            ConfigCompressorConfig,
+        )
+
+        backend, recover = outage
+        store = CompressionStore(backend=backend, enable_feedback=False)
+        monkeypatch.setattr("headroom.cache.compression_store.get_compression_store", lambda: store)
+        comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+
+        result = comp.compress(COMMENTED_TOML)
+        # No hash was issued for an original that was never stored, so all
+        # 30 comments stay in the output.
+        assert result.ccr_hash is None
+        assert result.lines_elided == 0
+        assert not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+        for i in range(30):
+            assert f"# note {i}:" in result.compressed
+
+        recover()
+        result = comp.compress(COMMENTED_TOML)
+        assert result.ccr_hash is not None
+        assert "# note 0:" not in result.compressed
+        entry = store.retrieve(result.ccr_hash)
+        assert entry is not None
+        assert entry.original_content == COMMENTED_TOML
 
 
 if __name__ == "__main__":

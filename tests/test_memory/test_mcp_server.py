@@ -11,24 +11,20 @@ mcp_server_mod = import_module_with_mcp_stub("headroom.memory.mcp_server")
 
 
 class _CapturingServer:
-    def __init__(self, name: str) -> None:
+    """MCP 2.x takes handlers as constructor callbacks rather than decorators."""
+
+    def __init__(self, name: str, on_list_tools=None, on_call_tool=None, **_: object) -> None:
         self.name = name
-        self.list_tools_handler = None
-        self.call_tool_handler = None
+        self.list_tools_handler = on_list_tools
+        self.call_tool_handler = on_call_tool
 
-    def list_tools(self):
-        def decorator(handler):
-            self.list_tools_handler = handler
-            return handler
 
-        return decorator
+class _CallParams:
+    """Stand-in for ``mcp.types.CallToolRequestParams``."""
 
-    def call_tool(self):
-        def decorator(handler):
-            self.call_tool_handler = handler
-            return handler
-
-        return decorator
+    def __init__(self, name: str, arguments: dict | None = None) -> None:
+        self.name = name
+        self.arguments = arguments
 
 
 def test_warm_up_backend_batches_embedding_and_indexing() -> None:
@@ -102,11 +98,11 @@ def test_tool_call_waits_for_handshake_warm_up(monkeypatch) -> None:
         monkeypatch.setattr(mcp_server_mod, "_handle_search", handle_search)
 
         server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
-        await server.list_tools_handler()
+        await server.list_tools_handler(None, None)
         await warm_up_started.wait()
 
         tool_call = asyncio.create_task(
-            server.call_tool_handler("memory_search", {"query": "preferences"})
+            server.call_tool_handler(None, _CallParams("memory_search", {"query": "preferences"}))
         )
         await asyncio.sleep(0)
 
@@ -114,7 +110,7 @@ def test_tool_call_waits_for_handshake_warm_up(monkeypatch) -> None:
         assert not tool_call.done()
 
         release_warm_up.set()
-        assert await tool_call == ["search result"]
+        assert (await tool_call).content == ["search result"]
         handle_search.assert_awaited_once_with(
             backend,
             {"query": "preferences"},
@@ -151,7 +147,7 @@ def test_failed_handshake_init_is_discarded_and_retried(monkeypatch) -> None:
         monkeypatch.setattr(mcp_server_mod, "_handle_search", handle_search)
 
         server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
-        await server.list_tools_handler()
+        await server.list_tools_handler(None, None)
         await first_warm_up_started.wait()
 
         fail_first_warm_up.set()
@@ -161,9 +157,10 @@ def test_failed_handshake_init_is_discarded_and_retried(monkeypatch) -> None:
         failed_backend.close.assert_awaited_once()
         handle_search.assert_not_awaited()
 
-        assert await server.call_tool_handler("memory_search", {"query": "preferences"}) == [
-            "search result"
-        ]
+        result = await server.call_tool_handler(
+            None, _CallParams("memory_search", {"query": "preferences"})
+        )
+        assert result.content == ["search result"]
         handle_search.assert_awaited_once_with(
             ready_backend,
             {"query": "preferences"},
@@ -201,7 +198,9 @@ def test_concurrent_tool_calls_share_backend_initialization(monkeypatch) -> None
         server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
         calls = [
             asyncio.create_task(
-                server.call_tool_handler("memory_search", {"query": f"query-{index}"})
+                server.call_tool_handler(
+                    None, _CallParams("memory_search", {"query": f"query-{index}"})
+                )
             )
             for index in range(2)
         ]
@@ -212,7 +211,10 @@ def test_concurrent_tool_calls_share_backend_initialization(monkeypatch) -> None
         handle_search.assert_not_awaited()
 
         release_warm_up.set()
-        assert await asyncio.gather(*calls) == [["search result"], ["search result"]]
+        assert [r.content for r in await asyncio.gather(*calls)] == [
+            ["search result"],
+            ["search result"],
+        ]
         assert handle_search.await_count == 2
         assert all(call.args[0] is backend for call in handle_search.await_args_list)
 
@@ -227,7 +229,7 @@ def test_server_cleanup_closes_initialized_backend_once(monkeypatch) -> None:
         monkeypatch.setattr(mcp_server_mod, "_warm_up_backend", AsyncMock())
 
         server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
-        await server.list_tools_handler()
+        await server.list_tools_handler(None, None)
         await asyncio.sleep(0)
 
         close_backend = server._headroom_close
@@ -253,7 +255,7 @@ def test_server_cleanup_cancels_pending_backend_initialization(monkeypatch) -> N
         monkeypatch.setattr(mcp_server_mod, "_warm_up_backend", warm_up)
 
         server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
-        await server.list_tools_handler()
+        await server.list_tools_handler(None, None)
         await init_started.wait()
 
         await server._headroom_close()
