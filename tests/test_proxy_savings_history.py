@@ -151,6 +151,8 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "output_tokens_saved_high": 0,
+        "output_savings_usd_high": 0.0,
         "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
@@ -205,6 +207,8 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "output_tokens_saved_high": 0,
+        "output_savings_usd_high": 0.0,
         "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
