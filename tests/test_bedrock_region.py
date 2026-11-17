@@ -374,6 +374,69 @@ class TestBedrockModelMapping:
                 "bedrock/global.anthropic.claude-opus-4-8"
             )
 
+    def test_cross_region_prefixed_id_passes_through_directly(self):
+        """au./us./eu./apac./global. prefixed IDs must be passed straight to
+        Bedrock without discovery remapping.  Remapping can route to an
+        APPLICATION inference profile owned by another team, causing a 403.
+        Regression test for the bug reported in BUG_FIX.md."""
+        # Simulate a discovery map that contains an APPLICATION-type profile
+        # for the same underlying model (the bad case: wrong profile selected).
+        bad_app_profile = "bedrock/arn:aws:bedrock:ap-southeast-2:002037730852:application-inference-profile/6lgt8epqa0wf"
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            return_value={"claude-opus-4-8": bad_app_profile},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="ap-southeast-2")
+            # The au. prefix must bypass discovery and pass through directly.
+            assert backend.map_model_id("au.anthropic.claude-opus-4-8") == (
+                "bedrock/au.anthropic.claude-opus-4-8"
+            )
+
+    def test_cross_region_prefixes_all_pass_through(self):
+        """All five cross-region prefix families pass through without remapping."""
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            return_value={},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+            cases = [
+                ("au.anthropic.claude-opus-4-8", "bedrock/au.anthropic.claude-opus-4-8"),
+                (
+                    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+                    "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0",
+                ),
+                (
+                    "eu.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "bedrock/eu.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                ),
+                (
+                    "apac.anthropic.claude-3-5-haiku-20241022-v1:0",
+                    "bedrock/apac.anthropic.claude-3-5-haiku-20241022-v1:0",
+                ),
+                ("global.anthropic.claude-opus-4-8", "bedrock/global.anthropic.claude-opus-4-8"),
+            ]
+            for model_in, expected in cases:
+                assert backend.map_model_id(model_in) == expected, (
+                    f"Expected {expected!r} for input {model_in!r}"
+                )
+
+    def test_litellm_qualified_cross_region_id_passes_through_with_contaminated_map(self):
+        """'bedrock/<cross-region-prefix>...' — the already LiteLLM-qualified form
+        documented in map_model_id's docstring — must also bypass discovery
+        remapping. Regression for the gap where only the bare 'us.anthropic...'
+        form was checked, so 'bedrock/us.anthropic...' still fell through to
+        normalization and could be remapped to a contaminating APPLICATION
+        profile in the discovery map."""
+        bad_app_profile = "bedrock/arn:aws:bedrock:ap-southeast-2:002037730852:application-inference-profile/6lgt8epqa0wf"
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            return_value={"claude-opus-4-8": bad_app_profile},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="ap-southeast-2")
+            assert backend.map_model_id("bedrock/au.anthropic.claude-opus-4-8") == (
+                "bedrock/au.anthropic.claude-opus-4-8"
+            )
+
 
 # =============================================================================
 # Normalize Bedrock Profile ID (edge cases)

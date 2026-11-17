@@ -51,7 +51,12 @@ def compute_optimal_k(
 
     # Tier 1: Fast path
     if n <= 8:
-        return n
+        # Still honor the caller's hard cap: ``max_k`` is documented as "never
+        # return more than this". Returning the raw ``n`` let a small ``max_k``
+        # (e.g. a tight search/log budget) be exceeded on tiny inputs, so the
+        # caller kept more items than it asked for. The near-duplicate branch
+        # below already clamps to ``effective_max``; do the same here.
+        return min(n, effective_max)
 
     # Check for near-total redundancy
     unique_count = count_unique_simhash(items)

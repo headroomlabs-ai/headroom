@@ -1,11 +1,10 @@
-import { mkdtemp, readdir } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-
+import http from "node:http";
+import https from "node:https";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import pluginModule from "./index.js";
-import { HeadroomPlugin, applyNativeProviderOverrides } from "./plugin.js";
+import HeadroomOpenCodePlugin, { HeadroomPlugin, headroomSetup } from "./plugin.js";
+
+const TRANSPORT_STATE = Symbol.for("headroom.opencode.transport");
 
 function pluginInput() {
   return {
@@ -20,208 +19,87 @@ function pluginInput() {
   } as never;
 }
 
+interface FakeModel {
+  id: string;
+  providerID: string;
+  package?: string;
+  settings?: Record<string, unknown>;
+  headers?: Record<string, string>;
+}
+
+interface FakeProvider {
+  id: string;
+  package: string;
+  settings?: Record<string, unknown>;
+}
+
+// Minimal OpenCode 2.x plugin context: records what setup registers.
+function pluginContextV2(
+  options: Record<string, unknown>,
+  catalog: { providers?: FakeProvider[]; models?: FakeModel[] } = {},
+) {
+  const tools: Array<Record<string, any>> = [];
+  const shellHooks: Array<(input: { env: Record<string, string | undefined> }) => unknown> = [];
+  const providers = catalog.providers ?? [];
+  const models = catalog.models ?? [];
+  const context = {
+    options,
+    location: {
+      directory: "/repo",
+      project: { id: "project-1", directory: "/repo", canonical: "/repo" },
+    },
+    model: {
+      transform: vi.fn(async (callback: (editor: Record<string, any>) => void) => {
+        callback({
+          list: () => models,
+          update: (providerID: string, modelID: string, update: (model: FakeModel) => void) => {
+            const model = models.find((m) => m.providerID === providerID && m.id === modelID);
+            if (model) update(model);
+          },
+          provider: {
+            get: (providerID: string) => {
+              const provider = providers.find((p) => p.id === providerID);
+              return provider ? { provider, models: new Map() } : undefined;
+            },
+          },
+        });
+        return { dispose: async () => {} };
+      }),
+    },
+    tool: {
+      transform: vi.fn(async (callback: (editor: { add: (tool: Record<string, any>) => void }) => void) => {
+        callback({ add: (tool) => tools.push(tool) });
+        return { dispose: async () => {} };
+      }),
+    },
+    shell: {
+      hook: vi.fn(async (name: string, callback: (input: { env: Record<string, string | undefined> }) => unknown) => {
+        expect(name).toBe("create.before");
+        shellHooks.push(callback);
+        return { dispose: async () => {} };
+      }),
+    },
+  };
+  return { context: context as never, tools, shellHooks };
+}
+
+function transportState(): { refs: number } | undefined {
+  return (globalThis as Record<symbol, { refs: number } | undefined>)[TRANSPORT_STATE];
+}
+
+function transportWireRoots(): string[] {
+  const state = (globalThis as Record<symbol, { wireRoots?: Array<{ origin: string; path: string }> }>)[
+    TRANSPORT_STATE
+  ];
+  return (state?.wireRoots ?? []).map((root) => `${root.origin}${root.path}`);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
-  delete process.env.HEADROOM_WORKSPACE_DIR;
+  vi.unstubAllGlobals();
 });
 
 describe("HeadroomPlugin", () => {
-  it("exports the OpenCode v1 plugin contract", () => {
-    expect(pluginModule).toMatchObject({
-      id: "headroom-opencode",
-      server: HeadroomPlugin,
-    });
-  });
-
-  it("injects native provider baseURLs for anthropic, openai, and github-copilot", async () => {
-    const plugin = await HeadroomPlugin(pluginInput(), {
-      proxyUrl: "http://127.0.0.1:8787",
-      mode: "native-fetch",
-    });
-    const config = {
-      provider: {
-        openai: { options: { apiKey: "test-openai" } },
-        anthropic: { options: { apiKey: "test-anthropic" } },
-        "github-copilot": { options: { fetch: vi.fn() } },
-      },
-    };
-
-    await plugin.config?.(config as never);
-
-    expect(config).toMatchObject({
-      provider: {
-        openai: { options: { apiKey: "test-openai", baseURL: "http://127.0.0.1:8787/v1" } },
-        anthropic: { options: { apiKey: "test-anthropic", baseURL: "http://127.0.0.1:8787/v1" } },
-        "github-copilot": { options: { fetch: expect.any(Function), baseURL: "http://127.0.0.1:8787/v1" } },
-      },
-    });
-    expect((config.provider as Record<string, unknown>).headroom).toBeUndefined();
-  });
-
-  it("does not create provider stubs when native overrides run against empty config", () => {
-    const config: Record<string, unknown> = {};
-
-    applyNativeProviderOverrides(config, "http://127.0.0.1:8787");
-
-    expect(config).toEqual({});
-  });
-
-  it("only rewrites providers already present in the OpenCode config", () => {
-    const config = {
-      provider: {
-        openai: { options: { apiKey: "test-openai" } },
-      },
-    };
-
-    applyNativeProviderOverrides(config as unknown as Record<string, unknown>, "http://127.0.0.1:8787");
-
-    expect(config).toEqual({
-      provider: {
-        openai: { options: { apiKey: "test-openai", baseURL: "http://127.0.0.1:8787/v1" } },
-      },
-    });
-  });
-
-  it("does not create native baseURL overrides for opencode family and preserves zenmux upstream", () => {
-    const config = {
-      provider: {
-        opencode: { options: { apiKey: "test-opencode", baseURL: "https://console.opencode.ai/api/v1" } },
-        "opencode-go": { options: { apiKey: "test-opencode-go", baseURL: "https://console.opencode.ai/api/v1" } },
-        zenmux: {
-          options: {
-            apiKey: "test-zenmux",
-            baseURL: "https://zenmux.ai/api/v1",
-            headers: { "X-Title": "opencode" },
-          },
-        },
-      },
-    };
-
-    applyNativeProviderOverrides(config as unknown as Record<string, unknown>, "http://127.0.0.1:8787");
-
-    expect(config).toEqual({
-      provider: {
-        opencode: {
-          options: {
-            apiKey: "test-opencode",
-            baseURL: "http://127.0.0.1:8787/v1",
-            headers: {
-              "x-headroom-base-url": "https://console.opencode.ai/api",
-            },
-          },
-        },
-        "opencode-go": {
-          options: {
-            apiKey: "test-opencode-go",
-            baseURL: "http://127.0.0.1:8787/v1",
-            headers: {
-              "x-headroom-base-url": "https://opencode.ai/zen/go",
-            },
-          },
-        },
-        zenmux: {
-          options: {
-            apiKey: "test-zenmux",
-            baseURL: "http://127.0.0.1:8787/v1",
-            headers: {
-              "X-Title": "opencode",
-              "x-headroom-base-url": "https://zenmux.ai/api",
-            },
-          },
-        },
-      },
-    });
-  });
-
-  it("preserves the upstream header for opencode non-chat requests", () => {
-    const config = {
-      provider: {
-        opencode: {
-          options: {
-            baseURL: "https://console.opencode.ai/proxy/connections/fixture/v1",
-          },
-        },
-      },
-    };
-
-    applyNativeProviderOverrides(config as unknown as Record<string, unknown>, "http://127.0.0.1:8787");
-
-    expect(config).toMatchObject({
-      provider: {
-        opencode: {
-          options: {
-            baseURL: "http://127.0.0.1:8787/v1",
-            headers: {
-              "x-headroom-base-url": "https://console.opencode.ai/proxy/connections/fixture",
-            },
-          },
-        },
-      },
-    });
-  });
-
-  it("adds runtime upstream header for opencode models", async () => {
-    const plugin = await HeadroomPlugin(pluginInput(), {
-      proxyUrl: "http://127.0.0.1:8787",
-      mode: "native-fetch",
-    });
-    const output = { headers: {} as Record<string, string> };
-
-    await plugin["chat.headers"]?.(
-      {
-        sessionID: "session-1",
-        agent: "build",
-        model: {
-          providerID: "opencode",
-          id: "gpt-5.2-codex",
-          api: {
-            id: "gpt-5.2-codex",
-            npm: "@ai-sdk/openai-compatible",
-            url: "https://console.opencode.ai/proxy/connections/fixture/v1",
-          },
-        },
-        provider: { id: "opencode", source: "custom", info: { id: "opencode" }, options: {} },
-        message: {},
-      } as never,
-      output,
-    );
-
-    expect(output.headers).toEqual({
-      "x-headroom-base-url": "https://console.opencode.ai/proxy/connections/fixture",
-    });
-  });
-
-  it("adds runtime upstream header for opencode-go models", async () => {
-    const plugin = await HeadroomPlugin(pluginInput(), {
-      proxyUrl: "http://127.0.0.1:8787",
-      mode: "native-fetch",
-    });
-    const output = { headers: {} as Record<string, string> };
-
-    await plugin["chat.headers"]?.(
-      {
-        sessionID: "session-1",
-        agent: "build",
-        model: {
-          providerID: "opencode-go",
-          id: "glm-5.2",
-          api: {
-            id: "glm-5.2",
-            npm: "@ai-sdk/openai-compatible",
-            url: "https://opencode.ai/zen/go/v1",
-          },
-        },
-        provider: { id: "opencode-go", source: "custom", info: { id: "opencode-go" }, options: {} },
-        message: {},
-      } as never,
-      output,
-    );
-
-    expect(output.headers).toEqual({
-      "x-headroom-base-url": "https://opencode.ai/zen/go",
-    });
-  });
-
   it("adds only Headroom metadata to shell env", async () => {
     const plugin = await HeadroomPlugin(pluginInput(), {
       proxyUrl: "http://127.0.0.1:8787/",
@@ -235,6 +113,7 @@ describe("HeadroomPlugin", () => {
     };
 
     await plugin["shell.env"]?.({ cwd: "/repo" }, output);
+    await plugin.dispose?.();
 
     expect(output.env).toMatchObject({
       HEADROOM_ACTIVE: "1",
@@ -244,6 +123,124 @@ describe("HeadroomPlugin", () => {
       OPENAI_BASE_URL: "https://deepseek.example/v1",
       ANTHROPIC_BASE_URL: "https://anthropic.example",
     });
+  });
+
+  it("widens transport routing to base URLs from OpenCode's config (#4747)", async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = {
+      config: {
+        get: async () => ({
+          data: {
+            provider: {
+              acme: { options: { baseURL: "https://gateway.invalid/tenant/acme" } },
+            },
+          },
+        }),
+      },
+      provider: { list: async () => ({ data: { all: [] } }) },
+    };
+    const plugin = await HeadroomPlugin(
+      { ...(pluginInput() as Record<string, unknown>), client } as never,
+      { proxyUrl: "http://127.0.0.1:8787" },
+    );
+
+    try {
+      // The config read is deliberately not awaited by the plugin, so let it land.
+      await vi.waitFor(() => {
+        expect(transportWireRoots()).toContain("https://gateway.invalid/tenant/acme");
+      });
+
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/v1/chat/completions");
+    } finally {
+      await plugin.dispose?.();
+    }
+  });
+
+  it("applies a config result without waiting for a pending provider listing (#4747)", async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    const fakeRequest = { on: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+    const httpSpy = vi.spyOn(http, "request").mockImplementation(() => fakeRequest as never);
+    const httpsSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
+
+    // The provider listing never settles: a stalled server must not hold back a
+    // base the config already reported.
+    const client = {
+      config: {
+        get: async () => ({
+          data: {
+            provider: {
+              acme: { options: { baseURL: "https://gateway.invalid/tenant/acme" } },
+            },
+          },
+        }),
+      },
+      provider: { list: () => new Promise<never>(() => {}) },
+    };
+    const plugin = await HeadroomPlugin(
+      { ...(pluginInput() as Record<string, unknown>), client } as never,
+      { proxyUrl: "http://127.0.0.1:8787" },
+    );
+
+    try {
+      // The read is still not awaited by the plugin, but nothing else blocks it.
+      await vi.waitFor(() => {
+        expect(transportWireRoots()).toContain("https://gateway.invalid/tenant/acme");
+      });
+
+      await fetch("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/v1/chat/completions");
+
+      https.request("https://gateway.invalid/tenant/acme/chat/completions", { method: "POST" });
+      expect(httpSpy).toHaveBeenCalledTimes(1);
+      expect(httpsSpy).not.toHaveBeenCalled();
+
+      // Still a root, not a blanket route for the host.
+      await fetch("https://gateway.invalid/tenant/acme/files/1", { method: "POST" });
+      expect(String(fetchMock.mock.calls[1][0])).toBe("https://gateway.invalid/tenant/acme/files/1");
+    } finally {
+      await plugin.dispose?.();
+      httpSpy.mockRestore();
+      httpsSpy.mockRestore();
+    }
+  });
+
+  it("treats an empty HEADROOM_PROXY_URL as unset and falls through to HEADROOM_BASE_URL", async () => {
+    vi.stubEnv("HEADROOM_PROXY_URL", "");
+    vi.stubEnv("HEADROOM_BASE_URL", "http://127.0.0.1:9999");
+    try {
+      const plugin = await HeadroomPlugin(pluginInput(), {});
+      const output = { env: {} as Record<string, string> };
+
+      await plugin["shell.env"]?.({ cwd: "/repo" }, output);
+      await plugin.dispose?.();
+
+      expect(output.env.HEADROOM_PROXY_URL).toBe("http://127.0.0.1:9999");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("treats an empty proxyUrl option as unset", async () => {
+    vi.stubEnv("HEADROOM_PROXY_URL", "");
+    vi.stubEnv("HEADROOM_BASE_URL", "");
+    try {
+      const plugin = await HeadroomPlugin(pluginInput(), { proxyUrl: "" });
+      const output = { env: {} as Record<string, string> };
+
+      await plugin["shell.env"]?.({ cwd: "/repo" }, output);
+      await plugin.dispose?.();
+
+      expect(output.env.HEADROOM_PROXY_URL).toBe("http://localhost:8787");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("exposes a headroom_retrieve tool backed by the proxy", async () => {
@@ -260,6 +257,7 @@ describe("HeadroomPlugin", () => {
       { hash: "0123456789abcdef01234567" },
       {} as never,
     );
+    await plugin.dispose?.();
 
     expect(result).toBe("original content");
     expect(fetchMock).toHaveBeenCalledWith(
@@ -267,22 +265,418 @@ describe("HeadroomPlugin", () => {
       expect.any(Object),
     );
   });
+});
 
-  it("registers and unregisters an OpenCode proxy client marker", async () => {
-    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "headroom-opencode-"));
-    process.env.HEADROOM_WORKSPACE_DIR = workspaceDir;
+describe("headroomSetup (OpenCode 2.x)", () => {
+  it("registers headroom_retrieve as a direct tool backed by the proxy", async () => {
+    const { context, tools } = pluginContextV2({ proxyUrl: "http://127.0.0.1:8787/" });
+    const cleanup = await headroomSetup(context);
 
-    const plugin = await HeadroomPlugin(pluginInput(), {
-      proxyUrl: "http://127.0.0.1:8787",
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => "original content",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(tools).toHaveLength(1);
+    const [retrieve] = tools;
+    expect(retrieve).toMatchObject({
+      name: "headroom_retrieve",
+      options: { codemode: false },
+      input: { type: "object", required: ["hash"] },
     });
+    const result = await retrieve.execute(
+      { hash: "0123456789abcdef01234567" },
+      { signal: new AbortController().signal, progress: async () => {} },
+    );
+    await cleanup?.();
 
-    const markerDir = path.join(workspaceDir, "clients", "8787");
-    const activeMarkers = await readdir(markerDir);
-    expect(activeMarkers).toHaveLength(1);
-    expect(activeMarkers[0]).toMatch(/^opencode-\d+-\d+\.json$/);
+    expect(result).toEqual({ content: "original content" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8787/v1/retrieve/0123456789abcdef01234567",
+      expect.any(Object),
+    );
+  });
 
-    await plugin.dispose?.();
+  it("adds only Headroom metadata to shell env", async () => {
+    const { context, shellHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787/",
+      backend: "litellm",
+    });
+    const cleanup = await headroomSetup(context);
+    const shell = {
+      env: {
+        OPENAI_BASE_URL: "https://deepseek.example/v1",
+        ANTHROPIC_BASE_URL: "https://anthropic.example",
+      } as Record<string, string | undefined>,
+    };
 
-    await expect(readdir(markerDir)).resolves.toEqual([]);
+    expect(shellHooks).toHaveLength(1);
+    await shellHooks[0](shell);
+    await cleanup?.();
+
+    expect(shell.env).toMatchObject({
+      HEADROOM_ACTIVE: "1",
+      HEADROOM_PROXY_URL: "http://127.0.0.1:8787",
+      HEADROOM_PROJECT: "project-1",
+      HEADROOM_BACKEND: "litellm",
+      OPENAI_BASE_URL: "https://deepseek.example/v1",
+      ANTHROPIC_BASE_URL: "https://anthropic.example",
+    });
+  });
+
+  it("points remote OpenAI-wire models at the proxy and names the real upstream", async () => {
+    const models: FakeModel[] = [
+      { id: "deepseek-v4.1-flash", providerID: "opencode-go" },
+      { id: "gpt-6-luna", providerID: "gateway", package: "@opencode/ai/providers/openai/responses" },
+    ];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787/" },
+      {
+        providers: [
+          {
+            id: "opencode-go",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "https://opencode.ai/zen/go/v1/" },
+          },
+          {
+            id: "gateway",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "https://gateway.example/api/v1" },
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": "https://opencode.ai",
+        "x-headroom-original-path": "/zen/go/v1/chat/completions",
+        "x-headroom-project": "project-1",
+      },
+    });
+    expect(models[1]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": "https://gateway.example",
+        "x-headroom-original-path": "/api/v1/responses",
+      },
+    });
+  });
+
+  it.each([
+    ["@opencode/ai/providers/anthropic", "https://api.githubcopilot.com", "/messages"],
+    ["@opencode/ai/providers/anthropic-compatible", "https://gateway.example/v1", "/v1/messages"],
+  ])("routes Anthropic Messages models through the proxy (%s)", async (packageName, baseURL, originalPath) => {
+    // GitHub Copilot serves Claude models as @opencode/ai/providers/anthropic
+    // with a prefix-free Copilot baseURL; the OpenAI-only wire check used to
+    // skip them.
+    const models: FakeModel[] = [{ id: "claude-sonnet-5.5", providerID: "github-copilot" }];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [{ id: "github-copilot", package: packageName, settings: { baseURL } }],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": new URL(baseURL).origin,
+        "x-headroom-original-path": originalPath,
+        "x-headroom-project": "project-1",
+      },
+    });
+  });
+
+  it("leaves a prefixed Anthropic Messages gateway on its own base URL", async () => {
+    // The proxy's Anthropic route rebuilds the upstream path from its incoming
+    // /v1/messages and ignores x-headroom-original-path, so rewriting a
+    // prefixed gateway would drop that prefix. Keep those models direct.
+    const models: FakeModel[] = [{ id: "glm-5.2", providerID: "zai-coding-plan" }];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [
+          {
+            id: "zai-coding-plan",
+            package: "@opencode/ai/providers/zai-coding-plan/messages",
+            settings: { baseURL: "https://api.z.ai/api/coding/paas/v4" },
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toEqual({ id: "glm-5.2", providerID: "zai-coding-plan" });
+  });
+
+  it("prefers a model's own baseURL over its provider's", async () => {
+    const models: FakeModel[] = [
+      {
+        id: "custom",
+        providerID: "opencode-go",
+        settings: { baseURL: "https://model.example/v1", temperature: 0 },
+        headers: { "x-user": "kept" },
+      },
+    ];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [
+          {
+            id: "opencode-go",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "https://opencode.ai/zen/go/v1" },
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toEqual({
+      id: "custom",
+      providerID: "opencode-go",
+      settings: { baseURL: "http://127.0.0.1:8787/v1", temperature: 0 },
+      headers: {
+        "x-user": "kept",
+        "x-headroom-base-url": "https://model.example",
+        "x-headroom-original-path": "/v1/chat/completions",
+        "x-headroom-project": "project-1",
+      },
+    });
+  });
+
+  it("keeps hosts excluded by option off the model rewrite", async () => {
+    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+    const models: FakeModel[] = [
+      { id: "zen", providerID: "opencode-go" },
+      { id: "kept", providerID: "gateway" },
+    ];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787", excludeHosts: [".opencode.ai"] },
+      {
+        providers: [
+          {
+            id: "opencode-go",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "https://opencode.ai/zen/go/v1" },
+          },
+          {
+            id: "gateway",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "https://gateway.example/api/v1" },
+          },
+        ],
+        models,
+      },
+    );
+
+    try {
+      const cleanup = await headroomSetup(context);
+      await cleanup?.();
+    } finally {
+      if (originalExclude === undefined) {
+        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+      } else {
+        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
+      }
+    }
+
+    expect(models[0].settings).toBeUndefined();
+    expect(models[0].headers).toBeUndefined();
+    expect(models[1]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: { "x-headroom-base-url": "https://gateway.example" },
+    });
+  });
+
+  it("keeps hosts excluded by environment off the model rewrite", async () => {
+    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+    process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = "opencode.ai";
+    try {
+      const models: FakeModel[] = [{ id: "zen", providerID: "opencode-go" }];
+      const { context } = pluginContextV2(
+        { proxyUrl: "http://127.0.0.1:8787" },
+        {
+          providers: [
+            {
+              id: "opencode-go",
+              package: "@opencode/ai/providers/openai-compatible",
+              settings: { baseURL: "https://zen.opencode.ai/zen/go/v1" },
+            },
+          ],
+          models,
+        },
+      );
+
+      const cleanup = await headroomSetup(context);
+      await cleanup?.();
+
+      expect(models[0].settings).toBeUndefined();
+      expect(models[0].headers).toBeUndefined();
+    } finally {
+      if (originalExclude === undefined) {
+        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+      } else {
+        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
+      }
+    }
+  });
+
+  it("handles adversarial slash runs in model base URLs in bounded time", async () => {
+    const trailing = "/".repeat(20000);
+    const models: FakeModel[] = [
+      {
+        id: "non-slash-tail",
+        providerID: "gateway",
+        settings: { baseURL: `https://gateway.example/api/v1${trailing}x` },
+      },
+      {
+        id: "slash-tail",
+        providerID: "gateway",
+        settings: { baseURL: `https://gateway.example/api/v1${trailing}` },
+      },
+    ];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [
+          {
+            id: "gateway",
+            package: "@opencode/ai/providers/openai-compatible",
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": "https://gateway.example",
+        "x-headroom-original-path": `/api/v1${trailing}x/chat/completions`,
+      },
+    });
+    expect(models[1]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": "https://gateway.example",
+        "x-headroom-original-path": "/api/v1/chat/completions",
+      },
+    });
+  });
+
+  it("leaves local, already-proxied, URL-less and unsupported-protocol models alone", async () => {
+    const models: FakeModel[] = [
+      { id: "llama", providerID: "ollama" },
+      { id: "gpt-4o", providerID: "openai" },
+      { id: "sonnet", providerID: "anthropic" },
+      { id: "gemini", providerID: "google" },
+    ];
+    const snapshot = structuredClone(models);
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [
+          {
+            id: "ollama",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "http://127.0.0.1:11434/v1" },
+          },
+          {
+            id: "openai",
+            package: "@opencode/ai/providers/openai/responses",
+            settings: { baseURL: "http://127.0.0.1:8787/v1" },
+          },
+          { id: "anthropic", package: "@opencode/ai/providers/anthropic" },
+          {
+            id: "google",
+            package: "@ai-sdk/google",
+            settings: { baseURL: "https://generativelanguage.googleapis.com/v1beta" },
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models).toEqual(snapshot);
+  });
+
+  it("releases the transport on cleanup so reloads do not leak it", async () => {
+    const { context } = pluginContextV2({ proxyUrl: "http://127.0.0.1:8787" });
+
+    const first = await headroomSetup(context);
+    expect(transportState()?.refs).toBe(1);
+    await first?.();
+    expect(transportState()).toBeUndefined();
+
+    const second = await headroomSetup(context);
+    expect(transportState()?.refs).toBe(1);
+    await second?.();
+    expect(transportState()).toBeUndefined();
+  });
+
+  it("releases the transport when hook registration fails", async () => {
+    const { context } = pluginContextV2({ proxyUrl: "http://127.0.0.1:8787" });
+    (context as { shell: { hook: () => Promise<never> } }).shell.hook = async () => {
+      throw new Error("registration failed");
+    };
+
+    await expect(headroomSetup(context)).rejects.toThrow("registration failed");
+    expect(transportState()).toBeUndefined();
+  });
+});
+
+describe("default export", () => {
+  it("carries both the OpenCode 1.x and 2.x entry points", () => {
+    expect(HeadroomOpenCodePlugin).toEqual({
+      id: "headroom",
+      server: HeadroomPlugin,
+      setup: headroomSetup,
+    });
+  });
+});
+
+
+describe("OpenCode 2.x workspace session identity", () => {
+  it.each([undefined, "explicit-session"])("carries the resolved session token through both routes (%s)", async (sessionToken) => {
+    vi.stubEnv("HEADROOM_OPENCODE_SESSION_TOKEN", "environment-session");
+    const models: FakeModel[] = [{
+      id: "custom", providerID: "gateway",
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "https://gateway.example/v1" },
+    }];
+    const { context } = pluginContextV2({ sessionToken }, { models });
+    const cleanup = await headroomSetup(context);
+    try {
+      const expected = sessionToken ?? "environment-session";
+      expect(models[0].headers?.["x-headroom-session-token"]).toBe(expected);
+      expect((globalThis as Record<symbol, { sessionToken?: string }>)[TRANSPORT_STATE]?.sessionToken).toBe(expected);
+    } finally {
+      await cleanup?.();
+      vi.unstubAllEnvs();
+    }
   });
 });

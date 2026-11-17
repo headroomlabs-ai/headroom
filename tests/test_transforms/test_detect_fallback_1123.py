@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+import headroom._ort as ort_runtime
 from headroom.transforms import content_router as cr
 
 # Patch the native detector via its string target ("headroom._core.detect_content_type")
@@ -13,6 +16,13 @@ from headroom.transforms import content_router as cr
 # headroom._core out of sys.modules (e.g. test_rust_core_smoke), which rebuilds the module
 # object. A captured alias would then go stale and the patch would miss the live module —
 # the control-flow tests would silently run the real detector and never see the exception.
+
+
+@pytest.fixture(autouse=True)
+def _compatible_mock_native_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep mocked native calls reachable regardless of prior test state."""
+    monkeypatch.setattr(ort_runtime, "rust_ort_runtime_compatible", lambda: True)
+    monkeypatch.setattr(cr, "_detect_native_unhealthy", False)
 
 
 def test_falls_back_on_rust_exception(monkeypatch):
@@ -58,8 +68,6 @@ def test_control_flow_exceptions_propagate(monkeypatch):
     monkeypatch.setattr("headroom._core.detect_content_type", _interrupt)
     monkeypatch.setattr(cr, "_detect_panic_warned", False, raising=False)
 
-    import pytest
-
     with pytest.raises(KeyboardInterrupt):
         cr._detect_content("content")
 
@@ -73,8 +81,6 @@ def test_cancelled_error_propagates(monkeypatch):
     monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
     monkeypatch.setattr("headroom._core.detect_content_type", _cancel)
     monkeypatch.setattr(cr, "_detect_panic_warned", False, raising=False)
-
-    import pytest
 
     with pytest.raises(asyncio.CancelledError):
         cr._detect_content("content")

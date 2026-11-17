@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -302,6 +303,14 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # double it. Defaults False for providers with disjoint buckets.
         "cache_inferred": False,
         "pricing_surface": None,
+        # Tool-schema deferral, disjoint from the positional ``tokens_saved``.
+        # The funnel already computed it for metrics.record_request; forwarding
+        # it here is what lets the dashboard's per-model table count the layer
+        # its own headline counts. Zero for this outcome (no deferral tags).
+        "tool_schema_saved": 0,
+        # Whether the positional tokens_sent is the provider's billed count.
+        # This outcome carries no provider_input_tokens, so it is an estimate.
+        "provider_reported": False,
     }
 
 
@@ -324,6 +333,22 @@ async def test_funnel_logs_request_with_derived_cache_hit() -> None:
     assert len(h.logger.logs) == 1
     log_entry = h.logger.logs[0]
     assert log_entry.cache_hit is True
+
+
+@pytest.mark.asyncio
+async def test_funnel_logs_request_timestamp_with_utc_offset() -> None:
+    """Recent-request timestamps must identify an absolute instant.
+
+    A naive ISO timestamp is interpreted in the browser's local timezone,
+    which makes the dashboard show negative ages when the proxy and browser
+    use different timezone settings.
+    """
+    h = _FunnelHarness()
+    await h._record_request_outcome(_outcome())
+
+    timestamp = datetime.fromisoformat(h.logger.logs[0].timestamp)
+    assert timestamp.tzinfo is not None
+    assert timestamp.utcoffset() == timezone.utc.utcoffset(timestamp)
 
 
 @pytest.mark.asyncio
@@ -396,8 +421,8 @@ async def test_funnel_emits_perf_log_with_canonical_shape(
     tok_after, tok_saved, cache_read, cache_write, cache_hit_pct,
     opt_ms, transforms — in that order, space-separated."""
     h = _FunnelHarness()
-    # Direct handler attach: caplog otherwise drops propagation-disabled
-    # records (the proxy disables ``headroom.*`` propagation once started).
+    # Direct handler attach keeps capture isolated from unrelated propagation
+    # mutations elsewhere in the suite.
     target = logging.getLogger("headroom.proxy")
     captured: list[logging.LogRecord] = []
 
@@ -699,3 +724,40 @@ def test_tokens_inflated_does_not_disturb_derived_sizes() -> None:
     assert o.attempted_input_tokens == 57845
     assert o.savings_pct == 0.0
     assert o.tokens_inflated == 2684
+
+
+@pytest.mark.asyncio
+async def test_funnel_books_the_modelled_output_range_on_the_lifetime(
+    tmp_path, monkeypatch
+) -> None:
+    """Registered factors reach the tracker's lifetime totals end to end:
+    outcome -> PrometheusMetrics.record_request -> SavingsTracker."""
+    from headroom.proxy import output_savings
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.savings_tracker import SavingsTracker
+
+    monkeypatch.setattr(output_savings, "MODELLED_REDUCTION", {4: (0.2, 0.5)})
+    monkeypatch.setattr(
+        output_savings, "_RECORDER", output_savings.SavingsRecorder(str(tmp_path / "o.json"))
+    )
+    tracker = SavingsTracker(path=str(tmp_path / "s.json"))
+    h = _FunnelHarness()
+    h.metrics = PrometheusMetrics(savings_tracker=tracker)
+    key = output_savings.stratum_key(
+        turn_kind="code", input_tokens=8000, model="claude-sonnet-4", has_tools=True
+    )
+
+    await h._record_request_outcome(
+        _outcome(
+            output_tokens=800,
+            transforms_applied=[
+                output_savings.stratum_label("treatment", key),
+                "output_shaper:verbosity:L4",
+            ],
+        )
+    )
+
+    lifetime = tracker.snapshot()["lifetime"]
+    assert lifetime["output_tokens_saved"] == 200
+    assert lifetime["output_tokens_saved_high"] == 800
+    assert lifetime["output_savings_usd_high"] > lifetime["output_savings_usd"] > 0

@@ -6,6 +6,7 @@ from collections.abc import Iterable
 
 from headroom.install.runtime import resolve_headroom_command
 
+from .antigravity import AntigravityRegistrar
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
@@ -14,6 +15,7 @@ from .opencode import OpencodeRegistrar
 
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
+CLAUDE_SERENA_CONTEXT = "claude-code"
 
 
 def get_all_registrars() -> list[MCPRegistrar]:
@@ -21,7 +23,13 @@ def get_all_registrars() -> list[MCPRegistrar]:
 
     The list grows as we add adapters for Cursor, Continue, Cline, etc.
     """
-    return [ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()]
+    return [
+        AntigravityRegistrar(),
+        ClaudeRegistrar(),
+        CodexRegistrar(),
+        GrokRegistrar(),
+        OpencodeRegistrar(),
+    ]
 
 
 def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
@@ -46,9 +54,9 @@ def build_serena_spec(context: str) -> ServerSpec:
     """Construct the canonical Serena MCP server spec for an agent context.
 
     ``--open-web-dashboard False`` suppresses Serena's browser popup on
-    startup. Headroom installs Serena by default, so without this flag every
-    wrapped session opens the Serena dashboard tab even for users who never
-    opted into Serena or created a ``~/.serena/serena_config.yml``. The flag
+    startup. Without this flag every session Headroom wraps with Serena
+    opens the Serena dashboard tab, even for users who never created a
+    ``~/.serena/serena_config.yml``. The flag
     overrides Serena's own config at startup (it sets
     ``web_dashboard_open_on_launch=False``), so it works regardless of the
     user's local config. The dashboard backend still runs and remains
@@ -59,8 +67,11 @@ def build_serena_spec(context: str) -> ServerSpec:
         name="serena",
         command="uvx",
         args=(
+            # The PyPI package (serena-agent) ships prebuilt wheels; the git
+            # source forced a from-source build that fails under proot-based
+            # filesystems where uv cannot hardlink into a build venv (#2871).
             "--from",
-            "git+https://github.com/oraios/serena",
+            "serena-agent",
             "serena",
             "start-mcp-server",
             "--project-from-cwd",

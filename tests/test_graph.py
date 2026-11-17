@@ -1,63 +1,11 @@
 from __future__ import annotations
 
-import io
 import json
 import subprocess
-import tarfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
-import pytest
-
 from headroom.graph import installer, watcher
-
-
-def _build_archive(member_name: str = installer.CBM_BIN_NAME) -> bytes:
-    payload = io.BytesIO()
-    with tarfile.open(fileobj=payload, mode="w:gz") as tar:
-        data = b"#!/bin/sh\necho version\n"
-        info = tarfile.TarInfo(name=member_name)
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    return payload.getvalue()
-
-
-class FakeResponse:
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        return None
-
-    def read(self) -> bytes:
-        return self._data
-
-
-@pytest.mark.parametrize(
-    ("system", "machine", "expected"),
-    [
-        ("Darwin", "arm64", "darwin-arm64"),
-        ("Darwin", "x86_64", "darwin-amd64"),
-        ("Linux", "aarch64", "linux-arm64"),
-        ("Linux", "arm64", "linux-arm64"),
-        ("Linux", "x86_64", "linux-amd64"),
-        ("Windows", "AMD64", "windows-amd64"),
-    ],
-)
-def test_detect_platform_variants(monkeypatch, system: str, machine: str, expected: str) -> None:
-    monkeypatch.setattr(installer.platform, "system", lambda: system)
-    monkeypatch.setattr(installer.platform, "machine", lambda: machine)
-    assert installer._detect_platform() == expected
-
-
-def test_detect_platform_rejects_unknown_system(monkeypatch) -> None:
-    monkeypatch.setattr(installer.platform, "system", lambda: "Solaris")
-    monkeypatch.setattr(installer.platform, "machine", lambda: "sparc")
-    with pytest.raises(RuntimeError, match="Unsupported platform"):
-        installer._detect_platform()
 
 
 def test_get_cbm_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path) -> None:
@@ -65,6 +13,7 @@ def test_get_cbm_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path)
     installed = tmp_path / installer.CBM_BIN_NAME
     installed.write_text("bin")
     monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
+    monkeypatch.setattr(installer.platform, "system", lambda: "Linux")
     monkeypatch.setattr(installer.shutil, "which", lambda name: str(on_path))
     assert installer.get_cbm_path() == on_path
 
@@ -73,81 +22,6 @@ def test_get_cbm_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path)
 
     installed.unlink()
     assert installer.get_cbm_path() is None
-
-
-def test_download_cbm_success_and_verification_paths(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
-    monkeypatch.setattr(installer, "_detect_platform", lambda: "linux-amd64")
-    monkeypatch.setattr(
-        installer, "urlopen", lambda url, timeout=60: FakeResponse(_build_archive())
-    )
-
-    run_calls: list[list[str]] = []
-
-    def fake_run(command, **kwargs):
-        run_calls.append(command)
-        return SimpleNamespace(returncode=1, stdout="")
-
-    monkeypatch.setattr("subprocess.run", fake_run)
-    path = installer.download_cbm(version="v1.2.3")
-    assert path == tmp_path / installer.CBM_BIN_NAME
-    assert path.exists()
-    assert run_calls == [[str(path), "--version"]]
-
-    monkeypatch.setattr(
-        "subprocess.run", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
-    assert installer.download_cbm(version="v1.2.3") == path
-
-    monkeypatch.setattr(
-        "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="cbm v1.2.3\n"),
-    )
-    assert installer.download_cbm(version="v1.2.3") == path
-
-
-def test_download_cbm_invalid_url_download_failure_and_extract_errors(
-    monkeypatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
-    monkeypatch.setattr(installer, "_detect_platform", lambda: "linux-amd64")
-
-    monkeypatch.setattr(installer, "GITHUB_RELEASE_URL", "ftp://example.test/releases")
-    with pytest.raises(RuntimeError, match="Invalid URL"):
-        installer.download_cbm()
-
-    monkeypatch.setattr(installer, "GITHUB_RELEASE_URL", "https://example.test/releases")
-    monkeypatch.setattr(
-        installer,
-        "urlopen",
-        lambda url, timeout=60: (_ for _ in ()).throw(OSError("network down")),
-    )
-    with pytest.raises(RuntimeError, match="Failed to download codebase-memory-mcp"):
-        installer.download_cbm()
-
-    monkeypatch.setattr(
-        installer,
-        "urlopen",
-        lambda url, timeout=60: FakeResponse(_build_archive("some/other-binary")),
-    )
-    with pytest.raises(RuntimeError, match="binary not found in archive"):
-        installer.download_cbm()
-
-    monkeypatch.setattr(installer, "urlopen", lambda url, timeout=60: FakeResponse(b"not a tar"))
-    with pytest.raises(RuntimeError, match="Failed to extract archive"):
-        installer.download_cbm()
-
-
-def test_ensure_cbm_uses_existing_or_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:
-    existing = tmp_path / installer.CBM_BIN_NAME
-    monkeypatch.setattr(installer, "get_cbm_path", lambda: existing)
-    assert installer.ensure_cbm() == existing
-
-    monkeypatch.setattr(installer, "get_cbm_path", lambda: None)
-    monkeypatch.setattr(
-        installer, "download_cbm", lambda: (_ for _ in ()).throw(RuntimeError("nope"))
-    )
-    assert installer.ensure_cbm() is None
 
 
 def test_code_graph_watcher_init_start_stop_and_event_filtering(

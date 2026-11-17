@@ -14,6 +14,7 @@ from .._shared import classify_error, is_error_content, normalize_tool_name
 from ..base import ConversationScanner, LearnPlugin
 from ..models import ErrorCategory, ProjectInfo, SessionData, ToolCall
 from ..writer import ContextWriter, GrokWriter
+from ._paths import path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,15 @@ class GrokPlugin(LearnPlugin, ConversationScanner):
                 continue
 
             decoded = unquote(workspace_dir.name)
-            project_path = Path(decoded) if decoded.startswith("/") else Path.cwd()
+            # The workspace dir name is a URL-encoded absolute cwd. Use
+            # Path.is_absolute() rather than a `startswith("/")` check so a
+            # Windows drive-letter path (e.g. `C:\Users\...`) is recognised as
+            # absolute instead of silently falling back to cwd (which would
+            # attribute the learnings to the wrong project and miss its
+            # GROK.md/AGENTS.md). Mirrors the Windows-aware path handling in
+            # memory/traffic_learner.py.
+            decoded_path = Path(decoded)
+            project_path = decoded_path if decoded_path.is_absolute() else Path.cwd()
             agents_md = project_path / "AGENTS.md"
             grok_md = project_path / "GROK.md"
 
@@ -68,9 +77,9 @@ class GrokPlugin(LearnPlugin, ConversationScanner):
                     project_path=project_path,
                     data_path=workspace_dir,
                     context_file=grok_md
-                    if grok_md.exists()
+                    if path_exists(grok_md)
                     else agents_md
-                    if agents_md.exists()
+                    if path_exists(agents_md)
                     else None,
                 )
             )

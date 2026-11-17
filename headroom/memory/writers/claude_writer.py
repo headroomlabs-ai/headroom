@@ -116,6 +116,6 @@ class ClaudeCodeMemoryWriter(AgentWriter):
 
             if not dry_run:
                 memory_dir.mkdir(parents=True, exist_ok=True)
-                (memory_dir / filename).write_text(content, encoding="utf-8")
+                (memory_dir / filename).write_text(content, encoding="utf-8", newline="\n")
 
         return topic_files

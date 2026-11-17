@@ -328,13 +328,14 @@ def detect_install_method(extras: str | None = None) -> InstallMethod:
 
       1. git checkout            → refuse (`git pull`)
       2. editable install        → refuse (reinstall from source)
-      3. Docker                  → refuse (pull a new image)
+      3. explicit HEADROOM_IN_DOCKER → refuse (official image opt-out)
       4. pipx                    → `pipx upgrade`
       5. uv tool                 → `uv tool upgrade`
       6. venv / virtualenv / conda → `sys.executable -m pip install -U`
       7. user-site (`pip --user`)  → `sys.executable -m pip install -U --user`
-      8. externally-managed system Python (PEP 668) → refuse with guidance
-      9. writable global Python  → `sys.executable -m pip install -U` (last resort)
+      8. bare /.dockerenv (system interpreter) → refuse (pull a new image)
+      9. externally-managed system Python (PEP 668) → refuse with guidance
+     10. writable global Python  → `sys.executable -m pip install -U` (last resort)
     """
     if _is_source_checkout():
         return InstallMethod(
@@ -351,7 +352,13 @@ def detect_install_method(extras: str | None = None) -> InstallMethod:
                 "reinstall with `pip install -U --force-reinstall .`."
             ),
         )
-    if _in_docker():
+    # An EXPLICIT HEADROOM_IN_DOCKER (set by the official image) is a deliberate
+    # "pull a newer image" opt-out and wins up front, even over a venv. The bare
+    # /.dockerenv heuristic is handled far lower, after ownership detection, so a
+    # pip / pipx / uv install inside a devcontainer, Codespace, or docker dev
+    # image is not shadowed by the mere fact that the environment is a container
+    # (#2816).
+    if os.environ.get("HEADROOM_IN_DOCKER", "").strip():
         return InstallMethod(
             kind="docker",
             can_self_update=False,
@@ -402,6 +409,18 @@ def detect_install_method(extras: str | None = None) -> InstallMethod:
             kind="pip-user",
             can_self_update=True,
             argv=[sys.executable, "-m", "pip", "install", "-U", "--user", _spec(extras)],
+        )
+
+    # Bare /.dockerenv with no venv / pipx / uv / user-site owner: the install
+    # belongs to the container's own interpreter, where "pull a newer image" is
+    # the only real route. An explicit HEADROOM_IN_DOCKER already returned above.
+    if _in_docker():
+        return InstallMethod(
+            kind="docker",
+            can_self_update=False,
+            guidance=(
+                "Running inside a container — pull a newer Headroom image instead of self-updating."
+            ),
         )
 
     if _is_externally_managed():

@@ -1,0 +1,33 @@
+{
+  "model": "claude-test-20260924",
+  "max_tokens": 128,
+  "stream": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Run the proposed action."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "run_action",
+      "description": "Run a sanitized test action.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "target": {"type": "string"}
+        },
+        "required": ["target"]
+      }
+    }
+  ],
+  "safeguards": {
+    "mode": "auto",
+    "tool_use_ids": ["toolu_auto_001"]
+  }
+}

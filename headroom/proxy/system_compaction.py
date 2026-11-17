@@ -41,6 +41,21 @@ def _json_byte_len(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")))
 
 
+def _last_cache_control_index(blocks: list[Any]) -> int:
+    """Index of the last block carrying ``cache_control``, or ``-1`` if none.
+
+    Everything at or before this index is inside a prefix the provider has
+    already hashed and is billing at the cache-read rate. Mutating those bytes
+    busts the entry and re-bills the whole prefix at write rate (1.25x list on
+    Anthropic), which costs far more than the compaction saves.
+    """
+    last = -1
+    for i, block in enumerate(blocks):
+        if isinstance(block, dict) and block.get("cache_control"):
+            last = i
+    return last
+
+
 def _compact_system_blocks(
     blocks: list[dict[str, Any]],
     router: Any,
@@ -57,8 +72,20 @@ def _compact_system_blocks(
     modified = False
     updated: list[dict[str, Any]] = []
 
-    for block in blocks:
+    # A cache_control marker anywhere in the system array freezes every block at
+    # or before it: the provider hashed those exact bytes, so rewriting any of
+    # them re-bills the whole prefix as cache creation. Preserving the marker
+    # field (as this function does) does NOT preserve the cache entry -- the key
+    # is the content, not the marker. Compact only what sits after the last
+    # breakpoint. See ``_last_cache_control_index``.
+    frozen_upto = _last_cache_control_index(blocks)
+
+    for idx, block in enumerate(blocks):
         if not isinstance(block, dict) or block.get("type") != "text":
+            updated.append(block)
+            continue
+
+        if idx <= frozen_upto:
             updated.append(block)
             continue
 

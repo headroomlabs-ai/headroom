@@ -1,0 +1,41 @@
+{
+  "config": {
+    "compaction_core_field_fraction": 0.8,
+    "compaction_heterogeneous_core_ratio": 0.6,
+    "compaction_max_buckets": 8,
+    "compaction_max_flatten_inner_keys": 6,
+    "compaction_min_buckets": 2,
+    "dedup_identical_items": true,
+    "enabled": true,
+    "factor_out_constants": false,
+    "first_fraction": 0.3,
+    "include_summaries": false,
+    "last_fraction": 0.15,
+    "lossless_min_savings_ratio": 0.15,
+    "lossless_only": false,
+    "max_items_after_crush": 15,
+    "min_items_to_analyze": 5,
+    "min_tokens_to_crush": 200,
+    "preserve_change_points": true,
+    "similarity_threshold": 0.8,
+    "toin_confidence_threshold": 0.5,
+    "uniqueness_threshold": 0.1,
+    "use_feedback_hints": true,
+    "variance_threshold": 2.0
+  },
+  "input": {
+    "bias": 1.0,
+    "content": "[null, true, false, null, true, false, null]",
+    "query": ""
+  },
+  "input_sha256": "9f40c7fded195680cbe1281d4061246c142926ca3db3c703654a9a7182591c92",
+  "label": "nulls_and_bools",
+  "output": {
+    "compressed": "[null, true, false, null, true, false, null]",
+    "original": "[null, true, false, null, true, false, null]",
+    "strategy": "mixed:passthrough(7->7)",
+    "was_modified": false
+  },
+  "recorded_at": "2026-10-09T03:59:17.344613+00:00",
+  "transform": "smart_crusher"
+}

@@ -204,6 +204,105 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
     assert captured["target_ratio"] == 0.10
 
 
+def test_diagnostics_content_blocks_unchanged_reports_protected_not_compressed(router, tokenizer):
+    """Regression for PR #3058 review: a content-block (Anthropic-shape)
+    message where every block is protected/passed through must be diagnosed
+    as unchanged -- not falsely reported as "compressed:content_blocks" just
+    because it took the content-blocks route.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_small_1",
+                    # Far below any min_chars compression threshold, so
+                    # _process_content_blocks passes it through untouched.
+                    "content": "ok",
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        collect_diagnostics=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+        read_protection_window=0,
+    )
+
+    assert len(result.message_decisions) == 1
+    decision = result.message_decisions[0]
+    assert decision.action == "protected:content_blocks_unchanged"
+    assert decision.tokens_before == decision.tokens_after
+    assert decision.tokens_before > 0
+
+
+def test_diagnostics_content_blocks_compressed_reports_accurate_tokens(
+    router, tokenizer, monkeypatch
+):
+    """Regression for PR #3058 review: a genuinely-compressed content-block
+    message must report real before/after token counts (via the content-block
+    tokenizer), not the previous hard-coded 0s that only counted string
+    content.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def ensure_background_load(self) -> None:
+            pass
+
+        def compress(self, content, **kwargs):
+            captured.update(kwargs)
+            compressed = " ".join(content.split()[:20]) + " Retrieve more: hash=deadbeef"
+            return SimpleNamespace(
+                compressed=compressed,
+                compressed_tokens=len(compressed.split()),
+            )
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: FakeKompress())
+    tool_content = " ".join(
+        f'{{"file":"src/module_{i}.py","line":{i},"text":"repeated search payload"}}'
+        for i in range(160)
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_search_1",
+                    "content": tool_content,
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        collect_diagnostics=True,
+        force_kompress=True,
+        target_ratio=0.10,
+        compress_user_messages=True,
+        min_tokens_to_compress=10,
+        read_protection_window=0,
+    )
+
+    assert len(result.message_decisions) == 1
+    decision = result.message_decisions[0]
+    assert decision.action == "compressed:content_blocks"
+    assert decision.tokens_before > 0
+    assert decision.tokens_after > 0
+    assert decision.tokens_after < decision.tokens_before
+
+
 def test_skip_kompress_routes_around_ml_stage(router, tokenizer, monkeypatch):
     """skip_kompress (cold-start fast pass) must never invoke the Kompress ML
     stage — units that would route there take the same fallback as when the
@@ -311,6 +410,69 @@ def test_anthropic_tool_result_lossy_without_marker_stays_verbatim(router, token
 
     # Unrecoverable lossy compression is rejected → original kept verbatim.
     assert result.messages[0]["content"][0]["content"] == tool_content
+
+
+def _multi_block_tool_result_messages(blocks: list[dict]) -> list[dict]:
+    return [
+        {"role": "user", "content": "fetch the worker logs"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tu1", "name": "mcp__logs__fetch", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": blocks}],
+        },
+        {"role": "user", "content": "any errors?"},
+    ]
+
+
+def test_list_form_tool_result_blocks_are_not_fused(router, tokenizer):
+    """A list-form tool_result with several text blocks (an MCP tool returning
+    more than one TextContent) is flattened for the compressors. The blocks
+    must stay on separate lines: joining them with "" fused the last line of
+    one block with the first line of the next (#4729)."""
+    lines_a = [
+        f"2026-11-10T10:{i % 60:02d}:00Z INFO worker-{i % 3} batch {i} ok" for i in range(150)
+    ]
+    lines_b = [f"2026-11-10T11:{i % 60:02d}:00Z WARN worker-{i % 3} retry {i}" for i in range(150)]
+    blocks = [
+        {"type": "text", "text": "\n".join(lines_a)},
+        {"type": "text", "text": "\n".join(lines_b)},
+    ]
+
+    result = router.apply(
+        _multi_block_tool_result_messages(blocks),
+        tokenizer,
+        compress_user_messages=True,
+        min_tokens_to_compress=10,
+        read_protection_window=0,
+    )
+
+    out = result.messages[2]["content"][0]["content"]
+    assert isinstance(out, list) and len(out) == 1 and out[0]["type"] == "text"
+    text = out[0]["text"]
+    assert text != "\n".join(lines_a + lines_b), "compressor did not run"
+    original = set(lines_a) | set(lines_b)
+    emitted = [line for line in text.splitlines() if line.startswith("2026-11-10T")]
+    assert emitted, "no log lines survived compression"
+    assert [line for line in emitted if line not in original] == []
+
+
+@pytest.mark.parametrize(
+    ("texts", "expected"),
+    [
+        (["a\nb", "c"], "a\nb\nc"),
+        (["a\n", "b"], "a\nb"),
+        (["a", "", "b"], "a\nb"),
+        (["only"], "only"),
+    ],
+)
+def test_join_tool_result_text_blocks(texts, expected):
+    from headroom.transforms.content_router import _join_tool_result_text_blocks
+
+    blocks = [{"type": "text", "text": t} for t in texts]
+    assert _join_tool_result_text_blocks(blocks) == expected
 
 
 # =============================================================================
@@ -1364,10 +1526,12 @@ class TestSmartCrusherFallback:
             ),
         )
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            content,
-            CompressionStrategy.SMART_CRUSHER,
-            context="",
+        compressed, compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                content,
+                CompressionStrategy.SMART_CRUSHER,
+                context="",
+            )
         )
 
         # Strategy chain must include smart_crusher
@@ -1409,10 +1573,12 @@ class TestSmartCrusherFallback:
             lambda self: mock_crusher,
         )
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            content,
-            CompressionStrategy.SMART_CRUSHER,
-            context="",
+        compressed, compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                content,
+                CompressionStrategy.SMART_CRUSHER,
+                context="",
+            )
         )
 
         # SmartCrusher should handle JSON directly
@@ -1467,10 +1633,12 @@ class TestSmartCrusherFallback:
             ),
         )
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            repetitive,
-            CompressionStrategy.SMART_CRUSHER,
-            context="",
+        compressed, compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                repetitive,
+                CompressionStrategy.SMART_CRUSHER,
+                context="",
+            )
         )
 
         # The chain must include the requested strategy
@@ -1484,37 +1652,36 @@ class TestSmartCrusherFallback:
             f"{strategy_chain}"
         )
 
-    def test_code_aware_fallback_also_uses_unified_block(self, router, monkeypatch):
-        """CodeAware strategy also uses the unified fallback block.
-        Verify it doesn't double-invoke Kompress either."""
+    def test_code_aware_declining_never_falls_back_to_kompress(self, router, monkeypatch):
+        """Code-aware declining a block leaves it unchanged; prose ML never runs (#4214).
+
+        Replaces the old "no double Kompress" check: with the CODE_AWARE ->
+        Kompress fallbacks removed, Kompress must not run even once.
+        """
         import headroom.transforms.content_router as crm
 
-        monkeypatch.setattr(
-            crm.ContentRouter,
-            "_try_ml_compressor",
-            lambda self, content, context="", question=None: (
-                content,
-                len(content.split()),
-            ),
-        )
+        ml_calls: list[str] = []
+
+        def spy(self, content, context="", question=None):
+            ml_calls.append(content)
+            return content, len(content.split())
+
+        monkeypatch.setattr(crm.ContentRouter, "_try_ml_compressor", spy)
 
         plain = "This is just plain text. " * 200
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            plain,
-            CompressionStrategy.CODE_AWARE,
-            context="",
+        compressed, _compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                plain,
+                CompressionStrategy.CODE_AWARE,
+                context="",
+            )
         )
 
-        # CodeAware should be in the chain
         assert "code_aware" in strategy_chain
-
-        # No duplicate fallback entries
-        kompress_count = strategy_chain.count("kompress")
-        assert kompress_count <= 1, (
-            f"Kompress appeared {kompress_count} times; "
-            f"duplicate fallback in CodeAware path: {strategy_chain}"
-        )
+        assert "kompress" not in strategy_chain
+        assert ml_calls == []
+        assert compressed == plain
 
 
 # =============================================================================
@@ -1699,3 +1866,90 @@ class TestCompressBlockContent:
         assert any("router:tool_result" in t for t in transforms_applied), (
             f"Expected router:tool_result:* in transforms, got: {transforms_applied}"
         )
+
+
+# =============================================================================
+# Mixed content: custom-tag protection (system-reminder mangling regression)
+# =============================================================================
+
+
+class TestMixedContentTagProtection:
+    """_compress_mixed must protect custom-tag blocks BEFORE section split.
+
+    Splitting first lands the open/close tags of a
+    ``<system-reminder>...</system-reminder>`` pair in different sections;
+    per-section protection then sees only unmatched tags (which protect
+    nothing) and the block's content — Claude Code ships CLAUDE.md this way —
+    is lossy-compressed and arrives word-dropped.
+    """
+
+    REMINDER = (
+        "<system-reminder>\n"
+        "Instruction prose that must survive byte-exact.\n\n"
+        "```bash\nrtk gain\n```\n\n"
+        "More instructions after the fence, also byte-exact.\n"
+        "</system-reminder>"
+    )
+
+    @staticmethod
+    def _mangling_router() -> ContentRouter:
+        """Router whose per-section compressor visibly mangles everything."""
+        router = ContentRouter(ContentRouterConfig(min_section_tokens=1))
+
+        def mangle(content, strategy, context, language=None, question=None, bias=1.0):
+            return "MANGLED", 1, [strategy.value], False
+
+        router._apply_strategy_to_content = mangle  # type: ignore[method-assign]
+        return router
+
+    def test_reminder_block_survives_mixed_compression_verbatim(self):
+        router = self._mangling_router()
+        content = (
+            "Prose before the reminder that may compress.\n\n"
+            + self.REMINDER
+            + "\n\nProse after the reminder that may compress."
+        )
+
+        result = router._compress_mixed(content, context="")
+
+        # The tag block (fence and all) is byte-exact in the output...
+        assert self.REMINDER in result.compressed
+        # ...while content outside it still went through the compressor.
+        assert "MANGLED" in result.compressed
+
+    def test_reminder_only_content_passes_through(self):
+        router = self._mangling_router()
+
+        result = router._compress_mixed(self.REMINDER, context="")
+
+        assert self.REMINDER in result.compressed
+        assert "MANGLED" not in result.compressed
+
+    def test_untagged_mixed_content_still_compresses(self):
+        router = self._mangling_router()
+        content = "Plain prose section.\n\n```python\nprint('hi')\n```\n\nMore prose."
+
+        result = router._compress_mixed(content, context="")
+
+        assert "MANGLED" in result.compressed
+        assert result.strategy_used == CompressionStrategy.MIXED
+
+
+class TestMixedContentAttribution:
+    def test_minified_json_with_unchanged_code_remains_mixed(self):
+        value = {f"field_{i}": i for i in range(500)}
+        code = "print('preserve this unchanged')"
+        content = f"```python\n{code}\n```\n\n{json.dumps(value, indent=2)}"
+        router = ContentRouter(ContentRouterConfig(min_section_tokens=10, enable_kompress=False))
+
+        result = router._compress_mixed(content, context="")
+
+        assert result.strategy_used == CompressionStrategy.MIXED
+        assert code in result.compressed
+        json_block = result.compressed.split("```", 2)[2].strip()
+        assert json.loads(json_block) == value
+        assert {decision.strategy for decision in result.routing_log} == {
+            CompressionStrategy.CODE_AWARE,
+            CompressionStrategy.JSON_MINIFIER,
+        }
+        assert result.total_compressed_tokens < result.total_original_tokens

@@ -19,12 +19,15 @@ import pytest
 from headroom.providers.claude.runtime import (
     REMOTE_CONTROL_GATED_MIN_VERSION,
     REMOTE_CONTROL_SIBLING_GATE_NOTE,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     detect_claude_code_version,
     is_custom_anthropic_base_url,
     parse_claude_code_version,
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
+    remote_control_gate_short_message,
     remote_control_sibling_gate_note,
 )
 
@@ -32,6 +35,34 @@ _CUSTOM = "http://127.0.0.1:8787"
 _NATIVE = "https://api.anthropic.com"
 _GATED = REMOTE_CONTROL_GATED_MIN_VERSION  # (2, 1, 196)
 _OLD = (2, 1, 195)
+
+
+def test_claude_auth_conflict_tracks_precedence_without_returning_values() -> None:
+    conflict = claude_auth_conflict_sources(
+        ("user settings", {"ANTHROPIC_AUTH_TOKEN": "secret-token"}),
+        ("project settings", {"ANTHROPIC_API_KEY": "secret-api"}),
+        ("shell environment", {}),
+    )
+
+    assert conflict == {
+        "ANTHROPIC_API_KEY": "project settings",
+        "ANTHROPIC_AUTH_TOKEN": "user settings",
+    }
+    message = claude_auth_conflict_message(conflict)
+    assert "secret-token" not in message
+    assert "secret-api" not in message
+    assert "project settings" in message
+    assert "user settings" in message
+
+
+def test_claude_auth_conflict_higher_precedence_empty_value_clears_key() -> None:
+    assert (
+        claude_auth_conflict_sources(
+            ("settings", {"ANTHROPIC_AUTH_TOKEN": "token", "ANTHROPIC_API_KEY": "key"}),
+            ("shell", {"ANTHROPIC_API_KEY": ""}),
+        )
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -263,3 +294,22 @@ def test_sibling_note_does_not_advise_1m_already_passed() -> None:
 )
 def test_is_custom_anthropic_base_url_host_edges(value, expected) -> None:
     assert is_custom_anthropic_base_url(value) is expected
+
+
+# ---------------------------------------------------------------------------
+# Compact banner line (#3426) keeps the #1779 accuracy rule
+# ---------------------------------------------------------------------------
+
+
+def test_short_message_known_gated_version_states_fact() -> None:
+    msg = remote_control_gate_short_message(version=_GATED)
+    assert msg == (
+        "Remote Control (/rc) is disabled while routed through Headroom — run `claude` "
+        "directly (no wrap) for sessions that need it."
+    )
+
+
+def test_short_message_unknown_version_states_threshold() -> None:
+    msg = remote_control_gate_short_message(version=None)
+    assert "is disabled on Claude Code 2.1.196+ while routed through Headroom" in msg
+    assert "may" not in msg

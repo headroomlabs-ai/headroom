@@ -6,10 +6,12 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.providers.codex.runtime import CodexRoutingDecision
+from headroom.proxy import upstream_guard
 from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
@@ -30,6 +32,9 @@ def _app() -> Any:
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
+    # This routing test uses reserved, intentionally unresolvable hostnames.
+    # Explicitly allow them so the SSRF guard can remain fail-closed on DNS errors.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "azure.example,custom.example,opencode.ai")
     calls: list[tuple[str, str, str, str]] = []
     gemini_calls: list[tuple[str, str, str, str]] = []
     gemini_count_calls: list[tuple[str, str, str, str]] = []
@@ -114,6 +119,9 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.post("/v1/messages/count_tokens").json()["base_url"] == (
             "https://api.anthropic.test"
         )
+        assert client.get("/api/hello").json()["base_url"] == ("https://api.anthropic.test")
+        assert client.head("/api/hello").status_code == 200
+        assert calls[-1] == ("HEAD", "/api/hello", "https://api.anthropic.test", "anthropic")
         assert client.get("/v1/models", headers={"x-goog-api-key": "test"}).json()["base_url"] == (
             "https://api.openai.test"
         )
@@ -144,6 +152,41 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.get("/v1beta/models").json()["provider"] == "gemini"
         assert client.get("/v1beta/models/demo").json()["sub_path"] == "models"
         assert client.post("/v1beta/models/demo:embedContent").json()["sub_path"] == "embedContent"
+        # Provider passthrough routes must honor the per-request upstream like
+        # /v1/messages and the catch-all do. Without this, a custom
+        # OpenAI-compatible provider's embeddings/audio/metadata requests are
+        # forwarded to the default provider target and fail with 401.
+        custom_embeddings = client.post(
+            "/v1/embeddings",
+            headers={"x-headroom-base-url": "https://custom.example/base/"},
+        ).json()
+        assert custom_embeddings["base_url"] == "https://custom.example/base"
+        assert custom_embeddings["path"] == "/v1/embeddings"
+        # Known provider routes keep their bounded labels so handle_passthrough
+        # records the outcome for the overridden upstream; the custom host is
+        # never turned into a label.
+        assert custom_embeddings["sub_path"] == "embeddings"
+        assert custom_embeddings["provider"] == "openai"
+        custom_count_tokens = client.post(
+            "/v1/messages/count_tokens",
+            headers={"x-headroom-base-url": "https://custom.example/anthropic/"},
+        ).json()
+        assert custom_count_tokens["base_url"] == "https://custom.example/anthropic"
+        assert custom_count_tokens["sub_path"] == "count_tokens"
+        assert custom_count_tokens["provider"] == "anthropic"
+        custom_gemini = client.get(
+            "/v1beta/models",
+            headers={"x-headroom-base-url": "https://custom.example/gemini/"},
+        ).json()
+        assert custom_gemini["base_url"] == "https://custom.example/gemini"
+        assert custom_gemini["sub_path"] == "models"
+        assert custom_gemini["provider"] == "gemini"
+        # An unsafe override is rejected instead of being relayed.
+        unsafe_embeddings = client.post(
+            "/v1/embeddings",
+            headers={"x-headroom-base-url": "http://127.0.0.1:9"},
+        )
+        assert unsafe_embeddings.status_code == 400
         assert client.post(
             "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
         ).json() == {
@@ -281,6 +324,133 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
     assert len(anthropic_calls) >= 2
 
 
+def test_codex_alpha_search_route_from_headroom_issue_2525() -> None:
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, str], bytes]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(
+                (
+                    method,
+                    url,
+                    dict(kwargs.get("headers", {})),
+                    kwargs.get("content", b""),
+                )
+            )
+            return httpx.Response(200, json={"ok": True})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        response = client.post(
+            "/v1/alpha/search?query=weather",
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "ChatGPT-Account-ID": "acct_123",
+            },
+            json={"query": "weather"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert len(fake_http_client.calls) == 1
+    method, url, headers, body = fake_http_client.calls[0]
+    assert method == "POST"
+    assert url == "https://chatgpt.com/backend-api/codex/alpha/search?query=weather"
+    assert headers["authorization"] == "Bearer oauth-token"
+    assert headers["chatgpt-account-id"] == "acct_123"
+    assert headers["content-length"] == "19"
+    assert headers["content-type"] == "application/json"
+    assert body == b'{"query":"weather"}'
+
+
+def test_non_chatgpt_alpha_search_falls_through_to_openai_upstream(monkeypatch) -> None:
+    calls: list[tuple[str, str, str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.method, request.url.path, base_url, sub_path, provider_name))
+        return JSONResponse(
+            {
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        response = client.post(
+            "/v1/alpha/search",
+            headers={"Authorization": "Bearer sk-proj-openai-test"},
+            json={"query": "weather"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "base_url": "https://api.openai.test",
+        "sub_path": "",
+        "provider": "",
+    }
+    assert calls == [
+        (
+            "POST",
+            "/v1/alpha/search",
+            "https://api.openai.test",
+            "",
+            "",
+        )
+    ]
+
+
+def test_codex_alpha_search_route_matrix(monkeypatch) -> None:
+    fallback_calls: list[tuple[str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        fallback_calls.append((request.url.path, base_url))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.urls.append(url)
+            return httpx.Response(200, json={"ok": True})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+
+        oauth_response = client.post(
+            "/v1/alpha/search",
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "ChatGPT-Account-ID": "acct_123",
+            },
+            json={"query": "weather"},
+        )
+        api_key_response = client.post(
+            "/v1/alpha/search",
+            headers={"Authorization": "Bearer sk-proj-openai-test"},
+            json={"query": "weather"},
+        )
+
+    assert oauth_response.status_code == 200
+    assert api_key_response.status_code == 200
+    assert fake_http_client.urls == ["https://chatgpt.com/backend-api/codex/alpha/search"]
+    assert fallback_calls == [("/v1/alpha/search", "https://api.openai.test")]
+
+
 def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> None:
     proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
     proxy = type(
@@ -307,12 +477,21 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     assert proxy_routes._select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
         "https://legacy.gemini.test"
     )
-    assert (
-        proxy_routes._select_passthrough_base_url(
-            proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+    # The azure branch honours the override, but only after the SSRF guard
+    # clears the destination (CVE-2026-77775). `azure.example` does not
+    # resolve, and the guard fails closed on resolution failure, so pin a
+    # public answer to keep this assertion about target *precedence*.
+    with patch.object(
+        upstream_guard.socket,
+        "getaddrinfo",
+        return_value=[(None, None, None, None, ("20.10.10.10", 443))],
+    ):
+        assert (
+            proxy_routes._select_passthrough_base_url(
+                proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+            )
+            == "https://azure.example/base"
         )
-        == "https://azure.example/base"
-    )
     assert proxy_routes._select_passthrough_base_url(proxy, {"api-key": "azure"}) == (
         "https://legacy.anthropic.test"
     )
@@ -382,7 +561,9 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
             "handle_anthropic_batch_passthrough"
         )
         assert client.post("/v1/chat/completions").json()["handler"] == "handle_openai_chat"
+        assert client.post("/chat/completions").json()["handler"] == "handle_openai_chat"
         assert client.post("/v1/responses").json()["handler"] == "handle_openai_responses"
+        assert client.post("/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/v1/codex/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/codex/responses").json()["handler"] == (
@@ -617,6 +798,7 @@ def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(m
     with TestClient(_app()) as client:
         fake = FakeAsyncClient()
         client.app.state.proxy.http_client = fake
+        client.app.state.proxy.http_client_h1 = fake
         assert client.get("/v1/codex/responses/items/resp_1").status_code == 200
         assert client.post("/backend-api/responses/items/resp_2").status_code == 200
         assert client.delete("/backend-api/codex/responses/items/resp_3").status_code == 200
@@ -931,6 +1113,7 @@ def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> Non
     with TestClient(_app()) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         response = client.get(
             "/v1/models?client_version=0.135.0",
             headers={
@@ -1054,6 +1237,7 @@ def test_v1_models_get_single_dynamic_under_chatgpt_auth() -> None:
     with TestClient(_app()) as client:
         fake_http_client = FakeAsyncClient()
         client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.http_client_h1 = fake_http_client
         ok = client.get(
             "/v1/models/gpt-5.3-codex-spark",
             headers={
@@ -1160,6 +1344,11 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
                         {"id": "claude-sonnet-4-5[1m]", "object": "model"},
                     ],
                 },
+                headers={
+                    "etag": '"stale"',
+                    "last-modified": "Thu, 01 Jan 1970 00:00:00 GMT",
+                    "cache-control": "max-age=60",
+                },
             )
 
         async def aclose(self) -> None:
@@ -1171,6 +1360,9 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
         response = client.get("/v1/models", headers={"x-api-key": "sk-ant-test"})
 
     assert response.status_code == 200
+    assert response.headers.get("etag") is None
+    assert response.headers.get("last-modified") is None
+    assert response.headers.get("cache-control") is None
     assert response.json()["data"] == [
         {"id": "claude-opus-4-8", "object": "model"},
         {"id": "claude-sonnet-4-5", "object": "model"},
@@ -1206,6 +1398,57 @@ def test_anthropic_model_detail_path_strips_ansi_model_id() -> None:
     assert fake_http_client.calls == [
         ("GET", "https://api.anthropic.test/v1/models/claude-opus-4-8")
     ]
+
+
+def test_issue_3312_grok_model_metadata() -> None:
+    fixture = {
+        "model": "grok-4.6",
+        "context_length": 500000,
+    }
+
+    class FakeAsyncClient:
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": fixture["model"],
+                            "object": "model",
+                            "context_length": fixture["context_length"],
+                        }
+                    ],
+                },
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            anthropic_api_url="https://api.anthropic.test",
+            openai_api_url="https://api.x.ai",
+            gemini_api_url="https://api.gemini.test",
+            cloudcode_api_url="https://cloudcode.test",
+            vertex_api_url="https://vertex.test",
+        )
+    )
+    with TestClient(app) as client:
+        client.app.state.proxy.http_client = FakeAsyncClient()
+        response = client.get("/v1/models", headers={"authorization": "Bearer sk-xai-test"})
+
+    entry = response.json()["data"][0]
+    assert response.status_code == 200
+    assert entry == {
+        "id": "grok-4.6",
+        "object": "model",
+        "context_length": 500000,
+        "context_window": 500000,
+    }
 
 
 def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
@@ -1246,3 +1489,118 @@ def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
 
     assert response.status_code == 200
     assert fake_http_client.bodies[0]["model"] == "claude-opus-4-8"
+
+
+def test_model_metadata_routes_honor_the_custom_base_url(monkeypatch) -> None:
+    # A client that names its own upstream must get its model list from that
+    # upstream, not from the proxy's default OpenAI one: the chat and
+    # responses handlers already honor the header (#4302).
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        listed = client.get(
+            "/v1/models",
+            headers={"x-headroom-base-url": "https://custom.example"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={"x-headroom-base-url": "https://custom.example/"},
+        )
+        # An Anthropic-compatible gateway names its upstream the same way.
+        anthropic = client.get(
+            "/v1/models",
+            headers={
+                "x-api-key": "gateway-key",
+                "x-headroom-base-url": "https://custom.example",
+            },
+        )
+
+    assert listed.json()["base_url"] == "https://custom.example"
+    assert fetched.json()["base_url"] == "https://custom.example"
+    assert calls[0][2] == "openai"
+    assert anthropic.json()["base_url"] == "https://custom.example"
+    assert calls[-1][2] == "anthropic"
+
+
+def test_model_metadata_routes_reject_an_unsafe_custom_base_url(monkeypatch) -> None:
+    # A client-named upstream goes through the same SSRF guard as the other
+    # routes: an unsafe one is refused, and the request never reaches an
+    # upstream. Falling back to the configured upstream would have sent the
+    # authenticated request, and its credentials, to a host the client did
+    # not name.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    credential = {"authorization": "Bearer synthetic-private-gateway-key"}
+    with TestClient(_app()) as client:
+        listed = client.get(
+            "/v1/models",
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
+        )
+        fetched = client.get(
+            "/v1/models/gpt-5",
+            headers={**credential, "x-headroom-base-url": "http://169.254.169.254"},
+        )
+
+    assert listed.status_code == 400
+    assert listed.json()["detail"] == "Rejected unsafe upstream base URL"
+    assert fetched.status_code == 400
+    # No upstream call at all: the rejected request must not be redirected to
+    # the configured upstream, which would disclose the credential.
+    assert calls == []
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/models/gpt-5"])
+def test_model_metadata_rejection_redacts_url_credentials(monkeypatch, caplog, path) -> None:
+    """Reject unsafe destinations without exposing URL credentials in the warning."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "")
+    calls = []
+
+    async def unexpected_passthrough(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("Rejected metadata request reached upstream")
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", unexpected_passthrough)
+    with caplog.at_level("WARNING"), TestClient(_app()) as client:
+        response = client.get(
+            path,
+            headers={
+                "authorization": "Bearer synthetic-gateway-key",
+                "x-headroom-base-url": (
+                    "https://synthetic-user:synthetic-password@127.0.0.1/v1"
+                    "?api_key=synthetic-query-secret"
+                ),
+            },
+        )
+    assert response.status_code == 400
+    assert calls == []
+    assert "rejecting unsafe x-headroom-base-url" in caplog.text
+    for secret in ("synthetic-user", "synthetic-password", "synthetic-query-secret"):
+        assert secret not in caplog.text

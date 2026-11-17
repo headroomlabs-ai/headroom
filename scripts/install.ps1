@@ -22,19 +22,56 @@ function Require-Command {
 function Ensure-PathEntry {
     param([string]$PathEntry)
 
-    $currentPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    # Persist to the User PATH by default. The 'User' scope lives in
+    # HKCU\Environment and is NOT redirected by a HOME/USERPROFILE override, so a
+    # caller that must not mutate the real persistent PATH (the installer test
+    # suite, which runs this against a throwaway fake home) sets
+    # HEADROOM_INSTALL_PATH_SCOPE=Process to keep the update ephemeral instead of
+    # leaking the temp shim dir into the developer's actual user PATH (#2970).
+    #
+    # Only those two persistence modes are supported. The value is handed to
+    # .NET's EnvironmentVariableTarget, whose 'Machine' member would rewrite the
+    # SYSTEM-wide PATH if this variable were inherited by an elevated installer,
+    # and a typo would otherwise fail late with an opaque enum-conversion error.
+    # Normalize case-insensitively and allow-list 'User'/'Process', failing early
+    # and clearly for 'Machine' or anything else.
+    $scope = 'User'
+    if ($env:HEADROOM_INSTALL_PATH_SCOPE) {
+        switch ($env:HEADROOM_INSTALL_PATH_SCOPE.Trim().ToLowerInvariant()) {
+            'user' { $scope = 'User' }
+            'process' { $scope = 'Process' }
+            default {
+                throw "HEADROOM_INSTALL_PATH_SCOPE must be 'User' or 'Process' (got '$($env:HEADROOM_INSTALL_PATH_SCOPE)'); 'Machine' and other targets are not supported."
+            }
+        }
+    }
+
+    $currentPath = [Environment]::GetEnvironmentVariable('Path', $scope)
     $parts = @()
     if ($currentPath) {
         $parts = $currentPath -split ';' | Where-Object { $_ }
     }
     if ($parts -notcontains $PathEntry) {
         $newPath = @($PathEntry) + $parts
-        [Environment]::SetEnvironmentVariable('Path', ($newPath -join ';'), 'User')
+        [Environment]::SetEnvironmentVariable('Path', ($newPath -join ';'), $scope)
     }
 }
 
 function Ensure-ProfileBlock {
     param([string]$PathEntry)
+
+    # $PROFILE is empty when PowerShell cannot resolve the profile path for the
+    # current user (a fresh account with no Documents folder, a service/CI
+    # context, a redirected profile). Split-Path below would then throw
+    # "Cannot bind argument to parameter 'Path' because it is an empty string",
+    # and with $ErrorActionPreference = 'Stop' that aborts the whole installer
+    # AFTER the wrapper and persistent User PATH were already written. Skip the
+    # profile convenience block instead: Ensure-PathEntry has already persisted
+    # the PATH for new sessions.
+    if ([string]::IsNullOrEmpty($PROFILE)) {
+        Write-Info 'Skipping PowerShell profile update: $PROFILE is not set in this environment (PATH was still updated for new sessions).'
+        return
+    }
 
     $markerStart = '# >>> headroom docker-native >>>'
     $markerEnd = '# <<< headroom docker-native <<<'
@@ -122,6 +159,18 @@ function Get-PassthroughEnvArgs {
     return ,$args.ToArray()
 }
 
+# Publish the proxy on host loopback only. The container itself must bind
+# 0.0.0.0 for Docker port forwarding to reach it, and the proxy refuses a
+# token-less non-loopback bind unless the operator states that the runtime
+# already confines the port. This is the only place that statement is made,
+# and it is always made together with the 127.0.0.1 publication it relies on.
+function Get-LoopbackPublishArgs {
+    param([int]$Port)
+    # Leading comma: return the array as one object so AddRange receives a
+    # string[] rather than an unrolled object[] (same as Get-SharedDockerArgs).
+    return ,[string[]]@('-p',"127.0.0.1`:$Port`:$Port",'--env','HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1')
+}
+
 function Get-SharedDockerArgs {
     Ensure-HostDirs
     $args = New-Object System.Collections.Generic.List[string]
@@ -157,14 +206,10 @@ function Get-SharedDockerArgs {
 function Add-TtyArgs {
     param($ArgsList)
 
+    # MCP stdio always uses a pipe for stdin. Docker only forwards stdin when
+    # explicitly given -i, regardless of whether the host console is redirected.
+    $ArgsList.Add('-i')
     if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
-        $ArgsList.Add('-it')
-        return
-    }
-    if (-not [Console]::IsInputRedirected) {
-        $ArgsList.Add('-i')
-    }
-    if (-not [Console]::IsOutputRedirected) {
         $ArgsList.Add('-t')
     }
 }
@@ -220,7 +265,8 @@ function Start-ProxyContainer {
 
     $containerName = "headroom-proxy-$Port-$PID"
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName,'-p',"$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName))
+    $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $Port))
     $dockerArgs.AddRange((Get-SharedDockerArgs))
     $dockerArgs.Add($HeadroomImage)
     $dockerArgs.Add('--host')
@@ -344,6 +390,35 @@ function Get-PersistentDockerArgs {
     }
 
     return ,$args.ToArray()
+}
+
+function Add-DashboardGatewayEnv {
+    param([System.Collections.Generic.List[string]]$ArgsList)
+
+    # This default is safe only because the published dashboard port is bound
+    # to the host loopback interface below. A host request published through
+    # Docker's default bridge reaches the
+    # container from the bridge gateway (for example, 172.17.0.1), not from
+    # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
+    # metadata gate works for the first-party persistent Docker preset while
+    # preserving an explicitly configured allowlist.
+    #
+    # An explicitly empty allowlist counts as configured. Look it up the way
+    # Get-PassthroughEnvArgs does: once Env: has been enumerated, Windows
+    # PowerShell 5.1 reports an empty variable as unset through Test-Path and
+    # [Environment]::GetEnvironmentVariable, which would add the gateway on top
+    # of the forwarded empty value.
+    if (Get-ChildItem Env: | Where-Object { $_.Name -eq 'HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS' }) {
+        return
+    }
+
+    $gateway = (& docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $gateway) {
+        $ArgsList.Add('--env')
+        $ArgsList.Add("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=$gateway/32")
+    } else {
+        Write-Warning 'Could not determine Docker bridge gateway; dashboard metadata remains restricted'
+    }
 }
 
 function Get-ManifestProxyArgs {
@@ -492,8 +567,10 @@ function Start-PersistentDockerInstall {
     docker rm -f $containerName | Out-Null 2>$null
 
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName))
+    $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $Port))
     $dockerArgs.AddRange((Get-PersistentDockerArgs))
+    Add-DashboardGatewayEnv -ArgsList $dockerArgs
     $dockerArgs.AddRange([string[]]@(
         '--env',"HEADROOM_DEPLOYMENT_PROFILE=$Profile",
         '--env','HEADROOM_DEPLOYMENT_PRESET=persistent-docker',
@@ -1666,7 +1743,7 @@ switch ($args[0]) {
     'proxy' {
         $port = 8787
         $forwardArgs = New-Object System.Collections.Generic.List[string]
-        foreach ($arg in $args) { $forwardArgs.Add($arg) }
+        for ($i = 1; $i -lt $args.Count; $i++) { $forwardArgs.Add($args[$i]) }
         for ($i = 1; $i -lt $args.Count; $i++) {
             if ($args[$i] -eq '--port' -or $args[$i] -eq '-p') {
                 Require-OptionValue -Arguments $args -Index $i -Option $args[$i]
@@ -1682,11 +1759,16 @@ switch ($args[0]) {
         $dockerArgs = New-Object System.Collections.Generic.List[string]
         $dockerArgs.AddRange([string[]]@('run','--rm'))
         Add-TtyArgs -ArgsList $dockerArgs
-        $dockerArgs.AddRange([string[]]@('-p',"$port`:$port"))
+        $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $port))
         $dockerArgs.AddRange((Get-SharedDockerArgs))
         $dockerArgs.Add('--entrypoint')
         $dockerArgs.Add('headroom')
         $dockerArgs.Add($HeadroomImage)
+        $dockerArgs.Add('proxy')
+        $dockerArgs.Add('--host')
+        $dockerArgs.Add('0.0.0.0')
+        $dockerArgs.Add('--port')
+        $dockerArgs.Add("$port")
         foreach ($arg in $forwardArgs) {
             $dockerArgs.Add($arg)
         }
@@ -1742,4 +1824,4 @@ Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Restart PowerShell"
 Write-Host "  2. Try: headroom proxy"
-Write-Host "  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md"
+Write-Host "  3. Docs: https://docs.headroomlabs.ai/docs/docker-install"

@@ -9,10 +9,15 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.helpers import _reset_session_ccr_tracker_for_test
 from headroom.proxy.server import ProxyConfig, create_app
 
 _RAW_TRANSCRIPT = "\n".join(f"row {idx}: payload payload payload" for idx in range(80))
+
+# The hash most fixtures below embed in a "[... Retrieve more: hash=...]"
+# marker to drive CCR tool injection.
+_MARKER_HASH = "abc123def456abc123def456"
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +33,28 @@ def _reset_ccr_tracker():
     _reset_session_ccr_tracker_for_test()
     yield
     _reset_session_ccr_tracker_for_test()
+
+
+@pytest.fixture(autouse=True)
+def _seed_marker_hash_in_store():
+    """Make ``_MARKER_HASH`` a real, verifiable compression-store entry.
+
+    CCRToolInjector.verify_ownership() (issue #2836) only advertises the
+    retrieve tool for hashes the compression store actually recognizes.
+    These fixtures hand-type marker text rather than compressing real
+    content through the store, so without this the hash would (correctly)
+    be treated as foreign and the tool would never get injected — these
+    tests are about the deferred-injection *policy*, not about exercising
+    real storage, so seed the one hash they all key off of.
+    """
+    reset_compression_store()
+    get_compression_store().store(
+        original="original tool output",
+        compressed="[100 items compressed to 10]",
+        explicit_hash=_MARKER_HASH,
+    )
+    yield
+    reset_compression_store()
 
 
 class _FakePrefixTracker:
@@ -138,7 +165,9 @@ def test_frozen_prefix_skips_marker_emission_when_tool_injection_is_deferred(mon
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
         proxy._get_compression_cache = lambda session_id: _FakeCompressionCache(
             frozen_count=1,
             cached_messages=cached_marker_messages,
@@ -221,7 +250,9 @@ def test_unfrozen_prefix_keeps_reversible_ccr_path(monkeypatch) -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -295,7 +326,9 @@ def test_token_mode_reclamp_keeps_reversible_ccr_path_when_effective_prefix_drop
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
         proxy._get_compression_cache = lambda session_id: _FakeCompressionCache(frozen_count=0)
 
         def _fake_apply(**kwargs):
@@ -372,7 +405,9 @@ def test_token_mode_compresses_frozen_prefix_turns_when_tool_is_not_already_pres
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
         proxy._get_compression_cache = lambda session_id: _FakeCompressionCache(frozen_count=1)
 
         def _fake_apply(**kwargs):
@@ -448,7 +483,9 @@ def test_existing_retrieve_tool_keeps_reversible_ccr_path_when_prefix_is_frozen(
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -536,7 +573,9 @@ def test_cache_mode_compresses_delta_but_replays_cached_prefix_when_markers_are_
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -629,7 +668,9 @@ def test_cache_mode_exact_prefix_replay_forwards_cached_compressed_prefix_and_in
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -722,7 +763,9 @@ def test_token_mode_cached_messages_skip_cache_update_when_pipeline_result_is_un
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
         proxy._get_compression_cache = lambda session_id: cache
 
         def _fake_apply(**kwargs):
@@ -795,7 +838,9 @@ def test_non_token_non_cache_mode_keeps_compression_and_injects_tool_for_new_mar
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -888,7 +933,9 @@ def test_non_token_non_cache_mode_keeps_reversible_path_and_records_waste_signal
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         class _FakeWasteSignals:
             def to_dict(self) -> dict[str, bool]:
@@ -975,7 +1022,9 @@ def test_cache_mode_existing_retrieve_tool_keeps_exact_prefix_replay(monkeypatch
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -1063,7 +1112,9 @@ def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -1173,7 +1224,9 @@ def test_non_token_non_cache_mode_preserves_original_messages_when_result_is_unc
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
@@ -1249,7 +1302,9 @@ def test_non_token_non_cache_mode_recovers_from_compression_errors(monkeypatch) 
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
         proxy.anthropic_pipeline.apply = lambda **kwargs: (_ for _ in ()).throw(
             RuntimeError("synthetic compression failure")
         )
@@ -1320,7 +1375,9 @@ def test_cache_mode_without_stable_delta_keeps_original_messages(monkeypatch) ->
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])

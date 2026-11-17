@@ -7,8 +7,8 @@
   "bump-patch-for-minor-pre-major": false,
   "draft": false,
   "prerelease": false,
-  "separate-pull-requests": false,
-  "pull-request-title-pattern": "chore: release ${version}",
+  "separate-pull-requests": true,
+  "pull-request-title-pattern": "chore: release${component} ${version}",
   "packages": {
     ".": {
       "package-name": "headroom-ai",
@@ -22,6 +22,11 @@
         {
           "type": "json",
           "path": "plugins/openclaw/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "plugins/opencode/package.json",
           "jsonpath": "$.version"
         }
       ]

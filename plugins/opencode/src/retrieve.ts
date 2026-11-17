@@ -1,6 +1,5 @@
 import type { CompressResult } from "headroom-ai";
-
-import { stripTrailingSlashes } from "./urls.js";
+import { compress } from "headroom-ai";
 
 let _proxyUrlCache: string | null = null;
 
@@ -9,15 +8,25 @@ export function setDefaultProxyUrl(url: string): void {
 }
 
 export function getDefaultProxyUrl(): string {
-  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
+  return _proxyUrlCache || process.env.HEADROOM_BASE_URL || "http://localhost:8787";
 }
 
 export interface RetrieveToolConfig {
   proxyBaseUrl: string;
 }
 
+/**
+ * Strip trailing "/" characters. A loop rather than a `+$` regex, which
+ * backtracks quadratically on inputs with long runs of slashes.
+ */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+
 export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
-  const origin = stripTrailingSlashes(config.proxyBaseUrl);
+  const origin = trimTrailingSlashes(config.proxyBaseUrl);
 
   return {
     name: "headroom_retrieve",
@@ -80,12 +89,6 @@ export async function compressWithHeadroom(
     proxyUrl?: string;
   } = {},
 ): Promise<CompressResult> {
-  // Imported lazily: `headroom-ai` (the optional TypeScript SDK) is not a
-  // dependency most OpenCode users have installed. The plugin's default
-  // export (HeadroomPlugin) must load and register successfully without it;
-  // only this opt-in retrieval helper needs it, and only when actually
-  // called.
-  const { compress } = await import("headroom-ai");
   return compress(messages, {
     baseUrl: options.proxyUrl ?? getDefaultProxyUrl(),
     model: options.model ?? "gpt-4o",

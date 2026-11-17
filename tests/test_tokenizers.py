@@ -17,6 +17,7 @@ from headroom.tokenizers import (
     list_supported_models,
     register_tokenizer,
 )
+from headroom.tokenizers.base import coerce_countable_text
 
 
 class TestTiktokenCounter:
@@ -411,6 +412,117 @@ class TestTokenizerRegistry:
         retrieved = get_tokenizer("my-custom-model")
         assert retrieved is custom
 
+    def test_register_custom_factory_is_lazy_case_insensitive_and_replaceable(self, monkeypatch):
+        """Model factories should override auto detection without polluting backends."""
+        registry = TokenizerRegistry()
+        for attr in ("_tokenizers", "_factories", "_cache"):
+            monkeypatch.setattr(registry, attr, getattr(registry, attr).copy())
+        monkeypatch.setattr(
+            registry,
+            "_model_factories",
+            getattr(registry, "_model_factories", {}).copy(),
+            raising=False,
+        )
+
+        model = "Custom-Factory-Model"
+        calls: list[str] = []
+        custom = CharacterCounter(chars_per_token=1.0)
+
+        def factory(requested_model: str) -> CharacterCounter:
+            calls.append(requested_model)
+            return custom
+
+        register_tokenizer(model, factory=factory)
+
+        assert model.lower() not in registry.list_backends()
+        first = get_tokenizer(model.upper())
+        assert first is custom
+        assert calls == [model.upper()]
+        assert get_tokenizer(model.lower()) is first
+        assert calls == [model.upper()]
+
+        forced = get_tokenizer(model, backend="estimation")
+        assert isinstance(forced, EstimatingTokenCounter)
+        assert calls == [model.upper()]
+
+        replacement = EstimatingTokenCounter(chars_per_token=2.0)
+        register_tokenizer(model, tokenizer=replacement)
+        assert get_tokenizer(model.lower()) is replacement
+
+        replacement_calls: list[str] = []
+        replacement_custom = CharacterCounter(chars_per_token=2.0)
+
+        def replacement_factory(requested_model: str) -> CharacterCounter:
+            replacement_calls.append(requested_model)
+            return replacement_custom
+
+        register_tokenizer(model.lower(), factory=replacement_factory)
+        recreated = get_tokenizer(model)
+        assert recreated is replacement_custom
+        assert replacement_calls == [model]
+        assert get_tokenizer(model.upper()) is recreated
+        assert replacement_calls == [model]
+
+    def test_model_factory_failure_does_not_poison_strict_or_recovery(self, monkeypatch):
+        """A fallback from a model factory must not hide later retries."""
+        registry = TokenizerRegistry()
+        for attr in ("_tokenizers", "_factories", "_cache"):
+            monkeypatch.setattr(registry, attr, getattr(registry, attr).copy())
+        monkeypatch.setattr(
+            registry,
+            "_model_factories",
+            getattr(registry, "_model_factories", {}).copy(),
+            raising=False,
+        )
+
+        model = "Transient-Factory-Model"
+        state = {"available": False}
+        calls: list[str] = []
+        custom = CharacterCounter(chars_per_token=1.0)
+
+        def factory(requested_model: str) -> CharacterCounter:
+            calls.append(requested_model)
+            if not state["available"]:
+                raise RuntimeError("temporary factory outage")
+            return custom
+
+        register_tokenizer(model, factory=factory)
+
+        first = get_tokenizer(model)
+        with pytest.raises(ValueError, match="No tokenizer available"):
+            get_tokenizer(model, fallback=False)
+
+        state["available"] = True
+        recovered = get_tokenizer(model, fallback=False)
+
+        assert isinstance(first, EstimatingTokenCounter)
+        assert recovered is custom
+        assert calls == [model, model, model]
+
+    def test_list_registered_includes_model_factories_and_replacements(self, monkeypatch):
+        """Registered model names should include both instances and factories."""
+        registry = TokenizerRegistry()
+        for attr in ("_tokenizers", "_factories", "_cache"):
+            monkeypatch.setattr(registry, attr, getattr(registry, attr).copy())
+        monkeypatch.setattr(
+            registry,
+            "_model_factories",
+            getattr(registry, "_model_factories", {}).copy(),
+            raising=False,
+        )
+
+        model = "Listed-Factory-Model"
+        register_tokenizer(model, factory=lambda _: CharacterCounter(chars_per_token=1.0))
+        assert model.lower() in registry.list_registered()
+
+        register_tokenizer(model, tokenizer=CharacterCounter(chars_per_token=2.0))
+        assert model.lower() in registry.list_registered()
+
+        register_tokenizer(model, factory=lambda _: CharacterCounter(chars_per_token=3.0))
+        registered = registry.list_registered()
+        assert model.lower() in registered
+        assert registered.count(model.lower()) == 1
+
     def test_list_supported_models(self):
         """Test listing supported models."""
         models = list_supported_models()
@@ -727,3 +839,164 @@ class TestLargeToolBlobEstimation:
             cur = cur["n"]
         cur["leaf"] = "x" * 60_000
         assert EstimatingTokenCounter()._count_serialized(deep) >= 0
+
+
+class TestThinkingBlockCounting:
+    """Thinking blocks price their text plus the decoded signature bytes."""
+
+    def test_signature_prices_between_zero_and_the_json_catch_all(self):
+        counter = EstimatingTokenCounter()
+        text = "consider the failing test " * 20
+        block = {"type": "thinking", "thinking": text, "signature": "A" * 4000}
+        signed = {"role": "assistant", "content": [block]}
+        unsigned = {"role": "assistant", "content": [{"type": "thinking", "thinking": text}]}
+        # The signature is encrypted reasoning the server replays as billed
+        # input, so it adds to the text at decoded bytes / 4 (4000 * 3/4 / 4)...
+        delta = counter.count_messages([signed]) - counter.count_messages([unsigned])
+        assert delta == 750
+        # ...which is well under the JSON catch-all's base64-as-prose price.
+        assert delta < counter._count_serialized(block)
+
+    def test_omitted_display_block_is_not_free(self):
+        # display: "omitted" (the 5.x default) returns an empty thinking field
+        # and carries the whole reasoning in the signature.
+        counter = EstimatingTokenCounter()
+        omitted = {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "", "signature": "A" * 4000}],
+        }
+        empty = {"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]}
+        assert counter.count_messages([omitted]) > counter.count_messages([empty])
+
+    def test_provider_walker_shares_the_thinking_rule(self):
+        from headroom.tokenizers.base import count_content_blocks
+
+        counter = EstimatingTokenCounter()
+        text = "consider the failing test " * 20
+        signed = [{"type": "thinking", "thinking": text, "signature": "A" * 4000}]
+        unsigned = [{"type": "thinking", "thinking": text}]
+        assert count_content_blocks(signed, counter.count_text) == counter._count_content_parts(
+            signed
+        )
+        assert (
+            count_content_blocks(signed, counter.count_text)
+            - count_content_blocks(unsigned, counter.count_text)
+            == 750
+        )
+
+
+class TestDictValuedTextFields:
+    """Structured (non-string) text fields must not crash token counting.
+
+    Regression (GH #4273): a dict-valued ``text`` block reached
+    ``tiktoken.encode`` unchanged and raised ``TypeError: unhashable type:
+    'dict'``, aborting compression for the whole request. The fix reuses
+    :func:`coerce_countable_text` so a non-string text-ish field is priced
+    like the JSON string it should have been.
+    """
+
+    @pytest.mark.parametrize(
+        "counter_cls",
+        [TiktokenCounter, EstimatingTokenCounter],
+        ids=["tiktoken", "estimator"],
+    )
+    def test_dict_text_block_counts_like_coerced_string(self, counter_cls):
+        counter = counter_cls()
+        text_dict = {"message": "non-string provider text"}
+        expected = coerce_countable_text(text_dict)
+
+        bad = {"role": "user", "content": [{"type": "text", "text": text_dict}]}
+        good = {"role": "user", "content": [{"type": "text", "text": expected}]}
+
+        assert counter.count_messages([bad]) == counter.count_messages([good])
+
+    @pytest.mark.parametrize(
+        "counter_cls",
+        [TiktokenCounter, EstimatingTokenCounter],
+        ids=["tiktoken", "estimator"],
+    )
+    def test_dict_text_block_does_not_mutate_input(self, counter_cls):
+        import copy
+
+        counter = counter_cls()
+        message = {
+            "role": "user",
+            "content": [{"type": "text", "text": {"message": "non-string provider text"}}],
+        }
+        original = copy.deepcopy(message)
+
+        counter.count_messages([message])
+
+        assert message == original
+
+    @pytest.mark.parametrize(
+        "counter_cls",
+        [TiktokenCounter, EstimatingTokenCounter],
+        ids=["tiktoken", "estimator"],
+    )
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {"type": "text", "text": {"message": "non-string provider text"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 20000}},
+        ],
+        ids=["text", "image"],
+    )
+    def test_unwrapped_content_block_counts_like_list_form(self, counter_cls, block):
+        # An image must keep its fixed estimate, not be priced as base64 text.
+        counter = counter_cls()
+        bare = {"role": "user", "content": block}
+        wrapped = {"role": "user", "content": [block]}
+
+        assert counter.count_messages([bare]) == counter.count_messages([wrapped])
+
+    @pytest.mark.parametrize(
+        "counter_cls",
+        [TiktokenCounter, EstimatingTokenCounter],
+        ids=["tiktoken", "estimator"],
+    )
+    def test_dict_role_counts_like_coerced_string(self, counter_cls):
+        counter = counter_cls()
+        role_dict = {"role": "user"}
+        expected = coerce_countable_text(role_dict)
+
+        bad = {"role": role_dict, "content": "hi"}
+        good = {"role": expected, "content": "hi"}
+
+        assert counter.count_messages([bad]) == counter.count_messages([good])
+
+    @pytest.mark.parametrize(
+        "counter_cls",
+        [TiktokenCounter, EstimatingTokenCounter],
+        ids=["tiktoken", "estimator"],
+    )
+    def test_dict_tool_result_content_counts_like_coerced_string(self, counter_cls):
+        counter = counter_cls()
+        tr_dict = {"output": "non-string provider text"}
+        expected = coerce_countable_text(tr_dict)
+
+        bad = {
+            "role": "user",
+            "content": [{"type": "tool_result", "content": tr_dict}],
+        }
+        good = {
+            "role": "user",
+            "content": [{"type": "tool_result", "content": expected}],
+        }
+
+        assert counter.count_messages([bad]) == counter.count_messages([good])
+
+    @pytest.mark.parametrize(
+        "counter_cls",
+        [TiktokenCounter, EstimatingTokenCounter],
+        ids=["tiktoken", "estimator"],
+    )
+    def test_dict_thinking_counts_like_coerced_string(self, counter_cls):
+        counter = counter_cls()
+        thinking_dict = {"reasoning": "non-string provider text"}
+        expected = coerce_countable_text(thinking_dict)
+
+        bad = {"role": "assistant", "content": [{"type": "thinking", "thinking": thinking_dict}]}
+        good = {"role": "assistant", "content": [{"type": "thinking", "thinking": expected}]}
+
+        assert counter.count_messages([bad]) == counter.count_messages([good])

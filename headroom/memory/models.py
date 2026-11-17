@@ -14,6 +14,46 @@ except ImportError:
     np = None  # type: ignore[assignment]
 
 
+def normalize_entity_refs(values: Any) -> list[str]:
+    """Coerce a raw entity-reference list into the plain ``list[str]`` it claims to be.
+
+    ``entity_refs`` (and the ``entities`` argument that feeds it) is typed
+    ``list[str]``, but nothing enforced that at runtime, so callers have
+    persisted the typed ``{"entity": ..., "entity_type": ...}`` shape -- the
+    format ``extracted_entities`` expects -- into it by mistake. Those dicts
+    then break every consumer that treats a ref as a string: ``set().update()``
+    raises ``TypeError: unhashable type: 'dict'`` and ``ref.lower()`` raises
+    ``AttributeError``, which took down whole memory searches rather than the
+    one bad row (see issue #2947).
+
+    Dicts are unwrapped to their ``entity`` name so no information is lost;
+    anything with no recoverable name is dropped rather than stringified, since
+    a ref like ``"{'entity_type': 'project'}"`` would only pollute the graph.
+    Order is preserved and duplicate names are collapsed.
+    """
+    if not values:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        if isinstance(value, str):
+            name = value
+        elif isinstance(value, dict):
+            # The extracted_entities shape, mistakenly used as a plain name.
+            candidate = value.get("entity") or value.get("name")
+            name = candidate if isinstance(candidate, str) else ""
+        else:
+            name = ""
+
+        if name and name not in seen:
+            seen.add(name)
+            normalized.append(name)
+
+    return normalized
+
+
 class ScopeLevel(Enum):
     """Memory scope hierarchy levels."""
 
@@ -132,7 +172,9 @@ class Memory:
             last_accessed=datetime.fromisoformat(data["last_accessed"])
             if data.get("last_accessed")
             else None,
-            entity_refs=data.get("entity_refs", []),
+            # Normalized on load so rows written before #2947 was fixed heal
+            # themselves instead of crashing search.
+            entity_refs=normalize_entity_refs(data.get("entity_refs")),
             embedding=embedding,
             metadata=data.get("metadata", {}),
         )

@@ -8,7 +8,17 @@ from typing import Literal
 ToolInjectionDecision = Literal[
     "inject_first_time",
     "inject_sticky_replay",
+    # CCR, eager mode (the default): the retrieval tool is injected on the
+    # session's first request, before anything has been compressed, so the
+    # tools array — the head of the provider cache key — never changes
+    # mid-session. Distinguished from inject_first_time so operators can tell
+    # "entered the array cold" from "entered it against a warm prefix".
+    "inject_eager",
+    # Sessionless path: history already references headroom_retrieve, so the
+    # tool definition is re-injected even without fresh compression (#2440).
+    "inject_history_reference",
     "skip",
+    "skip_no_client_tools",
     "skip_disabled_via_env",
 ]
 

@@ -16,10 +16,22 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
+
+
+@runtime_checkable
+class _HashOwnershipStore(Protocol):
+    """Structural type for verify_ownership()'s store dependency.
+
+    Only needs the existence check — matches CompressionStore.exists()
+    without coupling this module to the concrete cache implementation
+    (or requiring test doubles to subclass it).
+    """
+
+    def exists(self, hash_key: str, clean_expired: bool = False) -> bool: ...
 
 
 def create_ccr_tool_definition(
@@ -85,6 +97,35 @@ def create_ccr_tool_definition(
             },
         }
 
+    elif provider == "openai_responses":
+        # Responses API: the same function, declared flat. `name` and
+        # `parameters` sit directly on the tool rather than nested under
+        # "function" as chat completions wants, and the nested shape is
+        # rejected -- so falling through to `openai_definition` here would
+        # inject a tool the provider refuses, on exactly the turns where
+        # compression markers made the tool necessary.
+        return {
+            "type": "function",
+            "name": CCR_TOOL_NAME,
+            "description": (
+                "Retrieve original uncompressed content that was compressed to save tokens. "
+                "Use this when you need more data than what's shown in compressed tool results. "
+                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hash": {
+                        "type": "string",
+                        "description": (
+                            "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                        ),
+                    },
+                },
+                "required": ["hash"],
+            },
+        }
+
     elif provider == "google":
         # Google/Gemini format
         return {
@@ -113,6 +154,8 @@ def create_ccr_tool_definition(
 def create_system_instructions(
     hashes: list[str],
     retrieval_endpoint: str = "/v1/retrieve",
+    *,
+    retrieval_tool_name: str = CCR_TOOL_NAME,
 ) -> str:
     """Create system message instructions for CCR retrieval.
 
@@ -122,6 +165,7 @@ def create_system_instructions(
     Args:
         hashes: List of hash keys for compressed content in this context.
         retrieval_endpoint: The endpoint path for retrieval.
+        retrieval_tool_name: Executable tool name from the client's registry.
 
     Returns:
         Instruction text to append to system message.
@@ -132,10 +176,10 @@ def create_system_instructions(
 ## Compressed Context Available
 
 Some tool outputs have been compressed to reduce context size. If you need
-the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
+the full uncompressed data, you can retrieve it using the `{retrieval_tool_name}` tool.
 
 **How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
+- Call `{retrieval_tool_name}(hash="<hash>")` to get the full original content back
 
 **Available hashes:** {hash_list}
 
@@ -170,6 +214,11 @@ class CCRToolInjector:
     inject_tool: bool = True
     inject_system_instructions: bool = True
     retrieval_endpoint: str = "/v1/retrieve"
+    # Store used to verify a scanned marker's hash is actually ours before
+    # advertising it (issue #2836). None resolves lazily to
+    # get_compression_store() — request-scoped store if one is set, else the
+    # global singleton — matching how every other CCR call site resolves it.
+    compression_store: _HashOwnershipStore | None = None
 
     # Detected compression markers
     _detected_hashes: list[str] = field(default_factory=list)
@@ -189,7 +238,9 @@ class CCRToolInjector:
             #
             # Standard format: [N <type> compressed to M. Retrieve more: hash=xxx]
             # Matches items, lines, matches, or any other type
-            re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
+            re.compile(
+                r"\[(\d+) \w+ compressed to (\d+)(?: \([^)]+\))?\.(?: Original content preserved\.)? Retrieve more: hash=([a-f0-9]{24})\]"
+            ),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
             # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
@@ -207,6 +258,15 @@ class CCRToolInjector:
             # redeem (silent data loss, #1006). Match the load-bearing
             # "Retrieve original: hash=" phrase directly.
             re.compile(r"Retrieve original: hash=([a-f0-9]{12,24})"),
+            # CodeCompressor (and any marker that appends "Expires in Nm.]" or
+            # uses "N tokens compressed." rather than "compressed to M"):
+            # `[128 tokens compressed. ... Retrieve more: hash=xxx. Expires in
+            # 30m.]`. The bracket patterns above anchor the hash on a trailing
+            # `]`, so the hash=...`. Expires` suffix (and the missing "to M")
+            # makes them all miss it -- the same silent-data-loss failure as
+            # #1006. Match the load-bearing "Retrieve more: hash=" phrase
+            # directly, matching how parser.py / session_probes detect it.
+            re.compile(r"Retrieve more: hash=([a-f0-9]{12,24})"),
         ]
     )
 
@@ -281,7 +341,16 @@ class CCRToolInjector:
         return self._detected_hashes
 
     def _scan_text(self, text: str) -> None:
-        """Scan text for compression markers from any compressor."""
+        """Scan text for compression markers from any compressor.
+
+        Shape-only: this matches the bracket format any compressor (or,
+        as it turns out, any *other* context tool) can produce. Callers
+        that need to know the hash is actually ours — i.e. before
+        advertising it to the model via the retrieve tool — must call
+        :meth:`verify_ownership` afterward. Kept separate so this method
+        stays a pure, store-independent text scan (that's what the
+        existing marker-format test suite exercises).
+        """
         for pattern in self._marker_patterns:
             matches = pattern.findall(text)
             for match in matches:
@@ -292,6 +361,59 @@ class CCRToolInjector:
                     hash_key = match  # Single capture group (generic pattern)
                 if hash_key and hash_key not in self._detected_hashes:
                     self._detected_hashes.append(hash_key)
+
+    def verify_ownership(self, store: _HashOwnershipStore | None = None) -> list[str]:
+        """Drop any detected hash the compression store doesn't recognize.
+
+        The bracket-marker shape (``[... hash=...]``) is not unique to
+        Headroom — other context tools emit visually identical markers.
+        Matching shape alone (what :meth:`scan_for_markers` does) adopts
+        their hashes too: ``has_compressed_content`` goes true and the
+        retrieve tool + "Available hashes" instruction get injected for a
+        hash this proxy never stored. The model then calls
+        ``headroom_retrieve``, gets a guaranteed miss, and re-does the work
+        it already had (issue #2836).
+
+        Call this after :meth:`scan_for_markers` and before checking
+        ``has_compressed_content`` / injecting the tool. Uses the same
+        ``store.exists()`` check the retrieve endpoint itself performs, so
+        a hash that survives this filter is provably redeemable right now
+        (or, if it expires between this check and the model's next call,
+        fails the same way a genuinely-ours stale hash already would —
+        this only removes hashes that were never ours to begin with).
+
+        Args:
+            store: Compression store to verify against. Defaults to
+                ``get_compression_store()`` (request-scoped if set, else
+                the global singleton) — the same resolution every other
+                CCR call site uses.
+
+        Returns:
+            The filtered ``detected_hashes`` list (also updates
+            ``self.detected_hashes`` in place).
+        """
+        if not self._detected_hashes:
+            return self._detected_hashes
+        if store is None:
+            store = self.compression_store
+        if store is None:
+            from headroom.cache.compression_store import get_compression_store
+
+            store = get_compression_store()
+
+        def _safe_exists(hash_key: str) -> bool:
+            try:
+                return store.exists(hash_key)
+            except Exception:
+                # A store lookup failure must not make CCR verification
+                # blow up the request; treat as "not ours" (drop the
+                # marker) — the safe direction, since a dropped real
+                # marker just means the model can't use the retrieve tool
+                # for it this turn, the same failure mode as CCR being off.
+                return False
+
+        self._detected_hashes = [h for h in self._detected_hashes if _safe_exists(h)]
+        return self._detected_hashes
 
     def inject_tool_definition(
         self,
@@ -337,11 +459,10 @@ class CCRToolInjector:
 
         tools = tools or []
 
-        # Check if already present (e.g., from MCP server)
-        for tool in tools:
-            tool_name = tool.get("name") or tool.get("function", {}).get("name")
-            if tool_name == CCR_TOOL_NAME:
-                return tools, False  # Already present, skip injection
+        from .tool_calls import client_retrieval_tool_name
+
+        if client_retrieval_tool_name(tools):
+            return tools, False  # Already present, skip injection
 
         # Add CCR tool
         ccr_tool = create_ccr_tool_definition(self.provider)
@@ -350,11 +471,13 @@ class CCRToolInjector:
     def inject_into_system_message(
         self,
         messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Inject retrieval instructions into system message.
 
         Args:
             messages: List of messages.
+            tools: Available tool definitions for selecting an executable retrieval name.
 
         Returns:
             Updated messages with instructions added to system message.
@@ -362,9 +485,12 @@ class CCRToolInjector:
         if not self.inject_system_instructions or not self.has_compressed_content:
             return messages
 
+        from .tool_calls import client_retrieval_tool_name
+
         instructions = create_system_instructions(
             self._detected_hashes,
             self.retrieval_endpoint,
+            retrieval_tool_name=client_retrieval_tool_name(tools) or CCR_TOOL_NAME,
         )
 
         # Find and update system message
@@ -437,6 +563,10 @@ class CCRToolInjector:
             tool_was_injected is False if tool was already present (e.g., from MCP).
         """
         self.scan_for_markers(messages)
+        # Shape-only scanning also matches markers from other context tools;
+        # drop hashes this proxy never actually stored before they can
+        # drive tool injection (issue #2836).
+        self.verify_ownership()
 
         if not (self.has_compressed_content or session_has_done_ccr):
             return messages, tools, False
@@ -444,7 +574,7 @@ class CCRToolInjector:
         updated_tools, was_injected = self.inject_tool_definition(
             tools, session_has_done_ccr=session_has_done_ccr
         )
-        updated_messages = self.inject_into_system_message(messages)
+        updated_messages = self.inject_into_system_message(messages, tools=updated_tools)
 
         return updated_messages, updated_tools if updated_tools else None, was_injected
 

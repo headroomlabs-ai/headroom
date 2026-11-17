@@ -40,15 +40,59 @@ import importlib.util
 import logging
 import os
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_TELEMETRY_ENV_VAR = "ORT_DISABLE_TELEMETRY"
+
+
+def disable_ort_telemetry_by_default() -> None:
+    """Opt ONNX Runtime out of Microsoft's usage telemetry unless the caller chose.
+
+    Since 1.31, ONNX Runtime's Linux and macOS builds upload 1DS telemetry to
+    ``mobile.events.data.microsoft.com`` by default: a hashed device id kept in
+    ``~/Library/Application Support/Microsoft/DeveloperTools`` (macOS) plus, per
+    session, the model file and graph names, model hashes, execution providers
+    and hardware ids. ORT reads ``ORT_DISABLE_TELEMETRY`` once, when each copy
+    of the runtime initializes (the Python package and the dylib the Rust core
+    loads are separate copies), so this has to run before either can start.
+
+    ``setdefault`` keeps an explicit caller value, including ``0`` to allow it.
+    """
+    os.environ.setdefault(_TELEMETRY_ENV_VAR, "1")
+
+
 _ENV_VAR = "ORT_DYLIB_PATH"
+_MIN_RUST_ORT_API_VERSION = (1, 24)
 
 # Tri-state module cache: unset sentinel / resolved path / None (no pin).
 _UNSET = object()
 _pinned: object = _UNSET
+_pinned_from_override = False
+
+
+def _installed_ort_version() -> tuple[int, int] | None:
+    """Return the installed ONNX Runtime major/minor without importing it."""
+    try:
+        raw = version("onnxruntime")
+        return tuple(int(part) for part in raw.split(".")[:2])  # type: ignore[return-value]
+    except (PackageNotFoundError, ValueError):
+        return None
+
+
+def rust_ort_runtime_compatible() -> bool:
+    """Whether native Rust detection can safely initialize ORT C API 24.
+
+    A caller-supplied ``ORT_DYLIB_PATH`` remains an explicit override: its
+    library may be newer than the separately installed Python package. The
+    auto-pinned package library, however, must advertise at least 1.24.
+    """
+    if _pinned_from_override:
+        return True
+    installed = _installed_ort_version()
+    return installed is not None and installed >= _MIN_RUST_ORT_API_VERSION
 
 
 def ensure_ort_dylib_pinned() -> str | None:
@@ -84,11 +128,26 @@ def _resolve_ort_native_library(capi_dir: Path) -> Path | None:
 
 
 def _resolve_and_pin() -> str | None:
+    global _pinned_from_override
     try:
         existing = os.environ.get(_ENV_VAR)
         if existing:
+            _pinned_from_override = True
             logger.debug("%s already set; respecting user override: %s", _ENV_VAR, existing)
             return existing
+
+        installed = _installed_ort_version()
+        if installed is not None and installed < _MIN_RUST_ORT_API_VERSION:
+            # By design on Intel macOS, where the proxy extra pins onnxruntime
+            # <1.24 (no newer x86_64 wheels): Python detection is the supported
+            # path there, so this is information, not a warning.
+            logger.info(
+                "onnxruntime %d.%d exposes an older C API than Rust detection "
+                "requires (1.24+); leaving %s unset and using Python detection",
+                *installed,
+                _ENV_VAR,
+            )
+            return None
 
         spec = importlib.util.find_spec("onnxruntime")
         if spec is None or not spec.origin:

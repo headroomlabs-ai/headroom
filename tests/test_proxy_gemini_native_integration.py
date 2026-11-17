@@ -23,6 +23,7 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from tests._gemini_live import skip_if_gemini_quota_exhausted  # noqa: E402
 
 
 @pytest.fixture
@@ -54,6 +55,7 @@ class TestGeminiNativeGenerateContent:
             f"/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
             json={"contents": [{"parts": [{"text": "What is 2+2? Reply with just the number."}]}]},
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -78,6 +80,7 @@ class TestGeminiNativeGenerateContent:
                 "systemInstruction": {"parts": [{"text": "Always respond with exactly one word."}]},
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -96,6 +99,7 @@ class TestGeminiNativeGenerateContent:
                 ]
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"].lower()
@@ -126,6 +130,7 @@ class TestGeminiNativeGenerateContent:
                 ],
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -150,6 +155,7 @@ class TestGeminiNativeGenerateContent:
                 "generationConfig": {"maxOutputTokens": 50, "temperature": 0.1},
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
         # Response should be limited by maxOutputTokens
@@ -178,6 +184,7 @@ class TestGeminiNativeCompression:
                 ]
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -204,6 +211,7 @@ class TestGeminiNativeCompression:
                 ]
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         # The request should succeed - user messages are protected from compression
 
@@ -214,10 +222,11 @@ class TestGeminiNativeStats:
     def test_stats_track_gemini_provider(self, gemini_native_client, api_key):
         """Stats show requests under 'gemini' provider."""
         # Make a request
-        gemini_native_client.post(
+        response = gemini_native_client.post(
             f"/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
             json={"contents": [{"parts": [{"text": "Hi"}]}]},
         )
+        skip_if_gemini_quota_exhausted(response)
 
         stats = gemini_native_client.get("/stats").json()
         assert "gemini" in stats["requests"]["by_provider"]
@@ -225,10 +234,11 @@ class TestGeminiNativeStats:
 
     def test_stats_track_model(self, gemini_native_client, api_key):
         """Stats track the specific model used."""
-        gemini_native_client.post(
+        response = gemini_native_client.post(
             f"/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
             json={"contents": [{"parts": [{"text": "Hi"}]}]},
         )
+        skip_if_gemini_quota_exhausted(response)
 
         stats = gemini_native_client.get("/stats").json()
         assert "gemini-2.0-flash" in stats["requests"]["by_model"]
@@ -258,6 +268,7 @@ class TestGeminiNativeErrorHandling:
         response = gemini_native_client.post(
             f"/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}", json={"contents": []}
         )
+        skip_if_gemini_quota_exhausted(response)
         # Should either return error or handle gracefully
         assert response.status_code in [200, 400]
 
@@ -272,6 +283,7 @@ class TestGeminiNativeHeaderAuth:
             headers={"x-goog-api-key": api_key},
             json={"contents": [{"parts": [{"text": "Hi"}]}]},
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
 
 
@@ -284,6 +296,7 @@ class TestGeminiNativeCountTokens:
             f"/v1beta/models/gemini-2.0-flash:countTokens?key={api_key}",
             json={"contents": [{"parts": [{"text": "Hello, world!"}]}]},
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -301,6 +314,7 @@ class TestGeminiNativeCountTokens:
                 "systemInstruction": {"parts": [{"text": "You are a helpful assistant."}]},
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         # Note: systemInstruction may not be supported by countTokens in all versions
         assert response.status_code in [200, 400]
         if response.status_code == 200:
@@ -332,6 +346,7 @@ class TestGeminiNativeCountTokens:
                 ]
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -357,6 +372,7 @@ class TestGeminiNativeCountTokens:
                 ]
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
         assert "totalTokens" in data
@@ -369,6 +385,7 @@ class TestGeminiNativeCountTokens:
             headers={"x-goog-api-key": api_key},
             json={"contents": [{"parts": [{"text": "Hello"}]}]},
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
         assert "totalTokens" in data

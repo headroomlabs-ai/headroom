@@ -87,3 +87,44 @@ def test_read_transcript_lines_preserves_small_transcript(
         '{"marker":"first"}',
         '{"marker":"second"}',
     ]
+
+
+def test_compute_window_tokens_dedups_usage_by_message_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A single response stored across multiple transcript lines (one per content
+    block, same message.usage) must be counted once, not per line (#2340)."""
+    timestamp = "2026-01-01T00:00:00Z"
+    dup = {
+        "timestamp": timestamp,
+        "message": {
+            "id": "msg_dup",
+            "model": "claude-opus-4-1",
+            "usage": {"input_tokens": 100, "output_tokens": 10},
+        },
+    }
+    other = {
+        "timestamp": timestamp,
+        "message": {
+            "id": "msg_other",
+            "model": "claude-opus-4-1",
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        },
+    }
+    noid = {
+        "timestamp": timestamp,
+        "message": {"model": "claude-opus-4-1", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    }
+    lines = [dup, dup, dup, other, noid]
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("\n".join(json.dumps(e) for e in lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(session_tracking, "find_transcript_files", lambda: [transcript])
+
+    entry_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+    tokens = session_tracking.compute_window_tokens(entry_ts - 1, entry_ts + 1)
+
+    # msg_dup counted once (100), msg_other (5), id-less line (1) -> 106, NOT 306.
+    assert tokens.input == 106
+    assert tokens.output == 13
+    assert tokens.by_model["claude-opus-4-1"]["input"] == 106

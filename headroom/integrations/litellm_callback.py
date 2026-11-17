@@ -9,28 +9,34 @@
     # Cloud mode (managed CCR, TOIN, analytics via Headroom Cloud):
     litellm.callbacks = [HeadroomCallback(api_key="hdr_xxx")]
 
-Works with LiteLLM's completion(), acompletion(), and proxy modes.
+Works with LiteLLM's completion(), acompletion(), the Anthropic Messages
+proxy routes (/v1/messages), and proxy modes.
 Cloud mode requires httpx: pip install httpx
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+# _DEFAULT_CLOUD_URL and guard_egress stay importable from this module.
+from headroom.integrations._compress_backend import (  # noqa: F401
+    _DEFAULT_CLOUD_URL,
+    CompressBackend,
+)
+from headroom.offline import guard_egress, pin_litellm_cost_map_local  # noqa: F401
 
-_DEFAULT_CLOUD_URL = "https://api.headroomlabs.ai"
+logger = logging.getLogger(__name__)
 
 
 try:
+    pin_litellm_cost_map_local()
     from litellm.integrations.custom_logger import CustomLogger as _CustomLogger
 except ImportError:  # litellm not installed — fall back to plain object
     _CustomLogger = object  # type: ignore[assignment,misc]
 
 
-class HeadroomCallback(_CustomLogger):
+class HeadroomCallback(CompressBackend, _CustomLogger):
     """LiteLLM callback that compresses messages before each API call.
 
     Implements the LiteLLM callback hooks looked up by name:
@@ -60,6 +66,8 @@ class HeadroomCallback(_CustomLogger):
           HEADROOM_API_KEY: "hdr_xxx"
     """
 
+    _log = logger
+
     def __init__(
         self,
         min_tokens: int = 500,
@@ -70,29 +78,25 @@ class HeadroomCallback(_CustomLogger):
     ) -> None:
         super().__init__()
         self._min_tokens = min_tokens
-        self._model_limit = model_limit
-        self._hooks = hooks
         self._total_saved = 0
-
-        # Cloud mode: if api_key is set, compress via Headroom Cloud API
-        # Falls back to HEADROOM_API_KEY env var
-        import os
-
-        self._api_key = api_key or os.environ.get("HEADROOM_API_KEY", "").strip() or None
-        self._api_url = (
-            api_url or os.environ.get("HEADROOM_API_URL", "").strip() or _DEFAULT_CLOUD_URL
-        ).rstrip("/")
-        self._client: Any = None  # Lazy-initialized httpx.AsyncClient
+        self._init_compress_backend(model_limit, hooks, api_key, api_url)
 
     @property
     def total_tokens_saved(self) -> int:
         """Total tokens saved across all calls."""
         return self._total_saved
 
-    @property
-    def cloud_mode(self) -> bool:
-        """Whether cloud compression is enabled."""
-        return self._api_key is not None
+    async def aclose(self) -> None:
+        """Close the shared cloud HTTP client, if it was initialized.
+
+        Applications using LiteLLM should await this method during their async
+        shutdown lifecycle. It is safe to call when cloud mode was not used or
+        after the client has already been closed.
+        """
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
 
     async def async_pre_call_hook(
         self,
@@ -110,7 +114,16 @@ class HeadroomCallback(_CustomLogger):
         if data is None:
             return None
 
-        if call_type not in ("completion", "acompletion"):
+        # LiteLLM's proxy maps the Anthropic Messages API routes to their own
+        # call types (CallTypes.anthropic_messages for /v1/messages and
+        # /anthropic/v1/messages, plus the async twin), and the payload still
+        # carries "messages" in Anthropic format, which compress() handles.
+        if call_type not in (
+            "completion",
+            "acompletion",
+            "anthropic_messages",
+            "aanthropic_messages",
+        ):
             return data
 
         messages = data.get("messages", [])
@@ -142,59 +155,6 @@ class HeadroomCallback(_CustomLogger):
             logger.warning("Headroom compression failed, using original messages: %s", e)
 
         return data
-
-    def _local_compress(self, messages: list[dict], model: str) -> dict[str, Any] | None:
-        """Compress locally using headroom.compress()."""
-        from headroom.compress import compress
-
-        result = compress(
-            messages=messages,
-            model=model or "claude-sonnet-4-5-20250929",
-            model_limit=self._model_limit,
-            hooks=self._hooks,
-        )
-        return {
-            "messages": result.messages,
-            "tokens_before": result.tokens_before,
-            "tokens_after": result.tokens_after,
-            "tokens_saved": result.tokens_saved,
-            "compression_ratio": result.compression_ratio,
-        }
-
-    async def _cloud_compress(self, messages: list[dict], model: str) -> dict[str, Any] | None:
-        """Compress via Headroom Cloud API (managed CCR, TOIN, analytics)."""
-        if self._client is None:
-            try:
-                import httpx
-            except ImportError as e:
-                raise ImportError(
-                    "httpx is required for Headroom Cloud mode: pip install httpx"
-                ) from e
-            self._client = httpx.AsyncClient(timeout=30.0)
-
-        client = self._client
-        assert client is not None
-        resp = await client.post(
-            f"{self._api_url}/v1/saas/compress",
-            headers={
-                "X-Headroom-Key": self._api_key,
-                "Content-Type": "application/json",
-            },
-            content=json.dumps(
-                {
-                    "messages": messages,
-                    "model": model or "claude-sonnet-4-5-20250929",
-                    "model_limit": self._model_limit,
-                }
-            ),
-        )
-
-        if resp.status_code != 200:
-            logger.warning("Headroom Cloud API error: %d %s", resp.status_code, resp.text[:200])
-            return None
-
-        result: dict[str, Any] = resp.json()
-        return result
 
     async def async_post_call_success_hook(
         self,

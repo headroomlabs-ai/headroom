@@ -12,9 +12,14 @@
 //! - **Normalize** request bytes to make cache hits deterministic
 //!   under PAYG mode ([`tool_def_normalize`], PR-E1 / PR-E2;
 //!   [`anthropic_cache_control`], PR-E3; [`openai_cache_key`], PR-E4).
-//!   These mutate bytes only when the auth-mode gate and per-policy
-//!   preconditions (e.g. no customer `cache_control` marker) all clear;
-//!   OAuth and Subscription always passthrough.
+//!   These mutate *body* bytes only when the auth-mode gate and
+//!   per-policy preconditions (e.g. no customer `cache_control`
+//!   marker) all clear; for body mutations, OAuth and Subscription
+//!   always passthrough.
+//! - **Re-echo** client-sent state ([`beta_sticky`]): mutate request
+//!   *headers* only, on every auth mode, and only ever with values
+//!   the same client already put on the wire — anti-drift repair of
+//!   the client's own signal, never injection of Headroom state.
 //!
 //! Currently shipped:
 //!
@@ -49,6 +54,16 @@
 //!   `(model, system, tools)` and inject it so the upstream pins
 //!   cache lookup to a tenant-stable identity. **Mutates the body**
 //!   (only on PAYG) — see its docs for the gating contract.
+//! - [`beta_sticky`] — parity port of the Python proxy's PR-A6
+//!   `SessionBetaTracker`: per-`(provider, session)` LRU that unions
+//!   `anthropic-beta` / `openai-beta` tokens across turns so a client
+//!   dropping a token mid-conversation doesn't rotate the upstream
+//!   prefix-cache key. **Mutates request headers, never the body**;
+//!   applies to all auth modes exactly like the Python path (the
+//!   union only ever contains tokens this client itself sent, so
+//!   subscription stealth — invariant #10 "no beta drift" — is
+//!   preserved by construction). Operator opt-out:
+//!   `--beta-header-sticky disabled`.
 //!
 //! Sibling PRs hang additional submodules off this `mod.rs`. Conflict
 //! resolution between parallel Phase E PRs is intentionally trivial:
@@ -56,6 +71,7 @@
 //! `mod.rs`'s `pub mod` list.
 
 pub mod anthropic_cache_control;
+pub mod beta_sticky;
 pub mod drift_detector;
 pub mod openai_cache_key;
 pub mod tool_def_normalize;

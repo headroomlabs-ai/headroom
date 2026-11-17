@@ -66,7 +66,7 @@
 //!   key-sorted rebuild) of the corresponding subtree. Still well
 //!   under a millisecond on a typical agentic request; the detector
 //!   stays log-only and off the forwarded-bytes path.
-//! - One LRU lookup + insert. `lru = "0.12"` is O(1) amortised.
+//! - One LRU lookup + insert. `lru` is O(1) amortised.
 //! - One `tracing::info!` or `tracing::warn!`. No metric emission yet
 //!   (left for Phase F PR-F* when the global Prometheus registry can
 //!   accept session-scoped counters without a cardinality explosion).
@@ -399,8 +399,9 @@ pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralH
 
 /// 16-char hex prefix of SHA-256(session_key). Bounds the log line
 /// width and never reveals the raw key (which may be a bearer token
-/// or API key — see `derive_session_key`).
-fn session_key_log_prefix(session_key: &str) -> String {
+/// or API key — see `derive_session_key`). `pub(crate)` so the
+/// beta-sticky merge site logs the same session identity the same way.
+pub(crate) fn session_key_log_prefix(session_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(session_key.as_bytes());
     let digest = hasher.finalize();

@@ -211,13 +211,20 @@ pub trait OffloadTransform: Send + Sync {
 
     /// Run the offload. The orchestrator only calls this when
     /// `estimate_bloat(content) ≥ threshold`. On success, the
-    /// returned `cache_key` MUST resolve to the original payload
-    /// in `store`.
+    /// returned `cache_key` MUST resolve to `ccr_source` in `store`.
+    ///
+    /// `content` is the text to compress: the output of the prior
+    /// reformat/offload stages. `ccr_source` is the original pipeline
+    /// input, before any reformat ran. Offloads key and store
+    /// `ccr_source`, not `content`, so a retrieval marker resolves to
+    /// exactly what the caller passed in. Storing `content` would
+    /// capture reformatted text instead.
     fn apply(
         &self,
         content: &str,
         ctx: &CompressionContext,
         store: &dyn CcrStore,
+        ccr_source: &str,
     ) -> Result<OffloadOutput, TransformError>;
 
     /// Calibrated 0.0–1.0 quality score for telemetry. Future PR4
@@ -264,9 +271,10 @@ mod tests {
             content: &str,
             _ctx: &CompressionContext,
             store: &dyn CcrStore,
+            ccr_source: &str,
         ) -> Result<OffloadOutput, TransformError> {
-            let key = format!("test_key_{:024x}", content.len());
-            store.put(&key, content);
+            let key = format!("test_key_{:024x}", ccr_source.len());
+            store.put(&key, ccr_source);
             Ok(OffloadOutput::from_lengths(
                 content.len(),
                 content.to_string(),
@@ -322,7 +330,7 @@ mod tests {
         let store = InMemoryCcrStore::new();
         let t = TestOffload { bloat: 0.9 };
         let r = t
-            .apply("hello", &CompressionContext::default(), &store)
+            .apply("hello", &CompressionContext::default(), &store, "hello")
             .expect("offload writes");
         // Trait contract: cache_key is required and resolves in the store.
         assert!(!r.cache_key.is_empty());

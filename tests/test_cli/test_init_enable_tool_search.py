@@ -16,13 +16,24 @@ from headroom.cli import init as init_cli
 from headroom.providers.claude import install as claude_install
 
 
-def test_ensure_claude_hooks_sets_enable_tool_search(tmp_path: Path) -> None:
+def test_ensure_claude_hooks_sets_enable_tool_search(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_USE_FOUNDRY", raising=False)
     settings = tmp_path / "settings.json"
     init_cli._ensure_claude_hooks(settings, profile="init-user", port=8787)
 
     env = json.loads(settings.read_text(encoding="utf-8"))["env"]
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
     assert env["ENABLE_TOOL_SEARCH"] == "true"
+
+
+def test_ensure_claude_hooks_disables_tool_search_for_foundry(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_USE_FOUNDRY", "1")
+    settings = tmp_path / "settings.json"
+
+    init_cli._ensure_claude_hooks(settings, profile="init-user", port=8787)
+
+    env = json.loads(settings.read_text(encoding="utf-8"))["env"]
+    assert env["ENABLE_TOOL_SEARCH"] == "false"
 
 
 def test_ensure_claude_hooks_respects_user_tool_search_value(tmp_path: Path) -> None:

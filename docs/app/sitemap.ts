@@ -9,7 +9,7 @@
 import type { MetadataRoute } from 'next';
 import { source } from '@/lib/source';
 
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://headroom-docs.vercel.app';
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://docs.headroomlabs.ai';
 
 export default function sitemap(): MetadataRoute.Sitemap {
   const now = new Date();
