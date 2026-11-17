@@ -160,6 +160,8 @@ describe("tool-call preservation mock integration", () => {
 
     const engine = new HeadroomContextEngine({
       assembleCompressConfig: { protect_recent: 2 },
+      minContextChars: 0,
+      announceCompression: false,
     });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
 
@@ -190,7 +192,7 @@ describe("tool-call preservation mock integration", () => {
   it("assemble() includes CCR hint only when mock proxy returns hashes", async () => {
     mockLossyCompress({ ccrHashes: ["deadbeef"] });
 
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ minContextChars: 0 });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
 
     const result = await engine.assemble({
@@ -207,6 +209,7 @@ describe("tool-call preservation mock integration", () => {
     const engine = new HeadroomContextEngine({
       assembleCompressConfig: { protect_recent: 2 },
       skipAssembleWhenGatewayRouted: false,
+      minContextChars: 0,
     });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
 
@@ -258,6 +261,7 @@ describe("tool-call preservation mock integration", () => {
     const engine = new HeadroomContextEngine({
       skipAssembleWhenGatewayRouted: true,
       gatewayProviderIds: ["openrouter"],
+      minContextChars: 0,
     });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
 

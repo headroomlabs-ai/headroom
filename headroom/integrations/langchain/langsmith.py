@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -72,7 +72,7 @@ def _check_langchain_available() -> None:
     if not LANGCHAIN_AVAILABLE:
         raise ImportError(
             "LangChain is required for this integration. "
-            "Install with: pip install headroom[langchain] "
+            'Install with: pip install "headroom-ai[langchain]" '
             "or: pip install langchain-core"
         )
 
@@ -86,7 +86,7 @@ class PendingMetrics:
     tokens_saved: int
     savings_percent: float
     transforms_applied: list[str]
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class HeadroomLangSmithCallbackHandler(BaseCallbackHandler):

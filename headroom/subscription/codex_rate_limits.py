@@ -50,6 +50,7 @@ from threading import Lock
 
 import httpx
 
+from headroom.offline import OfflineEgressBlocked, guard_egress, is_offline, note_refusal
 from headroom.subscription.base import QuotaTracker
 
 logger = logging.getLogger(__name__)
@@ -423,7 +424,12 @@ def _build_usage_headers(request_headers: dict[str, str]) -> dict[str, str] | No
     """
     lower = {str(k).lower(): v for k, v in request_headers.items()}
     auth = str(lower.get("authorization", ""))
-    if not auth.startswith("Bearer ") or not auth[len("Bearer ") :].strip():
+    # The auth-scheme token is case-insensitive per RFC 7235 2.1, so a client
+    # sending "authorization: bearer <token>" must be recognized the same as
+    # "Bearer <token>". A case-sensitive check skipped the usage poll for such
+    # requests, so the Codex rate-limit window was never refreshed for them.
+    scheme, sep, credentials = auth.partition(" ")
+    if not sep or scheme.lower() != "bearer" or not credentials.strip():
         return None
     account_id = lower.get("chatgpt-account-id")
     if not account_id:
@@ -445,6 +451,7 @@ def _build_usage_headers(request_headers: dict[str, str]) -> dict[str, str] | No
 async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
     state = get_codex_rate_limit_state()
     try:
+        guard_egress("Codex rate-limit polling", url)
         async with httpx.AsyncClient(timeout=_USAGE_POLL_TIMEOUT_S) as client:
             resp = await client.get(url, headers=headers)
         if resp.status_code == 200:
@@ -454,6 +461,12 @@ async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
                 logger.debug("codex usage poll: 200 but no usable rate-limit data")
         else:
             logger.debug("codex usage poll: HTTP %s", resp.status_code)
+    except OfflineEgressBlocked as blocked:
+        # Background task: report the refusal as a sentence. Letting a
+        # BaseException out of a bare ``create_task`` surfaces as "Task
+        # exception was never retrieved" whenever the GC gets round to it,
+        # which is a traceback with no explanation in it.
+        note_refusal(blocked, logger)
     except Exception as exc:  # pragma: no cover - network/JSON defensive
         logger.debug("codex usage poll failed: %s", exc)
     finally:
@@ -463,6 +476,7 @@ async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
 def maybe_schedule_usage_poll(
     request_headers: dict[str, str],
     *,
+    from_local_operator: bool = False,
     url: str = CODEX_USAGE_URL,
     min_interval_s: float = USAGE_POLL_MIN_INTERVAL_S,
 ) -> bool:
@@ -471,9 +485,22 @@ def maybe_schedule_usage_poll(
     Safe to call on every Codex request: scoped to ChatGPT-session traffic via
     :func:`_build_usage_headers` and internally throttled to at most one live
     poll per ``min_interval_s``. Returns ``True`` when a poll was scheduled.
+
+    The poll spends the *caller's* bearer, so it runs only when
+    ``from_local_operator`` is true (the handler passes
+    :func:`headroom.subscription.credential_policy.is_local_operator_connection`).
+    A network caller on a shared proxy never drives it (VAPT 01-F16).
     """
+    if not from_local_operator:
+        return False
     headers = _build_usage_headers(request_headers)
     if headers is None:
+        return False
+    if is_offline():
+        # Cheap pre-check so an air-gapped proxy does not spawn (and log) a
+        # doomed task on every single Codex request. The guard inside
+        # _fetch_and_store_usage is still the thing that makes the refusal
+        # true; this only keeps the log and the event loop quiet.
         return False
     try:
         loop = asyncio.get_running_loop()

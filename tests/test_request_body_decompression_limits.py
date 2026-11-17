@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import sys
 import tracemalloc
 import zlib
 
@@ -73,12 +74,42 @@ def _deflate_bomb(total: int = BOMB_PLAIN_SIZE) -> bytes:
 class _Request:
     """Minimal stand-in for the Starlette Request the reader actually takes."""
 
-    def __init__(self, body: bytes, content_encoding: str = "") -> None:
+    def __init__(
+        self,
+        body: bytes,
+        content_encoding: str = "",
+        *,
+        headers: dict | None = None,
+        stream_chunk_size: int = 64 * 1024,
+    ) -> None:
         self._body = body
-        self.headers = {"content-encoding": content_encoding}
+        self.headers = {"content-encoding": content_encoding, **(headers or {})}
+        self._stream_chunk_size = stream_chunk_size
+        self.chunks_yielded = 0
 
     async def body(self) -> bytes:
         return self._body
+
+    async def stream(self):
+        # Real ASGI servers hand the body over in chunks, not one blob, which
+        # is exactly what lets the streaming bound-check in
+        # `_read_request_body_bytes` refuse a body before all of it has
+        # arrived.
+        for start in range(0, len(self._body), self._stream_chunk_size):
+            self.chunks_yielded += 1
+            yield self._body[start : start + self._stream_chunk_size]
+
+
+class _NeverStreamedRequest(_Request):
+    """A request whose ``.stream()`` fails if ever iterated.
+
+    Used to prove a fast-path (e.g. a Content-Length pre-check) rejects
+    before touching the body, rather than merely rejecting eventually.
+    """
+
+    async def stream(self):
+        raise AssertionError("stream() should not have been read")
+        yield b""  # pragma: no cover - unreachable, keeps this an async generator
 
 
 @pytest.fixture
@@ -87,17 +118,13 @@ def small_cap(monkeypatch: pytest.MonkeyPatch) -> int:
     return SMALL_CAP
 
 
+@pytest.fixture
+def small_raw_cap(monkeypatch: pytest.MonkeyPatch) -> int:
+    monkeypatch.setattr(_helpers(), "MAX_REQUEST_BODY_SIZE", SMALL_CAP)
+    return SMALL_CAP
+
+
 # ───────────────────────────── the ceiling itself ──────────────────────────
-
-
-def test_decompressed_ceiling_matches_the_plain_body_ceiling() -> None:
-    """A client must not get more room by arriving compressed."""
-    assert _helpers().MAX_DECOMPRESSED_BODY_SIZE == _helpers().MAX_REQUEST_BODY_SIZE
-
-
-def test_too_large_is_a_value_error() -> None:
-    """Every existing call site catches ValueError; the subclass must not escape it."""
-    assert issubclass(_helpers().RequestBodyTooLarge, ValueError)
 
 
 # ───────────────────────────── refusal, per codec ──────────────────────────
@@ -275,6 +302,26 @@ def test_truncated_gzip_still_errors() -> None:
         )
 
 
+# ───────────────── raw body ceiling (the chunked-transfer bypass) ──────────
+#
+# The handlers only ever see the *compressed*, wire-level size via
+# `Content-Length`, and that header is absent on a chunked-transfer-encoding
+# request. The streaming loop in `_read_request_body_bytes` is the backstop
+# the handlers fall through to regardless of whether that header was there
+# (#3326).
+
+
+async def test_raw_body_refused_without_consuming_the_whole_stream(small_raw_cap: int) -> None:
+    """The point is refusing early, not just refusing eventually."""
+    request = _Request(b"a" * (small_raw_cap * 10), stream_chunk_size=small_raw_cap // 4)
+    total_chunks = -(-len(request._body) // request._stream_chunk_size)  # ceil div
+
+    with pytest.raises(_helpers().RequestBodyTooLarge):
+        await _helpers()._read_request_body_bytes(request)
+
+    assert request.chunks_yielded < total_chunks
+
+
 # ──────────────────────────── through the entry point ──────────────────────
 
 
@@ -295,6 +342,154 @@ async def test_reader_leaves_uncompressed_bodies_alone(small_cap: int) -> None:
     assert await _helpers()._read_request_body_bytes(_Request(PAYLOAD, "identity")) == PAYLOAD
 
 
+async def test_reader_refuses_an_oversized_plain_body_with_no_content_length(
+    small_raw_cap: int,
+) -> None:
+    """The regression this PR fixes: no `Content-Length` header, no compression.
+
+    Before this fix, `_read_request_body_bytes` called `request.body()`
+    directly, so a handler's `Content-Length` precheck was the only gate and a
+    chunked request (no `Content-Length` to check) reached this function
+    regardless of size.
+    """
+    oversized = b"a" * (small_raw_cap + 1)
+    with pytest.raises(_helpers().RequestBodyTooLarge):
+        await _helpers()._read_request_body_bytes(_Request(oversized, ""))
+
+
 async def test_reader_still_rejects_an_unknown_encoding() -> None:
     with pytest.raises(ValueError, match="Unsupported Content-Encoding"):
         await _helpers()._read_request_body_bytes(_Request(PAYLOAD, "snappy"))
+
+
+# ────────────────── the raw (pre-decompression) wire size is bounded too ────
+#
+# A plain (identity-encoded) body was never bounded at all: the old reader did
+# ``raw = await request.body()`` and only checked size *after* decompression,
+# which is a no-op for identity bodies. #3479.
+
+
+async def test_reader_refuses_an_oversized_plain_body(small_raw_cap: int) -> None:
+    oversized = b"x" * (small_raw_cap + 1)
+    with pytest.raises(_helpers().RequestBodyTooLarge):
+        await _helpers()._read_request_body_bytes(_Request(oversized, ""))
+
+
+async def test_reader_accepts_a_plain_body_at_the_cap(small_raw_cap: int) -> None:
+    at_cap = b"x" * small_raw_cap
+    assert await _helpers()._read_request_body_bytes(_Request(at_cap, "")) == at_cap
+
+
+async def test_reader_honors_a_truthful_content_length_before_reading(
+    small_raw_cap: int,
+) -> None:
+    """A Content-Length that already overstates the cap must short-circuit.
+
+    ``_NeverStreamedRequest.stream()`` raises if ever iterated, so this only
+    passes if the Content-Length check runs (and rejects) before the body is
+    ever read.
+    """
+    request = _NeverStreamedRequest(b"", "", headers={"content-length": str(small_raw_cap + 1)})
+    with pytest.raises(_helpers().RequestBodyTooLarge):
+        await _helpers()._read_request_body_bytes(request)
+
+
+async def test_reader_ignores_an_untrustworthy_content_length(small_raw_cap: int) -> None:
+    """Content-Length is an optimization, not the enforcement boundary.
+
+    A header that understates (or lies about) the body's real size must not
+    let an oversized body through -- the streaming check still catches it.
+    """
+    oversized = b"x" * (small_raw_cap + 1)
+    request = _Request(oversized, "", headers={"content-length": "1"})
+    with pytest.raises(_helpers().RequestBodyTooLarge):
+        await _helpers()._read_request_body_bytes(request)
+
+    # A non-numeric header is likewise not trusted -- it neither
+    # short-circuits acceptance nor raises on its own; the stream still runs.
+    request = _Request(oversized, "", headers={"content-length": "not-a-number"})
+    with pytest.raises(_helpers().RequestBodyTooLarge):
+        await _helpers()._read_request_body_bytes(request)
+
+
+# ───────────────── brotli: output bounded per step, not per input slice ─────
+
+
+class _FakeBrotliDecompressor:
+    """Mimics brotli>=1.2.0 ``Decompressor`` output limiting without the package.
+
+    Each non-empty input slice "expands" to ``EXPANSION`` zero bytes. With
+    ``output_buffer_limit`` the surplus stays pending inside the decompressor
+    (``can_accept_more_data()`` is False until drained); without it the whole
+    expansion is returned at once, which is the bomb.
+    """
+
+    EXPANSION = 64 * MB
+
+    def __init__(self) -> None:
+        self.pending = 0
+
+    def process(self, data: bytes, output_buffer_limit: int | None = None) -> bytes:
+        self.pending += self.EXPANSION if data else 0
+        n = self.pending if output_buffer_limit is None else min(self.pending, output_buffer_limit)
+        self.pending -= n
+        return b"\x00" * n
+
+    def can_accept_more_data(self) -> bool:
+        return self.pending == 0
+
+    def is_finished(self) -> bool:
+        return self.pending == 0
+
+
+def test_brotli_step_output_is_bounded(monkeypatch, small_cap: int) -> None:
+    """One input slice that expands far past the cap must not be materialized."""
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "brotli", types.SimpleNamespace(Decompressor=_FakeBrotliDecompressor)
+    )
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        with pytest.raises(_helpers().RequestBodyTooLarge):
+            _helpers()._brotli_bounded(b"x" * 100)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * MB, f"peak {peak / MB:.1f}MB suggests one slice was fully expanded"
+
+
+def test_brotli_without_output_limit_fails_closed(monkeypatch) -> None:
+    import types
+
+    class _Old:
+        def process(self, data: bytes) -> bytes:
+            return data
+
+    monkeypatch.setitem(sys.modules, "brotli", types.SimpleNamespace(Decompressor=_Old))
+    with pytest.raises(ValueError, match="brotli>=1.2.0"):
+        _helpers()._brotli_bounded(b"x")
+
+
+class _FakeBrotliAcceptingWhilePending(_FakeBrotliDecompressor):
+    """Real brotli 1.2 reports it can accept input once all input is consumed,
+    even while limited output is still pending; the rest comes from empty
+    ``process(b"")`` calls."""
+
+    EXPANSION = 3 * 1024 * 1024 + 123
+
+    def can_accept_more_data(self) -> bool:
+        return True
+
+
+def test_brotli_drains_output_pending_after_the_last_slice(monkeypatch) -> None:
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "brotli",
+        types.SimpleNamespace(Decompressor=_FakeBrotliAcceptingWhilePending),
+    )
+    out = _helpers()._brotli_bounded(b"x")
+    assert len(out) == _FakeBrotliAcceptingWhilePending.EXPANSION

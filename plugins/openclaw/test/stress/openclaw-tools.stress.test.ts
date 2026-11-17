@@ -282,7 +282,7 @@ describe("native tool assemble() stress (mock proxy)", () => {
       (s) => s.toolName === "view_image" && s.payloadKind === "image",
     ) as NativeToolScenario;
     const transcript = buildToolScenarioTranscript(scenario, 99);
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ minContextChars: 0 });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
     const result = await engine.assemble({ sessionId: "drop-meta", messages: transcript });
     assertStructuredPayloadPreserved(transcript, result.messages, "view_image");
@@ -296,7 +296,7 @@ describe("native tool assemble() stress (mock proxy)", () => {
       (s) => s.toolName === "view_image" && s.payloadKind === "error",
     ) as NativeToolScenario;
     const transcript = buildToolScenarioTranscript(scenario, 7);
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ minContextChars: 0 });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
     const result = await engine.assemble({ sessionId: "drop-meta-err", messages: transcript });
     const before = extractToolResults(transcript).find((r) => r.toolName === "view_image");

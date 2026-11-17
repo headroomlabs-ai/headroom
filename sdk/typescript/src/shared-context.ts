@@ -45,6 +45,12 @@ export class SharedContext {
     this.model = model ?? "claude-sonnet-4-5-20250929";
     this.ttl = ttl ?? 3600;
     this.maxEntries = maxEntries ?? 100;
+    // A bound below 1 can never be met: evictIfFull would spin forever.
+    if (!(this.maxEntries >= 1)) {
+      throw new RangeError(
+        `SharedContext maxEntries must be at least 1, got ${this.maxEntries}`,
+      );
+    }
   }
 
   /**
@@ -182,7 +188,8 @@ export class SharedContext {
   private evictIfFull(): void {
     while (this.entries.size >= this.maxEntries) {
       const oldest = this.entries.keys().next().value;
-      if (oldest !== undefined) this.entries.delete(oldest);
+      if (oldest === undefined) break; // nothing left to evict
+      this.entries.delete(oldest);
     }
   }
 }

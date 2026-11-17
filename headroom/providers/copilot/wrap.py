@@ -208,18 +208,21 @@ def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> boo
         if not os.path.isdir(root):
             continue
         for dirpath, _dirnames, filenames in os.walk(root):
-            if "app.js" not in filenames:
+            # Since Copilot CLI 1.0.93 app.js is a loader and the env read lives in cli-main.js.
+            names = [n for n in ("app.js", "cli-main.js") if n in filenames]
+            if not names:
                 continue
             found_bundle = True
-            try:
-                with open(
-                    os.path.join(dirpath, "app.js"), encoding="utf-8", errors="replace"
-                ) as bundle:
-                    while chunk := bundle.read(1 << 20):
-                        if COPILOT_NATIVE_API_URL_ENV in chunk:
-                            return True
-            except OSError:
-                continue
+            for name in names:
+                try:
+                    with open(
+                        os.path.join(dirpath, name), encoding="utf-8", errors="replace"
+                    ) as bundle:
+                        while chunk := bundle.read(1 << 20):
+                            if COPILOT_NATIVE_API_URL_ENV in chunk:
+                                return True
+                except OSError:
+                    continue
     return False if found_bundle else None
 
 

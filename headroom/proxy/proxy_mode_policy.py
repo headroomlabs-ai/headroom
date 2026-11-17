@@ -56,12 +56,3 @@ def normalize_proxy_mode_decision(
         normalized=normalized,
         alias_used=key != normalized,
     )
-
-
-def normalize_proxy_mode_value(
-    mode: str | None,
-    *,
-    default: str = PROXY_MODE_TOKEN,
-) -> str:
-    """Return only the canonical proxy mode value."""
-    return normalize_proxy_mode_decision(mode, default=default).normalized

@@ -17,8 +17,11 @@ export { parseSSE, collectStream } from "./utils/stream.js";
 
 // --- Core types ---
 export type {
+  ProviderOptions,
   TextContentPart,
   ImageContentPart,
+  ReasoningContentPart,
+  PassthroughContentPart,
   ContentPart,
   ToolCall,
   SystemMessage,
@@ -51,6 +54,8 @@ export {
 // --- Config types ---
 export type {
   HeadroomMode,
+  CompressMode,
+  CompressRequestConfig,
   RelevanceTier,
   ContentType,
   BlockKind,

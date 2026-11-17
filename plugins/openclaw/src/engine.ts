@@ -7,6 +7,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { dirname, join } from "node:path";
+
 import { compress } from "headroom-ai";
 import {
   applyCompactionPlan,
@@ -22,9 +24,11 @@ import {
 } from "./turn-advancement-store.js";
 import {
   agentToOpenAI,
+  agentToOpenAIIndexed,
   estimateRoughTokens,
   normalizeAgentMessages,
   openAIToAgent,
+  restoreAgentMessages,
 } from "./convert.js";
 import {
   delegatesPersistentCompaction,
@@ -33,6 +37,7 @@ import {
   type PersistentCompactionConfig,
   type PersistentCompactionMode,
 } from "./compaction-mode.js";
+import { DurableAdvancementKeyStore, defaultCommitLogPath } from "./advancement-key-store.js";
 import {
   delegateCompactionToRuntime,
   type OpenClawCompactParams,
@@ -72,16 +77,9 @@ type HeadroomCompactParams = OpenClawCompactParams & {
   runtimeSettings?: { resolvedModel?: string | null; promptTokenBudget?: number };
 };
 
-/** Race a promise against a timeout and always release the timer. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timerId: ReturnType<typeof setTimeout> | undefined;
-  const timer = new Promise<never>((_, reject) => {
-    timerId = setTimeout(() => reject(new Error(`headroom compress() timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timer]).finally(() => {
-    if (timerId !== undefined) clearTimeout(timerId);
-  });
-}
+// Must stay static — OpenClaw prepends it to the cached system prompt.
+const HEADROOM_COMPRESSION_NOTICE =
+  "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
 
 export const DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO = 0.7;
 export const DEFAULT_ASSEMBLE_RESERVE_TOKENS = 20_000;
@@ -120,6 +118,7 @@ export interface HeadroomEngineConfig
   extends ProxyManagerConfig, PersistentCompactionConfig, TranscriptHygieneConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
+  minContextChars?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
   /**
@@ -166,6 +165,12 @@ export interface HeadroomEngineConfig
   skipAssembleWhenGatewayRouted?: boolean;
   gatewayProviderIds?: string[];
   routeCodexViaProxy?: boolean;
+  /** Where to durably record committed turn-advancement keys (see
+   * `DurableAdvancementKeyStore`; the markers live beside it in
+   * `markerDirFor(commitLogPath)`). Must be on a writable filesystem.
+   * Defaults to `defaultCommitLogPath()`. */
+  commitLogPath?: string;
+  announceCompression?: boolean;
 }
 
 /** OpenClaw 2026.9.x turn contract — required even when OpenClaw owns compaction (hybrid/openclaw). */
@@ -185,6 +190,11 @@ export class HeadroomContextEngine {
       transcriptSemantics: HEADROOM_TRANSCRIPT_SEMANTICS,
     };
   }
+
+  // Durable, restart-safe record of committed advancement keys, for
+  // commitTurn's idempotent-retry check. See advancement-key-store.ts for
+  // why this must survive a process restart and must not evict entries.
+  private advancementKeyStore: DurableAdvancementKeyStore;
 
   private proxyManager: ProxyManager;
   private proxyUrl: string | null = null;
@@ -209,6 +219,10 @@ export class HeadroomContextEngine {
   private readonly hygieneDebounce = new HygieneDebounceTracker();
   private readonly transcriptProjectionWaitMs: number;
   private readonly protectedToolNames: ReadonlySet<string>;
+  // Sessions shown the compression notice. Bounded via insertion-order
+  // eviction — no session lifecycle callback exists here to bound it otherwise.
+  private announcedSessions = new Set<string>();
+  private static readonly MAX_ANNOUNCED_SESSIONS = 1000;
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -221,6 +235,12 @@ export class HeadroomContextEngine {
     this.protectedToolNames = normalizeProtectedToolNames(config.protectToolResults);
     this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
+    this.advancementKeyStore = new DurableAdvancementKeyStore(
+      config.commitLogPath ??
+        (config.turnAdvancementStorePath
+          ? join(dirname(config.turnAdvancementStorePath), "commit-log.json")
+          : defaultCommitLogPath()),
+    );
   }
 
   // === ContextEngine Lifecycle ===
@@ -258,7 +278,9 @@ export class HeadroomContextEngine {
   /**
    * Assemble context for the model — THE CORE HOOK.
    *
-   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]
+   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]. Only messages the proxy
+   * actually changed are rebuilt; the rest are returned exactly as OpenClaw passed them, so the
+   * provider prompt cache survives up to the first compressed message (see restoreAgentMessages).
    */
   async assemble(params: {
     sessionId: string;
@@ -276,12 +298,20 @@ export class HeadroomContextEngine {
     if (!this.proxyUrl || this.config.enabled === false) {
       this.ensureProxyStarted();
       // Fallback: return messages unchanged
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
 
     if (this.isCircuitOpen()) {
       this.logger.warn("[headroom] Circuit open — using uncompressed messages");
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
 
     try {
@@ -320,37 +350,74 @@ export class HeadroomContextEngine {
       }
 
       // Convert AgentMessage → OpenAI format
-      const openaiMessages = agentToOpenAI(params.messages);
+      const openaiMessages = agentToOpenAIIndexed(params.messages);
       const assembleCompressConfig = resolveAssembleCompressConfig(
         this.config.assembleCompressConfig,
       );
+      const minContextChars = this.config.minContextChars ?? 800;
+      if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
+        this.logger.debug("[headroom] Context below compression threshold — using original messages");
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: 0,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
 
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
-      const result = await withTimeout(
-        compress(openaiMessages, {
-          model: params.model ?? "claude-sonnet-4-5",
-          baseUrl: this.proxyUrl,
-          fallback: true,
-          tokenBudget: params.tokenBudget,
-          config: assembleCompressConfig,
-        } as any),
-        this.config.requestTimeoutMs ?? 30_000,
-      );
+      const result = await compress(openaiMessages, {
+        model: params.model ?? "claude-sonnet-4-5",
+        baseUrl: this.proxyUrl,
+        // Failures must throw so they reach the catch below and count towards the
+        // circuit. With the SDK's default `fallback: true`, a connection error,
+        // timeout or 5xx resolves to a zero-token stub, which this method would
+        // otherwise treat as a successful no-op and reset the breaker with.
+        fallback: false,
+        tokenBudget: params.tokenBudget,
+        // The SDK applies this to AbortSignal.timeout(), so a timed-out call is
+        // cancelled instead of continuing in the background after fail-open.
+        timeout: this.config.requestTimeoutMs ?? 2_000,
+        config: assembleCompressConfig,
+      } as any);
+
+      // A zero token count on nonempty input means the proxy never answered — the
+      // SDK's fallback stub, or a response that was never tokenized. Count it as a
+      // failure so a resolved-but-empty result can't keep the breaker closed. Empty
+      // input is exempt: the proxy legitimately answers 0 tokens for it.
+      if (result.tokensBefore === 0 && openaiMessages.length > 0) {
+        this.tripCircuit(new Error("compress() returned no token count"));
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: 0,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+        };
+      }
+
+      const shouldAnnounceCompression =
+        (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
+        this.config.announceCompression !== false;
+      if (shouldAnnounceCompression) {
+        this.markCompressionAnnounced(params.sessionId);
+      }
 
       if (!result.compressed || result.tokensSaved === 0) {
         this.resetCircuit();
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: result.tokensBefore,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
         };
       }
 
       // Convert back to AgentMessage format, restoring images/tool blocks/metadata
-      // from the originals (the proxy does not reliably echo `_headroomMeta`).
-      const compressedAgentMessages = openAIToAgent(result.messages, {
-        originals: params.messages,
-        protectedToolNames: this.protectedToolNames,
-      });
+      // from the originals (the proxy does not reliably echo `_headroomMeta`) and
+      // protected tool results verbatim.
+      const compressedAgentMessages = restoreAgentMessages(
+        params.messages,
+        openaiMessages,
+        result.messages,
+        this.protectedToolNames,
+      );
       this.resetCircuit();
 
       // Track stats
@@ -369,13 +436,17 @@ export class HeadroomContextEngine {
         systemPromptAddition:
           result.tokensSaved > 100 && ccrHashes.length > 0
             ? `[Context compressed by Headroom: ${result.tokensSaved} tokens saved. Use headroom_retrieve with the hash to get full details.]`
-            : undefined,
+            : this.sessionCompressionNotice(params.sessionId),
       };
     } catch (error) {
       this.logger.error(`Assemble failed: ${error}`);
       this.tripCircuit(error);
       // Graceful fallback: return original messages
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
   }
 
@@ -553,6 +624,55 @@ export class HeadroomContextEngine {
     }
   }
 
+  /**
+   * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
+   * contract. Called only for the accepted, successful turn; failed or aborted
+   * turns never reach here. Must be one atomic, idempotent write keyed by
+   * `advancementKey`, so a host retry with the same key reports "duplicate"
+   * instead of re-applying the advancement — including a retry that arrives
+   * after this process restarted, which is why the record lives on disk (see
+   * `DurableAdvancementKeyStore`) rather than in memory. This engine keeps no
+   * turn state of its own (OpenClaw's transcript holds the accepted
+   * `messages`), so recording the key is the whole advancement.
+   */
+  async commitTurn(params: {
+    sessionId?: string;
+    sessionKey?: string;
+    advancementKey: string;
+    messages: unknown[];
+    admission?: unknown;
+    terminal?: unknown;
+    sessionTarget?: {
+      agentId?: string;
+      sessionId?: string;
+      sessionKey?: string;
+      storePath?: string;
+    };
+    runtimeSettings?: unknown;
+    runtimeContext?: unknown;
+    isHeartbeat?: boolean;
+  }): Promise<{ status: "committed" | "duplicate" }> {
+    // Key-store is the atomic dedup authority; it records only the
+    // advancementKey so the store doesn't grow with the turn's size.
+    const status = await this.advancementKeyStore.tryCommit(params.advancementKey);
+    if (status === "committed") {
+      const storePath = resolveTurnAdvancementStorePath({
+        sessionTarget: params.sessionTarget,
+        turnAdvancementStorePath:
+          this.config.turnAdvancementStorePath ??
+          (this.config.commitLogPath
+            ? join(dirname(this.config.commitLogPath), "turn-advancements.json")
+            : undefined),
+      });
+      this.getTurnAdvancementStore(storePath).commit({
+        advancementKey: params.advancementKey,
+        sessionId: params.sessionId ?? "",
+        messages: params.messages,
+      });
+    }
+    return { status };
+  }
+
   async afterTurn?(params: {
     sessionId: string;
     messages: any[];
@@ -576,42 +696,6 @@ export class HeadroomContextEngine {
     reason: string;
   }): Promise<void> {
     // No-op
-  }
-
-  /**
-   * Atomic + idempotent turn commit. OpenClaw calls this once the run for
-   * a logical turn completes successfully. We persist the accepted messages
-   * keyed by advancementKey so host retries and gateway restarts collapse to
-   * the same record even though OpenClaw owns the canonical transcript.
-   */
-  async commitTurn(params: {
-    sessionId: string;
-    sessionKey?: string;
-    advancementKey: string;
-    messages: unknown[];
-    admission?: unknown;
-    terminal?: unknown;
-    sessionTarget?: {
-      agentId?: string;
-      sessionId?: string;
-      sessionKey?: string;
-      storePath?: string;
-    };
-    runtimeSettings?: unknown;
-    runtimeContext?: unknown;
-    isHeartbeat?: boolean;
-  }): Promise<{ status: "committed" | "duplicate" }> {
-    const storePath = resolveTurnAdvancementStorePath({
-      sessionTarget: params.sessionTarget,
-      turnAdvancementStorePath: this.config.turnAdvancementStorePath,
-    });
-    const store = this.getTurnAdvancementStore(storePath);
-    const status = store.commit({
-      advancementKey: params.advancementKey,
-      sessionId: params.sessionId,
-      messages: params.messages,
-    });
-    return { status };
   }
 
   async dispose(): Promise<void> {
@@ -658,6 +742,26 @@ export class HeadroomContextEngine {
 
   private resetCircuit(): void {
     this.circuit = { errors: 0, openUntilMs: 0 };
+  }
+
+  private hasAnnouncedCompression(sessionId: string): boolean {
+    return this.announcedSessions.has(sessionId);
+  }
+
+  private markCompressionAnnounced(sessionId: string): void {
+    if (this.announcedSessions.has(sessionId)) return;
+    if (this.announcedSessions.size >= HeadroomContextEngine.MAX_ANNOUNCED_SESSIONS) {
+      const oldest = this.announcedSessions.values().next().value;
+      if (oldest !== undefined) this.announcedSessions.delete(oldest);
+    }
+    this.announcedSessions.add(sessionId);
+  }
+
+  /** The sticky notice if this session already earned it and announcements aren't opted out. */
+  private sessionCompressionNotice(sessionId: string): string | undefined {
+    return this.hasAnnouncedCompression(sessionId) && this.config.announceCompression !== false
+      ? HEADROOM_COMPRESSION_NOTICE
+      : undefined;
   }
 
   ensureProxyStarted(): void {
@@ -865,4 +969,15 @@ export class HeadroomContextEngine {
       );
     }
   }
+}
+
+function countContextChars(messages: ReturnType<typeof agentToOpenAIIndexed>): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.content?.length ?? 0;
+    for (const toolCall of message.tool_calls ?? []) {
+      total += toolCall.function?.arguments?.length ?? 0;
+    }
+  }
+  return total;
 }

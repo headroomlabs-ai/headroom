@@ -6,10 +6,11 @@
  * client sends AND exactly what happens to it on arrival. "Trust us" is not a
  * privacy policy.
  *
- * Deployed at otlp.headroomlabs.ai. Three jobs:
+ * Deployed at headroom-beacon.headroom-beacon.workers.dev (otlp.headroomlabs.ai
+ * is planned but not yet routed; see wrangler.toml). Three jobs:
  *
- *   1. Allowlist. Drop every field not on ALLOWED_KEYS before anything is
- *      written. This is the only privacy control that works retroactively —
+ *   1. Allowlist. Drop every field not on ALLOWED_KEYS, and every nested
+ *      field not described by NESTED, before anything is written. This is the only privacy control that works retroactively —
  *      if a future client version ships a bug that leaks a field, we cannot
  *      patch the installs already in the wild, but we can stop storing it
  *      here in one deploy.
@@ -25,7 +26,9 @@
  *
  * What this deliberately does NOT do: log, store, or forward the source IP.
  * Cloudflare offers it as cf-connecting-ip; it is the one field that would
- * deanonymise install_id, so it is never read.
+ * deanonymise install_id, so it is never read. Cloudflare's own per-request
+ * invocation logs would record it regardless of this code, which is why
+ * wrangler.toml turns them off (observability.logs.invocation_logs = false).
  */
 
 // Mostly mirrors the payload built by _Session.payload(); an extension may
@@ -98,6 +101,17 @@ const ALLOWED_KEYS = [
   // Allowlisted, slug-validated configuration, so the corpus can tell
   // "compression underperformed" from "compression was switched off".
   'config',
+  // The session's tokens split by harness and by model. `clients` and `models`
+  // only say who took part, so a session that mixed two could not be divided
+  // or priced. `client_usage` covers every turn: traffic with no identified
+  // harness is a row of its own instead of a gap.
+  'client_usage',
+  'model_usage',
+  // The harness's own release, numeric parts only.
+  'client_versions',
+  // Age of the install id in days, and whether it runs in a container or CI
+  // job: separates a returning user from an id minted on every run.
+  'install',
 ];
 
 // Resource attributes we keep. Same rule: allowlist, not denylist.
@@ -111,6 +125,145 @@ const ALLOWED_RESOURCE = [
   'host.arch',
 ];
 
+// What may sit UNDER each allowed key. Without this the allowlist stops at the
+// top level and a nested field a client bug adds is stored verbatim -- the very
+// leak the header says one deploy here can stop. Mirrors _Session.payload() and
+// _payload_v2() in headroom/telemetry/session.py. A nested key absent here is
+// dropped, so the ordering rule on ALLOWED_KEYS applies to it too: teach it
+// here before a client sends it.
+//
+// Leaves are 'num' (a finite number), 'bool', or 'str': a token of at most 128
+// characters with no whitespace, which is every string the client sends (slugs,
+// hex ids, public model ids, versions). Free text does not fit it. `[spec]` is
+// a list of spec; mapOf(spec) is an object whose KEYS are data (transform
+// names, skip reasons, status codes), each key itself held to 'str'.
+const MAP = Symbol('map');
+const mapOf = (spec) => ({ [MAP]: spec });
+const nums = (...keys) => Object.fromEntries(keys.map((k) => [k, 'num']));
+
+// A harness name: the client only sends ones from a closed list, so hold the
+// field to that shape instead of the wider 'str'.
+const SLUG = /^[a-z][a-z0-9_]{0,31}$/;
+// One turn-and-token row of `client_usage` / `model_usage`: _USAGE_FIELDS in
+// session.py.
+const USAGE = nums(
+  'n', 'original', 'saved', 'tool_saved', 'output', 'cache_read', 'cache_write',
+  'cache_write_inferred', 'cache_write_5m', 'cache_write_1h', 'uncached'
+);
+
+const NESTED = {
+  schema_version: 'num',
+  session: {
+    id: 'str', seq: 'num', duration_s: 'num', turns: 'num', ended: 'str', final: 'bool',
+  },
+  tokens: nums(
+    'original', 'attempted', 'input', 'output', 'saved', 'tool_saved',
+    'cache_read', 'cache_write', 'uncached'
+  ),
+  rates: nums(
+    'saved_pct', 'eligible_pct', 'yield_pct', 'all_layers_saved_pct',
+    'all_layers_yield_pct', 'cache_read_pct', 'overhead_pct'
+  ),
+  compression: {
+    transforms: mapOf('num'),
+    by_strategy: [{ strategy: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    ...nums(
+      'overhead_ms_total', 'latency_ms_total', 'overhead_ms_per_turn',
+      'latency_ms_per_turn', 'passthrough_turns', 'response_cache_hits'
+    ),
+  },
+  skips: mapOf('num'),
+  sources: mapOf('num'),
+  providers: ['str'],
+  models: ['str'],
+  failures: 'num',
+  failure_statuses: mapOf('num'),
+  // Emitted by an extension, not by session.py, so this repository does not
+  // define its shape. Bounded rather than described: numbers, booleans and
+  // tokens only, at most ROUTING_DEPTH levels deep. It gets a real schema here
+  // once the extension's payload is written down.
+  routing: 'any',
+  quality: {
+    ...nums('reread_tokens', 'reread_compressed_tokens', 'waste_turns'),
+    waste: [{ kind: 'str', tokens: 'num' }],
+  },
+  hist: mapOf({ edges: ['num'], counts: ['num'] }),
+  shapes: {
+    by_content: [{ content: 'str', strategy: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    by_tool: [{ shape: 'str', ...nums('n', 'tokens_in', 'tokens_out') }],
+    truncated: 'bool',
+  },
+  cache: {
+    gap_edges_s: ['num'], hits: ['num'], misses: ['num'],
+    ...nums('write_5m', 'write_1h', 'inferred_turns'),
+  },
+  trajectory: {
+    buckets: 'num', turns: ['num'], tokens: ['num'], saved: ['num'],
+    // Runs over the closed _TURN_KINDS alphabet, at most MAX_TRAJECTORY_RUNS.
+    kinds: /^(?:[cfepzso]\d{1,9}){0,64}$/,
+    kinds_truncated: 'bool',
+    msgs_max: 'num',
+  },
+  clients: [{ client: 'str', n: 'num' }],
+  errors: { count: 'num', by_status: mapOf('num') },
+  strata: [{ dim: 'str', value: 'str', n: 'num' }],
+  config: [{ key: 'str', value: 'str' }],
+  client_usage: [{ client: SLUG, ...USAGE }],
+  model_usage: [{ model: 'str', ...USAGE }],
+  client_versions: [{ client: SLUG, version: /^\d{1,4}(?:\.\d{1,4}){0,2}$/, n: 'num' }],
+  install: { age_days: 'num', container: 'bool', ci: 'bool' },
+};
+
+// A key allowed at the top but given no shape would be dropped in full. Fail
+// the deploy instead of shipping that.
+if ([...ALLOWED_KEYS].sort().join() !== Object.keys(NESTED).sort().join()) {
+  throw new Error('beacon: ALLOWED_KEYS and NESTED disagree');
+}
+
+const TOKEN = /^[\w.:/@+|-]{0,128}$/;
+// A slug-shaped string can still be a URL or a credential. Model ids and the
+// other slugs the client sends never carry a scheme or a well-known key prefix,
+// so those are dropped even though they pass TOKEN.
+const SECRETISH = /:\/\/|^(?:sk|pk|rk)[-_]|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^glpat-|^xox[abposr]-|^(?:AKIA|ASIA)[A-Z0-9]{12}|^AIza|^hf_|^eyJ/i;
+const isToken = (s) => TOKEN.test(s) && !SECRETISH.test(s);
+const ROUTING_DEPTH = 4;
+
+/** `value` reduced to what `spec` allows, or undefined when none of it is. */
+function clean(spec, value, depth = 0) {
+  if (spec === 'any') {
+    if (depth > ROUTING_DEPTH) return undefined;
+    spec = Array.isArray(value) ? ['any']
+      : value && typeof value === 'object' ? mapOf('any')
+      : typeof value === 'string' ? 'str'
+      : typeof value === 'number' ? 'num' : 'bool';
+  }
+  if (spec === 'num') return Number.isFinite(value) ? value : undefined;
+  if (spec === 'bool') return typeof value === 'boolean' ? value : undefined;
+  if (spec === 'str') return typeof value === 'string' && isToken(value) ? value : undefined;
+  if (spec instanceof RegExp) {
+    return typeof value === 'string' && spec.test(value) ? value : undefined;
+  }
+  if (Array.isArray(spec)) {
+    if (!Array.isArray(value)) return undefined;
+    return value.map((v) => clean(spec[0], v, depth + 1)).filter((v) => v !== undefined);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out = {};
+  if (spec[MAP]) {
+    for (const [key, v] of Object.entries(value)) {
+      const kept = isToken(key) ? clean(spec[MAP], v, depth + 1) : undefined;
+      if (kept !== undefined) out[key] = kept;
+    }
+    return out;
+  }
+  for (const [key, s] of Object.entries(spec)) {
+    if (!Object.hasOwn(value, key)) continue;
+    const kept = clean(s, value[key], depth + 1);
+    if (kept !== undefined) out[key] = kept;
+  }
+  return out;
+}
+
 // Cap on what ARRIVES, compressed or not.
 //
 // Was 64KB, chosen when the comment above it read "a beacon event is ~2KB" --
@@ -122,10 +275,8 @@ const ALLOWED_RESOURCE = [
 // retried, so the event would simply be lost.
 //
 // Restored to ~3x the worst legitimate payload. This is not the abuse control
-// and never was: the endpoint is unauthenticated by design and the WAF rate
-// limit (60 req/min/IP, see wrangler.toml) is what bounds a bad actor. At 60
-// requests a minute the difference between these two ceilings is 3.8 MB/min
-// and 15 MB/min, neither of which is interesting to Cloudflare.
+// and never was: the endpoint is unauthenticated by design and the RATE_LIMIT
+// binding (see fetch() and wrangler.toml) is what bounds a bad actor.
 const MAX_BODY_BYTES = 256 * 1024;
 
 // Cap on what an arriving body EXPANDS to. `raw.byteLength` cannot see this:
@@ -182,11 +333,13 @@ function unwrap(value) {
   return null;
 }
 
-function pick(obj, allowed) {
+function pick(obj, allowed, specOf) {
   const out = {};
   if (!obj || typeof obj !== 'object') return out;
   for (const key of allowed) {
-    if (key in obj) out[key] = obj[key];
+    if (!(key in obj)) continue;
+    const kept = clean(specOf(key), obj[key]);
+    if (kept !== undefined) out[key] = kept;
   }
   return out;
 }
@@ -199,14 +352,15 @@ function extract(payload) {
     for (const attr of rl.resource?.attributes || []) {
       resource[attr.key] = unwrap(attr.value);
     }
-    const cleanResource = pick(resource, ALLOWED_RESOURCE);
+    // Every resource attribute the client sends is a plain string.
+    const cleanResource = pick(resource, ALLOWED_RESOURCE, () => 'str');
 
     for (const sl of rl.scopeLogs || []) {
       for (const rec of sl.logRecords || []) {
         const body = unwrap(rec.body);
         if (!body || typeof body !== 'object') continue;
         records.push({
-          ...pick(body, ALLOWED_KEYS),
+          ...pick(body, ALLOWED_KEYS, (key) => NESTED[key]),
           resource: cleanResource,
           // Server-stamped. A client clock can be wrong or forged; this is the
           // timestamp partitioning and retention actually rely on.
@@ -220,114 +374,188 @@ function extract(payload) {
 
 // ----------------------------------------------------------------- rollup --
 //
-// The corpus is one object per heartbeat, ~1KB each — 65k on 2026-08-06 and
-// climbing. DuckDB reads them correctly, but a full `pull` is ~100k HTTPS round
-// trips for 95MB: minutes of pure per-object latency, no real bytes or compute.
-// Listing the bucket alone took 88 seconds.
+// The corpus is one object per heartbeat. Analysis reads rollup/**, never
+// sessions/**: each COMPLETE hour is collapsed into one object under rollup/,
+// keeping only the highest-seq heartbeat per (install, session). Raw is left
+// exactly as written, so any rollup can be rebuilt by deleting it.
 //
-// This job collapses each COMPLETE hour into one object under rollup/, keeping
-// only the highest-seq heartbeat per (install, session). One measured hour
-// (dt=2026-08-06/hh=14): 3,938 objects and 3,938 rows in, 1 object and 1,061
-// rows out. Analysis reads rollup/**, never sessions/**. Raw is left exactly as
-// written, so any rollup can be rebuilt by deleting it.
+// One invocation cannot do an hour on its own, and that is measured, not
+// feared. A Worker may have six requests in flight, so reads ran at ~12
+// objects/s whatever the code asked for, and a cron run is stopped at 15
+// minutes: ~11k objects. The fleet passed that on 2026-08-19 and by October 98%
+// of hours were being killed mid-read and writing nothing.
 //
-// Hourly rather than daily because every R2 binding call is a subrequest: a day
-// is ~65k of them against a 10k-per-invocation ceiling, an hour is ~4k.
+// So an hour is cut into slices and each slice is its own queue message, which
+// means its own invocation with its own six connections and its own 15 minutes:
+//
+//   scheduled()   finds hours with no rollup and enqueues one message per slice
+//   rollupSlice() reads one slice, writes rollup-parts/<hour>/<slice>
+//   finalizeHour() once every slice is in, merges them into rollup/<hour>/
+//
+// Slices are the first hex character of the object name. Names are
+// crypto.randomUUID() (see fetch()), so the sixteen slices are even, and the
+// split needs nothing but a LIST prefix — which is also why it works on every
+// object already in the bucket. Raise to two characters (256 slices) when a
+// slice stops fitting; the per-slice cost falls sixteen-fold.
 
-const READ_BUDGET = 60000; // objects per run; see [limits] in wrangler.toml
-// A get costs ~45ms of round trip and almost no CPU, so this is what decides
-// whether a run finishes: at 20 an hour took ~3 minutes, against a 15-minute
-// wall clock for a cron invocation. Raise it if an hour ever stops fitting.
-const FANOUT = 100;        // concurrent R2 gets
+const SLICES = '0123456789abcdef';
+// Requests in flight per invocation. Six is the platform's ceiling: asking for
+// more only queues inside the runtime.
+const POOL = 6;
+// A queued hour that still has no rollup after this long is enqueued again:
+// the safety net for a slice that ran out of retries. A second copy of a slice
+// that did finish is cheap, because queue() reuses the part already written.
+const REQUEUE_AFTER_MS = 3 * 3600_000;
+// Hours enqueued per cron run, sized so they drain well inside REQUEUE_AFTER_MS
+// (200 hours is 3,200 slices of a couple of minutes each, run in parallel). A
+// bigger backlog is not stuck, the next run simply continues it.
+const MAX_HOURS_PER_RUN = 200;
+// Wait before a failed slice is tried again, so a short R2 outage does not burn
+// every retry within seconds.
+const RETRY_DELAY_S = 60;
+// R2 deletes at most this many keys per call.
+const DELETE_BATCH = 1000;
 
 const partition = (d) =>
   `dt=${d.toISOString().slice(0, 10)}/hh=${d.toISOString().slice(11, 13)}`;
 
-/**
- * One hour of heartbeats -> one deduped NDJSON object.
- *
- * Returns `{ read, wrote }`. Spend is reported through the mutable `spend`
- * accumulator so the caller still knows it even when this throws: the budget
- * has to track real spend, and a flat guess lets a run that failed late
- * overshoot the subrequest ceiling and get killed inside an hour that would
- * otherwise have succeeded.
- *
- * Writes nothing unless the whole hour read cleanly. A rollup is built once and
- * then treated as done forever, so a partial read would silently become the
- * permanent record — better to write nothing and let the next run retry.
- */
-export async function rollupHour(env, part, spend = { read: 0 }) {
-  const best = new Map();
-  let failed = 0;   // transient: retry the hour
-  let corrupt = 0;  // permanent: record and move on
+/** Every object under a prefix, following the cursor. */
+async function listAll(env, options) {
+  const objects = [];
   let cursor;
   do {
-    const page = await env.CORPUS.list({ prefix: `sessions/${part}/`, cursor });
-    for (let i = 0; i < page.objects.length; i += FANOUT) {
-      // allSettled, not all: one transient R2 error among the ~4,000 gets in a
-      // real hour would otherwise reject the batch and discard the whole hour.
-      const settled = await Promise.allSettled(
-        page.objects
-          .slice(i, i + FANOUT)
-          .map((o) => env.CORPUS.get(o.key).then((r) => (r ? r.text() : null)))
-      );
-      for (const outcome of settled) {
-        spend.read++;
-        // A miss counts as a failure too. The key came from a LIST, so the
-        // object existed; treating it as empty would quietly shrink the rollup.
-        if (outcome.status !== 'fulfilled' || outcome.value === null) {
-          failed++;
-          continue;
-        }
-        for (const line of outcome.value.split('\n')) {
-          if (!line) continue;
-          let rec;
-          try {
-            rec = JSON.parse(line);
-          } catch {
-            // Counted and logged, but NOT a reason to abandon the hour. A
-            // failed get is transient and worth retrying; content this Worker
-            // itself wrote with JSON.stringify does not become valid later, so
-            // blocking on it would strand the hour until its raw objects
-            // expire and then lose the whole hour instead of one record.
-            corrupt++;
-            continue;
-          }
-          // A session heartbeats every 5 minutes carrying CUMULATIVE totals, so
-          // the highest seq IS the whole session and every earlier row is a
-          // strict subset. Sessions straddle hours, so readers still dedupe
-          // across rollups on this same key — this only shrinks each hour.
-          const id = `${rec.resource?.['headroom.install_id']} ${rec.session?.id}`;
-          const prev = best.get(id);
-          if (!prev || (rec.session?.seq ?? 0) > (prev.session?.seq ?? 0)) {
-            best.set(id, rec);
-          }
-        }
-      }
-    }
+    const page = await env.CORPUS.list({ ...options, cursor });
+    objects.push(...page.objects);
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
+  return objects;
+}
 
-  if (failed) {
-    throw new Error(`${part}: ${failed} of ${spend.read} objects unreadable`);
+/**
+ * Run `fn` over `items` with at most POOL calls in flight. Rejects on the first
+ * failure and starts nothing new after it: the slice is going to be retried
+ * whole, so further reads would be thrown away.
+ */
+async function pool(items, fn) {
+  let next = 0;
+  let failed = false;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      try {
+        await fn(items[next++]);
+      } catch (err) {
+        failed = true;
+        throw err;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(POOL, items.length) }, worker));
+}
+
+/**
+ * Fold NDJSON `text` into `best`, keeping the highest-seq record per session.
+ * Returns how many lines would not parse.
+ *
+ * A session heartbeats every 5 minutes carrying CUMULATIVE totals, so the
+ * highest seq IS the whole session and every earlier row is a strict subset.
+ * Sessions straddle hours, so readers still dedupe across rollups on this same
+ * key — this only shrinks each hour.
+ *
+ * The winner is kept as freshly serialised text, not as a slice of `text`: a
+ * slice would pin the whole source string in memory, and the merge reads
+ * sixteen of them against a 128MB isolate.
+ */
+function keepBest(best, text) {
+  let corrupt = 0;
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      // Counted, but NOT a reason to abandon the slice. Content this Worker
+      // itself wrote with JSON.stringify does not become valid later, so
+      // blocking on it would strand the hour instead of losing one record.
+      corrupt++;
+      continue;
+    }
+    const id = `${rec.resource?.['headroom.install_id']} ${rec.session?.id}`;
+    const seq = rec.session?.seq ?? 0;
+    const prev = best.get(id);
+    if (!prev || seq > prev.seq) best.set(id, { seq, line: JSON.stringify(rec) });
   }
+  return corrupt;
+}
+
+const ndjson = (best) => [...best.values()].map((r) => r.line).join('\n');
+
+/** True once an hour has its rollup (or its `empty` marker). */
+async function hourDone(env, part) {
+  const page = await env.CORPUS.list({ prefix: `rollup/${part}/`, limit: 1 });
+  return page.objects.length > 0;
+}
+
+/**
+ * One slice of one hour -> rollup-parts/<part>/<slice>.
+ *
+ * Throws if any listed object cannot be read, and writes nothing: the queue
+ * redelivers the message, and a part that was short would silently become the
+ * permanent record once merged. A slice with no objects still writes its (empty)
+ * part, because "all sixteen present" is what finalizeHour waits for.
+ */
+export async function rollupSlice(env, part, slice) {
+  const objects = await listAll(env, { prefix: `sessions/${part}/${slice}` });
+  const best = new Map();
+  let corrupt = 0;
+  await pool(objects, async (o) => {
+    const body = await env.CORPUS.get(o.key);
+    // The key came from a LIST, so the object existed; treating a miss as
+    // empty would quietly shrink the rollup.
+    if (!body) throw new Error(`${o.key}: listed but unreadable`);
+    // Folded as it arrives, so only the winners are held, never the slice.
+    corrupt += keepBest(best, await body.text());
+  });
   if (corrupt) {
-    console.error(`rollup ${part}: skipped ${corrupt} unparseable record(s)`);
+    console.error(`rollup ${part}/${slice}: skipped ${corrupt} unparseable record(s)`);
+  }
+  await env.CORPUS.put(`rollup-parts/${part}/${slice}`, ndjson(best));
+  return { read: objects.length, kept: best.size };
+}
+
+/**
+ * Merge an hour's sixteen parts into rollup/<part>/, then remove the parts.
+ * Returns false, having written nothing, while any slice is still missing.
+ *
+ * Safe to run twice at once: both runs read the same parts and write the same
+ * bytes. The one that loses the race finds a part already deleted and stops.
+ */
+export async function finalizeHour(env, part) {
+  const parts = await listAll(env, { prefix: `rollup-parts/${part}/` });
+  const have = new Set(parts.map((o) => o.key.slice(o.key.lastIndexOf('/') + 1)));
+  if (![...SLICES].every((s) => have.has(s))) return false;
+
+  // One session's heartbeats are spread across slices, so the parts overlap and
+  // the merge is a real dedupe, not a concatenation. Read one at a time: the
+  // parts together are several times the size of the result.
+  const best = new Map();
+  for (const slice of SLICES) {
+    const body = await env.CORPUS.get(`rollup-parts/${part}/${slice}`);
+    if (!body) return false;
+    keepBest(best, await body.text());
   }
 
   // A genuinely empty hour gets a marker rather than a zero-byte NDJSON that
   // every reader would have to special-case. Without it the hour stays
-  // "missing" and is re-listed on every run for the life of the bucket.
+  // "missing" and is enqueued again for the life of the bucket.
   if (best.size === 0) {
     await env.CORPUS.put(`rollup/${part}/empty`, '');
-    return { read: spend.read, wrote: 0 };
+  } else {
+    await env.CORPUS.put(`rollup/${part}/data.ndjson`, ndjson(best), {
+      httpMetadata: { contentType: 'application/x-ndjson' },
+    });
   }
-  await env.CORPUS.put(
-    `rollup/${part}/data.ndjson`,
-    [...best.values()].map((r) => JSON.stringify(r)).join('\n'),
-    { httpMetadata: { contentType: 'application/x-ndjson' } }
-  );
-  return { read: spend.read, wrote: best.size };
+  await env.CORPUS.delete(parts.map((o) => o.key));
+  return true;
 }
 
 /** Oldest `dt=` day still under sessions/, or null. One delimited LIST. */
@@ -340,59 +568,102 @@ export async function oldestRawDay(env) {
   return days.length ? days[0] : null;
 }
 
+/** `dt=…/hh=…` of a key under `prefix`, i.e. everything up to its last slash. */
+const partOf = (key, prefix) => key.slice(prefix.length, key.lastIndexOf('/'));
+
 export default {
-  /** Hourly cron. Builds every complete hour back to the oldest raw data. */
+  /**
+   * Hourly cron. Enqueues every complete hour that has no rollup, back to the
+   * oldest raw data. Does none of the reading itself — see the note above.
+   */
   async scheduled(event, env) {
     // Backfill reaches all the way to the oldest surviving raw day, NOT a fixed
     // window. A fixed window silently strands everything older than it the
-    // moment analysis stopped reading sessions/ — the raw objects are still
-    // there, but nothing would ever compact them, so they vanish from every
-    // report. Bounding by real data instead means the floor rises only when a
-    // lifecycle rule actually expires the raw objects.
+    // moment analysis stopped reading sessions/. Bounding by real data instead
+    // means the floor rises only when a lifecycle rule expires the raw objects.
     const oldest = await oldestRawDay(env);
     if (!oldest) return;
     const floorMs = Date.parse(`${oldest}T00:00:00Z`);
     if (Number.isNaN(floorMs)) return;
 
     // Only list from the floor forward. Rollups older than the oldest raw day
-    // can never be rebuilt, so enumerating them answers nothing — this is what
-    // keeps the listing bounded by retention rather than by total history.
-    const done = new Set();
-    let cursor;
-    do {
-      const page = await env.CORPUS.list({
-        prefix: 'rollup/',
-        startAfter: `rollup/dt=${oldest}`,
-        cursor,
-      });
-      for (const o of page.objects) {
-        // Tolerates both `<part>/data.ndjson` and the `<part>/empty` marker.
-        const rel = o.key.slice('rollup/'.length);
-        const cut = rel.lastIndexOf('/');
-        if (cut > 0) done.add(rel.slice(0, cut));
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
+    // can never be rebuilt, so enumerating them answers nothing.
+    const done = new Set(
+      (await listAll(env, { prefix: 'rollup/', startAfter: `rollup/dt=${oldest}` })).map((o) =>
+        partOf(o.key, 'rollup/')
+      )
+    );
+    const inFlight = await listAll(env, { prefix: 'rollup-parts/' });
 
-    // Newest first, so a backlog drains from the present backwards and the
-    // freshest hour is never the one starved by the budget. Starts one hour
-    // back: the current hour is still being written to.
-    let budget = READ_BUDGET;
-    for (let t = event.scheduledTime - 3600_000; t >= floorMs && budget > 0; t -= 3600_000) {
+    // Sweep what a finished hour left behind. finalizeHour removes its parts,
+    // but three things can outlive it: a duplicate slice that was still reading
+    // when the hour was merged, parts whose delete failed after the publish,
+    // and a `queued` marker written after a very small hour had already merged.
+    // Nothing else would ever remove them, and this prefix is listed every run.
+    const leftover = inFlight
+      .filter((o) => done.has(partOf(o.key, 'rollup-parts/')))
+      .map((o) => o.key);
+    for (let i = 0; i < leftover.length; i += DELETE_BATCH) {
+      await env.CORPUS.delete(leftover.slice(i, i + DELETE_BATCH));
+    }
+
+    // When each in-flight hour was enqueued, so an hour still being worked on
+    // is not enqueued again every time the cron fires.
+    const queuedAt = new Map(
+      inFlight
+        .filter((o) => o.key.endsWith('/queued'))
+        .map((o) => [partOf(o.key, 'rollup-parts/'), o.uploaded.getTime()])
+    );
+
+    // Newest first, so the freshest hour is never the one a backlog starves.
+    // Starts one hour back: the current hour is still being written to.
+    let enqueued = 0;
+    for (
+      let t = event.scheduledTime - 3600_000;
+      t >= floorMs && enqueued < MAX_HOURS_PER_RUN;
+      t -= 3600_000
+    ) {
       const part = partition(new Date(t));
       if (done.has(part)) continue;
-      // Shared with rollupHour so a throw still reports what it spent.
-      const spend = { read: 0 };
+      const at = queuedAt.get(part);
+      if (at !== undefined && event.scheduledTime - at < REQUEUE_AFTER_MS) continue;
       try {
-        await rollupHour(env, part, spend);
+        // Marker first: if the send then fails, the hour waits for the
+        // re-enqueue instead of being sent twice by the next run.
+        await env.CORPUS.put(`rollup-parts/${part}/queued`, '');
+        await env.ROLLUP_QUEUE.sendBatch([...SLICES].map((slice) => ({ body: { part, slice } })));
       } catch (err) {
-        // Newest-first means an hour that always throws — one grown past the
-        // subrequest ceiling, say — would otherwise block every older hour
-        // behind it forever. Skip it and keep draining; it has no marker, so
-        // the next run retries it.
-        console.error(`rollup ${part} failed after ${spend.read} objects: ${err}`);
+        // One hour failing to enqueue must not end the run for the rest.
+        console.error(`rollup ${part}: enqueue failed: ${err}`);
       }
-      budget -= spend.read;
+      enqueued++;
+    }
+  },
+
+  /**
+   * Queue consumer: one message is one slice of one hour. A slice that throws
+   * is retried by the queue on its own, so one bad read costs that slice a
+   * retry instead of costing the hour everything it had already read.
+   */
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      const { part, slice } = message.body;
+      try {
+        // A redelivery, or a re-enqueue that raced the merge: nothing to do,
+        // and writing a part now would leave it behind for good.
+        if (!(await hourDone(env, part))) {
+          // The hour is closed, so a part that is already there is still
+          // right: a second copy of the message only has to try the merge.
+          if (!(await env.CORPUS.head(`rollup-parts/${part}/${slice}`))) {
+            await rollupSlice(env, part, slice);
+          }
+          await finalizeHour(env, part);
+        }
+        message.ack();
+      } catch (err) {
+        console.error(`rollup ${part}/${slice} failed: ${err}`);
+        message.retry({ delaySeconds: RETRY_DELAY_S });
+      }
     }
   },
 
@@ -403,6 +674,31 @@ export default {
     const url = new URL(request.url);
     if (url.pathname !== '/v1/logs') {
       return new Response('not found', { status: 404 });
+    }
+
+    // Abuse bound, checked before the body is read so a flood costs neither
+    // the inflate nor an R2 write. Keyed on one constant rather than the
+    // sender: a per-IP limit would mean reading cf-connecting-ip, which this
+    // Worker never does (see the header). The price is that a flood also
+    // sheds real events until the window rolls over -- acceptable for
+    // fire-and-forget telemetry, and the cap sits ~10x above normal traffic.
+    //
+    // 429 is safe for old clients: only 400/415 make them drop gzip
+    // (_GZIP_REFUSED_STATUSES in headroom/telemetry/session.py).
+    //
+    // Fails open: with no binding (local tests, an old wrangler.toml) or when
+    // the rate-limit service itself errors, the upload proceeds. A limiter
+    // outage must not drop every legitimate beacon; the cost is that a flood
+    // during that outage is unbounded until the service recovers.
+    if (env.RATE_LIMIT) {
+      let limited = false;
+      try {
+        const { success } = await env.RATE_LIMIT.limit({ key: 'all' });
+        limited = !success;
+      } catch (err) {
+        console.error('beacon: rate limiter unavailable, failing open:', String(err));
+      }
+      if (limited) return new Response('rate limited', { status: 429 });
     }
 
     const raw = await request.arrayBuffer();
@@ -446,7 +742,8 @@ export default {
     // two independent spellings of this scheme would mean the writer and the
     // compactor could drift apart and silently match zero objects.
     // ponytail: one object per request. Compacted hourly into rollup/ by
-    // scheduled() above — analysis reads that, never this.
+    // the queue consumer above — analysis reads that, never this. The random
+    // UUID is load-bearing there: its first character is the slice.
     const key = `sessions/${partition(new Date())}/${crypto.randomUUID()}.json`;
     const ndjson = records.map((r) => JSON.stringify(r)).join('\n');
 

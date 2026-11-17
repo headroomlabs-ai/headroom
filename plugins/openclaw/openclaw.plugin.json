@@ -26,6 +26,10 @@
       "label": "Compression Request Timeout",
       "help": "Maximum milliseconds to wait for one compression request before returning the original messages."
     },
+    "minContextChars": {
+      "label": "Minimum Context Size",
+      "help": "Skip the proxy for smaller contexts that cannot produce meaningful savings. Set to 0 to disable."
+    },
     "circuitBreakerThreshold": {
       "label": "Circuit Breaker Threshold",
       "help": "Consecutive compression failures before temporarily bypassing Headroom."
@@ -85,6 +89,14 @@
     "skipAssembleWhenGatewayRouted": {
       "label": "Skip Assemble When Gateway Routed",
       "help": "When true and gatewayProviderIds is non-empty, skip assemble() compression because live provider traffic already passes through the Headroom proxy (avoids double compression). Default: false."
+    },
+    "announceCompression": {
+      "label": "Announce Compression In System Prompt",
+      "help": "When enabled, a static, cache-stable notice is added to the system prompt the first time a session compresses more than 100 tokens. Disable to guarantee the plugin never modifies the system prompt."
+    },
+    "commitLogPath": {
+      "label": "Turn Commit Log Path",
+      "help": "Where to record committed turn advancements (the markers go in a sibling directory). Must be writable. Defaults to $HEADROOM_WORKSPACE_DIR/openclaw/commit-log.json, else ~/.headroom/openclaw/commit-log.json."
     }
   },
   "configSchema": {
@@ -128,7 +140,12 @@
       "requestTimeoutMs": {
         "type": "integer",
         "minimum": 1,
-        "default": 30000
+        "default": 2000
+      },
+      "minContextChars": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 800
       },
       "circuitBreakerThreshold": {
         "type": "integer",
@@ -223,6 +240,14 @@
       "skipAssembleWhenGatewayRouted": {
         "type": "boolean",
         "default": false
+      },
+      "announceCompression": {
+        "type": "boolean",
+        "default": true
+      },
+      "commitLogPath": {
+        "type": "string",
+        "minLength": 1
       }
     }
   },

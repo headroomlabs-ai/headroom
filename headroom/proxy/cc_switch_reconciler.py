@@ -50,6 +50,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,23 @@ class CCSwitchReconciler:
         self.current_upstream: str | None = None
         self._task: asyncio.Task | None = None
         self._last_mtime_ns: int | None = None
+
+    def _is_self(self, url: str) -> bool:
+        """True if ``url`` names this proxy (``localhost`` or its bind address, any path).
+
+        Loopback families are distinct sockets: ``[::1]`` is not the proxy when it is
+        bound to ``127.0.0.1``, so another local provider on that address is captured.
+        """
+        try:
+            want = urlsplit(self.proxy_url)
+            got = urlsplit(url)
+            return (
+                (got.hostname or "").lower() in {"localhost", (want.hostname or "").lower()}
+                and got.scheme == want.scheme
+                and got.port == want.port
+            )
+        except ValueError:
+            return False
 
     async def start(self) -> None:
         if self._task is not None:
@@ -162,10 +180,23 @@ class CCSwitchReconciler:
                 self._atomic_write(data)
                 logger.info("cc-switch reconciler: official -> route via Headroom")
                 return True
-            return False  # leave official direct (default, safe for OAuth)
+            # Leaving official direct (default, safe for OAuth) still has to
+            # drop a previously captured third-party upstream. The upstream is
+            # process-wide (``HeadroomProxy.ANTHROPIC_API_URL`` is a class
+            # attr), so a stale DeepSeek/Kimi endpoint would keep receiving
+            # this proxy's Anthropic traffic from every client still routed
+            # through it -- with Anthropic credentials attached.
+            if self.current_upstream not in (None, self.default_upstream):
+                logger.info(
+                    "cc-switch reconciler: official -> upstream reset to %s",
+                    self.default_upstream,
+                )
+                self.current_upstream = self.default_upstream
+                self._set_upstream(self.default_upstream)
+            return False
 
         # Already pointing at us: nothing to do (loop guard).
-        if url.rstrip("/") == self.proxy_url:
+        if self._is_self(url):
             return False
 
         # Third-party / custom endpoint: capture it as upstream, point Claude at us.

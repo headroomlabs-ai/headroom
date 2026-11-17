@@ -209,9 +209,10 @@ def test_port_fallback(
     assert captured["env"]["KIMI_BASE_URL"] == "http://127.0.0.1:9999/v1"
 
 
-def test_non_kimi_fallback_display_is_unchanged(
+def test_non_kimi_fallback_display_follows_actual_port(
     capfd: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
+    """A port fallback rewrites the banner too, so it shows the URL the child got."""
     env = {**os.environ, "OTHER_BASE_URL": "http://127.0.0.1:8787/v1"}
     display = ["OTHER_BASE_URL=http://127.0.0.1:8787/v1"]
     child_result = tmp_path / "other-child.txt"
@@ -243,7 +244,8 @@ def test_non_kimi_fallback_display_is_unchanged(
 
     assert raised.value.code == 0
     output = capfd.readouterr().out
-    assert "OTHER_BASE_URL=http://127.0.0.1:8787/v1" in output
+    assert "OTHER_BASE_URL=http://127.0.0.1:9001/v1" in output
+    assert "127.0.0.1:8787" not in output
     assert child_result.read_text() == "CHILD|http://127.0.0.1:9001/v1"
 
 

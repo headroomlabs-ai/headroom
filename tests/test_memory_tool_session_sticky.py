@@ -500,6 +500,51 @@ def test_memory_disabled_after_inject_still_injects() -> None:
     assert bytes1 == bytes2
 
 
+def test_no_client_tools_suppresses_fresh_and_sticky_injection() -> None:
+    """Requests without client-declared tools must not receive memory tools."""
+    defs = _anthropic_memory_defs()
+    client_tools = [{"name": "client_tool", "description": "client-owned", "input_schema": {}}]
+
+    fresh_tools, fresh_was = apply_session_sticky_memory_tools(
+        provider="anthropic",
+        session_id="s-fresh-no-client-tools",
+        request_id="r-fresh",
+        existing_tools=None,
+        memory_tools_to_inject=defs,
+        inject_this_turn=True,
+        client_declared_tools=False,
+    )
+    assert fresh_was is False
+    assert fresh_tools == []
+
+    # Establish sticky memory tools while the client has declared tools.
+    tools1, was1 = apply_session_sticky_memory_tools(
+        provider="anthropic",
+        session_id="s-no-client-tools",
+        request_id="r-1",
+        existing_tools=client_tools,
+        memory_tools_to_inject=defs,
+        inject_this_turn=True,
+        client_declared_tools=True,
+    )
+    assert was1 is True
+    assert "memory_search" in _names_in(tools1)
+
+    # A later request omits tools entirely. Sticky replay must not turn it into
+    # a tool-capable request that the client cannot service.
+    tools2, was2 = apply_session_sticky_memory_tools(
+        provider="anthropic",
+        session_id="s-no-client-tools",
+        request_id="r-2",
+        existing_tools=[],
+        memory_tools_to_inject=defs,
+        inject_this_turn=True,
+        client_declared_tools=False,
+    )
+    assert was2 is False
+    assert tools2 == []
+
+
 def test_different_sessions_independent() -> None:
     """Session A injects; session B doesn't; verify isolation."""
     defs = _anthropic_memory_defs()

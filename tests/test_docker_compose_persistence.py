@@ -63,3 +63,80 @@ def test_top_level_compose_marks_source_build_version() -> None:
     assert ".git/*" in dockerignore
     assert "!.git/HEAD" in dockerignore
     assert "!.git/refs/**" in dockerignore
+
+
+def test_native_compose_keeps_host_publication_loopback_and_optional_token() -> None:
+    compose = yaml.safe_load(
+        (ROOT / "docker" / "docker-compose.native.yml").read_text(encoding="utf-8")
+    )
+    proxy = compose["services"]["proxy"]
+
+    assert proxy["ports"] == ["127.0.0.1:${HEADROOM_PORT:-8787}:${HEADROOM_PORT:-8787}"]
+    assert proxy["environment"]["HEADROOM_HOST"] == "0.0.0.0"
+    assert proxy["environment"]["HEADROOM_PROXY_TOKEN"] == "${HEADROOM_PROXY_TOKEN:-}"
+    assert proxy["command"] == ["--host", "0.0.0.0", "--port", "${HEADROOM_PORT:-8787}"]
+
+
+def test_native_compose_lets_the_host_dashboard_read_its_data(monkeypatch) -> None:
+    """The compose proxy must serve /stats-history to the host browser, which
+    reaches the 127.0.0.1 publication as the compose network's gateway."""
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    compose = yaml.safe_load(
+        (ROOT / "docker" / "docker-compose.native.yml").read_text(encoding="utf-8")
+    )
+    proxy = compose["services"]["proxy"]
+    assert proxy["ports"][0].startswith("127.0.0.1:")
+
+    for name, value in proxy["environment"].items():
+        if name != "HOME" and not name.endswith("_DIR"):
+            # "${VAR:-default}" with VAR unset, as compose resolves it.
+            value = value.split(":-", 1)[1].rstrip("}") if value.startswith("${") else value
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.18.0.1")
+    host = proxy["command"][proxy["command"].index("--host") + 1]
+    app = create_app(ProxyConfig(host=host, optimize=False, cache_enabled=False))
+
+    browser = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.18.0.1", 1))
+    assert browser.get("/stats-history").status_code == 200
+    other_container = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.18.0.5", 1))
+    assert other_container.get("/stats-history").status_code == 404
+
+
+def test_differential_capture_compose_keeps_proxy_internal_and_host_ports_loopback() -> None:
+    compose = yaml.safe_load(
+        (ROOT / "docker" / "differential-network-capture" / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    services = compose["services"]
+    assert (
+        services["headroom-proxy"]["environment"]["HEADROOM_PROXY_TOKEN"]
+        == "${HEADROOM_PROXY_TOKEN:?Set HEADROOM_PROXY_TOKEN}"
+    )
+    assert (
+        services["mitm-headroom-client"]["environment"]["CAPTURE_PROXY_TOKEN"]
+        == "${HEADROOM_PROXY_TOKEN:?Set HEADROOM_PROXY_TOKEN}"
+    )
+    assert (
+        services["mitm-headroom-client"]["environment"]["CAPTURE_PROXY_TOKEN_HOSTS"]
+        == "headroom-proxy"
+    )
+    assert services["mitm-direct"]["ports"] == ["127.0.0.1:${DIRECT_MITM_PORT:-18080}:8080"]
+    assert services["mitm-headroom-upstream"]["ports"] == [
+        "127.0.0.1:${HEADROOM_MITM_PORT:-18081}:8080"
+    ]
+    assert "ports" not in services["mitm-headroom-client"]
+    assert "HEADROOM_CLIENT_MITM_PORT" not in compose["services"]["mitm-headroom-client"].get(
+        "environment", {}
+    )
+
+
+def test_published_dockerfile_stages_default_to_loopback() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert dockerfile.count("ENV HEADROOM_HOST=127.0.0.1") == 2
+    assert 'CMD ["--port", "8787"]' not in dockerfile
+    assert 'CMD ["--host", "0.0.0.0"]' not in dockerfile
