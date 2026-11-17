@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 200" width="880" height="200" role="img"
+     aria-label="Headroom for teams and enterprises. Want more savings? Headroom OSS shows what is possible; Enterprise saves more. More cost savings, tokens secured, on premise, deep attribution and many more features. Talk to us: hello@headroomlabs.ai.">
+  <title>Headroom for teams and enterprises — talk to us</title>
+
+  <defs>
+    <!-- Brand palette and type scale as in hero.svg: Mint #00F0B5, Obsidian #070A0F,
+         Slate #98A4B3, White; title 42/700, lead 14.5, eyebrow 10.5 tracked. -->
+    <style>
+      .s { font-family: "Segoe UI", Inter, -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="878" height="198" rx="18" fill="#070A0F" stroke="#00F0B5" stroke-opacity="0.35" stroke-width="1.5"/>
+
+  <g class="s">
+    <text x="40" y="48" font-size="10.5" letter-spacing="1.6" fill="#00F0B5">HEADROOM FOR TEAMS &amp; ENTERPRISES</text>
+    <text x="40" y="96" font-size="42" font-weight="700" letter-spacing="-0.8" fill="#FFFFFF">Want more savings?</text>
+    <text x="40" y="128" font-size="14.5" fill="#98A4B3">Headroom OSS shows what is possible. Enterprise saves more, and adds:</text>
+    <text x="40" y="160" font-size="14.5" fill="#FFFFFF">More cost savings · Tokens secured · On premise · Deep attribution · and more</text>
+
+    <rect x="676" y="72" width="164" height="44" rx="22" fill="#00F0B5"/>
+    <text x="758" y="99" font-size="14.5" font-weight="700" text-anchor="middle" fill="#070A0F">Talk to us →</text>
+    <text x="758" y="140" font-size="13" text-anchor="middle" fill="#98A4B3">hello@headroomlabs.ai</text>
+  </g>
+</svg>

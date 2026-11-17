@@ -1,3 +1,5 @@
+import pytest
+
 from headroom.transforms.content_detector import ContentType
 from headroom.transforms.mixed_content import (
     _extract_json_block,
@@ -49,6 +51,60 @@ def test_split_into_sections_preserves_typed_boundaries():
     assert sections[3].start_line == 5
 
 
+@pytest.mark.parametrize(
+    ("info_string", "language"),
+    [
+        ("c++", "c++"),
+        ("c#", "c#"),
+        ("objective-c", "objective-c"),
+        ("js {1,3}", "js"),
+        ('python title="app.py"', "python"),
+        (" c++", "c++"),
+        ("python\r", "python"),
+    ],
+)
+def test_split_accepts_fence_info_strings_beyond_word_characters(info_string, language):
+    content = "\n".join(
+        [
+            "Here is the header file we wrote today.",
+            f"```{info_string}",
+            "int add(int a, int b);",
+            "```",
+            "Please review this carefully and tell me what you think.",
+            '{"name": "demo", "version": 1}',
+        ]
+    )
+
+    sections = split_into_sections(content)
+
+    assert [section.content_type for section in sections] == [
+        ContentType.PLAIN_TEXT,
+        ContentType.SOURCE_CODE,
+        ContentType.PLAIN_TEXT,
+        ContentType.JSON_ARRAY,
+    ]
+    assert sections[1].language == language
+    assert sections[1].content == "int add(int a, int b);"
+    assert sections[1].is_code_fence is True
+    assert sections[2].content == "Please review this carefully and tell me what you think."
+
+
+def test_fence_pattern_stays_linear_on_a_long_unclosed_fence_line():
+    import time
+
+    from headroom.transforms.mixed_content import _CODE_FENCE_PATTERN
+
+    line = "```" + "a" * 50_000 + "`"
+    best = float("inf")
+    for _ in range(3):
+        start = time.perf_counter()
+        assert _CODE_FENCE_PATTERN.match(line) is None
+        best = min(best, time.perf_counter() - start)
+    # Linear: well under 1 ms here. A quadratic pattern takes seconds, so a
+    # generous budget still catches it on a loaded runner.
+    assert best < 0.5, f"{best * 1000:.1f}ms on a 50,000-character fence line"
+
+
 def test_split_carves_grep_context_lines_into_search_sections():
     """Regression (#3580): prose + ``grep -A`` output keeps code out of text.
 
@@ -98,3 +154,22 @@ def test_extract_json_block_ignores_delimiters_inside_strings():
 
     assert end_line == 3
     assert block == "\n".join(lines)
+
+
+def test_split_does_not_carve_timestamped_log_rows_as_search():
+    """Regression (#3736 residual): the detector rejects ISO-timestamped log
+    rows as search output; the splitter must not carve them either, while
+    real ``path:NN:content`` grep lines still carve.
+    """
+    logs = [
+        "2026-09-23T10:05:07Z worker-1 INFO request handled",
+        "2026-09-23T10:05:13Z worker-2 ERROR upstream timeout",
+    ]
+    content = "\n".join(["Intro text", "```python", "print('x')", "```", *logs])
+
+    assert ContentType.SEARCH_RESULTS not in [
+        section.content_type for section in split_into_sections(content)
+    ]
+
+    grep = "\n".join(["Intro text", "```python", "print('x')", "```", "src/app.py:10:print('x')"])
+    assert split_into_sections(grep)[-1].content_type == ContentType.SEARCH_RESULTS

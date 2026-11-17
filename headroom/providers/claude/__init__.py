@@ -14,6 +14,7 @@ from .runtime import (
     TOOL_SEARCH_ENV,
     claude_auth_conflict_message,
     claude_auth_conflict_sources,
+    claude_effective_env,
     detect_claude_code_version,
     is_custom_anthropic_base_url,
     parse_claude_code_version,
@@ -21,6 +22,7 @@ from .runtime import (
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
+    remote_control_gate_short_message,
     remote_control_sibling_gate_note,
     resolve_1m_model,
 )
@@ -53,6 +55,7 @@ __all__ = [
     "TOOL_SEARCH_ENV",
     "claude_auth_conflict_message",
     "claude_auth_conflict_sources",
+    "claude_effective_env",
     "detect_claude_code_version",
     "is_custom_anthropic_base_url",
     "parse_claude_code_version",
@@ -61,5 +64,6 @@ __all__ = [
     "remote_control_applies_to_auth",
     "remote_control_gate_active",
     "remote_control_gate_message",
+    "remote_control_gate_short_message",
     "remote_control_sibling_gate_note",
 ]

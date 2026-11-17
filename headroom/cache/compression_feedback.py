@@ -344,13 +344,6 @@ class CompressionFeedback:
                 # Extract potential field names from query
                 self._extract_field_hints(pattern, event.query)
 
-    def _truncate_strategy_dicts(self, pattern: LocalToolPattern) -> None:
-        """Truncate strategy counters using the shared strategy outcome domain."""
-        outcomes = pattern.strategy_outcomes
-        outcomes.prune()
-        pattern.strategy_compressions = outcomes.compressions
-        pattern.strategy_retrievals = outcomes.retrievals
-
     def _extract_field_hints(self, pattern: LocalToolPattern, query: str) -> None:
         """Extract potential field names from search queries.
 

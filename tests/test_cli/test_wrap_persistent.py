@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import errno
+from types import SimpleNamespace
 
 import click
 import pytest
 
 import headroom.cli.wrap as wrap_cli
+import headroom.install.health as install_health
+import headroom.install.runtime as install_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +20,13 @@ def _no_attached_wrappers(monkeypatch: pytest.MonkeyPatch) -> None:
     flaky. Individual tests override this to simulate attached wrappers.
     """
     monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    # These recovery tests control readiness through the health probe; process
+    # identity and launchd ownership have their own runtime-level coverage.
+    monkeypatch.setattr(
+        install_runtime,
+        "runtime_ready",
+        lambda manifest: install_health.probe_ready(manifest.health_url),
+    )
     for name in (
         "ANTHROPIC_TARGET_API_URL",
         "OPENAI_TARGET_API_URL",
@@ -35,9 +45,18 @@ class _Manifest:
     preset = "persistent-service"
     supervisor_kind = "service"
     health_url = "http://127.0.0.1:8787/readyz"
+    runtime_kind = "python"
 
 
-def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> None:
+@pytest.fixture(params=["darwin", "linux", "win32"])
+def runtime_platform(monkeypatch: pytest.MonkeyPatch, request) -> None:
+    # Replace only this module's sys reference, never the process-wide object.
+    monkeypatch.setattr(install_runtime, "sys", SimpleNamespace(platform=request.param))
+
+
+def test_ensure_proxy_recovers_matching_persistent_deployment(
+    monkeypatch, runtime_platform
+) -> None:
     calls: list[str] = []
 
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: False)
@@ -48,7 +67,8 @@ def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> No
         lambda manifest: calls.append(f"start:{manifest.profile}"),
     )
     monkeypatch.setattr(
-        "headroom.install.runtime.wait_ready", lambda manifest, timeout_seconds=45: True
+        "headroom.install.runtime.wait_ready",
+        lambda manifest, timeout_seconds=45, require_identity=False: True,
     )
     monkeypatch.setattr(
         wrap_cli,
@@ -65,7 +85,9 @@ def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> No
     assert calls == ["start:default"]
 
 
-def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkeypatch) -> None:
+def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(
+    monkeypatch, runtime_platform
+) -> None:
     calls: list[str] = []
 
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
@@ -81,7 +103,8 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
         lambda manifest: calls.append(f"start:{manifest.profile}"),
     )
     monkeypatch.setattr(
-        "headroom.install.runtime.wait_ready", lambda manifest, timeout_seconds=45: True
+        "headroom.install.runtime.wait_ready",
+        lambda manifest, timeout_seconds=45, require_identity=False: True,
     )
     monkeypatch.setattr(
         wrap_cli,
@@ -301,14 +324,14 @@ def test_find_persistent_manifest_prefers_default_profile(monkeypatch) -> None:
     assert manifest.profile == "default"
 
 
-def test_recover_persistent_proxy_reuses_healthy_deployment(monkeypatch) -> None:
+def test_recover_persistent_proxy_reuses_healthy_deployment(monkeypatch, runtime_platform) -> None:
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
 
     assert wrap_cli._recover_persistent_proxy(8787) is True
 
 
-def test_recover_persistent_proxy_warns_for_task_deployment(monkeypatch) -> None:
+def test_recover_persistent_proxy_warns_for_task_deployment(monkeypatch, runtime_platform) -> None:
     class TaskManifest(_Manifest):
         supervisor_kind = "task"
 
@@ -316,6 +339,31 @@ def test_recover_persistent_proxy_warns_for_task_deployment(monkeypatch) -> None
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
 
     assert wrap_cli._recover_persistent_proxy(8787) is False
+
+
+def test_recover_persistent_proxy_routes_docker_task_to_docker_supervisor(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class DockerTaskManifest(_Manifest):
+        preset = "persistent-task"
+        runtime_kind = "docker"
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: DockerTaskManifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.install.runtime.runtime_ready", lambda manifest: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.start_persistent_docker",
+        lambda manifest: calls.append("docker"),
+    )
+    waits: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "headroom.install.runtime.wait_ready",
+        lambda manifest, **kwargs: waits.append(kwargs) or True,
+    )
+
+    assert wrap_cli._recover_persistent_proxy(8787) is True
+    assert calls == ["docker"]
+    assert waits == [{"timeout_seconds": 45, "require_identity": True}]
 
 
 def test_ensure_proxy_restarts_idle_stale_ephemeral_proxy(monkeypatch) -> None:
@@ -1124,6 +1172,7 @@ def test_ensure_proxy_starts_isolated_ephemeral_proxy_for_copilot_subscription_s
 
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: None)
     monkeypatch.setattr(
         wrap_cli,
         "_find_available_port",
@@ -1165,6 +1214,7 @@ def test_ensure_proxy_isolates_copilot_subscription_seed_with_api_token_only(mon
 
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: None)
     monkeypatch.setattr(
         wrap_cli,
         "_find_available_port",
@@ -1814,3 +1864,217 @@ def test_ensure_proxy_recovered_feature_restart_failure_raises(monkeypatch) -> N
 
     with pytest.raises(click.ClickException, match="could not be restarted"):
         wrap_cli._ensure_proxy(8787, False, memory=True)
+
+
+def _dedicated_start(monkeypatch, *, health, manifest=None):
+    """Drive a Copilot-seeded wrap that must start a dedicated proxy beside port 8787."""
+    calls: list[object] = []
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: manifest)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda start_port, **kw: 8788)
+    monkeypatch.setattr(
+        wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append(("start", args, kwargs))
+    )
+    wrap_cli._ensure_proxy(8787, False, copilot_api_token="tid-session-token")
+    assert calls and calls[0][0] == "start"
+    return calls[0][2]
+
+
+def test_dedicated_copilot_proxy_carries_the_shared_proxys_extensions(monkeypatch, capsys) -> None:
+    """An enterprise shared proxy enables its savings sinks with --proxy-extension;
+    the dedicated proxy a Copilot seed forces must keep reporting through them."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+    health = {"config": {"pid": "1", "proxy_extensions": ["routemegood", "observability"]}}
+
+    kwargs = _dedicated_start(monkeypatch, health=health)
+
+    assert kwargs["proxy_extensions"] == ["observability", "routemegood"]
+    assert "Extensions carried over from the proxy on port 8787: observability,routemegood" in (
+        capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize("configured", ["teams", ""])
+def test_dedicated_copilot_proxy_env_extensions_win(monkeypatch, capsys, configured) -> None:
+    """The env var is inherited by the subprocess and outranks the carry-over;
+    an empty value is the documented way to start a bare dedicated proxy."""
+    monkeypatch.setenv("HEADROOM_PROXY_EXTENSIONS", configured)
+    health = {"config": {"pid": "1", "proxy_extensions": ["observability"]}}
+
+    kwargs = _dedicated_start(monkeypatch, health=health)
+
+    assert kwargs["proxy_extensions"] is None
+    out = capsys.readouterr().out
+    assert "carried over" not in out
+    assert "could not read the extensions" not in out
+
+
+def test_dedicated_copilot_proxy_ignores_a_foreign_port_holder(monkeypatch, capsys) -> None:
+    """A non-Headroom service on the port ran no extensions: nothing to carry, no warning."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    kwargs = _dedicated_start(monkeypatch, health={"status": "ok"})
+
+    assert not kwargs["proxy_extensions"]
+    assert "could not read the extensions" not in capsys.readouterr().out
+
+
+def test_dedicated_copilot_proxy_warns_when_the_shared_proxy_hides_its_extensions(
+    monkeypatch, capsys
+) -> None:
+    """A proxy that predates the /health field cannot be read; say so instead of
+    silently starting bare."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    kwargs = _dedicated_start(monkeypatch, health={"config": {"pid": "1"}})
+
+    assert kwargs["proxy_extensions"] is None
+    out = capsys.readouterr().out
+    assert "Warning: could not read the extensions of the proxy on port 8787" in out
+    assert "HEADROOM_PROXY_EXTENSIONS=<names>" in out
+
+
+def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest(monkeypatch) -> None:
+    """With no reachable /health, the manifest's recorded environment says what ran."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _ExtManifest(_Manifest):
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": "observability, lossless_guard"}
+
+    kwargs = _dedicated_start(monkeypatch, health=None, manifest=_ExtManifest())
+
+    assert kwargs["proxy_extensions"] == ["lossless_guard", "observability"]
+
+
+def test_dedicated_copilot_proxy_reads_extensions_from_the_manifest_proxy_args(monkeypatch) -> None:
+    """A manifest edited by hand can enable extensions as ``--proxy-extension``
+    flags in ``proxy_args``; the runtime passes them to the proxy verbatim, so
+    they count, in both flag forms. Click lets the flag outrank
+    ``HEADROOM_PROXY_EXTENSIONS``, so a ``base_env`` value next to the flags is
+    not something the shared proxy ran and must not be carried."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _ArgsManifest(_Manifest):
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": "skill_search"}
+        proxy_args = [
+            "--host",
+            "127.0.0.1",
+            "--proxy-extension",
+            "observability,control_plane",
+            "--proxy-extension=lossless_guard",
+        ]
+
+    kwargs = _dedicated_start(monkeypatch, health=None, manifest=_ArgsManifest())
+
+    assert kwargs["proxy_extensions"] == ["control_plane", "lossless_guard", "observability"]
+
+
+def test_dedicated_copilot_proxy_falls_back_to_the_manifest_for_an_older_proxy(
+    monkeypatch, capsys
+) -> None:
+    """A running proxy that predates the /health field is not the last word when
+    the deployment's manifest records what it was installed with."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _ExtManifest(_Manifest):
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": "control_plane"}
+
+    kwargs = _dedicated_start(monkeypatch, health={"config": {"pid": "1"}}, manifest=_ExtManifest())
+
+    assert kwargs["proxy_extensions"] == ["control_plane"]
+    assert "could not read the extensions" not in capsys.readouterr().out
+
+
+def test_dedicated_copilot_proxy_warns_for_an_older_proxy_whose_manifest_is_silent(
+    monkeypatch, capsys
+) -> None:
+    """A manifest without HEADROOM_PROXY_EXTENSIONS does not prove the running
+    proxy has none (its runtime env layers on the launch environment), so an
+    older proxy plus a silent manifest is unknown and warns."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _SilentManifest(_Manifest):
+        base_env = {"ANTHROPIC_API_KEY": "sk-ant-redacted"}
+
+    kwargs = _dedicated_start(
+        monkeypatch, health={"config": {"pid": "1"}}, manifest=_SilentManifest()
+    )
+
+    assert kwargs["proxy_extensions"] is None
+    assert "Warning: could not read the extensions of the proxy on port 8787" in (
+        capsys.readouterr().out
+    )
+
+
+def test_dedicated_copilot_proxy_trusts_an_explicitly_empty_manifest_value(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+
+    class _BareManifest(_Manifest):
+        base_env = {"HEADROOM_PROXY_EXTENSIONS": ""}
+
+    kwargs = _dedicated_start(monkeypatch, health=None, manifest=_BareManifest())
+
+    assert not kwargs["proxy_extensions"]
+    assert "could not read the extensions" not in capsys.readouterr().out
+
+
+def test_attached_routing_mismatch_carries_the_shared_proxys_extensions(
+    monkeypatch, capsys
+) -> None:
+    """The non-persistent shared proxy with live clients and other routing is
+    left running; the dedicated proxy started beside it keeps its extensions."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "backend": "anthropic",
+            "augment_api_url": "https://xlb.api.augmentcode.com",
+            "proxy_extensions": ["control_plane", "observability"],
+        },
+    }
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [999])
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda start_port, **kw: 8799)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not be killed")),
+    )
+    monkeypatch.setattr(
+        wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append(("start", args, kwargs))
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert (proc, actual_port) == (None, 8799)
+    assert calls[0][2]["proxy_extensions"] == ["control_plane", "observability"]
+    assert "Extensions carried over from the proxy on port 8787" in capsys.readouterr().out
+
+
+def test_plain_start_passes_no_extensions(monkeypatch) -> None:
+    """Nothing owns the port: the proxy starts from the shell env as before."""
+    monkeypatch.delenv("HEADROOM_PROXY_EXTENSIONS", raising=False)
+    calls: list[object] = []
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: False)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_query_proxy_health",
+        lambda port: (_ for _ in ()).throw(AssertionError("no proxy to ask")),
+    )
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda start_port, **kw: 8787)
+    monkeypatch.setattr(
+        wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append(("start", args, kwargs))
+    )
+
+    wrap_cli._ensure_proxy(8787, False)
+
+    assert calls[0][2]["proxy_extensions"] is None

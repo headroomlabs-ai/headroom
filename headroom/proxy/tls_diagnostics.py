@@ -33,6 +33,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+from headroom.offline import OfflineEgressBlocked, guard_egress, note_refusal
+
 logger = logging.getLogger("headroom.proxy")
 
 DOCS_URL = "https://docs.headroomlabs.ai/docs/corporate-networks"
@@ -302,6 +304,14 @@ def probe_presented_chain(
 def _probe_uncached(host: str, port: int, *, timeout: float, allow_private: bool) -> ChainInfo:
     proxy = _proxy_for(host)
     info = ChainInfo(host=host, port=port, reachable=False, via_proxy=proxy)
+    # A second connection Headroom opens on its own, so HEADROOM_OFFLINE refuses
+    # it. It only enriches a diagnostic: on the request path the refusal becomes
+    # "no chain to report", and the TLS explanation is still given without it.
+    try:
+        guard_egress("TLS certificate-chain probe", f"{host}:{port}")
+    except OfflineEgressBlocked as blocked:
+        info.error = f"skipped: {note_refusal(blocked, logger)}"
+        return info
     # Certificate-inspection handshake only: it reads the presented chain and
     # closes without sending a byte, so it deliberately skips verification (the
     # chain is what we are diagnosing). It still refuses TLS < 1.2, and it only
@@ -459,7 +469,13 @@ def probe_endpoint(name: str, url: str, *, timeout: float = 8.0) -> EndpointRepo
     Reports the presented chain (and any inspection vendor), whether the chain
     verifies under the policy Headroom will use, and whether the response is a
     gateway block page instead of the service.
+
+    Raises :class:`OfflineEgressBlocked` under ``HEADROOM_OFFLINE`` before
+    either connection is attempted; ``headroom doctor`` reports that as a
+    skipped check.
     """
+    guard_egress("doctor --network endpoint check", url)
+
     import httpx
 
     from headroom.proxy.ssl_context import build_httpx_verify

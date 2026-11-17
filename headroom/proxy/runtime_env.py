@@ -73,6 +73,35 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "int",
         "Min tool-output chars before the ast-grep read rewrite.",
     ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_ON_DISK",
+        "bool",
+        "Verify ast-grep Read truncation against disk when no client banner is found. "
+        "Always UNKNOWN on Windows (no dir_fd/O_NOFOLLOW support).",
+    ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_MAX_BYTES",
+        "int",
+        "Max on-disk file size (bytes) the disk-verify fallback will read.",
+    ),
+    Knob(
+        "HEADROOM_DEFERRED_TOOL_AFFINITY",
+        "bool",
+        "Keep defer_loading tools out of the Anthropic prefix-tracker lineage key "
+        "(default on; 0 counts them again).",
+    ),
+    Knob(
+        "HEADROOM_WEB_SEARCH_HISTORY",
+        "bool",
+        "Drop web_search_call history from a Responses request that declares no "
+        "web_search tool (default on; 0 disables).",
+    ),
+    Knob(
+        "HEADROOM_BUFFERED_UPSTREAM_STREAM",
+        "bool",
+        "Send buffered CCR requests upstream as stream:true and fold the reply "
+        "(default on; 0 sends stream:false).",
+    ),
 )
 
 _KNOBS_BY_ENV: dict[str, Knob] = {k.env: k for k in RUNTIME_ENV_KNOBS}

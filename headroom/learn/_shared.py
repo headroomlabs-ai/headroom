@@ -69,7 +69,14 @@ _ERROR_PATTERNS: list[tuple[re.Pattern[str], ErrorCategory]] = [
         ErrorCategory.USER_REJECTED,
     ),
     (re.compile(r"[Ss]ibling tool call errored", re.I), ErrorCategory.SIBLING_ERROR),
-    (re.compile(r"exit code|non-zero|exited with", re.I), ErrorCategory.EXIT_CODE),
+    # A signal kill is the shell's exit status 128+N, so it shares EXIT_CODE.
+    (
+        re.compile(
+            r"exit code|non-zero|exited with|killed by signal|^\s*Killed(?::\s*\d+)?\s*$",
+            re.I | re.M,
+        ),
+        ErrorCategory.EXIT_CODE,
+    ),
     (
         re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
         ErrorCategory.BUILD_FAILURE,

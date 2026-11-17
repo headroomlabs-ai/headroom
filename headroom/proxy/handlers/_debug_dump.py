@@ -11,10 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+
+from headroom.log_safety import content_logging_enabled, redact_url
+from headroom.proxy.wire_debug_redaction_policy import WIRE_DEBUG_REDACTED, redact_for_wire_debug
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +32,9 @@ def _debug_dump_mode(config: Any) -> str:
     """
     if getattr(config, "stateless", False):
         return "off"
-    raw = os.environ.get("HEADROOM_DEBUG_DUMP", "").strip().lower()
-    if raw in ("full", "all", "content"):
+    if content_logging_enabled():
         return "full"
+    raw = os.environ.get("HEADROOM_DEBUG_DUMP", "").strip().lower()
     if raw in ("1", "true", "yes", "on", "redacted"):
         return "redacted"
     return "off"
@@ -54,23 +57,6 @@ def _redact_debug_value(value: Any, _max_len: int = 80) -> Any:
     return value
 
 
-def _redact_url(url: str) -> str:
-    """Drop the query string and fragment from ``url``.
-
-    Some upstreams carry credentials in the query (Gemini's ``?key=``), and the
-    query is never needed to debug a rejected request, so it is elided in every
-    mode — ``full`` opts in to prompt content, not to credentials.
-    """
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "<unparseable url>"
-    if not parts.query and not parts.fragment:
-        return url
-    redacted = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-    return f"{redacted}?<redacted>" if parts.query else redacted
-
-
 def _decode_sent_body(body: Any) -> Any:
     """Decode the exact bytes sent upstream back to JSON for the dump."""
     if not isinstance(body, (bytes, bytearray)):
@@ -79,6 +65,41 @@ def _decode_sent_body(body: Any) -> Any:
         return json.loads(body)
     except ValueError:
         return f"<{len(body)} bytes, not JSON>"
+
+
+def redact_dump_headers(
+    headers: Mapping[str, str], extra_secret_names: Iterable[str] = ()
+) -> dict[str, Any]:
+    """Return ``headers`` for a dump with every credential header fully masked.
+
+    ``extra_secret_names`` are header names the operator configured to carry
+    a credential (``*_extra_headers``), masked whatever their name looks like.
+    """
+    extra = {name.lower() for name in extra_secret_names}
+    redacted = redact_for_wire_debug(dict(headers))
+    return {k: WIRE_DEBUG_REDACTED if k.lower() in extra else v for k, v in redacted.items()}
+
+
+def write_owner_only_json(path: Path, payload: Any) -> None:
+    """Write ``payload`` as JSON readable by the owner only (dir 0700, file 0600).
+
+    The modes passed to ``mkdir`` and ``os.open`` apply only when they create
+    the path, so an existing directory or file is tightened as well, before any
+    content is written.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    # No O_TRUNC: an existing file is emptied only once it is owner-only.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        if hasattr(os, "fchmod"):  # POSIX; Windows has no owner-only mode bits
+            os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
 
 
 def write_upstream_error_dump(
@@ -113,13 +134,14 @@ def write_upstream_error_dump(
         from headroom import paths as _hr_paths
 
         dump_dir = _hr_paths.debug_400_dir()
-        dump_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         dump_path = dump_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{request_id}.json"
         sent_body = _decode_sent_body(body)
-        payload = json.dumps(
+        # The dump can hold prompt content: keep it readable by the owner only.
+        write_owner_only_json(
+            dump_path,
             {
                 "request_id": request_id,
-                "url": _redact_url(url),
+                "url": redact_url(url),
                 "status": status,
                 "provider": provider,
                 "model": model,
@@ -128,13 +150,7 @@ def write_upstream_error_dump(
                 "body_source": body_source,
                 "body": sent_body if mode == "full" else _redact_debug_value(sent_body),
             },
-            indent=2,
-            default=str,
         )
-        # The dump can hold prompt content: keep it readable by the owner only.
-        fd = os.open(dump_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
         return dump_path
     except Exception:
         logger.debug("upstream error debug dump skipped", exc_info=True)

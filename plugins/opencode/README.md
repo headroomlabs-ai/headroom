@@ -11,6 +11,25 @@ OpenCode integration helpers for Headroom. The package supports two integration 
 npm install headroom-opencode
 ```
 
+## Building from source
+
+Tsup 9 requires Node.js `^22.18.0 || ^24.11.0 || >=26.0.0`. The current locked
+graph also includes ini 7, which requires `^22.22.2 || ^24.15.0 || >=26.0.0`.
+These are development-install requirements; the published plugin and its host
+retain their own runtime requirements. Node.js 24.22.2 is a verified choice
+for this dependency graph. From `plugins/opencode`, run:
+
+```bash
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm run build:standalone
+```
+
+For a reproducible real OpenCode 2.x → proxy → local SSE upstream check, see
+[the transport runtime proof](RUNTIME_PROOF.md). It records the tested scope and limitations.
+
 ## Provider Config Helpers
 
 Use these helpers when you need to generate OpenCode config that routes a `headroom` provider through a running Headroom proxy.
@@ -35,32 +54,39 @@ The generated provider uses `@ai-sdk/openai-compatible` and points model request
 
 ## Native OpenCode Plugin
 
-Use `HeadroomPlugin` when OpenCode should intercept provider traffic in-process and expose Headroom tooling from a plugin.
+The package's default export is an OpenCode plugin that loads on both OpenCode 1.x and 2.x. Register it in `opencode.json`:
 
-```ts
-import { HeadroomPlugin } from "headroom-opencode";
-
-export default async function plugin(input) {
-  return HeadroomPlugin(input, {
-    proxyUrl: process.env.HEADROOM_PROXY_URL ?? "http://127.0.0.1:8787",
-  });
+```json
+{
+  "plugin": [
+    ["headroom-opencode", { "proxyUrl": "http://127.0.0.1:8787" }]
+  ]
 }
 ```
 
-`HeadroomPlugin`:
+OpenCode 2.x migrates the 1.x `plugin` key automatically. To configure it the 2.x way, use `"plugins": [{ "package": "headroom-opencode", "options": { ... } }]`.
 
-- installs Headroom transport interception for OpenCode provider traffic.
-- exposes the `headroom_retrieve` tool.
-- publishes `HEADROOM_PROXY_URL` in the plugin output env.
-- defaults to `http://127.0.0.1:8787` when no proxy URL is supplied.
-- skips routing for hosts listed in `excludeHosts` (or `HEADROOM_OPENCODE_EXCLUDE_HOSTS`); those requests go straight upstream with no compression or telemetry.
+The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `server` (`HeadroomPlugin`) and 2.x calls `setup` (`headroomSetup`); each ignores the other's field. Both entry points:
+
+- install Headroom transport interception for OpenCode provider traffic.
+- expose the `headroom_retrieve` tool (a direct tool on 2.x, not only through code mode).
+- add `HEADROOM_ACTIVE`, `HEADROOM_PROXY_URL`, `HEADROOM_PROJECT` (and `HEADROOM_BACKEND` when set) to shell command environments.
+- default to `HEADROOM_PROXY_URL`, then `http://127.0.0.1:8787`, when no `proxyUrl` option is supplied.
+- skip routing for hosts listed in `excludeHosts` (or `HEADROOM_OPENCODE_EXCLUDE_HOSTS`); those requests go straight upstream with no compression or telemetry.
+- route the provider base URLs configured in OpenCode, so a compatible gateway with an arbitrary path prefix is still compressed. Only wire endpoints (`/chat/completions`, `/responses`, `/messages`) under a configured base route; other paths on that host pass through.
+
+Routing is decided by method, path shape, and configured bases, never by host identity. A `POST` routes when its path ends in a wire endpoint *and* the segment before that endpoint is a version (`/v1`, `/v1beta`, `/v4`), `api`, or a recognised root (`backend-api`, `codex`, `openai`, `anthropic`, `zen`) — or when it sits under one of OpenCode's configured provider base URLs. Everything else goes direct, including a bare `/messages` on an unknown host: that is the same shape as a messaging API, so becoming the bare path is not evidence of a provider. Two shapes still route without a configured base, because no path can tell them from a gateway: `/api/v2/messages` and `/v2/responses`. List the host in `excludeHosts` if one of your own services has that shape.
+
+On 2.x, setup returns a cleanup that releases the transport, so hot reloads do not stack interceptors.
+
+OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. For models with a resolved `baseURL`, the plugin also rewrites OpenAI chat-completions, Responses, and Anthropic Messages traffic so that it points at the proxy — including GitHub Copilot's Claude models. Anthropic Messages base URLs with a path prefix (for example a gateway rooted at `/api/...`) stay on their own base URL, because the proxy's Messages route ignores the original-path header and cannot preserve that prefix. Headers name the real upstream and request path, as the transport does, and authentication settings are retained. Local, excluded, and unsupported-protocol models are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
 
 To keep a provider off the proxy, list its host. An entry matches the host and all of its subdomains, and `.example.com` / `*.example.com` are accepted as spellings of `example.com`:
 
 ```jsonc
 // opencode.json
 {
-  "plugin": [["/path/to/headroom/providers/opencode/_dist/entry.opencode.js", { "excludeHosts": ["opencode.ai"] }]]
+  "plugin": [["/path/to/headroom/providers/opencode/_dist", { "excludeHosts": ["opencode.ai"] }]]
 }
 ```
 
@@ -117,6 +143,7 @@ The provider config exposes these as `headroom/<model>` and defaults to `headroo
 |---|---|---|
 | `HEADROOM_PROXY_URL` | Native plugin | Proxy URL used by `HeadroomPlugin` |
 | `HEADROOM_OPENCODE_EXCLUDE_HOSTS` | Native plugin | Comma-separated hosts (and their subdomains) that bypass the proxy; the `excludeHosts` plugin option takes precedence |
+| `HEADROOM_OPENCODE_WIRE_ROOTS` | Native plugin | Set from OpenCode's configured provider base URLs so spawned Node processes route the same bases; rarely set by hand |
 | `OPENCODE_CONFIG_CONTENT` | OpenCode wrapper | Generated OpenCode provider, model, and MCP config |
 
 ## License

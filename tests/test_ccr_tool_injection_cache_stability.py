@@ -18,10 +18,12 @@ prefix is still cold, and the array never changes again.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
-from headroom.ccr.tool_injection import CCR_TOOL_NAME, create_ccr_tool_definition
+from headroom.cache.compression_store import CompressionStore
+from headroom.ccr.tool_injection import CCR_TOOL_NAME, CCRToolInjector, create_ccr_tool_definition
 from headroom.proxy.helpers import (
     _reset_session_ccr_tracker_for_test,
     apply_session_sticky_ccr_tool,
@@ -104,7 +106,7 @@ def test_the_tool_is_present_from_the_very_first_request(provider):
 
 
 def test_the_tool_definition_is_small_enough_that_eager_is_obviously_right():
-    """Guards the premise: if this ever grows large, revisit the trade."""
+    """Bound the cold-prefix overhead that justifies eager injection."""
     size = len(json.dumps(create_ccr_tool_definition()))
     assert size < 2000, (
         f"headroom_retrieve is now {size} bytes; eager injection was justified "
@@ -173,6 +175,109 @@ def test_a_client_provided_tool_still_wins(monkeypatch):
     )
     assert injected is False
     assert _names(tools).count(CCR_TOOL_NAME) == 1
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "headroom_headroom_retrieve",
+        "mcp__headroom__headroom_retrieve",
+        "mcp_Headroom_headroom_retrieve",
+    ],
+)
+def test_client_retrieval_alias_never_advertises_an_unavailable_tool(provider, alias):
+    """Mixed-tool turns must only offer retrieval names the client can execute."""
+    retrieval = create_ccr_tool_definition(provider)
+    if provider == "openai":
+        retrieval["function"]["name"] = alias
+        read_tool = {"type": "function", "function": {"name": "Read", "parameters": {}}}
+    else:
+        retrieval["name"] = alias
+        read_tool = CLIENT_TOOLS[0]
+    client_tools = [retrieval, read_tool]
+    session_id = f"sess-client-alias-{provider}-{alias}"
+
+    # A cold request, actual compression, and later replay all retain a usable
+    # retrieval tool without introducing the unavailable bare proxy spelling.
+    for compressed in (False, True, False):
+        tools, injected = apply_session_sticky_ccr_tool(
+            provider=provider,
+            session_id=session_id,
+            request_id="req-client-alias",
+            existing_tools=client_tools,
+            has_compressed_content_this_turn=compressed,
+            allow_eager=True,
+        )
+        assert not injected
+        assert alias in _names(tools)
+        assert CCR_TOOL_NAME not in _names(tools)
+
+    # The no-session library/Google fallback must obey the same client registry.
+    injector = CCRToolInjector(provider=provider, inject_tool=True)
+    tools, injected = injector.inject_tool_definition(client_tools, session_has_done_ccr=True)
+    assert not injected
+    assert alias in _names(tools)
+    assert CCR_TOOL_NAME not in _names(tools)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize("alias", ["mcp__other__headroom_retrieve", "mcp_Other_headroom_retrieve"])
+def test_unrelated_mcp_server_cannot_displace_proxy_retrieval(provider, alias):
+    retrieval = create_ccr_tool_definition(provider)
+    if provider == "openai":
+        retrieval["function"]["name"] = alias
+    else:
+        retrieval["name"] = alias
+    client_tools = [retrieval]
+    tools, _ = apply_session_sticky_ccr_tool(
+        provider=provider,
+        session_id=None,
+        request_id="req-unrelated-mcp",
+        existing_tools=client_tools,
+        has_compressed_content_this_turn=True,
+    )
+    assert CCR_TOOL_NAME in _names(tools)
+    assert alias in _names(tools)
+
+    injector = CCRToolInjector(provider=provider)
+    fallback_tools, _ = injector.inject_tool_definition(client_tools, session_has_done_ccr=True)
+    assert CCR_TOOL_NAME in _names(fallback_tools)
+    assert alias in _names(fallback_tools)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "headroom_headroom_retrieve",
+        "mcp__headroom__headroom_retrieve",
+        "mcp_Headroom_headroom_retrieve",
+    ],
+)
+def test_retrieval_instructions_name_an_executable_client_tool(provider, alias):
+    store = CompressionStore(enable_feedback=False)
+    hash_key = store.store(original='{"value":42}', compressed="compressed")
+    messages = [
+        {"role": "system", "content": "Use the available tools."},
+        {"role": "tool", "content": f"<<ccr:{hash_key} 1_rows_offloaded>>"},
+    ]
+    retrieval = create_ccr_tool_definition(provider)
+    if provider == "openai":
+        retrieval["function"]["name"] = alias
+    else:
+        retrieval["name"] = alias
+    injector = CCRToolInjector(
+        provider=provider,
+        inject_system_instructions=True,
+        compression_store=store,
+    )
+    updated_messages, updated_tools, _ = injector.process_request(messages, [retrieval])
+    instructions = updated_messages[0]["content"]
+    call_names = re.findall(r"`([^`]+)\(hash=", instructions)
+    assert call_names == [alias]
+    assert set(call_names).issubset(_names(updated_tools))
+    assert hash_key in instructions
 
 
 def test_sticky_replay_is_byte_identical_to_the_eager_injection():

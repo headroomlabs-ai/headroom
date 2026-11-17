@@ -39,10 +39,58 @@ class TestLazyImports:
                 _is_pytorch_available,
             )
 
+            # The probe memoises, so a real answer from an earlier call would
+            # otherwise mask the patch above.
+            _is_pytorch_available.cache_clear()
             # Without both torch and onnxruntime, should return False
             assert _is_pytorch_available() is False
+            _is_pytorch_available.cache_clear()
             # Note: is_kompress_available() may still return True if onnxruntime
             # was already imported before patching. Test the individual checkers.
+
+    def test_unloadable_native_dep_degrades_instead_of_raising(self) -> None:
+        """An installed-but-unloadable torch raises OSError, not ImportError.
+
+        On Windows without the MSVC redistributable, `import torch` fails with
+        WinError 126 loading c10.dll. The probe caught only ImportError, so the
+        OSError escaped a function whose contract is to return a bool -- and the
+        request-path gate in content_router guards with `except ImportError`
+        too, so it propagated into request handling instead of degrading to
+        "kompress unavailable".
+        """
+        import builtins
+
+        from headroom.transforms import kompress_compressor as kmod
+
+        kmod._is_onnx_available.cache_clear()
+        kmod._is_pytorch_available.cache_clear()
+
+        real_import = builtins.__import__
+        attempts = {"torch": 0}
+
+        def fake_import(name: str, *args: object, **kwargs: object) -> object:
+            if name in ("onnxruntime", "optimum"):
+                raise ImportError(f"No module named {name!r}")
+            if name == "torch":
+                attempts["torch"] += 1
+                raise OSError(
+                    "[WinError 126] The specified module could not be found. "
+                    'Error loading "torch\\lib\\c10.dll" or one of its dependencies.'
+                )
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", fake_import):
+            # Must degrade, not raise.
+            assert kmod._is_pytorch_available() is False
+            assert kmod.is_kompress_available() is False
+            # Cached: a failing import is not retried per request. Python drops
+            # failed modules from sys.modules, so nothing memoises it for us.
+            for _ in range(5):
+                assert kmod.is_kompress_available() is False
+            assert attempts["torch"] == 1
+
+        kmod._is_onnx_available.cache_clear()
+        kmod._is_pytorch_available.cache_clear()
 
     def test_dataclasses_importable_without_torch(self) -> None:
         """KompressConfig, KompressResult, KompressCompressor are importable without torch."""

@@ -127,6 +127,14 @@ class TestCodexHome:
 
 
 class TestPortDiscovery:
+    @pytest.fixture(autouse=True)
+    def isolate_live_client_discovery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+        monkeypatch.delenv("HEADROOM_PORT", raising=False)
+        monkeypatch.delenv("HEADROOM_PORT_DISCOVERY", raising=False)
+
     def test_default_port_reads_env(self) -> None:
         assert pd.default_port({}) == 8787
         assert pd.default_port({"HEADROOM_PORT": "9100"}) == 9100
@@ -145,6 +153,36 @@ class TestPortDiscovery:
             cwd=tmp_path,
         )
         assert ports == [8787, 9100, 9200, 9300]
+
+    def test_candidates_order_live_client_markers_by_recency(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clients = tmp_path / "workspace" / "clients"
+        markers = {
+            3001: (9000, 100.0),
+            3002: (9001, 200.0),
+            3003: (9002, 300.0),
+        }
+        for pid, (port, started_at) in markers.items():
+            marker = clients / str(port) / f"{pid}.json"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({"pid": pid, "started_at": started_at}), encoding="utf-8")
+        dead_marker = clients / "9002" / "3003.json"
+        monkeypatch.setattr(pd, "pid_alive", lambda pid: pid != 3003)
+
+        marker_path = tmp_path / ".claude" / ".headroom_wrap_marker.json"
+        marker_path.parent.mkdir()
+        marker_path.write_text(json.dumps({"port": 9300}), encoding="utf-8")
+        ports = pd.candidate_ports(
+            8787,
+            environ={"HEADROOM_PORT": "9100"},
+            manifests=[_manifest("profile", 9200)],
+            cwd=tmp_path,
+            extra=[9400],
+        )
+
+        assert ports == [8787, 9100, 9400, 9200, 9300, 9001, 9000]
+        assert not dead_marker.exists()
 
     def test_candidates_are_bounded(self, tmp_path: Path) -> None:
         manifests = [_manifest(str(i), 10000 + i) for i in range(50)]
@@ -331,6 +369,26 @@ class TestCodexProviderPortWarning:
         assert "port 9200" in capsys.readouterr().err
         assert 'base_url = "http://127.0.0.1:8787/v1"' in config.read_text(encoding="utf-8")
 
+    def test_init_provider_preserves_user_options_on_repoint(self, tmp_path, monkeypatch):
+        import tomllib
+
+        monkeypatch.setattr(init_mod, "retag_to_headroom", lambda _path: None)
+        config = tmp_path / "config.toml"
+        config.write_text(
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:9200/v1"\n'
+            "request_max_retries = 7\n"
+            '[profiles.work]\nmodel_provider = "custom"\n',
+            encoding="utf-8",
+        )
+        for port in (8787, 9500):
+            init_mod._ensure_codex_provider(config, port)
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+            provider = parsed["model_providers"]["headroom"]
+            assert provider["base_url"] == f"http://127.0.0.1:{port}/v1"
+            assert provider["request_max_retries"] == 7
+            assert parsed["profiles"]["work"]["model_provider"] == "custom"
+
 
 class TestInitPortResolution:
     def _ctx(self, args: list[str]) -> click.Context:
@@ -413,6 +471,21 @@ class TestHookAlignment:
         monkeypatch.setattr(init_mod, "load_manifest", lambda profile: _manifest(profile, 8787))
         message = init_mod.alignment_warning("codex", "init-user", probe=lambda p: False)
         assert message is not None and "--port 8787 codex" in message
+
+    def test_codex_root_openai_base_url_beats_an_inactive_headroom_table(
+        self, home: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        custom = tmp_path / "custom-codex"
+        custom.mkdir()
+        (custom / "config.toml").write_text(
+            'openai_base_url = "http://127.0.0.1:9200/v1"\n[model_providers.headroom]\n'
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(custom))
+        monkeypatch.setattr(init_mod, "load_manifest", lambda profile: _manifest(profile, 8787))
+        message = init_mod.alignment_warning("codex", "init-user", probe=lambda p: False)
+        assert message is not None and "127.0.0.1:9200" in message
 
     def test_session_start_emits_hook_json(self, claude_settings: Path) -> None:
         self._route_claude(claude_settings, 9200)
@@ -565,12 +638,39 @@ class TestDoctorAdditions:
         monkeypatch.setattr(doctor_mod, "check_deployments", lambda manifests: None)
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: home / "settings.json")
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: home / "savings.json")
-        result = CliRunner().invoke(main, ["doctor", "--json"])
+        result = CliRunner().invoke(main, ["doctor", "--json", "--port", "8787"])
         payload = json.loads(result.output)
         assert payload["exit_code"] == 2  # still a failure at the probed port
         proxy = next(c for c in payload["checks"] if c["name"] == "proxy")
         assert "port 9200" in proxy["summary"]
         assert "headroom doctor --port 9200" in proxy["hint"]
+
+    def test_doctor_names_live_proxy_from_client_marker(
+        self, home: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        marker = tmp_path / "workspace" / "clients" / "8788" / "4242.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(json.dumps({"pid": 4242, "started_at": 100.0}), encoding="utf-8")
+        monkeypatch.setattr(pd, "pid_alive", lambda pid: pid == 4242)
+
+        def fake_probe(url: str, timeout: float = 2.0) -> dict[str, Any] | None:
+            if url == "http://127.0.0.1:8788/livez":
+                return {"service": "headroom-proxy", "alive": True, "version": "1"}
+            return None
+
+        monkeypatch.setattr(doctor_mod, "probe_json", fake_probe)
+        monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
+        monkeypatch.setattr(doctor_mod, "check_deployments", lambda manifests: None)
+        monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: home / "settings.json")
+        monkeypatch.setattr(doctor_mod, "savings_path", lambda: home / "savings.json")
+
+        result = CliRunner().invoke(main, ["doctor", "--json"])
+
+        payload = json.loads(result.output)
+        assert payload["port"] == 8787
+        proxy = next(c for c in payload["checks"] if c["name"] == "proxy")
+        assert "port 8788" in proxy["summary"]
+        assert "headroom doctor --port 8788" in proxy["hint"]
 
 
 # ---------------------------------------------------------------------------
@@ -589,3 +689,49 @@ class TestSelfhealWarning:
         monkeypatch.setattr(pd, "find_live_proxy_elsewhere", lambda requested, **k: None)
         wrap_mod._warn_live_proxy_after_selfheal({"port": 8787})
         assert capsys.readouterr().err == ""
+
+
+def test_init_adopted_provider_survives_unwrap(tmp_path, monkeypatch):
+    import tomllib
+
+    monkeypatch.setattr(init_mod, "retag_to_headroom", lambda _path: None)
+    config = tmp_path / "config.toml"
+    original = '[model_providers.headroom]\nbase_url = "http://127.0.0.1:9200/v1"\nrequest_max_retries = 7\n'
+    config.write_text(original, encoding="utf-8")
+    for port in (8787, 9500):
+        init_mod._ensure_codex_provider(config, port)
+    restored = init_mod._strip_codex_init_block(config.read_text(encoding="utf-8"))
+    assert tomllib.loads(restored) == tomllib.loads(original)
+
+
+def test_init_replaces_auth_when_credentials_change(tmp_path, monkeypatch):
+    import json
+
+    import tomllib
+
+    monkeypatch.setattr(init_mod, "retag_to_headroom", lambda _path: None)
+    monkeypatch.setattr(init_mod, "codex_home_dir", lambda: tmp_path)
+    auth = tmp_path / "auth.json"
+    config = tmp_path / "config.toml"
+    for payload, oauth in (
+        (
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "test-oauth", "account_id": "test-account"},
+            },
+            True,
+        ),
+        ({"OPENAI_API_KEY": "test-key"}, False),
+        (
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "test-oauth", "account_id": "test-account"},
+            },
+            True,
+        ),
+    ):
+        auth.write_text(json.dumps(payload), encoding="utf-8")
+        init_mod._ensure_codex_provider(config, 8787)
+        provider = tomllib.loads(config.read_text(encoding="utf-8"))["model_providers"]["headroom"]
+        assert provider.get("requires_openai_auth", False) is oauth
+        assert ("auth" in provider) is not oauth

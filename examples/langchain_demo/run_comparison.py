@@ -255,16 +255,13 @@ def run_agent_headroom(scenario: dict, api_key: str) -> AgentRun:
     )
 
     # Wrap with Headroom
-    config = HeadroomConfig(
-        smart_crusher_threshold=500,  # Compress tool outputs > 500 tokens
-        smart_crusher_max_items=20,  # Keep max 20 items
-        cache_alignment=True,
-        rolling_window=True,
-    )
+    # Default settings. The pipeline builds its ContentRouter from the router's
+    # own defaults, so HeadroomConfig.smart_crusher would not change what runs.
+    config = HeadroomConfig()
 
     headroom_model = HeadroomChatModel(
         wrapped_model=base_model,
-        headroom_config=config,
+        config=config,
     ).bind_tools(tools)
 
     # Build conversation
@@ -327,7 +324,7 @@ def run_agent_headroom(scenario: dict, api_key: str) -> AgentRun:
     duration_ms = (time.time() - start_time) * 1000
 
     # Get Headroom metrics
-    tokens_saved = headroom_model.get_total_tokens_saved()
+    tokens_saved = headroom_model.total_tokens_saved
 
     return AgentRun(
         scenario=scenario["name"],
@@ -456,7 +453,7 @@ def run_simulation():
 
         print(f"\n  Total tool output: {total_tool_tokens:,} tokens")
         print(f"  With 3 iterations, baseline input would be: ~{total_tool_tokens * 2:,} tokens")
-        print(f"  With Headroom (20 items max), estimated: ~{total_tool_tokens // 5:,} tokens")
+        print(f"  With Headroom (rough 5x estimate), estimated: ~{total_tool_tokens // 5:,} tokens")
         print(
             f"  Estimated savings: ~{total_tool_tokens * 2 - total_tool_tokens // 5:,} tokens (~80%)"
         )
@@ -498,8 +495,7 @@ def print_summary(baseline_runs: list[AgentRun], headroom_runs: list[AgentRun]):
 Headroom reduced input tokens by {pct_saved:.1f}% across all scenarios.
 
 Key optimizations applied:
-- SmartCrusher: Compressed tool outputs from 50-200 items to ~20 relevant items
-- CacheAligner: Stabilized system prompt for better cache hits
+- SmartCrusher: Compressed the large JSON tool outputs (50-200 items each)
 - Context preserved: Agent still found the right information
 
 This translates to:

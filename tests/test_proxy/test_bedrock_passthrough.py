@@ -352,6 +352,30 @@ def test_oversized_body_returns_413_and_never_forwards(monkeypatch):
     http.send.assert_not_called()
 
 
+def test_client_disconnect_during_body_read_returns_204(monkeypatch):
+    """A client that hangs up mid-body must not crash the handler: the
+    ClientDisconnect branch returns an empty 204 and never forwards.
+    """
+    from starlette.requests import ClientDisconnect
+
+    import headroom.proxy.helpers as helpers_mod
+
+    async def _disconnect(request):
+        raise ClientDisconnect()
+
+    monkeypatch.setattr(helpers_mod, "read_request_json_with_bytes", _disconnect)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        resp = client.post(INVOKE, json={"messages": [], "max_tokens": 8})
+
+    assert resp.status_code == 204
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "route", [INVOKE, INVOKE_STREAM], ids=["invoke", "invoke-with-response-stream"]
 )
@@ -448,6 +472,34 @@ def test_outcome_recorded_with_bedrock_provider():
     outcome = proxy._record_request_outcome.await_args.args[0]
     assert outcome.provider == "bedrock"
     assert outcome.tokens_saved == 750
+
+
+@pytest.mark.parametrize("upstream_status", [400, 403, 429, 500, 503])
+def test_outcome_carries_real_upstream_status_on_error(upstream_status):
+    """Regression: handle_bedrock_invoke built RequestOutcome without a
+    status_code kwarg, so an upstream throttle/auth/model error recorded as
+    the dataclass default of 200 — the failed turn then fed the success
+    funnel (savings/cost/request-log) in emit_request_outcome instead of
+    being short-circuited by its `status_code >= 400` guard."""
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        _install_fake_client(
+            proxy, _FakeUpstream(status_code=upstream_status, chunks=(b'{"error":true}',))
+        )
+        proxy._record_request_outcome = AsyncMock()
+        proxy.anthropic_pipeline.apply = MagicMock(
+            return_value=_FakeResult([{"role": "user", "content": "c"}], 1000, 250)
+        )
+        resp = client.post(
+            INVOKE,
+            json={"messages": [{"role": "user", "content": "q" * 3000}], "max_tokens": 8},
+        )
+
+    assert resp.status_code == upstream_status
+    assert proxy._record_request_outcome.await_count == 1
+    outcome = proxy._record_request_outcome.await_args.args[0]
+    assert outcome.status_code == upstream_status
 
 
 # ── env config path ───────────────────────────────────────────────────
