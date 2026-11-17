@@ -806,9 +806,20 @@ def _call_cli_llm(
 
     if model == "claude-cli":
         idle_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", _CLI_IDLE_TIMEOUT)
-        return _call_claude_cli_streaming(
-            cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
-        )
+        try:
+            return _call_claude_cli_streaming(
+                cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
+            )
+        except RuntimeError as exc:
+            # Claude Code refuses --strict-mcp-config when an admin-managed
+            # (enterprise) MCP config is present. The admin's servers load
+            # either way, so drop the flag and run once more.
+            if "--strict-mcp-config when an enterprise MCP config" not in str(exc):
+                raise
+            cmd = [part for part in cmd if part != "--strict-mcp-config"]
+            return _call_claude_cli_streaming(
+                cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
+            )
 
     stdin = prompt
     if model == "agy-cli":

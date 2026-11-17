@@ -896,6 +896,27 @@ class TestCallCliLlm:
             '{"disableAllHooks":true}',
         ]
 
+    def test_claude_cli_drops_strict_mcp_config_under_an_enterprise_mcp_config(self):
+        refused = _fake_claude_popen(
+            stdout_lines=[],
+            stderr_lines=[
+                "You cannot use --strict-mcp-config when an enterprise MCP config is present\n"
+            ],
+            returncode=1,
+        )
+        ok = _fake_claude_popen(
+            stdout_lines=[_result_event('{"context_file_rules": [], "memory_file_rules": []}')]
+        )
+        procs = iter([refused, ok])
+        popen = MagicMock(side_effect=lambda *a, **k: next(procs)(*a, **k))
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            result = _call_cli_llm("test digest", "claude-cli")
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        assert "--strict-mcp-config" in popen.call_args_list[0][0][0]
+        retry = popen.call_args_list[1][0][0]
+        assert "--strict-mcp-config" not in retry
+        assert retry[retry.index("--tools") + 1] == ""
+
     def test_claude_cli_progress_callback_is_throttled(self):
         stdout = [
             _stream_event("system", subtype="init"),
