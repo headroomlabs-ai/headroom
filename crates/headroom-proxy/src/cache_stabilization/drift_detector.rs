@@ -66,7 +66,7 @@
 //!   key-sorted rebuild) of the corresponding subtree. Still well
 //!   under a millisecond on a typical agentic request; the detector
 //!   stays log-only and off the forwarded-bytes path.
-//! - One LRU lookup + insert. `lru = "0.12"` is O(1) amortised.
+//! - One LRU lookup + insert. `lru` is O(1) amortised.
 //! - One `tracing::info!` or `tracing::warn!`. No metric emission yet
 //!   (left for Phase F PR-F* when the global Prometheus registry can
 //!   accept session-scoped counters without a cardinality explosion).

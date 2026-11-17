@@ -93,6 +93,11 @@ print(f"Compression ratio: {result.compression_ratio:.1%}")
 - Verbose success output
 - Repeated patterns
 
+Omission markers count `ERROR`, `FAIL`, `WARN`, and `INFO` levels only among the dropped lines, not the full input. An error retained in the compressed output is therefore not advertised as omitted. Debug, trace, and unclassified lines are not listed in the level breakdown.
+When only debug, trace, or unclassified lines are dropped, the marker is simply `[N lines omitted]`, without a severity breakdown.
+
+`result.stats` continues to report whole-input totals; the marker's narrower counts do not change those statistics. CCR still retains the exact original log when enabled.
+
 ## DiffCompressor
 
 Compresses unified diffs while keeping the actual changes and enough context to understand them.
@@ -182,6 +187,7 @@ The ContentRouter selects the right compressor automatically. Here's when each f
 | Content Pattern | Compressor | Detection Signal |
 |---|---|---|
 | `file:line:content` lines | SearchCompressor | grep/ripgrep output format |
+| `file-line-content` context lines (`grep -A/-B/-C`) | SearchCompressor | grep/ripgrep context-line format (same section carving as match lines; `file:line:content` and context lines may mix with `--` separators) |
 | pytest, npm, cargo markers | LogCompressor | Build tool output patterns |
 | `---/+++` and `@@` markers | DiffCompressor | Unified diff format |
 | Prose, documentation | KompressCompressor | ContentRouter's default for `PLAIN_TEXT` (`CompressionStrategy.TEXT` and `KOMPRESS` share the same ML compressor dispatch -- see `headroom/transforms/content_router.py:3524-3540`) |

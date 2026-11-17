@@ -73,9 +73,12 @@ def test_inject_fresh_create_writes_managed_marker_and_no_backup(omp_home: Path)
     assert base_url == "http://127.0.0.1:8787/p/proj"
 
     text = models_file.read_text(encoding="utf-8")
+    providers = yaml.safe_load(text)["providers"]
+    openai_base_url = "http://127.0.0.1:8787/p/proj/v1"
     assert MANAGED_MARKER in text
-    assert yaml.safe_load(text)["providers"]["anthropic"]["baseUrl"] == base_url
-
+    assert providers["anthropic"]["baseUrl"] == base_url
+    assert providers["openai"]["baseUrl"] == openai_base_url
+    assert providers["openai-codex"]["baseUrl"] == openai_base_url
     # Nothing pre-existed, so there is nothing to snapshot.
     assert not backup_path(models_file).exists()
 
@@ -87,6 +90,10 @@ def test_inject_over_existing_backs_up_pristine_and_merges(omp_home: Path) -> No
         "    apiKey: sk-user-secret\n"
         "  openai:\n"
         "    baseUrl: https://api.openai.com/v1\n"
+        "    apiKey: sk-user-openai\n"
+        "  openai-codex:\n"
+        "    baseUrl: https://chatgpt.com/backend-api/codex\n"
+        "    oauth: true\n"
         "models:\n"
         "  - id: my-custom-model\n"
     )
@@ -99,9 +106,13 @@ def test_inject_over_existing_backs_up_pristine_and_merges(omp_home: Path) -> No
 
     merged = yaml.safe_load(omp_home.read_text(encoding="utf-8"))
     assert merged["providers"]["anthropic"]["baseUrl"] == base_url
-    # Only anthropic.baseUrl is set; every other user key survives the merge.
+    openai_base_url = "http://127.0.0.1:8787/p/proj/v1"
+    assert merged["providers"]["openai"]["baseUrl"] == openai_base_url
+    assert merged["providers"]["openai"]["apiKey"] == "sk-user-openai"
+    assert merged["providers"]["openai-codex"]["baseUrl"] == openai_base_url
+    assert merged["providers"]["openai-codex"]["oauth"] is True
+    # Only supported provider base URLs are set; every other user key survives.
     assert merged["providers"]["anthropic"]["apiKey"] == "sk-user-secret"
-    assert merged["providers"]["openai"]["baseUrl"] == "https://api.openai.com/v1"
     assert merged["models"] == [{"id": "my-custom-model"}]
     assert MANAGED_MARKER in omp_home.read_text(encoding="utf-8")
 
@@ -122,6 +133,8 @@ def test_reinject_new_port_regenerates_from_pristine_backup(omp_home: Path) -> N
     merged = yaml.safe_load(omp_home.read_text(encoding="utf-8"))
     assert base_url_9999 == "http://127.0.0.1:9999/p/proj"
     assert merged["providers"]["anthropic"]["baseUrl"] == base_url_9999
+    assert merged["providers"]["openai"]["baseUrl"] == "http://127.0.0.1:9999/p/proj/v1"
+    assert merged["providers"]["openai-codex"]["baseUrl"] == "http://127.0.0.1:9999/p/proj/v1"
     # Regenerated from the backup, so user creds still survive the new port.
     assert merged["providers"]["anthropic"]["apiKey"] == "sk-user-secret"
 
@@ -173,8 +186,8 @@ def test_build_launch_env_passes_env_through_and_emits_display(omp_home: Path) -
     source = {"PATH": "/usr/bin", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
     env, display = build_launch_env(8787, source, project="proj")
 
-    # Anthropic inference redirects through models.yml. The provider-independent
-    # Pi-compatible extension uses its own loopback endpoint variable.
+    # The provider redirects live in models.yml; the environment additionally
+    # carries the loopback endpoint the Pi-compatible Headroom extension reads.
     assert env == {
         **source,
         "HEADROOM_PI_BASE_URL": "http://127.0.0.1:8787",
@@ -182,6 +195,8 @@ def test_build_launch_env_passes_env_through_and_emits_display(omp_home: Path) -
     assert env is not source  # a copy, so caller's environ can't be mutated
     assert display == [
         "models.yml: providers.anthropic.baseUrl=http://127.0.0.1:8787/p/proj",
+        "models.yml: providers.openai.baseUrl=http://127.0.0.1:8787/p/proj/v1",
+        "models.yml: providers.openai-codex.baseUrl=http://127.0.0.1:8787/p/proj/v1",
         "HEADROOM_PI_BASE_URL=http://127.0.0.1:8787",
     ]
 
@@ -243,12 +258,18 @@ def test_wrap_omp_happy_path_injects_before_launch(runner: CliRunner, omp_home: 
     text_at_launch = captured["models_text_at_launch"]
     assert isinstance(text_at_launch, str)
     assert MANAGED_MARKER in text_at_launch
-    base_url = yaml.safe_load(text_at_launch)["providers"]["anthropic"]["baseUrl"]
+    providers = yaml.safe_load(text_at_launch)["providers"]
+    base_url = providers["anthropic"]["baseUrl"]
+    openai_base_url = providers["openai"]["baseUrl"]
     assert base_url.startswith("http://127.0.0.1:8787/p/")
+    assert openai_base_url == f"{base_url}/v1"
+    assert providers["openai-codex"]["baseUrl"] == openai_base_url
 
     display = captured["env_vars_display"]
     assert isinstance(display, list)
     assert f"models.yml: providers.anthropic.baseUrl={base_url}" in display
+    assert f"models.yml: providers.openai.baseUrl={openai_base_url}" in display
+    assert f"models.yml: providers.openai-codex.baseUrl={openai_base_url}" in display
     assert "HEADROOM_PI_BASE_URL=http://127.0.0.1:8787" in display
 
 
@@ -286,8 +307,11 @@ def test_wrap_omp_rewrites_both_routes_after_proxy_port_fallback(
     models = yaml.safe_load(omp_home.read_text(encoding="utf-8"))
     base_url = models["providers"]["anthropic"]["baseUrl"]
     assert base_url.startswith("http://127.0.0.1:8788/p/")
+    openai_base_url = models["providers"]["openai"]["baseUrl"]
     assert captured["display"] == [
         f"models.yml: providers.anthropic.baseUrl={base_url}",
+        f"models.yml: providers.openai.baseUrl={openai_base_url}",
+        f"models.yml: providers.openai-codex.baseUrl={openai_base_url}",
         "HEADROOM_PI_BASE_URL=http://127.0.0.1:8788",
     ]
 

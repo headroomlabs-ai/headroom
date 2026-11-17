@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
@@ -7,7 +8,9 @@ import pytest
 
 from headroom.providers.copilot.vscode import (
     configure_vscode_proxy_settings,
+    copilot_harness_settings_enabled,
     remove_vscode_proxy_settings,
+    unrouted_vscode_profiles,
     vscode_proxy_url,
     vscode_settings_path,
 )
@@ -65,6 +68,77 @@ def test_configure_update_and_remove_preserve_jsonc_verbatim(tmp_path: Path) -> 
     assert remove_vscode_proxy_settings(path) is False
 
 
+def _live_settings(path: Path) -> dict[str, object]:
+    """Parse the written JSONC the way VS Code does: comments and trailing commas ignored."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    body = "\n".join(line for line in lines if not line.strip().startswith("//"))
+    return json.loads(body.replace(",\n}", "\n}"))
+
+
+def test_configure_keeps_new_chats_on_the_local_harness(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = '{\n\t"editor.fontSize": 15\n}\n'
+    path.write_text(original, encoding="utf-8")
+
+    configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
+
+    # A chat on the Copilot harness ignores the endpoint overrides, and VS Code
+    # can flip either default by rollout, so both are pinned explicitly.
+    settings = _live_settings(path)
+    assert settings["chat.defaultToCopilotHarness"] is False
+    assert settings["chat.editor.preferCopilotHarness"] is False
+    assert copilot_harness_settings_enabled(path) == []
+    assert remove_vscode_proxy_settings(path) is True
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_configure_upgrades_a_block_written_before_the_harness_settings(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = '{\n\t"editor.fontSize": 15\n}\n'
+    path.write_text(
+        '{\n\t"editor.fontSize": 15,\n'
+        "\t// --- Headroom Copilot proxy --- (comma-added)\n"
+        '\t"github.copilot.advanced.debug.overrideProxyUrl": "http://127.0.0.1:8787",\n'
+        '\t"github.copilot.advanced.debug.overrideAuthType": "token",\n'
+        '\t"github.copilot.advanced.debug.overrideCapiUrl": "http://127.0.0.1:8787"\n'
+        "\t// --- end Headroom Copilot proxy ---\n}\n",
+        encoding="utf-8",
+    )
+
+    assert configure_vscode_proxy_settings(path, "http://127.0.0.1:8787") == "updated"
+
+    settings = _live_settings(path)
+    assert settings["chat.defaultToCopilotHarness"] is False
+    assert settings["chat.editor.preferCopilotHarness"] is False
+    assert "github.copilot.advanced.debug.overrideAuthType" not in settings
+    assert remove_vscode_proxy_settings(path) is True
+    assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("user_value", [True, False])
+def test_configure_leaves_a_harness_setting_the_user_already_chose(
+    tmp_path: Path, user_value: bool
+) -> None:
+    path = tmp_path / "settings.json"
+    original = f'{{\n\t"chat.defaultToCopilotHarness": {json.dumps(user_value)},\n}}\n'
+    path.write_text(original, encoding="utf-8")
+
+    for _ in range(2):  # a re-run must not start writing the key either
+        configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
+        configured = path.read_text(encoding="utf-8")
+        # A second copy inside the block would win silently: JSONC keeps the last one.
+        assert configured.count('"chat.defaultToCopilotHarness"') == 1
+        settings = _live_settings(path)
+        assert settings["chat.defaultToCopilotHarness"] is user_value
+        assert settings["chat.editor.preferCopilotHarness"] is False
+        assert copilot_harness_settings_enabled(path) == (
+            ["chat.defaultToCopilotHarness"] if user_value else []
+        )
+
+    assert remove_vscode_proxy_settings(path) is True
+    assert path.read_text(encoding="utf-8") == original
+
+
 def test_configure_refuses_malformed_and_unmanaged_override(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     for original in (
@@ -107,3 +181,102 @@ def test_configure_refuses_duplicate_managed_markers(tmp_path: Path) -> None:
     with pytest.raises(click.ClickException, match="marker block"):
         configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
     assert path.read_text(encoding="utf-8") == original
+
+
+def _write_profiles(tmp_path: Path, state: object) -> Path:
+    user_dir = tmp_path / "User"
+    storage = user_dir / "globalStorage" / "storage.json"
+    storage.parent.mkdir(parents=True)
+    storage.write_text(state if isinstance(state, str) else json.dumps(state), encoding="utf-8")
+    return user_dir
+
+
+def test_unrouted_profiles_lists_only_profiles_with_their_own_settings(tmp_path: Path) -> None:
+    user_dir = _write_profiles(
+        tmp_path,
+        {
+            "userDataProfiles": [
+                {"location": "6c87cdb4", "name": "Work"},
+                {"location": "-1f2e3d", "name": "Negative hash"},
+                {"location": "aa11", "name": "Shared", "useDefaultFlags": {"settings": True}},
+                {"location": "../escape", "name": "Traversal"},
+                {"location": {"scheme": "vscode-remote", "path": "/p"}, "name": "Remote"},
+                "not-a-profile",
+            ]
+        },
+    )
+
+    assert unrouted_vscode_profiles(user_dir) == [
+        ("Work", user_dir / "profiles" / "6c87cdb4" / "settings.json"),
+        ("Negative hash", user_dir / "profiles" / "-1f2e3d" / "settings.json"),
+    ]
+
+
+@pytest.mark.parametrize("managed", [True, False])
+def test_unrouted_profiles_skips_a_profile_that_overrides_both_endpoints(
+    tmp_path: Path, managed: bool
+) -> None:
+    user_dir = _write_profiles(
+        tmp_path, {"userDataProfiles": [{"location": "6c87cdb4", "name": "Work"}]}
+    )
+    profile_settings = user_dir / "profiles" / "6c87cdb4" / "settings.json"
+    profile_settings.parent.mkdir(parents=True)
+    if managed:
+        configure_vscode_proxy_settings(profile_settings, "http://127.0.0.1:8787")
+    else:
+        profile_settings.write_text(
+            """{
+    "github.copilot.advanced.debug.overrideProxyUrl": "http://127.0.0.1:8787",
+    "github.copilot.advanced.debug.overrideCapiUrl": "http://127.0.0.1:8787",
+}
+""",
+            encoding="utf-8",
+        )
+
+    assert unrouted_vscode_profiles(user_dir) == []
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        # The marker is itself a comment, so on its own it proves nothing.
+        """{
+    // --- Headroom Copilot proxy ---
+}
+""",
+        """{
+    // --- Headroom Copilot proxy ---
+    // "github.copilot.advanced.debug.overrideProxyUrl": "http://127.0.0.1:8787",
+    // "github.copilot.advanced.debug.overrideCapiUrl": "http://127.0.0.1:8787"
+    // --- end Headroom Copilot proxy ---
+}
+""",
+        """{
+    "note": "// --- Headroom Copilot proxy ---",
+    "github.copilot.advanced.debug.overrideCapiUrl": "http://127.0.0.1:8787"
+}
+""",
+        '{ "github.copilot.advanced.debug.overrideCapiUrl": ',
+    ],
+    ids=["marker-only", "commented-out-keys", "one-key", "unparseable"],
+)
+def test_unrouted_profiles_counts_only_live_override_settings(
+    tmp_path: Path, settings: str
+) -> None:
+    user_dir = _write_profiles(
+        tmp_path, {"userDataProfiles": [{"location": "6c87cdb4", "name": "Work"}]}
+    )
+    profile_settings = user_dir / "profiles" / "6c87cdb4" / "settings.json"
+    profile_settings.parent.mkdir(parents=True)
+    profile_settings.write_text(settings, encoding="utf-8")
+
+    assert unrouted_vscode_profiles(user_dir) == [("Work", profile_settings)]
+
+
+@pytest.mark.parametrize("state", ["{not json", [], {"userDataProfiles": {"a": 1}}, {}])
+def test_unrouted_profiles_tolerates_unexpected_vscode_state(tmp_path: Path, state: object) -> None:
+    assert unrouted_vscode_profiles(_write_profiles(tmp_path, state)) == []
+
+
+def test_unrouted_profiles_without_vscode_state(tmp_path: Path) -> None:
+    assert unrouted_vscode_profiles(tmp_path) == []

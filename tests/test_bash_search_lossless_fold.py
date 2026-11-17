@@ -151,6 +151,24 @@ def test_source_output_from_search_command_untouched(tokenizer):
     assert out == CODE
 
 
+GO_LOG = "".join(
+    f"2026/09/02 14:{30 + i // 60:02d}:{i % 60:02d} ERROR handler: upstream timeout req={i}\n"
+    for i in range(40)
+)
+
+
+@pytest.mark.parametrize("command", ["grep ERROR /var/log/api.log", "cat /var/log/api.log"])
+def test_go_log_keeps_its_timestamps(command, tokenizer):
+    # Split as path:line:content, `2026/09/02 14:30:00 ...` would fold into a
+    # `2026/09/02 14` header over `30:00 ...` rows. `cat` reaches the search
+    # fold through the router's lossless-first stage, `grep` through the
+    # bash-search fold.
+    out, transforms = _anthropic(command, GO_LOG, tokenizer)
+    assert "router:bash:lossless_search" not in transforms
+    assert "router:tool_result:lossless_search" not in transforms
+    assert "2026/09/02 14" not in out.split("\n")
+
+
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----
 from headroom.transforms.lossless_compaction import (
     compact_lossless as _cl,
@@ -169,6 +187,10 @@ def test_path_fold_roundtrip_and_shrinks_pure_list():
     assert _puh(_ph(c)) == c  # exact inverse
     assert len(folded) < len(c)  # shrinks
     assert folded != c
+    c = "src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n"
+    assert _cl(c, "paths") == "src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n"
+    c = "app/[slug]/page.tsx\napp/[slug]/layout.tsx\n"
+    assert _cl(c, "paths") == "app/[slug]/\npage.tsx\nlayout.tsx\n"
 
 
 def test_path_fold_safe_passthrough_on_non_path_shapes():
@@ -187,6 +209,62 @@ def test_path_fold_mixed_content_roundtrips_or_passes_through():
     assert _puh(_ph(out)) == out or out == c  # never corrupts
     # simplest invariant: decoding whatever we emit reconstructs the input
     assert _puh(_ph(c)) == c or _cl(c, "paths") == c
+
+
+def test_path_fold_leaves_html_closing_tags_alone():
+    # `</body>` is markup, not dir `</` + base `body>`. The fold round-trips,
+    # but the model only sees the folded side and reads broken HTML.
+    tail = "  </script>\n</body>\n</html>\n"
+    assert _cl(tail, "paths") == tail
+    assert _cl("</body>\n</html>", "paths") == "</body>\n</html>"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{{#each people}}\n{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n",
+        "{#each items as item}\n  <li>{item}</li>\n{/each}\n{/if}\n",
+        "<pre>\n&lt;/body&gt;\n&lt;/html&gt;\n</pre>\n",
+        "Results for 3 hosts:\nN/A\nN/A\nN/A\n",
+        # sections made only of closers
+        "{{/if}}\n{{/each}}\n",
+        "{/if}\n{/each}\n",
+        "[/quote]\n[/b]\n",
+        "&lt;/body&gt;\n&lt;/html&gt;\n",
+    ],
+)
+def test_path_fold_skips_text_that_only_contains_path_shaped_lines(text):
+    # Closers and slashed values among other lines are not a path listing.
+    assert _cl(text, "paths") == text
+
+
+def test_router_keeps_html_closing_tags_in_mixed_content(monkeypatch):
+    # A page tail (no DOCTYPE/<html> root, so no HTML override) with a JSON-LD
+    # block routes MIXED; every section gets the lossless folds tried on it.
+    monkeypatch.delenv("HEADROOM_LOSSLESS_COMPACTION", raising=False)
+    ld = json.dumps(
+        {
+            "@context": "https://schema.org",
+            "@type": "Product",
+            "name": "Example Widget",
+            "offers": {"@type": "Offer", "price": "19.00", "priceCurrency": "USD"},
+        },
+        indent=2,
+    )
+    body = "".join(
+        f"    <p>Paragraph {i} of the example page with some ordinary text.</p>\n"
+        for i in range(20)
+    )
+    tail = (
+        "  <main>\n" + body + "  </main>\n"
+        '  <script type="application/ld+json">\n' + ld + "\n  </script>\n</body>\n</html>\n"
+    )
+    result = ContentRouter(ContentRouterConfig()).compress(tail)
+    # Fails loudly if routing changes, so the test cannot silently stop
+    # covering the mixed path.
+    assert result.strategy_used.value == "mixed"
+    assert result.compressed.endswith("  </script>\n</body>\n</html>\n")
+    assert "</\n" not in result.compressed
 
 
 # ---- EXPERIMENT: HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO (light Kompress on reads) ----

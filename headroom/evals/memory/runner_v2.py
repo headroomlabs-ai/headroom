@@ -24,8 +24,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import litellm
-
 from headroom.evals.memory.locomo import (
     LOCOMO_CATEGORIES,
     LoCoMoCase,
@@ -37,6 +35,12 @@ from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 from headroom.memory.models import Memory
 from headroom.memory.system import MemoryBackend
 from headroom.memory.tools import MEMORY_TOOLS
+from headroom.offline import pin_litellm_cost_map_local
+
+# Before the import: litellm fetches its pricing table at import time unless
+# told not to, and HEADROOM_OFFLINE forbids that fetch.
+pin_litellm_cost_map_local()
+import litellm  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +467,9 @@ Categories to use:
         # Get just the save tool
         save_tool = next(t for t in MEMORY_TOOLS if t["function"]["name"] == "memory_save")
 
+        from headroom.offline import guard_egress
+
+        guard_egress(f"{self._config.save_model} API for the memory eval save phase")
         for session in conversation.sessions:
             # Format session as dialogue
             session_text = f"\n[Session Date: {session.datetime}]\n"
@@ -685,6 +692,9 @@ The answer should contain ONLY the specific information requested, nothing more.
         max_rounds = 3
         final_answer = "Information not found"
 
+        from headroom.offline import guard_egress
+
+        guard_egress(f"{self._config.answer_model} API for the memory eval answers")
         for round_num in range(max_rounds):
             try:
                 response = await asyncio.to_thread(

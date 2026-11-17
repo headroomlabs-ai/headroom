@@ -25,7 +25,7 @@ from headroom.dashboard import (  # noqa: E402
     register_static_mime_types,
 )
 
-ASSETS = ["tailwind.min.js", "htmx.min.js", "alpine.min.js"]
+ASSETS = ["tailwind.min.js", "alpine.min.js"]
 
 
 @pytest.fixture(autouse=True)

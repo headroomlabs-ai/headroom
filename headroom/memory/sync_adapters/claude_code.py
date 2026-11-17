@@ -55,15 +55,17 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
 
     Returns (frontmatter_dict, body).
     """
-    if not content.startswith("---"):
+    # Delimiters occupy their own lines. A name/description can legitimately
+    # contain "---"; treating that substring as the end corrupts the body and
+    # its content hash on the next import.
+    match = re.match(
+        r"\A---[ \t]*\r?\n(.*?)^---[ \t]*(?:\r?\n|\Z)", content, re.DOTALL | re.MULTILINE
+    )
+    if match is None:
         return {}, content
 
-    end = content.find("---", 3)
-    if end == -1:
-        return {}, content
-
-    fm_text = content[3:end].strip()
-    body = content[end + 3 :].strip()
+    fm_text = match.group(1).strip()
+    body = content[match.end() :].strip()
 
     fm: dict[str, str] = {}
     for line in fm_text.split("\n"):
@@ -193,7 +195,7 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
                     "source_agent": source_agent,
                 }
             )
-            target.write_text(f"{fm}\n\n{content}\n", encoding="utf-8")
+            target.write_text(f"{fm}\n\n{content}\n", encoding="utf-8", newline="\n")
             written += 1
 
             # Track for MEMORY.md index
@@ -236,7 +238,7 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
         else:
             content = "# Memory\n" + new_section
 
-        memory_md.write_text(content, encoding="utf-8")
+        memory_md.write_text(content, encoding="utf-8", newline="\n")
 
     def fingerprint(self) -> str:
         """Hash of all .md filenames + contents for change detection."""

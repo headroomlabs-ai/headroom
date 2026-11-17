@@ -41,6 +41,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -229,12 +231,23 @@ class BaselineModel:
             self.strata.setdefault(key, _Accum()).merge(acc)
         self.glob.merge(other.glob)
 
-    def lookup(self, key: str) -> tuple[float, float, int]:
+    def lookup(self, key: str, *, fall_back_to_global: bool = False) -> tuple[float, float, int]:
         """Return ``(mean, var, n)`` for *key* with hierarchical back-off.
 
-        Falls back by trimming trailing (least-specific) stratum fields, then
-        to the global mean. Back-off keeps the estimate defined for strata the
-        baseline never saw, at the cost of specificity.
+        Falls back by trimming trailing (least-specific) stratum fields, so a
+        stratum the baseline never saw is still scored against its nearest
+        observed neighbours. Returns ``(0.0, 0.0, 0)`` when even that finds
+        nothing -- callers already treat ``n == 0`` as "no evidence".
+
+        ``fall_back_to_global`` restores the old last resort of the
+        all-requests mean. It is off by default because that mean is not a
+        control for anything: the baseline is seeded once, from whatever the
+        user ran *before* installing, so every model family they adopt later
+        resolves to it. On a real ledger that meant 48% of requests -- sonnet
+        and fable turns whose replies average 43-770 tokens -- being scored
+        against one opus-derived mean of 1,083, which alone produced 74% of the
+        reported savings. Scoring a short no-tool ask against a long
+        tool-calling turn is not a synthetic control, it is a unit conversion.
         """
         acc = self.strata.get(key)
         if acc is not None and acc.n > 0:
@@ -242,11 +255,16 @@ class BaselineModel:
         parts = key.split("|")
         while len(parts) > 1:
             parts = parts[:-1]
-            prefix = "|".join(parts)
+            prefix = "|".join(parts) + "|"
+            neighbours = _Accum()
             for k, a in self.strata.items():
-                if k.startswith(prefix + "|") and a.n > 0:
-                    return a.mean, a.var, a.n
-        return self.glob.mean, self.glob.var, self.glob.n
+                if a.n > 0 and k.startswith(prefix):
+                    neighbours.merge(a)
+            if neighbours.n > 0:
+                return neighbours.mean, neighbours.var, neighbours.n
+        if fall_back_to_global:
+            return self.glob.mean, self.glob.var, self.glob.n
+        return 0.0, 0.0, 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -315,6 +333,37 @@ def register_modelled_factors(level: int, conservative: float, optimistic: float
     MODELLED_REDUCTION[level] = (conservative, optimistic)
 
 
+def _shaped_level(labels: Any) -> int | None:
+    """The verbosity level a request was shaped at, or ``None`` if it was not."""
+    for label in labels or ():
+        text = str(label)
+        if not text.startswith(_SHAPED_LABEL_PREFIX + "L"):
+            continue
+        try:
+            return int(text[len(_SHAPED_LABEL_PREFIX) + 1 :])
+        except ValueError:
+            continue
+    return None
+
+
+def modelled_request_savings(labels: Any, output_tokens: int) -> tuple[int, int]:
+    """Output tokens one shaped request saved, from its level's benchmark factors.
+
+    ``(low, high)`` at the conservative and optimistic factor, using the same
+    inversion as :meth:`SavingsLedger.estimate_from_model`: observed output is
+    already shaped, so ``saved = observed * r / (1 - r)``. ``(0, 0)`` when the
+    request was not shaped or its level has no registered factors.
+    """
+    level = _shaped_level(labels)
+    if output_tokens <= 0 or level is None:
+        return 0, 0
+    factors = MODELLED_REDUCTION.get(level)
+    if factors is None:
+        return 0, 0
+    low, high = (int(round(output_tokens * r / (1.0 - r))) for r in factors)
+    return low, high
+
+
 @dataclass
 class SavingsEstimate:
     """Result of an estimation pass."""
@@ -338,6 +387,90 @@ class SavingsEstimate:
 _SHAPED_LABEL_PREFIX = "output_shaper:verbosity:"
 
 
+# :data:`MEASURED_MIN_CLUSTERS` decides whether a stratum is a real sample at
+# all. The gates below decide something stricter: whether the measurement has
+# earned the headline slot away from the synthetic control.
+
+# Conversations per arm a stratum needs before it may count toward the
+# headline. The 95% band is computed per REQUEST, so it reads one long
+# conversation as many independent draws: five control conversations of 200
+# requests each report about +/-4pp where the honest band is tens of points.
+# Only capped per-stratum cluster ids are stored, so a cluster-robust band
+# cannot be computed; this floor is the clustering guard instead. It must stay
+# at or below ``_CLUSTER_CAP``, which ``n_clusters`` saturates at.
+MEASURED_SUPERSEDE_MIN_CLUSTERS = 30
+
+# Share of the conversation-labelled treatment requests the measured strata
+# must cover. Below it the holdout describes a corner of the traffic, not the
+# traffic. Labelled requests only: the measurement can only ever be built from
+# those, so unlabelled legacy volume must neither help nor block it.
+MEASURED_MIN_COVERAGE = 0.5
+
+# ...and the 95% band must be at least this tight, in percentage points of
+# reduction. A stratum can clear every cluster floor and still be too noisy to
+# say anything.
+MEASURED_MAX_CI_HALF_WIDTH_PCT = 10.0
+
+
+def _measured_covers(measured: SavingsEstimate, labelled_requests: int) -> bool:
+    """Whether the measured strata describe the traffic, not a corner of it."""
+    return measured.n_requests >= MEASURED_MIN_COVERAGE * labelled_requests
+
+
+def _measured_supersedes(measured: SavingsEstimate, labelled_requests: int) -> bool:
+    """Whether the A/B measurement has outgrown the synthetic-control estimate."""
+    half_width = (measured.ci_high_pct - measured.ci_low_pct) / 2.0
+    if half_width > MEASURED_MAX_CI_HALF_WIDTH_PCT:
+        return False
+    return _measured_covers(measured, labelled_requests)
+
+
+@contextmanager
+def ledger_lock(path: Any) -> Iterator[None]:
+    """Serialize read-modify-write of the ledger file across processes.
+
+    The lock lives in a sidecar file because ``save`` replaces the ledger's
+    inode. Same platform split as ``cli.wrap._locked_file``.
+    """
+    import sys
+    from pathlib import Path
+
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as handle:
+        if sys.platform == "win32":
+            import msvcrt
+            import os
+            import time
+
+            # msvcrt.locking locks bytes from the current position, so lock a
+            # real byte at offset 0. LK_LOCK raises after ~10 one-second
+            # retries, so loop on the non-blocking form instead.
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 @dataclass
 class SavingsLedger:
     """Accumulates shaped (treatment) and unshaped (control) observations and
@@ -352,6 +485,9 @@ class SavingsLedger:
     baseline: BaselineModel = field(default_factory=BaselineModel)
     treatment: dict[str, _Accum] = field(default_factory=dict)
     control: dict[str, _Accum] = field(default_factory=dict)
+    # Set by ``from_dict`` when it dropped pre-rule arms, so the owner can
+    # persist the drop instead of re-dropping (and re-warning) on every load.
+    dropped_legacy_arms: bool = field(default=False, compare=False, repr=False)
 
     # ---- recording -------------------------------------------------------
 
@@ -391,7 +527,9 @@ class SavingsLedger:
                 var += (n * n) * (mu_var / m)
         return self._finalize(total_saved, total_baseline, var, n_requests, "estimated")
 
-    def estimate_from_holdout(self) -> SavingsEstimate | None:
+    def estimate_from_holdout(
+        self, min_clusters: int = MEASURED_MIN_CLUSTERS
+    ) -> SavingsEstimate | None:
         """A/B measurement: per-stratum control mean minus treatment mean.
 
         Only strata with conversation-labelled data in BOTH arms contribute,
@@ -423,7 +561,7 @@ class SavingsLedger:
             c = self.control.get(key)
             if c is None or c.qn == 0 or t.qn == 0:
                 continue
-            if c.n_clusters < MEASURED_MIN_CLUSTERS or t.n_clusters < MEASURED_MIN_CLUSTERS:
+            if c.n_clusters < min_clusters or t.n_clusters < min_clusters:
                 continue
             contributing += 1
             # Everything below reads the qualified subset only. The clusters
@@ -513,22 +651,65 @@ class SavingsLedger:
         )
 
     def best_estimate(self, level: int | None = None) -> SavingsEstimate:
-        """Strongest available tier: measured > estimated > modelled.
+        """Strongest believable tier: measured > estimated > modelled.
 
         ``level`` enables the modelled fallback; without it the behaviour is
         unchanged from before, which keeps every existing caller honest.
+
+        The measured tier is preferred only once it is worth believing. With
+        conversation-stable keys five conversations per arm fill quickly, so on
+        the bare cluster gate a corner of the traffic, or a few long
+        conversations, would decide the headline. The measured number displaces
+        the synthetic control only when every stratum it is built from holds
+        :data:`MEASURED_SUPERSEDE_MIN_CLUSTERS` conversations per arm, those
+        strata cover :data:`MEASURED_MIN_COVERAGE` of the labelled treatment
+        requests, and its band is tight enough to mean something. With no
+        baseline to fall back on, the bare cluster gate's measurement is still
+        reported, since it displaces nothing, but only while it covers the
+        traffic: a corner of it is not a headline either way.
         """
-        measured = self.estimate_from_holdout()
-        if measured is not None:
-            return measured
+        return self.select_tier(level)[0]
+
+    def select_tier(self, level: int | None = None) -> tuple[SavingsEstimate, int | None]:
+        """:meth:`best_estimate`, plus the cluster gate the measured tier used.
+
+        The second element is the ``min_clusters`` that qualified the measured
+        estimate, or ``None`` for any other tier. A per-request booking needs
+        it to tell whether the request's own stratum is part of the
+        measurement; the headline excludes strata that are not.
+        """
+        measured = self.estimate_from_holdout(min_clusters=MEASURED_SUPERSEDE_MIN_CLUSTERS)
+        labelled = sum(t.qn for t in self.treatment.values())
+        if measured is not None and _measured_supersedes(measured, labelled):
+            return measured, MEASURED_SUPERSEDE_MIN_CLUSTERS
         estimated = self.estimate_from_baseline()
         if estimated.n_requests > 0:
-            return estimated
+            return estimated, None
+        measured = self.estimate_from_holdout()
+        if measured is not None and _measured_covers(measured, labelled):
+            return measured, MEASURED_MIN_CLUSTERS
         if level is not None:
             modelled = self.estimate_from_model(level)
             if modelled is not None:
-                return modelled
-        return estimated
+                return modelled, None
+        return estimated, None
+
+    def measured_stratum_saving(
+        self, key: str, output_tokens: int, min_clusters: int
+    ) -> int | None:
+        """Tokens one request in ``key`` saved, from that stratum's own A/B.
+
+        ``None`` when the stratum is not part of the measurement at
+        ``min_clusters`` -- the same qualification :meth:`estimate_from_holdout`
+        applies, so a stratum the headline excludes is never credited.
+        """
+        t = self.treatment.get(key)
+        c = self.control.get(key)
+        if t is None or c is None or c.qn == 0 or t.qn == 0:
+            return None
+        if c.n_clusters < min_clusters or t.n_clusters < min_clusters:
+            return None
+        return max(0, int(round(c.qmean - output_tokens)))
 
     # ---- persistence -----------------------------------------------------
 
@@ -544,7 +725,7 @@ class SavingsLedger:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> SavingsLedger:
+    def from_dict(cls, d: dict[str, Any], *, warn_legacy: bool = True) -> SavingsLedger:
         ledger = cls(baseline=BaselineModel.from_dict(d.get("baseline") or {}))
         if not d.get("shaped_only"):
             # Pre-rule arms cannot be told apart from shaped ones entry by
@@ -553,6 +734,8 @@ class SavingsLedger:
             # baseline is kept: it is learned from pre-shaper history, costs a
             # `learn --verbosity` run to rebuild, and was never the poisoned part.
             if d.get("treatment") or d.get("control"):
+                ledger.dropped_legacy_arms = True
+            if ledger.dropped_legacy_arms and warn_legacy:
                 logger.warning(
                     "output-savings ledger predates shaped-only recording; "
                     "dropping %d treatment and %d control strata and "
@@ -579,20 +762,28 @@ class SavingsLedger:
         fsutil.write_text(p, json.dumps(self.to_dict(), separators=(",", ":")))
 
     @classmethod
-    def load(cls, path: Any) -> SavingsLedger:
+    def load(cls, path: Any, *, warn_legacy: bool = True) -> SavingsLedger:
         from pathlib import Path
 
         p = Path(path)
         if not p.exists():
             return cls()
         try:
-            return cls.from_dict(json.loads(p.read_text()))
+            return cls.from_dict(json.loads(p.read_text()), warn_legacy=warn_legacy)
         except (json.JSONDecodeError, ValueError, OSError) as exc:
             # Fail open (empty ledger), but surface the loss — silently
             # swallowing a corrupt file made lost history indistinguishable
             # from no history yet (#18).
             logger.warning("output-savings ledger %s unreadable, starting empty: %s", p, exc)
             return cls()
+
+    @classmethod
+    def store_baseline(cls, path: Any, baseline: BaselineModel) -> None:
+        """Replace the on-disk baseline, keeping the live arms already there."""
+        with ledger_lock(path):
+            ledger = cls.load(path)
+            ledger.baseline = baseline
+            ledger.save(path)
 
 
 # --------------------------------------------------------------------------
@@ -620,6 +811,11 @@ class SavingsRecorder:
         self._ledger = SavingsLedger.load(self._path)
         self._flush_every = flush_every
         self._since_flush = 0
+        if self._ledger.dropped_legacy_arms:
+            # Persist the drop now. With the shaper off nothing ever records,
+            # so waiting for a periodic flush would leave the legacy file on
+            # disk indefinitely.
+            self._migrate_legacy()
 
     def record_from_labels(self, labels: Any, output_tokens: int) -> bool:
         """Record one outcome given its transforms_applied labels. Returns True
@@ -690,6 +886,64 @@ class SavingsRecorder:
             return max(0, int(round(mean - output_tokens))) if n > 0 else 0
         return 0
 
+    def request_savings_range(self, labels: Any, output_tokens: int) -> tuple[int, int]:
+        """Per-request output tokens saved as ``(low, high)``, for the rollup.
+
+        Only a request that was actually shaped saves anything: the treatment
+        stratum label is attached before shaping is attempted, so the
+        ``output_shaper:verbosity:L<n>`` label is the proof, as in
+        :meth:`record_from_labels`. A holdout (control) request saved nothing.
+
+        The tier is whatever :meth:`SavingsLedger.best_estimate` picks for the
+        request's level, so the lifetime dollars always come from the same
+        tier the dashboard's percentage does:
+
+        * measured -> this stratum's own control mean minus the observed
+          output, low = high, and only if the stratum is part of the
+          measurement (0 otherwise: the headline excludes it too);
+        * estimated -> the learned baseline for this request's stratum,
+          low = high (0 where the stratum has no baseline);
+        * modelled -> the level's benchmark factors, a low-high band.
+
+        With no factors registered (plain OSS) the modelled tier never
+        appears, so nothing changes there.
+        """
+        # Zero output means the provider reported no usage, not a silent
+        # reply: every tier would otherwise book the whole baseline as saved.
+        if output_tokens <= 0:
+            return 0, 0
+        label_strings = [str(label) for label in labels or ()]
+        level = _shaped_level(label_strings)
+        if level is None:
+            return 0, 0
+        key = None
+        for text in label_strings:
+            parsed = parse_stratum_label(text)
+            if parsed is None:
+                continue
+            arm, key = parsed
+            if arm != "treatment":
+                return 0, 0
+            break
+        n = 0
+        mean = 0.0
+        measured_point: int | None = None
+        with self._lock:
+            tier, min_clusters = self._ledger.select_tier(level)
+            if tier.kind == "estimated" and key is not None:
+                mean, _var, n = self._ledger.baseline.lookup(key)
+            if min_clusters is not None and key is not None:
+                measured_point = self._ledger.measured_stratum_saving(
+                    key, output_tokens, min_clusters
+                )
+        if tier.kind == "modelled":
+            return modelled_request_savings(label_strings, output_tokens)
+        if tier.kind == "measured":
+            point = measured_point or 0
+            return point, point
+        point = max(0, int(round(mean - output_tokens))) if n > 0 else 0
+        return point, point
+
     def _reload_baseline_locked(self) -> None:
         """Adopt the on-disk baseline written by ``learn --verbosity --apply``.
 
@@ -707,13 +961,31 @@ class SavingsRecorder:
         same number of samples still takes effect, and the empty-disk guard keeps
         a truncated file from wiping a baseline we already hold."""
         try:
-            disk = SavingsLedger.load(self._path)
+            # Only the baseline is read here, and the constructor already
+            # reported any legacy arms. Warning again would repeat on every
+            # /stats poll whenever the file can't be rewritten (stateless).
+            disk = SavingsLedger.load(self._path, warn_legacy=False)
         except OSError:
             return
         if disk.baseline.total_samples == 0:
             return
         if disk.baseline.to_dict() != self._ledger.baseline.to_dict():
             self._ledger.baseline = disk.baseline
+
+    def _migrate_legacy(self) -> None:
+        from ..paths import process_is_stateless
+
+        if process_is_stateless():
+            return
+        try:
+            with ledger_lock(self._path):
+                # Re-read under the lock: another writer may have replaced the
+                # file since the first load, and its copy is the newer one.
+                self._ledger = SavingsLedger.load(self._path, warn_legacy=False)
+                if self._ledger.dropped_legacy_arms:
+                    self._ledger.save(self._path)
+        except OSError:
+            pass
 
     def _flush_locked(self) -> None:
         from ..paths import process_is_stateless
@@ -723,8 +995,9 @@ class SavingsRecorder:
             self._since_flush = 0
             return
         try:
-            self._reload_baseline_locked()
-            self._ledger.save(self._path)
+            with ledger_lock(self._path):
+                self._reload_baseline_locked()
+                self._ledger.save(self._path)
             self._since_flush = 0
         except OSError:
             pass

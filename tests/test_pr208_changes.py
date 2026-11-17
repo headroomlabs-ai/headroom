@@ -290,42 +290,15 @@ class TestLatencyHistogram:
 
 
 # ---------------------------------------------------------------------------
-# is_anthropic_auth tests
+# is_anthropic_auth (deprecated)
 # ---------------------------------------------------------------------------
 
 
-class TestIsAnthropicAuth:
-    """Tests for headroom.proxy.helpers.is_anthropic_auth."""
+def test_is_anthropic_auth_is_deprecated() -> None:
+    from headroom.proxy.helpers import is_anthropic_auth
 
-    def test_detects_x_api_key(self) -> None:
-        from headroom.proxy.helpers import is_anthropic_auth
-
+    with pytest.warns(DeprecationWarning, match="is_anthropic_auth is deprecated"):
         assert is_anthropic_auth({"x-api-key": "sk-ant-abc123"}) is True
-
-    def test_detects_anthropic_version_header(self) -> None:
-        from headroom.proxy.helpers import is_anthropic_auth
-
-        assert is_anthropic_auth({"anthropic-version": "2023-06-01"}) is True
-
-    def test_detects_bearer_sk_ant_prefix(self) -> None:
-        from headroom.proxy.helpers import is_anthropic_auth
-
-        assert is_anthropic_auth({"authorization": "Bearer sk-ant-abc123"}) is True
-
-    def test_rejects_openai_bearer_token(self) -> None:
-        from headroom.proxy.helpers import is_anthropic_auth
-
-        assert is_anthropic_auth({"authorization": "Bearer sk-openai-xyz"}) is False
-
-    def test_rejects_empty_headers(self) -> None:
-        from headroom.proxy.helpers import is_anthropic_auth
-
-        assert is_anthropic_auth({}) is False
-
-    def test_rejects_non_anthropic_auth(self) -> None:
-        from headroom.proxy.helpers import is_anthropic_auth
-
-        assert is_anthropic_auth({"authorization": "Bearer some-token"}) is False
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,7 @@ __all__ = [
     "get_conversation_savings",
     "reset_conversation_savings",
     "savings_conversation_key",
+    "turn_conversation_key",
 ]
 
 _ID_KEYS = ("id", "conversation_id", "session_id", "thread_id")
@@ -75,6 +76,10 @@ def savings_conversation_key(body: Any, *, session_id: str | None = None) -> str
        top-level ``conversation_id``/``session_id``/``thread_id``, one of
        those inside ``metadata``/``client_metadata``, or a transport-scoped
        ``session_id`` the caller vouches for (a WebSocket, a session header).
+       A ``thread_id`` wins over a ``session_id`` beside it: Codex sends both,
+       and its ``session_id`` is the root thread's on every request of the
+       session, so a guardian or subagent request would otherwise reset the
+       root's running total and make its next turn re-book its history.
        Two things are deliberately NOT accepted. The holdout key's fallbacks
        (the instructions prefix, the literal ``responses``): two independent
        conversations with the same instructions would share a running total
@@ -99,9 +104,24 @@ def savings_conversation_key(body: Any, *, session_id: str | None = None) -> str
         return None
     if body.get("previous_response_id") or body.get("conversation"):
         return None
+    return turn_conversation_key(body, session_id=session_id)
 
+
+def turn_conversation_key(body: Any, *, session_id: str | None = None) -> str | None:
+    """The conversation a Responses request names, or ``None`` when it names none.
+
+    Premise 1 of :func:`savings_conversation_key` only, with the same ids and
+    the same digest: an incremental body (``previous_response_id``) still
+    belongs to its conversation, so this is the key turn hooks see as
+    ``TurnContext.conversation`` on every turn. So does a body that names a
+    server-side ``conversation`` (an id, or an object with one), which
+    :func:`savings_conversation_key` excludes before calling this.
+    """
+    if not isinstance(body, dict):
+        return None
+    body = _unwrap_response_create_body(body)
     identity = ""
-    for key in ("conversation_id", "session_id", "thread_id"):
+    for key in ("conversation_id", "thread_id", "session_id", "conversation"):
         value = _explicit_id(body.get(key))
         if value:
             identity = f"{key}:{value}"
@@ -114,8 +134,8 @@ def savings_conversation_key(body: Any, *, session_id: str | None = None) -> str
             for key in (
                 "conversation_id",
                 "conversation_key",
-                "session_id",
                 "thread_id",
+                "session_id",
                 "codex_session_id",
             ):
                 value = _explicit_id(container.get(key))

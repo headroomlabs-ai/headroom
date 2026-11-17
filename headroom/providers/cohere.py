@@ -21,12 +21,15 @@ import warnings
 from datetime import date
 from typing import Any
 
+from headroom.log_safety import describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
 
 try:
+    pin_litellm_cost_map_local()
     import litellm
 
     LITELLM_AVAILABLE = True
@@ -230,6 +233,11 @@ class CohereProvider(Provider):
                     If provided, uses tokenize API for accurate counts.
         """
         self._client = client
+        # Cache counters per model so their internal TokenCountCache persists
+        # across requests, like the Anthropic and OpenAI providers. A fresh
+        # counter per call threw the cache away every request, re-tokenizing a
+        # stable prefix (system prompt + tools) on every turn.
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -256,7 +264,9 @@ class CohereProvider(Provider):
                 f"Model '{model}' is not recognized as a Cohere model. "
                 f"Supported models: {list(_CONTEXT_LIMITS.keys())}"
             )
-        return CohereTokenCounter(model, client=self._client)
+        if model not in self._token_counters:
+            self._token_counters[model] = CohereTokenCounter(model, client=self._client)
+        return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
         """Get context limit for a Cohere model.
@@ -277,8 +287,11 @@ class CohereProvider(Provider):
                         result = info["max_tokens"]
                         if result is not None:
                             return int(result)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        f"LiteLLM get_model_info failed for {safe_id(model_variant)}: "
+                        f"{describe_exception(e)}"
+                    )
 
         # Fallback to built-in limits
         model_lower = model.lower()

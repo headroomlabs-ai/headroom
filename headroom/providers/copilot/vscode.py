@@ -28,6 +28,11 @@ _CAPI_KEY = "github.copilot.advanced.debug.overrideCapiUrl"
 # VS Code flags unknown keys, and shipping one that does nothing invited the
 # conclusion that the override mechanism had stopped working.
 _AUTH_KEY = "github.copilot.advanced.debug.overrideAuthType"
+# A chat on VS Code's "Copilot harness" (Agent Host, the bundled Copilot SDK
+# runtime) ignores both endpoint overrides and never reaches the proxy. Both
+# settings default to false but are tagged `experiment: startup`, so a rollout
+# can flip them per user; only an explicit user value pins the Local harness.
+_COPILOT_HARNESS_KEYS = ("chat.defaultToCopilotHarness", "chat.editor.preferCopilotHarness")
 
 
 def _read_settings(path: Path) -> str:
@@ -108,29 +113,33 @@ def _strip_jsonc_comments(value: str) -> str:
     return "".join(result)
 
 
-def _validate_settings(raw: str, path: Path) -> None:
+def _parse_settings(raw: str) -> object:
     candidate = _strip_jsonc_comments(raw)
     if candidate.startswith("\ufeff"):
         candidate = candidate[1:]
-    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    return json.loads(re.sub(r",\s*([}\]])", r"\1", candidate))
+
+
+def _validate_settings(raw: str, path: Path) -> dict[str, object]:
     try:
-        parsed = json.loads(candidate)
+        parsed = _parse_settings(raw)
     except json.JSONDecodeError as exc:
         raise click.ClickException(
             f"Could not safely parse {path}: {exc}. Headroom did not overwrite it."
         ) from exc
     if not isinstance(parsed, dict):
         raise click.ClickException(f"{path} must contain a JSON object; refusing to overwrite it.")
+    return parsed
 
 
-def _managed_block(proxy_url: str, *, owns_preceding_comma: bool, line_sep: str) -> str:
+def _managed_block(
+    settings: Mapping[str, object], *, owns_preceding_comma: bool, line_sep: str
+) -> str:
     marker = _MARKER_START + (" (comma-added)" if owns_preceding_comma else "")
-    return (
-        f"\t{marker}{line_sep}"
-        f"\t{json.dumps(_PROXY_KEY)}: {json.dumps(proxy_url)},{line_sep}"
-        f"\t{json.dumps(_CAPI_KEY)}: {json.dumps(proxy_url)}{line_sep}"
-        f"\t{_MARKER_END}"
+    entries = f",{line_sep}".join(
+        f"\t{json.dumps(key)}: {json.dumps(value)}" for key, value in settings.items()
     )
+    return f"\t{marker}{line_sep}{entries}{line_sep}\t{_MARKER_END}"
 
 
 def remove_vscode_proxy_settings(path: Path) -> bool:
@@ -163,7 +172,12 @@ def remove_vscode_proxy_settings(path: Path) -> bool:
 
 
 def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
-    """Add/update transparent routing while preserving all non-Headroom text."""
+    """Add/update transparent routing while preserving all non-Headroom text.
+
+    The block also pins new chats to the Local harness, except for a harness
+    setting the user already set themselves: theirs is left alone, and
+    ``copilot_harness_settings_enabled`` reports it when it bypasses Headroom.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = _read_settings(path) if path.exists() else "{}\n"
     _validate_settings(raw, path)
@@ -176,6 +190,9 @@ def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
             f"{path} already configures a Copilot endpoint override outside Headroom's "
             "managed block; refusing to replace it. Remove it or use --no-configure."
         )
+    user_settings = _validate_settings(raw, path)
+    managed: dict[str, object] = {_PROXY_KEY: proxy_url, _CAPI_KEY: proxy_url}
+    managed.update({key: False for key in _COPILOT_HARNESS_KEYS if key not in user_settings})
 
     close = raw.rfind("}")
     if close < 0:
@@ -191,10 +208,56 @@ def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
         before
         + separator
         + newline
-        + _managed_block(proxy_url, owns_preceding_comma=needs_comma, line_sep=line_sep)
+        + _managed_block(managed, owns_preceding_comma=needs_comma, line_sep=line_sep)
         + line_sep
         + after
     )
     _validate_settings(updated, path)
     fsutil.write_text(path, updated)
     return "updated" if had_managed_block else "added"
+
+
+def copilot_harness_settings_enabled(path: Path) -> list[str]:
+    """Return the harness settings in ``path`` that send new chats around Headroom."""
+    settings = _validate_settings(_read_settings(path), path)
+    return [key for key in _COPILOT_HARNESS_KEYS if settings.get(key) is True]
+
+
+def unrouted_vscode_profiles(user_dir: Path) -> list[tuple[str, Path]]:
+    """Return ``(name, settings.json)`` for profiles that ignore ``user_dir/settings.json``.
+
+    A window in a profile with its own settings reads only that profile's
+    settings.json, and Copilot takes its endpoint overrides from user settings
+    alone, so overrides in the user directory's settings.json never reach it.
+    A directory that is not a VS Code user directory has no profiles.
+    """
+    try:
+        state = json.loads(
+            (user_dir / "globalStorage" / "storage.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return []
+    profiles = state.get("userDataProfiles") if isinstance(state, dict) else None
+    unrouted: list[tuple[str, Path]] = []
+    for profile in profiles if isinstance(profiles, list) else []:
+        if not isinstance(profile, dict):
+            continue
+        flags = profile.get("useDefaultFlags")
+        location = profile.get("location")
+        # VS Code names local profile folders hash(uuid).toString(16); any other
+        # location (a remote URI) is not a folder under profiles/.
+        if (isinstance(flags, dict) and flags.get("settings")) or not (
+            isinstance(location, str) and re.fullmatch(r"[\w-]+", location)
+        ):
+            continue
+        path = user_dir / "profiles" / location / "settings.json"
+        try:
+            settings = _parse_settings(_read_settings(path))
+        except (OSError, ValueError, click.ClickException):
+            settings = None
+        # Only live settings count: the managed-block marker is itself a comment.
+        if isinstance(settings, dict) and _PROXY_KEY in settings and _CAPI_KEY in settings:
+            continue
+        name = profile.get("name")
+        unrouted.append((name if isinstance(name, str) else location, path))
+    return unrouted

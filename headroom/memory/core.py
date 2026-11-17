@@ -9,11 +9,12 @@ embedding, indexing, caching, and memory bubbling.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from headroom.memory.config import MemoryConfig
-from headroom.memory.factory import create_memory_system
+from headroom.memory.factory import _adapt_text_search, create_memory_system
 from headroom.memory.models import Memory, ScopeLevel
 from headroom.memory.ports import MemoryFilter, TextFilter, VectorFilter
 
@@ -95,6 +96,7 @@ class HierarchicalMemory:
         self._store = store
         self._vector_index = vector_index
         self._text_index = text_index
+        self._search_text = _adapt_text_search(text_index)
         self._embedder = embedder
         self._cache = cache
         self._config = config or MemoryConfig()
@@ -187,6 +189,8 @@ class HierarchicalMemory:
             embedding = await self._embedder.embed(content)
             memory.embedding = embedding
 
+        self._validate_embedding(memory)
+
         # Save to store
         await self._store.save(memory)
 
@@ -254,6 +258,10 @@ class HierarchicalMemory:
             embeddings = await self._embedder.embed_batch(texts)
             for memory, embedding in zip(memories, embeddings):
                 memory.embedding = embedding
+
+        # Validate the whole batch before persisting any of its rows.
+        for memory in memories:
+            self._validate_embedding(memory)
 
         # Batch save
         await self._store.save_batch(memories)
@@ -438,7 +446,7 @@ class HierarchicalMemory:
             limit=limit,
         )
 
-        return await self._text_index.search(text_filter)
+        return await self._search_text(text_filter)
 
     # =========================================================================
     # Memory Updates
@@ -475,6 +483,11 @@ class HierarchicalMemory:
         content_changed = False
 
         if content is not None and content != memory.content:
+            # Validate before mutating a possibly shared store/cache object.
+            if re_embed:
+                embedding = await self._embedder.embed(content)
+                self._validate_embedding(replace(memory, embedding=embedding))
+                memory.embedding = embedding
             memory.content = content
             content_changed = True
 
@@ -486,10 +499,6 @@ class HierarchicalMemory:
 
         if metadata is not None:
             memory.metadata.update(metadata)
-
-        # Re-embed if content changed
-        if content_changed and re_embed:
-            memory.embedding = await self._embedder.embed(memory.content)
 
         # Save updates
         await self._store.save(memory)
@@ -577,6 +586,8 @@ class HierarchicalMemory:
         # Embed new content
         if auto_embed:
             new_memory.embedding = await self._embedder.embed(new_content)
+
+        self._validate_embedding(new_memory)
 
         # Perform supersession in store
         new_memory = await self._store.supersede(old_memory_id, new_memory, supersede_time)
@@ -790,14 +801,14 @@ class HierarchicalMemory:
     async def get_user_memories(
         self,
         user_id: str,
-        limit: int = 100,
+        limit: int | None = 100,
         include_sessions: bool = True,
     ) -> list[Memory]:
         """Get all memories for a user.
 
         Args:
             user_id: User identifier.
-            limit: Maximum memories to return.
+            limit: Maximum memories to return, or None for all matching memories.
             include_sessions: If True, include session-level memories.
                             If False, only return user-level memories.
 
@@ -840,6 +851,17 @@ class HierarchicalMemory:
     # =========================================================================
     # Internal Methods
     # =========================================================================
+
+    def _validate_embedding(self, memory: Memory) -> None:
+        """Reject incompatible vectors before changing the primary store."""
+        if memory.embedding is not None and memory.embedding.shape != (
+            self._vector_index.dimension,
+        ):
+            raise ValueError(
+                f"Embedding shape {memory.embedding.shape} does not match "
+                f"index dimension {self._vector_index.dimension}; configure vector_dimension "
+                "to match the embedder"
+            )
 
     async def _index_for_text_search(self, memory: Memory) -> None:
         """Index a memory for full-text search.
@@ -893,15 +915,6 @@ class HierarchicalMemory:
         logger.debug(
             f"Bubbled memory {memory.id} from {current_scope.value} to {target_scope.value}"
         )
-
-    def _scope_level_value(self, level: ScopeLevel) -> int:
-        """Get numeric value for scope level (lower = broader scope)."""
-        return {
-            ScopeLevel.USER: 0,
-            ScopeLevel.SESSION: 1,
-            ScopeLevel.AGENT: 2,
-            ScopeLevel.TURN: 3,
-        }[level]
 
     # =========================================================================
     # Properties

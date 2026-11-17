@@ -131,3 +131,139 @@ describe("detectFormat", () => {
     expect(detectFormat(messages)).toBe("vercel");
   });
 });
+
+describe("detectFormat: Vercel media parts", () => {
+  it("detects a media-only Vercel turn with a file part", () => {
+    expect(
+      detectFormat([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+          ],
+        },
+      ]),
+    ).toBe("vercel");
+  });
+
+  it("detects a media-only Vercel turn with an image part", () => {
+    expect(
+      detectFormat([
+        { role: "user", content: [{ type: "image", image: new Uint8Array([137, 80, 78, 71]), mediaType: "image/png" }] },
+      ]),
+    ).toBe("vercel");
+  });
+
+  it("still treats OpenAI image_url parts as openai", () => {
+    expect(
+      detectFormat([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] }]),
+    ).toBe("openai");
+  });
+
+  it("still treats Anthropic image blocks (with a source) as anthropic", () => {
+    expect(
+      detectFormat([
+        { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }] },
+      ]),
+    ).toBe("anthropic");
+  });
+});
+
+describe("detectFormat: Anthropic document blocks", () => {
+  it("detects a turn whose only Anthropic marker is a document block", () => {
+    expect(
+      detectFormat([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Report" },
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } },
+          ],
+        },
+      ]),
+    ).toBe("anthropic");
+  });
+});
+
+describe("detectFormat: Anthropic thinking blocks", () => {
+  it("detects a turn whose only Anthropic marker is a thinking block", () => {
+    const messages = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "...", signature: "SIG" },
+          { type: "text", text: "hello" },
+        ],
+      },
+    ];
+    expect(detectFormat(messages)).toBe("anthropic");
+  });
+
+  it("detects a turn whose only Anthropic marker is a redacted_thinking block", () => {
+    const messages = [
+      { role: "assistant", content: [{ type: "redacted_thinking", data: "REDACTED" }, { type: "text", text: "hello" }] },
+    ];
+    expect(detectFormat(messages)).toBe("anthropic");
+  });
+});
+
+describe("detectFormat: Vercel reasoning parts and providerOptions", () => {
+  it("detects a turn whose only Vercel marker is a reasoning part", () => {
+    const messages = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "reasoning", text: "..." }, { type: "text", text: "hello" }] },
+    ];
+    expect(detectFormat(messages)).toBe("vercel");
+  });
+
+  it("detects a message-level providerOptions key as Vercel", () => {
+    const messages = [{ role: "user", content: "hi", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } }];
+    expect(detectFormat(messages)).toBe("vercel");
+  });
+});
+
+describe("detectFormat: OpenAI content markers outrank message-level providerOptions", () => {
+  // The public OpenAI message types allow `providerOptions`, so the key alone must not route
+  // an OpenAI conversation through the Vercel converter, which keeps only text/image/file parts.
+  it("keeps an OpenAI user message with providerOptions and an image_url part as openai", () => {
+    const messages = [
+      {
+        role: "user",
+        providerOptions: { openai: {} },
+        content: [
+          { type: "text", text: "Describe this" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+        ],
+      },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+
+  it("keeps an OpenAI user message with providerOptions and a file part (file object) as openai", () => {
+    const messages = [
+      {
+        role: "user",
+        providerOptions: { openai: {} },
+        content: [{ type: "text", text: "Summarize" }, { type: "file", file: { file_id: "file-abc" } }],
+      },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+
+  it("keeps an OpenAI user message with providerOptions and an input_audio part as openai", () => {
+    const messages = [
+      { role: "user", providerOptions: { openai: {} }, content: [{ type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }] },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+
+  it("lets an image_url part on a later message outrank providerOptions on an earlier one", () => {
+    const messages = [
+      { role: "system", content: "You describe images.", providerOptions: { openai: {} } },
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/cat.png" } }] },
+    ];
+    expect(detectFormat(messages)).toBe("openai");
+  });
+});

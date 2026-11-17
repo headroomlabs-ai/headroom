@@ -147,12 +147,15 @@ impl OffloadTransform for JsonOffload {
         content: &str,
         ctx: &CompressionContext,
         store: &dyn CcrStore,
+        ccr_source: &str,
     ) -> Result<OffloadOutput, TransformError> {
         let prose = &self.prose;
         let prose_hook = |leaf: &str, query: &str| {
             let leaf_ctx = CompressionContext::with_query(query);
+            // Each leaf is its own CCR source: its marker resolves to the
+            // leaf text the crusher saw.
             prose
-                .apply(leaf, &leaf_ctx, store)
+                .apply(leaf, &leaf_ctx, store, leaf)
                 .ok()
                 .map(|output| (output.output, output.cache_key))
         };
@@ -173,9 +176,10 @@ impl OffloadTransform for JsonOffload {
         // through the orchestrator-supplied store, append a marker so
         // the LLM sees a resolvable handle. SmartCrusher's per-array
         // markers in `result.compressed` stay informational — the LLM
-        // retrieves the full original via this outer hash.
-        let key = md5_hex_24(content);
-        store.put(&key, content);
+        // retrieves the full original via this outer hash. The hash and
+        // stored payload come from `ccr_source` (the pipeline input).
+        let key = md5_hex_24(ccr_source);
+        store.put(&key, ccr_source);
         let mut output = result.compressed;
         output.push_str("\n[json_offload CCR: hash=");
         output.push_str(&key);
@@ -298,7 +302,7 @@ mod tests {
         let input = serde_json::json!([{"description": diff}]).to_string();
         let store = InMemoryCcrStore::new();
         let output = offload()
-            .apply(&input, &CompressionContext::default(), &store)
+            .apply(&input, &CompressionContext::default(), &store, &input)
             .expect("diff-shaped leaf should still process through the direct offload path");
         let marker = output
             .output
@@ -318,7 +322,12 @@ mod tests {
         let input = serde_json::json!([{"summary": html}]).to_string();
         let store = InMemoryCcrStore::new();
         let result = offload()
-            .apply(&input, &CompressionContext::with_query("recovery"), &store)
+            .apply(
+                &input,
+                &CompressionContext::with_query("recovery"),
+                &store,
+                &input,
+            )
             .expect("structured html should still process");
         assert!(result.output.contains(",html,"));
     }
@@ -424,7 +433,7 @@ mod tests {
         let arr = build_tabular_array(500);
         let store = InMemoryCcrStore::new();
         let r = offload()
-            .apply(&arr, &CompressionContext::default(), &store)
+            .apply(&arr, &CompressionContext::default(), &store, &arr)
             .expect("smart crusher should compress");
         assert!(r.bytes_saved > 0);
         assert!(!r.cache_key.is_empty());
@@ -441,7 +450,7 @@ mod tests {
         let arr = build_tabular_array(2);
         let store = InMemoryCcrStore::new();
         let err = offload()
-            .apply(&arr, &CompressionContext::default(), &store)
+            .apply(&arr, &CompressionContext::default(), &store, &arr)
             .expect_err("must skip");
         match err {
             TransformError::Skipped { transform, .. } => assert_eq!(transform, "json_offload"),
@@ -454,7 +463,12 @@ mod tests {
     fn apply_skipped_for_non_json_input() {
         let store = InMemoryCcrStore::new();
         let err = offload()
-            .apply("not json at all", &CompressionContext::default(), &store)
+            .apply(
+                "not json at all",
+                &CompressionContext::default(),
+                &store,
+                "not json at all",
+            )
             .expect_err("must skip non-json");
         match err {
             TransformError::Skipped { .. } => {}
@@ -487,7 +501,7 @@ mod tests {
         let store = InMemoryCcrStore::new();
         let ctx = CompressionContext::with_query("needle");
         let r = offload()
-            .apply(&s, &ctx, &store)
+            .apply(&s, &ctx, &store, &s)
             .expect("crusher should run");
         // Output should reference "needle" — SmartCrusher's anchor logic
         // should keep that row.
@@ -503,10 +517,10 @@ mod tests {
         let store_a = InMemoryCcrStore::new();
         let store_b = InMemoryCcrStore::new();
         let r_a = offload()
-            .apply(&arr, &CompressionContext::default(), &store_a)
+            .apply(&arr, &CompressionContext::default(), &store_a, &arr)
             .expect("ok");
         let r_b = offload()
-            .apply(&arr, &CompressionContext::default(), &store_b)
+            .apply(&arr, &CompressionContext::default(), &store_b, &arr)
             .expect("ok");
         assert_eq!(
             r_a.cache_key, r_b.cache_key,

@@ -6,77 +6,54 @@
 //! - Build/log output       → LogCompressor
 //! - Search-result tool_results → SearchCompressor
 //! - Git diff tool_results  → DiffCompressor
-//! - Source code            → no-op (Rust port pending)
+//! - Source code            → CodeAwareCompressor
 //! - Unknown / image / html → no-op
 //!
 //! Plus the cache-safety invariant: bytes outside the rewritten
 //! block are byte-identical to the input (SHA-256 prefix + suffix).
 
-use headroom_core::transforms::live_zone::DEFAULT_MODEL;
-use headroom_core::transforms::{
-    compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome,
+mod common;
+
+use common::{
+    body_with_tool_result, dispatch, go_handlers_source, kompress_available, python_module_source,
+    sha256, tool_result_action,
 };
+use headroom_core::transforms::{BlockAction, LiveZoneOutcome};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
-fn body_of(value: Value) -> Vec<u8> {
-    serde_json::to_vec(&value).unwrap()
-}
+/// The script from #4214 (a fenced Python snippet whose keywords Kompress
+/// deleted). The reporter's own fence is not published; this reconstruction
+/// keeps the lines quoted in the issue and parses as Python.
+const ISSUE_4214_SCRIPT: &str = r#"import json, collections
 
-fn dispatch(body: &[u8]) -> LiveZoneOutcome {
-    compress_anthropic_live_zone(body, 0, AuthMode::Payg, DEFAULT_MODEL)
-        .expect("dispatcher returns Ok on valid bodies")
-}
-
-/// Find the byte range of the FIRST occurrence of `needle` inside
-/// `haystack`. Used by the byte-fidelity test below to identify the
-/// JSON-encoded tool_result.content slot we expect the dispatcher to
-/// rewrite. Returns `(start, end)` half-open.
-fn find_byte_range(haystack: &[u8], needle: &[u8]) -> (usize, usize) {
-    let pos = haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .unwrap_or_else(|| {
-            panic!(
-                "needle of {} bytes not found in haystack of {} bytes",
-                needle.len(),
-                haystack.len()
-            )
-        });
-    (pos, pos + needle.len())
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().into()
-}
-
-/// Build a body with one user message containing one `tool_result`
-/// whose `content` is `text`. Returns the full body and the byte
-/// range of the JSON-encoded `content` slot (including the surrounding
-/// quotes) within that body — useful for byte-fidelity assertions.
-fn body_with_tool_result(text: &str) -> (Vec<u8>, (usize, usize)) {
-    let body = body_of(json!({
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 64,
-        "system": "you are a helpful assistant",
-        "messages": [{
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "toolu_dispatch_test",
-                "content": text,
-            }],
-        }],
-    }));
-    // The JSON-encoded `content` slot is exactly `serde_json::to_vec(&text)`,
-    // since text is shorter than the whole body and serde uses the same
-    // encoding for the embedded string.
-    let needle = serde_json::to_vec(&text).unwrap();
-    let range = find_byte_range(&body, &needle);
-    (body, range)
-}
+d = json.load(open('turns.json'))
+segs=[s for s in open('segs.txt').read().split() if s]
+def load(path):
+    try:
+        return json.load(open(path))
+    except Exception as e: return None
+for i,s in enumerate(segs):
+    t0=(d or {}).get('turns') or []
+    if not t0 or len(t0) < 2:
+        continue
+    else:
+        label = s if s else 'unknown'
+    counts = collections.Counter(x.get('role') for x in t0)
+    for role, n in counts.items():
+        if n > 1 or role == 'tool':
+            print(i, label, role, n)
+        else:
+            print(i, label, role)
+    total = sum(counts.values())
+    if total > 10 or label == 'big':
+        print('large session', label, total)
+    out = [k for k in counts if counts[k] > 0]
+    print(json.dumps(out))
+summary = {s: i for i, s in enumerate(segs)}
+for k, v in summary.items():
+    if v % 2 == 0 or k.startswith('a'):
+        print(k, v)
+print('done', len(segs))"#;
 
 // ─── Routing tests ─────────────────────────────────────────────────────
 
@@ -262,29 +239,147 @@ fn diff_tool_result_routes_to_diff_compressor() {
 }
 
 #[test]
-fn source_code_tool_result_routes_to_no_op() {
-    // Detector classifies this as SourceCode. PR-B3 routes it to
-    // no-op (Rust code-compressor port pending). Pin the contract
-    // so a future "wire it up" PR can flip this assertion.
-    let code = "
-fn main() {
-    let x: i32 = 42;
-    let y = x * 2;
-    println!(\"{}\", y);
-    if x > 0 {
-        println!(\"positive\");
-    } else {
-        println!(\"non-positive\");
+fn source_code_tool_result_routes_to_code_compressor() {
+    // Detector classifies this as SourceCode. PR-B4 wires the arm up to
+    // the tree-sitter-backed CodeAwareCompressor. This flips the PR-B3
+    // pin ("a future 'wire it up' PR can flip this assertion").
+    let code = python_module_source(10);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+
+    let (body, _) = body_with_tool_result(&code);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        LiveZoneOutcome::NoChange { manifest } => panic!(
+            "expected CodeAwareCompressor to shrink a 10-function Python module; got NoChange. manifest: {manifest:?}"
+        ),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::Compressed {
+            strategy,
+            original_tokens,
+            compressed_tokens,
+            ..
+        } => {
+            assert_eq!(
+                strategy, "code_compressor",
+                "expected code_compressor dispatch"
+            );
+            assert!(
+                compressed_tokens < original_tokens,
+                "tokenizer-validated gate (PR-B4) must accept only token-shrinking output \
+                 ({compressed_tokens} < {original_tokens})"
+            );
+        }
+        other => panic!("expected BlockAction::Compressed, got {other:?}"),
     }
 }
-"
-    .repeat(20);
+
+#[test]
+fn source_code_declined_by_code_compressor_is_never_kompressed() {
+    // The code compressor leaves Go source untouched (exact passthrough).
+    // That must stay a NoOp: handing it to Kompress, a prose model, drops
+    // keywords such as `func`, `if` and `for` from the code (#4214). The
+    // warmup makes Kompress live when the model is cache-resident, so on
+    // such a host the old fallback would have rewritten this block.
+    let _ = kompress_available();
+    let code = go_handlers_source(30);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
     let (body, _) = body_with_tool_result(&code);
+
+    match dispatch(&body) {
+        LiveZoneOutcome::NoChange { manifest } => {
+            let action = manifest
+                .block_outcomes
+                .iter()
+                .find(|b| b.block_type == "tool_result")
+                .expect("tool_result block present")
+                .action
+                .clone();
+            assert!(
+                matches!(&action, BlockAction::NoCompressionApplied { content_type } if content_type == "source_code"),
+                "expected a source_code NoOp, got {action:?}"
+            );
+        }
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "a declined source-code block must be forwarded unchanged, not rewritten. manifest: {manifest:?}"
+        ),
+    }
+}
+
+#[test]
+fn issue_4214_script_is_never_kompressed() {
+    // The Python script quoted in #4214, repeated until the block clears the
+    // SourceCode threshold. The code compressor may shrink it (it keeps the
+    // keywords) or leave it alone, but the prose model must never rewrite it.
+    // A guard rather than a discriminator: the code compressor already handles
+    // Python, so this passes before the fix too; the Go test above is the one
+    // that fails without it.
+    let _ = kompress_available();
+    let code = format!("{ISSUE_4214_SCRIPT}\n").repeat(3);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold"
+    );
+    let (body, _) = body_with_tool_result(&code);
+
+    match dispatch(&body) {
+        LiveZoneOutcome::NoChange { .. } => {}
+        LiveZoneOutcome::Modified { manifest, .. } => match tool_result_action(&manifest) {
+            BlockAction::Compressed { strategy, .. } => assert_eq!(
+                strategy, "code_compressor",
+                "only the code compressor may rewrite the #4214 script"
+            ),
+            other => panic!("unexpected action {other:?}"),
+        },
+    }
+}
+
+#[test]
+fn tiny_source_code_below_threshold_no_op() {
+    // Detector classifies this as SourceCode, but it's well under the
+    // 2048-byte SourceCode threshold, so the dispatcher must not even
+    // spin up the CodeAwareCompressor.
+    let code = "\
+import os
+from typing import Any
+
+
+def add(a: int, b: int) -> int:
+    \"\"\"Add two integers.\"\"\"
+    return a + b
+
+
+if __name__ == \"__main__\":
+    print(add(1, 2))
+";
+    assert!(
+        code.len() < 2048,
+        "fixture must stay below the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+
+    let (body, _) = body_with_tool_result(code);
     let out = dispatch(&body);
     let manifest = match &out {
         LiveZoneOutcome::NoChange { manifest } => manifest,
         LiveZoneOutcome::Modified { manifest, .. } => {
-            panic!("PR-B3 must NOT compress SourceCode (Rust port pending). manifest: {manifest:?}")
+            panic!("tiny source-code block must not be compressed. manifest: {manifest:?}")
         }
     };
     let action = manifest
@@ -295,26 +390,119 @@ fn main() {
         .action
         .clone();
     match action {
-        BlockAction::NoCompressionApplied { content_type } => {
-            // Source-code-shaped content above the SourceCode byte
-            // threshold (2 KiB) but below any active compressor:
-            // SmartCrusher / log / search / diff don't apply, and
-            // the Rust code-compressor port is not yet wired.
-            assert!(
-                content_type == "source_code" || content_type == "text",
-                "unexpected content_type tag: {content_type}"
-            );
+        BlockAction::BelowByteThreshold {
+            content_type,
+            threshold_bytes,
+            ..
+        } => {
+            assert_eq!(threshold_bytes, 2048, "expected the SourceCode threshold");
+            assert_eq!(content_type, "source_code", "unexpected content_type tag");
         }
-        BlockAction::BelowByteThreshold { content_type, .. } => {
-            // Detector may classify code-with-prose as PlainText
-            // (5 KiB threshold) — for ~2.6 KiB of mixed code/prose
-            // that still routes to no-op for B4. Pin the tag.
-            assert!(
-                content_type == "text" || content_type == "source_code",
-                "unexpected content_type tag: {content_type}"
-            );
+        other => panic!("expected BelowByteThreshold, got {other:?}"),
+    }
+}
+
+#[test]
+fn plain_text_below_threshold_no_op() {
+    // Plain prose, well under the 5120-byte PlainText threshold, so the
+    // dispatcher must not even attempt Kompress.
+    let prose = "The quarterly report highlighted steady growth across every \
+        region, with the operations team noting improved throughput on the \
+        warehouse floor and customer support tickets trending downward for \
+        the third month running. Leadership expects the trend to continue \
+        into next quarter, barring any supply chain disruptions.";
+    assert!(
+        prose.len() < 5120,
+        "fixture must stay below the PlainText byte threshold (5120); got {} bytes",
+        prose.len()
+    );
+
+    let (body, _) = body_with_tool_result(prose);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+        LiveZoneOutcome::Modified { manifest, .. } => {
+            panic!("sub-threshold plain text must not be compressed. manifest: {manifest:?}")
         }
-        other => panic!("expected NoCompressionApplied or BelowByteThreshold, got {other:?}"),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::BelowByteThreshold {
+            content_type,
+            threshold_bytes,
+            ..
+        } => {
+            assert_eq!(threshold_bytes, 5120, "expected the PlainText threshold");
+            assert_eq!(content_type, "text", "unexpected content_type tag");
+        }
+        other => panic!("expected BelowByteThreshold, got {other:?}"),
+    }
+}
+
+#[test]
+fn plain_text_routes_to_kompress_when_model_cached() {
+    // RUNTIME-SKIP: ask the loader itself whether the model is
+    // cache-resident, rather than re-deriving cache paths here. A
+    // hand-rolled probe has to be kept byte-compatible with
+    // `Kompress::from_cache`'s own root and artifact resolution, and
+    // when it drifts the skip becomes a lie — the test silently stops
+    // running on hosts where production would load the model.
+    if !kompress_available() {
+        eprintln!(
+            "SKIP: kompress model/tokenizer not cache-resident;              run `python scripts/record_kompress_trace.py` first"
+        );
+        return;
+    }
+
+    // Repetitive news-article-like prose: > 350 words so Kompress's
+    // chunk_words=350 chunking actually engages, and > 5120 bytes to
+    // clear the PlainText byte threshold.
+    let mut article = String::new();
+    for i in 0..60 {
+        article.push_str(&format!(
+            "City officials announced today that the downtown revitalization \
+             project will proceed as planned despite budget concerns raised \
+             during round {i} of public comment. "
+        ));
+    }
+    assert!(
+        article.split_whitespace().count() > 350,
+        "fixture must exceed 350 words so Kompress chunking engages; got {} words",
+        article.split_whitespace().count()
+    );
+    assert!(
+        article.len() > 5120,
+        "fixture must clear the PlainText byte threshold (5120); got {} bytes",
+        article.len()
+    );
+
+    let (body, _) = body_with_tool_result(&article);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        LiveZoneOutcome::NoChange { manifest } => panic!(
+            "expected Kompress to compress a {}-word repetitive article; got NoChange. manifest: {manifest:?}",
+            article.split_whitespace().count()
+        ),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::Compressed { strategy, .. } => {
+            assert_eq!(strategy, "kompress", "expected kompress dispatch");
+        }
+        other => panic!("expected BlockAction::Compressed via kompress, got {other:?}"),
     }
 }
 

@@ -39,6 +39,16 @@ class TestCohereProvider:
         count = counter.count_text("Hello, world!")
         assert count > 0
 
+    def test_get_token_counter_is_cached_per_model(self, provider):
+        """Counters are memoized per model so their internal token-count cache
+        survives across requests, matching the Anthropic/OpenAI providers."""
+        first = provider.get_token_counter("command-r-plus")
+        assert provider.get_token_counter("command-r-plus") is first
+        # A different model gets its own counter.
+        other = provider.get_token_counter("command-r")
+        assert other is not first
+        assert provider.get_token_counter("command-r") is other
+
     def test_get_context_limit_command_a(self, provider):
         """Test context limit for Command A (256K)."""
         limit = provider.get_context_limit("command-a")

@@ -30,10 +30,37 @@ class IdentityResolver(Protocol):
 _resolver: IdentityResolver | None = None
 
 
+class UnresolvedPrincipalError(LookupError):
+    """An installed identity resolver could not establish a principal."""
+
+
 def set_identity_resolver(resolver: IdentityResolver | None) -> None:
     """Install (or clear) a custom identity resolver — the enterprise hook."""
     global _resolver
     _resolver = resolver
+
+
+def resolve_authenticated_principal(request: Any) -> str | None:
+    """Return the authenticated principal for ``request``, or ``None``.
+
+    Only a registered custom resolver (see :func:`set_identity_resolver`)
+    establishes a real per-caller identity. The OSS default binds every
+    network caller to the same proxy-token identity and lets loopback callers
+    *choose* a partition by header, so neither is an authenticated principal
+    and both return ``None`` here. Callers that must isolate data between
+    principals (e.g. the response cache) combine this with the caller's own
+    provider credential rather than trusting the default identity.
+
+    An installed resolver that raises, or returns no principal, means the
+    principal is unknown rather than absent: this raises so the caller fails
+    closed instead of silently sharing data across principals.
+    """
+    if _resolver is None:
+        return None
+    principal = _resolver(request, default="")
+    if not principal:
+        raise UnresolvedPrincipalError("identity resolver returned no principal")
+    return principal
 
 
 def _default_os_user() -> str:

@@ -124,6 +124,7 @@ else:
     crontab.chmod(crontab.stat().st_mode | stat.S_IXUSR)
 
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent))
     monkeypatch.setenv("PATH", str(bin_dir))
@@ -181,6 +182,10 @@ def _assert_wrapper_unchanged(models: Path, models_bytes: bytes, backup_bytes: b
     assert backup_path(models).read_bytes() == backup_bytes
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="lifecycle harness requires POSIX shebangs, chmod, and symlinks",
+)
 def test_pi_omp_durable_lifecycle_is_idempotent_and_wrapper_safe(
     monkeypatch: pytest.MonkeyPatch, isolated_hosts: dict[str, Path]
 ) -> None:
@@ -297,6 +302,10 @@ def test_pi_omp_durable_lifecycle_is_idempotent_and_wrapper_safe(
     assert versions == ["0.34.0", "0.34.0", "0.35.0", "0.35.0", "0.34.0", "0.34.0"]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="lifecycle harness requires POSIX shebangs, chmod, and symlinks",
+)
 def test_preexisting_pi_package_is_never_removed(
     monkeypatch: pytest.MonkeyPatch, isolated_hosts: dict[str, Path]
 ) -> None:

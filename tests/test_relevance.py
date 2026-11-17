@@ -148,6 +148,21 @@ class TestBM25Scorer:
         assert scores[0].matched_terms == ["alpha"]
         assert sorted(scores[1].matched_terms) == ["alpha", "beta"]
 
+    def test_precomputed_query_freq_matches_recomputed(self):
+        """Passing a precomputed Counter(query_tokens) into ``_bm25_score``
+        must yield identical (score, matched_terms) to letting it recompute
+        the Counter itself. ``score_batch`` relies on this to count the shared
+        context once instead of once per item."""
+        from collections import Counter
+
+        scorer = BM25Scorer()
+        doc_tokens = scorer._tokenize("alpha beta beta gamma id-9c1f2a3b4d5e")
+        query_tokens = scorer._tokenize("beta gamma id-9c1f2a3b4d5e delta")
+
+        recomputed = scorer._bm25_score(doc_tokens, query_tokens)
+        with_freq = scorer._bm25_score(doc_tokens, query_tokens, query_freq=Counter(query_tokens))
+        assert with_freq == recomputed
+
 
 class TestEmbeddingScorer:
     """Tests for embedding-based semantic scorer."""
@@ -170,6 +185,20 @@ class TestEmbeddingScorer:
         scores = scorer.score_batch(items, context)
         # "failed"/"error" semantically relates to "errors"
         assert scores[0].score > scores[1].score
+
+    def test_batches_past_the_cap_keep_each_score_with_its_item(self, scorer):
+        """Three EMBED_BATCH_SIZE batches of mixed lengths, the related item in
+        the last: a misaligned batch boundary would hand its score away."""
+        items = [
+            f"inventory row {i}: " + "pallets of garden furniture " * (i % 5 + 1) for i in range(40)
+        ]
+        items[37] = "authentication failed for user admin: invalid password"
+
+        scores = [s.score for s in scorer.score_batch(items, "login error")]
+        assert len(scores) == 40
+        assert max(range(40), key=scores.__getitem__) == 37
+        for item, batched in zip(items, scores):
+            assert batched == pytest.approx(scorer.score(item, "login error").score, abs=1e-3)
 
     def test_paraphrase_match(self, scorer):
         """Embeddings match paraphrases."""

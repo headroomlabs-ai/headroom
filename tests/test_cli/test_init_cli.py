@@ -8,6 +8,7 @@ import os
 import sys
 import types
 from contextlib import contextmanager
+from hashlib import sha1
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,19 @@ import pytest
 from click.testing import CliRunner
 
 from headroom.install.models import DeploymentManifest
+from headroom.install.paths import _PROFILE_RE as PROFILE_RE
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_home(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user-home")
+
+
+@pytest.fixture(autouse=True)
+def _ensure_getuid(monkeypatch) -> None:
+    """Tests fake sys.platform='darwin' even on Windows, where os.getuid is absent."""
+    if not hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -135,6 +149,7 @@ def test_native_init_uses_shared_profile_and_task(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     manifest = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["pi"],
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         artifacts=[],
@@ -191,6 +206,7 @@ def test_explicit_omp_init_dispatches_native_host(monkeypatch) -> None:
 def native_manifest(init_cli, targets, artifacts):
     return SimpleNamespace(
         profile=init_cli._GLOBAL_PROFILE,
+        service_name=f"headroom-{init_cli._GLOBAL_PROFILE}",
         targets=list(targets),
         supervisor_kind=init_cli.SupervisorKind.TASK.value,
         artifacts=list(artifacts),
@@ -682,6 +698,7 @@ def test_native_config_publish_then_failure_restores_raw_snapshot(
     config_path.write_bytes(original)
     manifest = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["pi"],
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         artifacts=[],
@@ -717,6 +734,7 @@ def test_native_config_rollback_preserves_concurrent_change_and_combines_error(
     config_path.write_bytes(original)
     manifest = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["pi"],
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         artifacts=[],
@@ -750,6 +768,7 @@ def test_native_init_failure_rolls_back_package_config_task_and_manifest(
     init_cli, _ = _load_init_module(monkeypatch)
     previous = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["claude", "pi"],
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         artifacts=[],
@@ -836,6 +855,7 @@ def test_native_init_combines_initiating_and_rollback_failures(monkeypatch) -> N
     init_cli, _ = _load_init_module(monkeypatch)
     manifest = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["pi"],
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         artifacts=[],
@@ -890,6 +910,7 @@ def test_repeated_native_init_deduplicates_artifacts_and_task_records(monkeypatc
     task = init_cli.ArtifactRecord("crontab", "user:init-user")
     manifest = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["pi"],
         supervisor_kind=init_cli.SupervisorKind.TASK.value,
         artifacts=[package, config, task],
@@ -1362,6 +1383,7 @@ def test_native_running_but_unready_runtime_is_restored_and_verified(monkeypatch
     init_cli, _ = _load_init_module(monkeypatch)
     previous = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         supervisor_kind="none",
         artifacts=[],
         health_url="http://ready",
@@ -1369,6 +1391,7 @@ def test_native_running_but_unready_runtime_is_restored_and_verified(monkeypatch
     )
     manifest = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["pi"],
         supervisor_kind="none",
         artifacts=[],
@@ -1409,6 +1432,7 @@ def test_native_running_but_unready_runtime_is_restored_and_verified(monkeypatch
 def test_native_runtime_restoration_polls_delayed_transitions(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     manifest = SimpleNamespace(profile="init-user", preset="persistent-task")
+    service_name="headroom-init-user",
     statuses = iter(["running", "stopped", "stopped", "running"])
     calls: list[str] = []
     monkeypatch.setattr(init_cli, "runtime_status", lambda value: next(statuses))
@@ -1424,6 +1448,7 @@ def test_native_runtime_restoration_polls_delayed_transitions(monkeypatch) -> No
 def test_native_runtime_restoration_reports_stop_timeout(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     manifest = SimpleNamespace(profile="init-user", preset="persistent-task")
+    service_name="headroom-init-user",
     monkeypatch.setattr(init_cli, "runtime_status", lambda value: "running")
     monkeypatch.setattr(init_cli.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(init_cli, "stop_runtime", lambda value: None)
@@ -1436,6 +1461,7 @@ def test_native_runtime_restart_failure_is_combined(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     previous = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         supervisor_kind="none",
         artifacts=[],
         health_url="http://ready",
@@ -1486,6 +1512,7 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
     init_cli, _ = _load_init_module(monkeypatch)
     previous = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         supervisor_kind="none",
         artifacts=[],
         health_url="http://ready",
@@ -1493,6 +1520,7 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
     )
     manifest = SimpleNamespace(
         profile="init-user",
+        service_name="headroom-init-user",
         targets=["pi"],
         supervisor_kind="none",
         artifacts=[],
@@ -1906,6 +1934,7 @@ def test_init_codex_creates_hooks_feature_flag_on_first_init(
     parsed = tomllib.loads(content)
     assert parsed["model_provider"] == "headroom"
     assert parsed["features"]["hooks"] is True
+    assert parsed["model_providers"]["headroom"]["name"] == "OpenAI"
     assert "codex_hooks" not in content
 
 
@@ -2130,6 +2159,46 @@ def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Pa
     assert session_entries[-1]["hooks"][0]["command"].endswith("--marker headroom-init-claude")
 
 
+def test_ensure_claude_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    """The external hook timeout must stay above the internal wait_ready(45s)
+    call _ensure_profile_running makes after a cold start (#3417), or the host
+    kills the hook before a first-ever proxy start can ever report ready."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_claude_hooks(settings_path, "init-local-demo", 9001)
+
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        timeout = payload["hooks"][event][-1]["hooks"][0]["timeout"]
+        assert timeout > 45
+
+
+def test_ensure_copilot_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    config_path = tmp_path / "copilot.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_copilot_hooks(config_path, "init-user")
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["timeout"] > 45
+
+
+def test_ensure_codex_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "hooks.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_codex_hooks(path, "init-user")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["hooks"][0]["timeout"] > 45
+
+
 def test_ensure_copilot_hooks_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     config_path = tmp_path / "copilot.json"
@@ -2207,7 +2276,7 @@ def test_ensure_codex_provider_replaces_existing_marker(monkeypatch, tmp_path: P
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
     path.write_text(
-        f"prefix\n{init_cli._CODEX_PROVIDER_MARKER_START}\nold = true\n{init_cli._CODEX_PROVIDER_MARKER_END}\n",
+        f"# prefix\n{init_cli._CODEX_PROVIDER_MARKER_START}\nold = true\n{init_cli._CODEX_PROVIDER_MARKER_END}\n",
         encoding="utf-8",
     )
 
@@ -2290,10 +2359,59 @@ def test_ensure_codex_provider_preserves_profile_overrides(monkeypatch, tmp_path
     assert parsed["profiles"]["work"]["openai_base_url"] == "https://azure.example/v1"
 
 
+def test_ensure_codex_provider_preserves_multiline_inline_profile_overrides(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A profile in a multi-line inline table (TOML 1.1) keeps its provider."""
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'model_provider = "openai"\n'
+        "profiles = {\n"
+        "  work = {\n"
+        '    model_provider = "company",\n'
+        '    openai_base_url = "https://company.example/v1",\n'
+        "  },\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["model_provider"] == "headroom"
+    assert parsed["profiles"]["work"] == {
+        "model_provider": "company",
+        "openai_base_url": "https://company.example/v1",
+    }
+
+
+@pytest.mark.parametrize("sep", [" ", "\x85"])
+def test_ensure_codex_provider_keeps_single_line_string_with_unicode_separator(
+    monkeypatch, tmp_path: Path, sep: str
+) -> None:
+    """Provider-looking text after U+2028/U+0085 in a string stays in the value."""
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    notes = f'hello{sep}model_provider = "company"{sep}world'
+    path.write_text(f"notes = '{notes}'\n\n[features]\nhooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["notes"] == notes
+    assert parsed["model_provider"] == "headroom"
+
+
 def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
     monkeypatch, tmp_path: Path
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     path = tmp_path / "config.toml"
     (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
 
@@ -2306,12 +2424,17 @@ def test_ensure_codex_provider_omits_requires_openai_auth_for_api_key(
     monkeypatch, tmp_path: Path
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     path = tmp_path / "config.toml"
-    (tmp_path / "auth.json").write_text('{"auth_mode": "apikey"}', encoding="utf-8")
+    (tmp_path / "auth.json").write_text(
+        '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+    )
 
     init_cli._ensure_codex_provider(path, 8787)
 
     assert "requires_openai_auth" not in path.read_text(encoding="utf-8")
+    assert "auth = { command =" in path.read_text(encoding="utf-8")
+    assert "sk-test-only" not in path.read_text(encoding="utf-8")
 
 
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
@@ -2328,6 +2451,76 @@ def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_pat
     assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
     assert "hooks = true" in content
     assert "codex_hooks" not in content
+
+
+@pytest.mark.parametrize("sep", [" ", "\x85"])
+def test_ensure_codex_feature_flag_keeps_single_line_string_with_unicode_separator(
+    monkeypatch, tmp_path: Path, sep: str
+) -> None:
+    from headroom.providers.codex.config_toml import loads_codex_config
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    notes = f"hello{sep}codex_hooks = true{sep}world"
+    path.write_text(f"[features]\nnotes = '{notes}'\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = loads_codex_config(path.read_text(encoding="utf-8"))
+    assert parsed["features"] == {"notes": notes, "hooks": True}
+
+
+@pytest.mark.parametrize("custom_home", [False, True])
+@pytest.mark.parametrize("auth_mode", ["apikey", "chatgpt"])
+def test_local_codex_provider_reads_credentials_from_user_home(
+    monkeypatch, tmp_path: Path, custom_home: bool, auth_mode: str
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    codex_home = tmp_path / "custom" if custom_home else tmp_path / "home" / ".codex"
+    if custom_home:
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    codex_home.mkdir(parents=True)
+    (codex_home / "auth.json").write_text(
+        json.dumps({"auth_mode": auth_mode, "OPENAI_API_KEY": "sk-test-only"}),
+        encoding="utf-8",
+    )
+    project_config = tmp_path / "project" / ".codex" / "config.toml"
+
+    init_cli._ensure_codex_provider(project_config, 8787)
+
+    provider = tomllib.loads(project_config.read_text(encoding="utf-8"))["model_providers"][
+        "headroom"
+    ]
+    if auth_mode == "chatgpt":
+        assert provider["requires_openai_auth"] is True
+        assert "auth" not in provider
+    else:
+        assert "requires_openai_auth" not in provider
+        assert Path(provider["auth"]["args"][0]).parent == codex_home.resolve()
+    assert "sk-test-only" not in project_config.read_text(encoding="utf-8")
+
+
+def test_init_codex_helper_collision_leaves_provider_config_unchanged(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from headroom.providers.codex.install import codex_auth_helper_path
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    config = tmp_path / "config.toml"
+    original = 'model_provider = "openai"\n'
+    config.write_text(original, encoding="utf-8")
+    helper = codex_auth_helper_path(auth, config_path=config)
+    helper.write_text("user content", encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="Codex provider configuration was not updated"):
+        init_cli._ensure_codex_provider(config, 8787)
+
+    assert config.read_text(encoding="utf-8") == original
+    assert helper.read_text(encoding="utf-8") == "user content"
 
 
 def test_ensure_codex_feature_flag_replaces_marker_inside_features_scope(
@@ -2800,16 +2993,19 @@ def test_ensure_profile_running_covers_runtime_modes(monkeypatch) -> None:
         preset=init_cli.InstallPreset.PERSISTENT_DOCKER.value,
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         profile="docker-profile",
+        service_name="headroom-init-user",
     )
     service_manifest = SimpleNamespace(
         preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
         supervisor_kind=init_cli.SupervisorKind.SERVICE.value,
         profile="service-profile",
+        service_name="headroom-init-user",
     )
     task_manifest = SimpleNamespace(
         preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         profile="task-profile",
+        service_name="headroom-init-user",
     )
     manifests = {
         "docker-profile": docker_manifest,
@@ -2830,7 +3026,8 @@ def test_ensure_profile_running_covers_runtime_modes(monkeypatch) -> None:
 
     monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
 
-    def fake_wait_ready(manifest, timeout_seconds: int) -> bool:
+    def fake_wait_ready(manifest, timeout_seconds: int, require_identity: bool) -> bool:
+        assert require_identity is True
         wait_calls.append((manifest.profile, timeout_seconds))
         return False
 
@@ -2865,10 +3062,13 @@ def test_ensure_profile_running_suppresses_hook_recovery_output(monkeypatch, cap
         preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
         supervisor_kind=init_cli.SupervisorKind.SERVICE.value,
         profile="service-profile",
+        service_name="headroom-init-user",
     )
 
     monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
 
     def noisy_start_supervisor(manifest) -> None:
         print("python stdout")
@@ -2892,10 +3092,13 @@ def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) 
         preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         profile="task-profile",
+        service_name="headroom-init-user",
     )
     detached_calls: list[str] = []
     monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: True)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: True
+    )
     monkeypatch.setattr(
         init_cli,
         "start_detached_agent",
@@ -2911,7 +3114,9 @@ def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) 
 
     monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
     monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
     monkeypatch.setattr(
         init_cli,
         "start_detached_agent",
@@ -2926,6 +3131,7 @@ def test_ensure_profile_running_skips_spawn_when_start_lock_is_held(monkeypatch)
         preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         profile="task-profile",
+        service_name="headroom-init-user",
     )
     detached_calls: list[str] = []
 
@@ -2934,7 +3140,9 @@ def test_ensure_profile_running_skips_spawn_when_start_lock_is_held(monkeypatch)
         yield False
 
     monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
-    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
     monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
     monkeypatch.setattr(
         init_cli,
@@ -2953,6 +3161,7 @@ def test_ensure_profile_running_does_not_spawn_again_during_slow_startup(monkeyp
         preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
         supervisor_kind=init_cli.SupervisorKind.NONE.value,
         profile="task-profile",
+        service_name="headroom-init-user",
     )
     detached_calls: list[str] = []
     wait_calls: list[int] = []
@@ -2962,7 +3171,8 @@ def test_ensure_profile_running_does_not_spawn_again_during_slow_startup(monkeyp
     def fake_start_lock(profile: str):
         yield True
 
-    def fake_wait_ready(manifest, timeout_seconds: int) -> bool:
+    def fake_wait_ready(manifest, timeout_seconds: int, require_identity: bool) -> bool:
+        assert require_identity is True
         wait_calls.append(timeout_seconds)
         return bool(detached_calls and timeout_seconds == init_cli._STARTUP_READY_TIMEOUT_SECONDS)
 
@@ -3003,6 +3213,8 @@ def test_init_codex_windows_warns_about_upstream_hook_limitation(monkeypatch) ->
     init_cli._init_codex(global_scope=True, profile="init-user", port=9000)
 
     assert any("disabled upstream on Windows" in message for message in messages)
+    # Routing to a proxy nothing restarts must come with a way out (#3749).
+    assert any("headroom unwrap codex" in message for message in messages)
 
 
 def test_init_openclaw_propagates_nonzero_exit(monkeypatch) -> None:
@@ -3233,3 +3445,202 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
         f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
     )
     assert 'model = "gpt-4o"' in orphan_stripped
+
+
+@pytest.mark.parametrize(
+    "dir_name",
+    [
+        "Мастеринг в HW",
+        "项目",
+        "café-app",
+        "Ünicode Projekt",
+    ],
+)
+def test_local_profile_accepts_non_ascii_directory_names(monkeypatch, tmp_path, dir_name) -> None:
+    """A non-ASCII working directory must still yield a valid profile name.
+
+    ``str.isalnum`` is Unicode-aware, so Cyrillic/CJK/accented letters survived
+    into the slug and ``validate_profile_name`` then rejected it, making
+    ``headroom init`` unusable from such a directory.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    root = tmp_path / dir_name
+    root.mkdir()
+
+    profile = init_cli._local_profile(root)
+
+    assert PROFILE_RE.fullmatch(profile), profile
+    assert profile.startswith("init-")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX paths can hold non-UTF-8 bytes")
+def test_local_profile_handles_non_utf8_directory_names(monkeypatch) -> None:
+    """A directory name that is not valid UTF-8 must not crash profile derivation (#4267)."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    first = Path(os.fsdecode(b"/headroom-nonexistent/proj-\xff"))
+    second = Path(os.fsdecode(b"/headroom-nonexistent/proj-\xfe"))
+
+    first_profile = init_cli._local_profile(first)
+    second_profile = init_cli._local_profile(second)
+
+    assert PROFILE_RE.fullmatch(first_profile), first_profile
+    assert PROFILE_RE.fullmatch(second_profile), second_profile
+    assert first_profile != second_profile
+
+
+def test_local_profile_is_unchanged_for_ascii_directory_names(monkeypatch, tmp_path) -> None:
+    """The ASCII slug path keeps its existing output."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    root = tmp_path / "my-repo"
+    root.mkdir()
+
+    digest = sha1(str(root.resolve()).encode("utf-8")).hexdigest()[:8]
+    assert init_cli._local_profile(root) == f"init-my-repo-{digest}"
+
+
+def test_local_profile_distinguishes_identical_non_ascii_names(monkeypatch, tmp_path) -> None:
+    """Two folders sharing a fully non-ASCII name must not collide."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    first = tmp_path / "a" / "项目"
+    second = tmp_path / "b" / "项目"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    assert init_cli._local_profile(first) != init_cli._local_profile(second)
+
+
+def test_write_json_keeps_the_existing_file_when_the_write_fails(monkeypatch, tmp_path) -> None:
+    """``init`` rewrites user-owned files such as ~/.claude/settings.json.
+
+    A plain ``write_text`` truncates first, so a failure mid-write (ENOSPC,
+    SIGKILL) left a half-written file; the write must be atomic.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"theme": "dark"}\n', encoding="utf-8")
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("headroom.fsutil.os.fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="No space left"):
+        init_cli._write_json(settings, {"theme": "dark", "env": {"A": "1"}})
+
+    assert settings.read_text(encoding="utf-8") == '{"theme": "dark"}\n'
+    assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
+
+
+def test_ensure_profile_running_never_retries_wait_ready_without_identity(monkeypatch) -> None:
+    """A TypeError from wait_ready must surface, not trigger an unchecked retry.
+
+    A removed fallback caught TypeError and re-called wait_ready without
+    require_identity=True, silently dropping the runtime identity check.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        profile="task-profile",
+        service_name="headroom-init-user",
+    )
+    calls: list[dict[str, object]] = []
+
+    def strict_wait_ready(manifest, **kwargs) -> bool:
+        calls.append(kwargs)
+        if "require_identity" in kwargs:
+            raise TypeError("boom")
+        return False
+
+    @contextmanager
+    def held_lock(profile: str):
+        yield False
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "wait_ready", strict_wait_ready)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", held_lock)
+
+    with pytest.raises(TypeError, match="boom"):
+        init_cli._ensure_profile_running("task-profile")
+
+    assert calls == [{"timeout_seconds": 1, "require_identity": True}]
+
+
+def test_ensure_profile_running_logs_a_failed_recovery(monkeypatch, caplog) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.SERVICE.value,
+        profile="service-profile",
+        service_name="headroom-init-user",
+    )
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(init_cli, "runtime_ownership", lambda manifest: "service")
+    monkeypatch.setattr(
+        init_cli,
+        "wait_ready",
+        lambda manifest, timeout_seconds, require_identity: timeout_seconds == 45,
+    )
+    monkeypatch.setattr(init_cli, "start_supervisor", lambda manifest: None)
+
+    with caplog.at_level("WARNING", logger="headroom.cli.init"):
+        init_cli._ensure_profile_running("service-profile")
+    assert not [r for r in caplog.records if r.name == "headroom.cli.init"]
+
+    monkeypatch.setattr(
+        init_cli,
+        "start_supervisor",
+        lambda manifest: (_ for _ in ()).throw(RuntimeError("launchctl bootstrap failed")),
+    )
+    with caplog.at_level("WARNING", logger="headroom.cli.init"):
+        init_cli._ensure_profile_running("service-profile")
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "headroom.cli.init"]
+    assert messages == [
+        "headroom: could not start persistent proxy 'service-profile': launchctl bootstrap "
+        "failed. Check it with `headroom install status --profile service-profile`."
+    ]
+
+
+def test_ensure_profile_running_logs_a_recovery_that_never_becomes_ready(
+    monkeypatch, caplog
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        profile="task-profile",
+        service_name="headroom-init-user",
+    )
+    started: list[str] = []
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(init_cli, "runtime_ownership", lambda manifest: "task")
+    monkeypatch.setattr(
+        init_cli, "wait_ready", lambda manifest, timeout_seconds, require_identity: False
+    )
+    monkeypatch.setattr(init_cli, "start_detached_agent", started.append)
+
+    with caplog.at_level("WARNING", logger="headroom.cli.init"):
+        init_cli._ensure_profile_running("task-profile")
+
+    assert started == ["task-profile"]
+    messages = [r.getMessage() for r in caplog.records if r.name == "headroom.cli.init"]
+    assert messages == [
+        "headroom: could not start persistent proxy 'task-profile': it did not become ready "
+        "within 45s. Check it with `headroom install status --profile task-profile`."
+    ]

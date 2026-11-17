@@ -117,3 +117,36 @@ def test_result_falls_back_to_placeholder_without_text() -> None:
     out, n = strip_unsupported_ccr_retrieve_blocks(messages, tools=[])
     assert n == 2
     assert out[1]["content"][0] == {"type": "text", "text": "[headroom_retrieve result omitted]"}
+
+
+def test_parallel_retrieve_keeps_sibling_tool_result_first() -> None:
+    # headroom_retrieve issued in parallel with Bash, its result listed first.
+    # Neutralizing in place produced user [text, tool_result(Bash)], which
+    # Anthropic rejects: "`tool_use` ids were found without `tool_result`
+    # blocks immediately after".
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_ccr", "name": CCR_TOOL_NAME, "input": {}},
+                {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_ccr", "content": "expanded"},
+                {"type": "tool_result", "tool_use_id": "toolu_bash", "content": "ok"},
+                {"type": "text", "text": "keep going"},
+            ],
+        },
+    ]
+    out, n = strip_unsupported_ccr_retrieve_blocks(messages, tools=[{"name": "Bash"}])
+
+    assert n == 2
+    assert [b["type"] for b in out[0]["content"]] == ["text", "tool_use"]
+    assert out[1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "toolu_bash", "content": "ok"},
+        {"type": "text", "text": "expanded"},
+        {"type": "text", "text": "keep going"},
+    ]
