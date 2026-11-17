@@ -262,3 +262,14 @@ def test_value_factoring_round_trips_equals_in_column_names() -> None:
     factored = factor_values(_crush(records))
     assert "__dict:3" in factored
     assert expand_compacted(factored) == records
+
+
+def test_container_shaped_string_cells_round_trip() -> None:
+    # A string whose text is a JSON container (`"[]"`, `"{}"`, `"[1,2]"`) must come back as
+    # that string, not as the value it spells. #4053 fixed the scalar-looking case; containers
+    # were still un-escaped by the classifier, which made both render byte-identically.
+    values = [[], "[]", [1, 2], "[1,2]", {}, "{}"]
+    records = [{"id": i, "v": v} for i, v in enumerate(values * 10)]
+    block = _crush(records)
+    assert block, "expected the table to compact"
+    assert expand_compacted(block) == records
