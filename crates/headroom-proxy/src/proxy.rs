@@ -425,7 +425,17 @@ pub fn build_app(state: AppState) -> Router {
         );
     }
 
-    router.fallback(any(catch_all)).with_state(state)
+    // Inbound gate (caller locality + optional HEADROOM_PROXY_TOKEN).
+    // Applied last so it wraps every route and the fallback: the upstream
+    // Python proxy sees this process as a loopback caller and cannot tell
+    // who the real peer is itself.
+    let router = router
+        .fallback(any(catch_all))
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.proxy_token.clone(),
+            crate::inbound_auth::inbound_gate,
+        ));
+    router.with_state(state)
 }
 
 /// Catch-all handler. If the request is a WebSocket upgrade, hand off to the
@@ -645,6 +655,21 @@ pub(crate) async fn forward_http(
     if !state.config.rewrite_host {
         if let Some(h) = req.headers().get(http::header::HOST) {
             outgoing_headers.insert(http::header::HOST, h.clone());
+        }
+    }
+    // The upstream (the Python proxy) sees this process as a loopback
+    // peer; never also hand it a loopback Host for a caller that is not
+    // local here, or its local-only routes would treat that caller as local.
+    if req
+        .extensions()
+        .get::<crate::inbound_auth::NonLocalCaller>()
+        .is_some()
+    {
+        if let Some(host) = crate::inbound_auth::host_override_for_non_local(
+            outgoing_headers.get(http::header::HOST),
+            &state.config.upstream,
+        ) {
+            outgoing_headers.insert(http::header::HOST, host);
         }
     }
 
