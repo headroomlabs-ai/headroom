@@ -64,11 +64,19 @@ Public Python API: `OAuth2ClientCredentials`, `OAuth2Middleware`, `OAuth2Error`,
 
 | Failure | Behavior |
 |---|---|
-| Missing/invalid config at startup | `install()` raises -> proxy **fails closed** (won't start mis-auth'd) |
+| Missing/invalid config at startup | `install()` raises and is marked `fail_closed` -> **proxy refuses to start** (won't start mis-auth'd) |
 | Token endpoint unreachable / non-2xx / non-JSON / no `access_token` | `OAuth2Error` -> `502`, per-request, proxy stays up, retried next request |
 | `expires_in` = 0/negative/absent | clamped to a positive TTL (never stale, never per-request mint) |
 | Concurrent first requests | single-flight lock -> exactly one mint per refresh |
 | Malformed `HEADROOM_OAUTH2_HEADERS` (CR/LF) | offending pair dropped with a warning (no header injection) |
+
+Core's default is to log a failed `install()` and keep serving without that
+extension — right for an optional feature, wrong here: skipping this middleware
+leaves the proxy relaying the client's own `Authorization` upstream. The
+extension therefore sets `install.fail_closed = True`, which makes `install_all`
+re-raise so startup aborts. That needs a headroom-ai whose
+`headroom/proxy/extensions.py` honours the marker; on an older core the flag is
+ignored and the proxy starts without the middleware, as it did before #4737.
 
 ## Resilience (Docker / native / wrappers / providers / multi-process)
 
