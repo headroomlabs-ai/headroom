@@ -885,6 +885,8 @@ class PrometheusMetrics:
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
         output_tokens_saved: int = 0,
+        # High end of a modelled output-savings range; None means "same as low".
+        output_tokens_saved_high: int | None = None,
         project: str | None = None,
         client: str | None = None,
         # ``{dimension: label}`` for this request (headroom.proxy.attribution).
@@ -1148,6 +1150,7 @@ class PrometheusMetrics:
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
+                output_tokens_saved_high=output_tokens_saved_high,
                 output_tokens=output_tokens,
                 estimated_savings_usd=savings_usd,
             )
