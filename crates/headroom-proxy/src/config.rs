@@ -1,5 +1,6 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
+use crate::inbound_auth::ProxyToken;
 use clap::{Parser, ValueEnum};
 use headroom_core::rollout::{
     feature_names, split_feature_names, Feature, RolloutChannel, RolloutSnapshot,
@@ -272,8 +273,10 @@ pub struct CliArgs {
     )]
     pub unsafe_allow_unstable_features: bool,
 
-    /// Address the proxy listens on (e.g. 0.0.0.0:8787).
-    #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
+    /// Address the proxy listens on. Loopback by default, like the Python
+    /// proxy; a non-loopback address needs `HEADROOM_PROXY_TOKEN` (or
+    /// `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1`) to start.
+    #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "127.0.0.1:8787")]
     pub listen: SocketAddr,
 
     /// Restrict the Prometheus `/metrics` scrape endpoint to loopback
@@ -294,6 +297,20 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub metrics_require_loopback: bool,
+
+    /// Inbound proxy token. When set, every request from a non-loopback
+    /// peer must present it as `x-headroom-proxy-token` or
+    /// `Authorization: Bearer`, the same rules as the Python proxy, or it
+    /// gets 401 without reaching the upstream. Prefer the env var: a
+    /// command-line value is visible in the process list. A non-loopback
+    /// `--listen` refuses to start without it unless
+    /// `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` acknowledges the open bind.
+    #[arg(
+        long = "proxy-token",
+        env = "HEADROOM_PROXY_TOKEN",
+        hide_env_values = true
+    )]
+    pub proxy_token: Option<String>,
 
     /// Upstream base URL the proxy forwards to (e.g. http://127.0.0.1:8788).
     /// REQUIRED — there is no default; we want operators to be explicit.
@@ -496,7 +513,7 @@ pub struct CliArgs {
     pub enable_conversations_passthrough: bool,
 
     /// Phase D PR-D1: enable the native Bedrock InvokeModel route.
-    /// When `true` (default), `POST /model/{model_id}/invoke` is
+    /// When `true`, `POST /model/{model_id}/invoke` is
     /// handled by the Rust `bedrock::invoke` handler — Anthropic-shape
     /// bodies run through the live-zone compression path and the
     /// proxy re-signs the request with SigV4 before forwarding to
@@ -506,15 +523,21 @@ pub struct CliArgs {
     /// re-sign — operators MUST run an unsigned upstream that
     /// happens to know what to do, otherwise this fails closed).
     ///
+    /// Default `false`: the route signs every request it receives with
+    /// this host's AWS credentials and does not authenticate the caller,
+    /// so only enable it where every caller that can reach `--listen`
+    /// may use those credentials. `--features native_bedrock` also
+    /// enables it; `false` here (or `--disable-features native_bedrock`)
+    /// forces it off.
+    ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_ENABLE_BEDROCK_NATIVE`
-    /// env var → default (`true`).
+    /// env var → rollout (`native_bedrock`, not on by default).
     #[arg(
         long = "enable-bedrock-native",
         env = "HEADROOM_PROXY_ENABLE_BEDROCK_NATIVE",
-        default_value_t = true,
         action = clap::ArgAction::Set,
     )]
-    pub enable_bedrock_native: bool,
+    pub enable_bedrock_native: Option<bool>,
 
     /// AWS region to use when signing Bedrock requests. Default
     /// `us-east-1`. The Bedrock endpoint URL derived from this
@@ -602,6 +625,39 @@ pub struct CliArgs {
     )]
     pub vertex_adc_scope: String,
 
+    /// Mount the native Vertex `:rawPredict` / `:streamRawPredict`
+    /// route. That route replaces the caller's `Authorization` with a
+    /// bearer from this host's Google ADC and does not authenticate the
+    /// caller, so only enable it where every caller that can reach
+    /// `--listen` may use that identity. Default `false`: Vertex paths
+    /// fall through to the catch-all with the caller's own headers.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_ENABLE_VERTEX_NATIVE`
+    /// env var → default (`false`).
+    #[arg(
+        long = "enable-vertex-native",
+        env = "HEADROOM_PROXY_ENABLE_VERTEX_NATIVE",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub enable_vertex_native: bool,
+
+    /// Let the native Vertex route attach the ADC bearer when
+    /// `--upstream` is not an `https://*.googleapis.com` host (a local
+    /// emulator or a gateway that forwards to Vertex). Default `false`:
+    /// the route refuses such requests and no token is fetched.
+    ///
+    /// Source priority: CLI flag →
+    /// `HEADROOM_PROXY_VERTEX_ALLOW_NON_GOOGLE_UPSTREAM` env var →
+    /// default (`false`).
+    #[arg(
+        long = "vertex-allow-non-google-upstream",
+        env = "HEADROOM_PROXY_VERTEX_ALLOW_NON_GOOGLE_UPSTREAM",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub vertex_allow_non_google_upstream: bool,
+
     /// Native savings stats: record per-request savings/cost
     /// telemetry and serve `/stats`, `/stats/timeseries`,
     /// `/stats/events`, and `/dashboard`. When disabled, nothing is
@@ -676,6 +732,8 @@ pub struct Config {
     /// Gate the Prometheus `/metrics` endpoint to loopback clients.
     /// Default `false`; recommend `true` when `listen` is non-loopback.
     pub metrics_require_loopback: bool,
+    /// Inbound token required from non-loopback peers (`None` = no gate).
+    pub proxy_token: Option<ProxyToken>,
     pub upstream: Url,
     pub upstream_timeout: Duration,
     pub upstream_connect_timeout: Duration,
@@ -721,7 +779,7 @@ pub struct Config {
     /// C5+/B-phase territory).
     pub enable_conversations_passthrough: bool,
     /// PR-D1: enable the native Bedrock InvokeModel route. Default
-    /// `true`. When disabled, the explicit Rust handlers are not
+    /// `false`. When disabled, the explicit Rust handlers are not
     /// mounted; operators relying on the Python LiteLLM converter
     /// keep their existing path.
     pub enable_bedrock_native: bool,
@@ -748,6 +806,11 @@ pub struct Config {
     /// Optional outbound proxy URL for all upstream-bound requests.
     /// `None` means reqwest falls back to `HTTPS_PROXY` / `HTTP_PROXY` env vars.
     pub outbound_proxy: Option<String>,
+    /// Mount the native Vertex route. Default `false`.
+    pub enable_vertex_native: bool,
+    /// Attach the ADC bearer even when `upstream` is not a Google API
+    /// host. Default `false`.
+    pub vertex_allow_non_google_upstream: bool,
     /// Native savings stats: record per-request telemetry and serve
     /// `/stats`, `/stats/timeseries`, `/stats/events`, `/dashboard`.
     pub stats: bool,
@@ -761,17 +824,17 @@ impl Config {
         if args.enable_responses_streaming {
             explicit_features.push(Feature::OpenAiResponsesStreaming);
         }
-        if args.enable_bedrock_native {
+        if args.enable_bedrock_native == Some(true) {
             explicit_features.push(Feature::NativeBedrock);
         }
-        // Preserve the pre-rollout rollback controls as legacy disables. Both
-        // features are stable defaults in the registry, so merely omitting a
-        // false flag from `explicit_features` would turn it straight back on.
+        // Preserve the pre-rollout rollback controls as legacy disables: a
+        // false flag must win over a default or a `--features` request.
+        // An omitted Bedrock flag leaves the decision to the rollout.
         let mut disabled_features = split_feature_names(&args.disable_features);
         if !args.enable_responses_streaming {
             disabled_features.push(Feature::OpenAiResponsesStreaming.spec().name.to_owned());
         }
-        if !args.enable_bedrock_native {
+        if args.enable_bedrock_native == Some(false) {
             disabled_features.push(Feature::NativeBedrock.spec().name.to_owned());
         }
         let rollout = RolloutSnapshot::from_parts_with_explicit(
@@ -793,6 +856,7 @@ impl Config {
             rollout: rollout.clone(),
             listen: args.listen,
             metrics_require_loopback: args.metrics_require_loopback,
+            proxy_token: args.proxy_token.as_deref().and_then(ProxyToken::new),
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
             upstream_connect_timeout: args.upstream_connect_timeout,
@@ -812,8 +876,10 @@ impl Config {
                 args.enable_responses_streaming,
             ),
             enable_conversations_passthrough: args.enable_conversations_passthrough,
-            enable_bedrock_native: rollout
-                .is_enabled(Feature::NativeBedrock, args.enable_bedrock_native),
+            enable_bedrock_native: rollout.is_enabled(
+                Feature::NativeBedrock,
+                args.enable_bedrock_native == Some(true),
+            ),
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -821,6 +887,8 @@ impl Config {
             vertex_region: args.vertex_region,
             vertex_adc_scope: args.vertex_adc_scope,
             outbound_proxy: args.outbound_proxy,
+            enable_vertex_native: args.enable_vertex_native,
+            vertex_allow_non_google_upstream: args.vertex_allow_non_google_upstream,
             stats: args.stats,
             stats_path: args.stats_path.or_else(default_stats_path),
         }
@@ -837,6 +905,7 @@ impl Config {
             // carry no `ConnectInfo`. Tests that exercise the gate set
             // this to `true` explicitly.
             metrics_require_loopback: false,
+            proxy_token: None,
             upstream,
             upstream_timeout: Duration::from_secs(60),
             upstream_connect_timeout: Duration::from_secs(5),
@@ -871,8 +940,8 @@ impl Config {
             // production traffic will hit.
             enable_responses_streaming: true,
             enable_conversations_passthrough: true,
-            // PR-D1: bedrock route default-on so tests exercise
-            // it without per-test opt-in. Tests that set
+            // PR-D1: bedrock route on so tests exercise it without
+            // per-test opt-in (production default is off). Tests that set
             // `bedrock_endpoint` to a wiremock URL get the full
             // sign-and-forward path.
             enable_bedrock_native: true,
@@ -887,6 +956,11 @@ impl Config {
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
             outbound_proxy: None,
+            // Vertex route on, against the wiremock upstream, so tests
+            // exercise it without per-test opt-in (production default
+            // is off for both, see `CliArgs`).
+            enable_vertex_native: true,
+            vertex_allow_non_google_upstream: true,
             // Stats on (routes mounted, recording active) but
             // in-memory: tests never touch a real home directory.
             stats: true,
@@ -970,6 +1044,36 @@ mod rollout_input_tests {
         }
         assert!(!config.enable_responses_streaming);
         assert!(!config.enable_bedrock_native);
+    }
+
+    #[test]
+    fn native_bedrock_is_off_by_default_and_follows_rollout_requests() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["headroom-proxy", "--upstream", "http://127.0.0.1:9"];
+            argv.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+        };
+        assert!(!parse(&[]).enable_bedrock_native);
+        assert!(parse(&["--features", "native_bedrock"]).enable_bedrock_native);
+        assert!(parse(&["--enable-bedrock-native", "true"]).enable_bedrock_native);
+        assert!(
+            !parse(&[
+                "--features",
+                "native_bedrock",
+                "--disable-features",
+                "native_bedrock"
+            ])
+            .enable_bedrock_native
+        );
+        assert!(
+            !parse(&[
+                "--features",
+                "native_bedrock",
+                "--enable-bedrock-native",
+                "false"
+            ])
+            .enable_bedrock_native
+        );
     }
 
     #[test]
