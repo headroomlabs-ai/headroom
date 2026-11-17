@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass
 
 
@@ -118,6 +119,27 @@ def classify_client_signals(signals: AuthSignals, *, default: str | None = None)
         if needle in ua_lower:
             return name
     return default
+
+
+# Up to three numeric parts, and nothing numeric after them: a date stamp or a
+# four-part number is not cut down into a release that never existed.
+_UA_VERSION_RE = re.compile(r"\d{1,4}(?:\.\d{1,4}){0,2}(?![.\d])")
+
+
+def client_version_from_user_agent(user_agent: str) -> tuple[str, str] | None:
+    """``(harness, version)`` from a User-Agent such as ``claude-cli/2.1.311``.
+
+    Only the numeric release that directly follows a known harness prefix in
+    :data:`CLIENT_UA_MAP` is returned, so nothing else in the header can ride
+    along. ``None`` when the harness is unknown or carries no numeric version.
+    """
+    ua_lower = user_agent.lower()
+    for needle, name in CLIENT_UA_MAP:
+        at = ua_lower.find(needle)
+        if at >= 0:
+            match = _UA_VERSION_RE.match(ua_lower, at + len(needle))
+            return (name, match.group(0)) if match else None
+    return None
 
 
 def is_codex_responses_path(path: str) -> bool:

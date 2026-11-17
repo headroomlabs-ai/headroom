@@ -93,22 +93,33 @@ def _seed_ccr_entry() -> str:
     )
 
 
+# What the guard answers: the body FastAPI gives an unknown path, so the route is
+# invisible rather than forbidden. A detail route answers 404 with its OWN message
+# ("No telemetry found for signature: ...") when its key is absent, so a bare 404
+# status cannot tell the guard from a missing key.
+GUARD_DENIAL = {"detail": "Not Found"}
+
+
 @pytest.mark.parametrize("method,path", GATED)
 def test_non_loopback_caller_gets_404(method: str, path: str) -> None:
-    # A vanilla TestClient presents client.host="testclient", which is not a
-    # loopback IP, so the guard returns 404 (invisible, not 403).
-    client = TestClient(_make_app())
+    # A routable, non-loopback peer (TEST-NET-3), with a loopback Host header so the
+    # client-IP check is the only thing that can refuse it. A vanilla TestClient
+    # presents client.host="testclient", which is not an IP at all, so it would
+    # not tell "denies non-loopback IPs" from "denies a peer it cannot parse".
+    client = TestClient(_make_app(), base_url="http://127.0.0.1", client=("203.0.113.9", 4242))
     resp = client.request(method, path)
     assert resp.status_code == 404, resp.text
+    assert resp.json() == GUARD_DENIAL, resp.text
 
 
 @pytest.mark.parametrize("method,path", GATED)
 def test_loopback_caller_allowed(method: str, path: str) -> None:
     client = _loopback_client()
     resp = client.request(method, path, json={} if method == "post" else None)
-    # Detail routes legitimately return 404 when their test key is absent;
-    # the companion non-loopback test proves the guard itself.
+    # Detail routes legitimately return 404 when their test key is absent, but with
+    # their own message; the guard's denial body would mean it refused loopback.
     assert resp.status_code in {200, 404, 422}, resp.text
+    assert resp.json() != GUARD_DENIAL, resp.text
 
 
 def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1175,3 +1186,17 @@ def test_settings_write_refused_for_trusted_gateway_peer(
 def test_settings_write_allowed_for_real_loopback() -> None:
     resp = _loopback_client().post("/settings", json={"values": {}})
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize("host", ["headroom-remote.invalid", "evil.example:8787"])
+def test_local_only_routes_refuse_the_hosts_the_rust_front_relays_for_remote_callers(
+    host: str,
+) -> None:
+    # The Rust front reaches this proxy from 127.0.0.1. For a caller that is
+    # not local on its side it sends a non-loopback Host (the reserved
+    # headroom-remote.invalid when the Host would otherwise name loopback),
+    # so these routes must refuse a loopback peer carrying such a Host.
+    client = TestClient(_make_app(), base_url=f"http://{host}", client=("127.0.0.1", 12345))
+    assert client.get("/admin/upstream").status_code == 404
+    assert client.get("/debug/tasks").status_code == 404
+    assert client.get("/transformations/feed").status_code == 404
