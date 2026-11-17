@@ -139,8 +139,11 @@ class OpenAICcrAdapter(GenericCcrAdapter):
     def continuation_url(
         self, api_urls: dict[str, str], request_context: Any, batch_context: Any
     ) -> str:
-        del request_context, batch_context
-        return f"{api_urls['openai']}/v1/chat/completions"
+        del request_context
+        # The batch context records the resolved provider target; its stored
+        # credential belongs to that target, not the public host.
+        base = (batch_context.api_base_url or api_urls['openai']).rstrip("/")
+        return f"{base}/v1/chat/completions"
 
     def continuation_headers(self, batch_context: Any) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

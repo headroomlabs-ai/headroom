@@ -84,10 +84,18 @@ class GoogleCcrAdapter(GenericCcrAdapter):
         self, api_urls: dict[str, str], request_context: Any, batch_context: Any
     ) -> str:
         model = request_context.model
-        url = f"{api_urls['google']}/v1beta/models/{model}:generateContent"
+        # The batch context records the resolved provider target; its stored
+        # credential belongs to that target, not the public host.
+        base = (batch_context.api_base_url or api_urls["google"]).rstrip("/")
+        return f"{base}/v1beta/models/{model}:generateContent"
+
+    def continuation_headers(self, batch_context: Any) -> dict[str, str]:
+        # A header, not `?key=`: a key in the URL lands in request logs and in
+        # the text of the HTTPStatusError raised on a failed call.
+        headers = {"Content-Type": "application/json"}
         if batch_context.api_key:
-            url = f"{url}?key={batch_context.api_key}"
-        return url
+            headers["x-goog-api-key"] = batch_context.api_key
+        return headers
 
     def continuation_body(
         self,
