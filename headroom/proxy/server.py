@@ -124,6 +124,7 @@ from headroom.providers.registry import (
 from headroom.proxy import runtime_env
 from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import CLIENT_UA_MAP, should_stamp_codex_client
+from headroom.proxy.auth_policy import client_version_from_user_agent
 from headroom.proxy.background_compression import BackgroundCompressor
 from headroom.proxy.budget_basis_policy import resolve_estimated_basis_policy
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -222,6 +223,7 @@ from headroom.subscription.tracker import (
 )
 from headroom.telemetry import get_telemetry_collector
 from headroom.telemetry.beacon import beacon_off_reason, is_beacon_enabled, is_telemetry_enabled
+from headroom.telemetry.session import record_client_version
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
     CacheAligner,
@@ -4461,6 +4463,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     proxy.metrics.record_stack(stack)
                 except Exception:
                     logger.debug("record_stack failed", exc_info=True)
+        if method == "POST":
+            # The harness's own release, for the anonymous beacon. Every route,
+            # not only /v1/: Gemini, Bedrock and ChatGPT-auth Codex live
+            # elsewhere. Only the middleware sees the User-Agent; nothing but a
+            # known harness name and a numeric version leaves this call.
+            try:
+                harness = client_version_from_user_agent(headers.get("user-agent", ""))
+                if harness:
+                    record_client_version(*harness)
+            except Exception:
+                logger.debug("record_client_version failed", exc_info=True)
         try:
             response = await call_next(request)
         except asyncio.CancelledError:

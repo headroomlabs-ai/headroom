@@ -101,6 +101,17 @@ const ALLOWED_KEYS = [
   // Allowlisted, slug-validated configuration, so the corpus can tell
   // "compression underperformed" from "compression was switched off".
   'config',
+  // The session's tokens split by harness and by model. `clients` and `models`
+  // only say who took part, so a session that mixed two could not be divided
+  // or priced. `client_usage` covers every turn: traffic with no identified
+  // harness is a row of its own instead of a gap.
+  'client_usage',
+  'model_usage',
+  // The harness's own release, numeric parts only.
+  'client_versions',
+  // Age of the install id in days, and whether it runs in a container or CI
+  // job: separates a returning user from an id minted on every run.
+  'install',
 ];
 
 // Resource attributes we keep. Same rule: allowlist, not denylist.
@@ -129,6 +140,16 @@ const ALLOWED_RESOURCE = [
 const MAP = Symbol('map');
 const mapOf = (spec) => ({ [MAP]: spec });
 const nums = (...keys) => Object.fromEntries(keys.map((k) => [k, 'num']));
+
+// A harness name: the client only sends ones from a closed list, so hold the
+// field to that shape instead of the wider 'str'.
+const SLUG = /^[a-z][a-z0-9_]{0,31}$/;
+// One turn-and-token row of `client_usage` / `model_usage`: _USAGE_FIELDS in
+// session.py.
+const USAGE = nums(
+  'n', 'original', 'saved', 'tool_saved', 'output', 'cache_read', 'cache_write',
+  'cache_write_inferred', 'cache_write_5m', 'cache_write_1h', 'uncached'
+);
 
 const NESTED = {
   schema_version: 'num',
@@ -187,6 +208,10 @@ const NESTED = {
   errors: { count: 'num', by_status: mapOf('num') },
   strata: [{ dim: 'str', value: 'str', n: 'num' }],
   config: [{ key: 'str', value: 'str' }],
+  client_usage: [{ client: SLUG, ...USAGE }],
+  model_usage: [{ model: 'str', ...USAGE }],
+  client_versions: [{ client: SLUG, version: /^\d{1,4}(?:\.\d{1,4}){0,2}$/, n: 'num' }],
+  install: { age_days: 'num', container: 'bool', ci: 'bool' },
 };
 
 // A key allowed at the top but given no shape would be dropped in full. Fail
