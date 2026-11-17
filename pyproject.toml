@@ -330,6 +330,11 @@ bedrock = [
 redis = [
     "redis>=5.0.0",
 ]
+# System tray icon (opt-in: `headroom proxy --tray` / `headroom tray`; Windows first)
+tray = [
+    "pystray>=0.19.5",
+    "pillow>=12.3.0",
+]
 # HTML content extraction
 html = [
     "trafilatura>=1.6.0",
