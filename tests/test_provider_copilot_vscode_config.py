@@ -8,6 +8,7 @@ import pytest
 
 from headroom.providers.copilot.vscode import (
     configure_vscode_proxy_settings,
+    copilot_harness_settings_enabled,
     remove_vscode_proxy_settings,
     unrouted_vscode_profiles,
     vscode_proxy_url,
@@ -65,6 +66,77 @@ def test_configure_update_and_remove_preserve_jsonc_verbatim(tmp_path: Path) -> 
     assert remove_vscode_proxy_settings(path) is True
     assert path.read_text(encoding="utf-8") == original
     assert remove_vscode_proxy_settings(path) is False
+
+
+def _live_settings(path: Path) -> dict[str, object]:
+    """Parse the written JSONC the way VS Code does: comments and trailing commas ignored."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    body = "\n".join(line for line in lines if not line.strip().startswith("//"))
+    return json.loads(body.replace(",\n}", "\n}"))
+
+
+def test_configure_keeps_new_chats_on_the_local_harness(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = '{\n\t"editor.fontSize": 15\n}\n'
+    path.write_text(original, encoding="utf-8")
+
+    configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
+
+    # A chat on the Copilot harness ignores the endpoint overrides, and VS Code
+    # can flip either default by rollout, so both are pinned explicitly.
+    settings = _live_settings(path)
+    assert settings["chat.defaultToCopilotHarness"] is False
+    assert settings["chat.editor.preferCopilotHarness"] is False
+    assert copilot_harness_settings_enabled(path) == []
+    assert remove_vscode_proxy_settings(path) is True
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_configure_upgrades_a_block_written_before_the_harness_settings(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = '{\n\t"editor.fontSize": 15\n}\n'
+    path.write_text(
+        '{\n\t"editor.fontSize": 15,\n'
+        "\t// --- Headroom Copilot proxy --- (comma-added)\n"
+        '\t"github.copilot.advanced.debug.overrideProxyUrl": "http://127.0.0.1:8787",\n'
+        '\t"github.copilot.advanced.debug.overrideAuthType": "token",\n'
+        '\t"github.copilot.advanced.debug.overrideCapiUrl": "http://127.0.0.1:8787"\n'
+        "\t// --- end Headroom Copilot proxy ---\n}\n",
+        encoding="utf-8",
+    )
+
+    assert configure_vscode_proxy_settings(path, "http://127.0.0.1:8787") == "updated"
+
+    settings = _live_settings(path)
+    assert settings["chat.defaultToCopilotHarness"] is False
+    assert settings["chat.editor.preferCopilotHarness"] is False
+    assert "github.copilot.advanced.debug.overrideAuthType" not in settings
+    assert remove_vscode_proxy_settings(path) is True
+    assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("user_value", [True, False])
+def test_configure_leaves_a_harness_setting_the_user_already_chose(
+    tmp_path: Path, user_value: bool
+) -> None:
+    path = tmp_path / "settings.json"
+    original = f'{{\n\t"chat.defaultToCopilotHarness": {json.dumps(user_value)},\n}}\n'
+    path.write_text(original, encoding="utf-8")
+
+    for _ in range(2):  # a re-run must not start writing the key either
+        configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
+        configured = path.read_text(encoding="utf-8")
+        # A second copy inside the block would win silently: JSONC keeps the last one.
+        assert configured.count('"chat.defaultToCopilotHarness"') == 1
+        settings = _live_settings(path)
+        assert settings["chat.defaultToCopilotHarness"] is user_value
+        assert settings["chat.editor.preferCopilotHarness"] is False
+        assert copilot_harness_settings_enabled(path) == (
+            ["chat.defaultToCopilotHarness"] if user_value else []
+        )
+
+    assert remove_vscode_proxy_settings(path) is True
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_configure_refuses_malformed_and_unmanaged_override(tmp_path: Path) -> None:
