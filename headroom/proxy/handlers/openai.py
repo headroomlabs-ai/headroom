@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import quote, unquote, urlparse
 
 from headroom.log_safety import describe_exception, safe_id
@@ -503,7 +503,8 @@ def _resolve_openai_handler_path(
     return parsed.path
 
 
-def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+def _openai_base_url_candidate(request_headers: dict[str, str]) -> tuple[str, str] | None:
+    """Return ``(raw, normalized)`` for an ``x-headroom-base-url`` override, before the guard."""
     raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
     if raw_base_url is None:
         return None
@@ -521,13 +522,47 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
 
     if urlparse(normalized).scheme not in {"http", "https"}:
         return None
-    if not is_safe_upstream_url(normalized):
-        # Client-supplied upstream resolves to a private/loopback/link-local or
-        # cloud-metadata address (SSRF). Ignore the override and fall back to the
-        # configured upstream; set HEADROOM_ALLOWED_BASE_URLS to permit specific
-        # internal endpoints.
-        logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
+    return raw_base_url, normalized
+
+
+def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+    candidate = _openai_base_url_candidate(request_headers)
+    if candidate is None:
         return None
+    raw_base_url, normalized = candidate
+    if not is_safe_upstream_url(normalized):
+        _reject_unsafe_openai_override(raw_base_url)
+    return normalized
+
+
+def _reject_unsafe_openai_override(raw_base_url: str) -> NoReturn:
+    """Refuse an ``x-headroom-base-url`` that resolves to a non-public address.
+
+    Client-supplied upstream resolves to a private/loopback/link-local or
+    cloud-metadata address. Refuse, as the other routes do: falling back to
+    the configured upstream would send the prompt and the Authorization
+    meant for the named gateway to a host the client did not choose. Set
+    HEADROOM_ALLOWED_BASE_URLS to permit specific internal endpoints.
+    """
+    from fastapi import HTTPException
+
+    logger.warning("rejecting unsafe x-headroom-base-url: %r", raw_base_url)
+    raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+
+
+async def _resolve_openai_upstream_base_async(request_headers: dict[str, str]) -> str | None:
+    """:func:`_resolve_openai_upstream_base` for the async request handlers.
+
+    The guard resolves the client-chosen host with a blocking wait; the async
+    form runs that lookup on a worker thread so a slow-resolving host does not
+    hold up every other request on the event loop.
+    """
+    candidate = _openai_base_url_candidate(request_headers)
+    if candidate is None:
+        return None
+    raw_base_url, normalized = candidate
+    if not await is_safe_upstream_url_async(normalized):
+        _reject_unsafe_openai_override(raw_base_url)
     return normalized
 
 
@@ -3643,7 +3678,7 @@ class OpenAIHandlerMixin:
             )
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        custom_upstream_base_url = await _resolve_openai_upstream_base_async(request.headers)
         upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         # Ghost text and next edits: CAPI does not serve these models. A
         # caller-chosen x-headroom-base-url is left alone, as in
@@ -6422,7 +6457,7 @@ class OpenAIHandlerMixin:
         # cannot ride a Grok request to api.x.ai. Mixed ChatGPT-auth plus
         # Grok signals still withhold extras, even though the ChatGPT branch
         # below sends the request to chatgpt.com.
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        custom_upstream_base_url = await _resolve_openai_upstream_base_async(request.headers)
         upstream_base_url = custom_upstream_base_url
         openai_upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
         headers = merge_extra_headers(
@@ -11236,6 +11271,8 @@ class OpenAIHandlerMixin:
         # outcome (`commit`). With none claiming it — legacy mode — nothing
         # below this comment changes behaviour.
         from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
+        from headroom.proxy.gateway_native import attach_view as attach_native_view
+        from headroom.proxy.gateway_native import native_count, view_count, view_recent, view_shape
         from headroom.proxy.gateway_responses import build_view as build_responses_view
         from headroom.proxy.gateway_responses import is_responses_body
         from headroom.proxy.gateway_responses import mark_view as mark_responses_view
@@ -11307,9 +11344,13 @@ class OpenAIHandlerMixin:
         # `input` in place: `build_provider_body` rebuilds the same view to put
         # the compressed text back, so nothing outside these two points needs
         # to know which wire shape arrived. See `gateway_responses`.
+        # Gemini `contents` and Bedrock Converse get the same kind of view;
+        # see `gateway_native`.
         if is_responses_body(body):
             body["messages"] = build_responses_view(body).messages
             mark_responses_view(body)
+        elif isinstance(body, dict):
+            attach_native_view(body)
 
         messages = body.get("messages")
         model = body.get("model")
@@ -11502,6 +11543,27 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
+            # A Gemini or Converse body cannot carry `headroom_retrieve` (its
+            # tools are forwarded untouched) and gets no re-drive, so a CCR
+            # marker in it would point at content the model can never fetch.
+            native = view_shape(body)
+            if mode == "ccr" and native:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                f"config.mode='ccr' is not supported for {native} bodies: "
+                                "Headroom cannot add its retrieval tool to a native Gemini "
+                                "or Bedrock Converse request, so the model could not "
+                                "resolve a CCR marker. Use lossless, lossy_inline or "
+                                "lossless_then_lossy, or omit config.mode for the default "
+                                "marker-free mode."
+                            ),
+                        }
+                    },
+                )
             if mode == "lossless":
                 pipeline = self._lossless_pipeline()
             elif mode in ("lossy_inline", "lossless_then_lossy"):
@@ -11521,17 +11583,22 @@ class OpenAIHandlerMixin:
                 "model_limit": context_limit,
                 **proxy_pipeline_kwargs(self.config),
             }
-            if mode == "lossless":
+            # A native body's pipeline numbers view messages, so a dedup
+            # pointer would name a message the model does not see.
+            if mode == "lossless" or native:
                 pipeline_kwargs["cross_turn_dedup_recoverable"] = False
             if compress_user_messages:
                 pipeline_kwargs["compress_user_messages"] = True
             if target_ratio is not None:
                 pipeline_kwargs["target_ratio"] = float(target_ratio)
+            # Both counts are in the caller's messages; a native body's
+            # pipeline sees view messages.
             if protect_recent is not None:
-                pipeline_kwargs["protect_recent"] = int(protect_recent)
+                pipeline_kwargs["protect_recent"] = view_recent(body, int(protect_recent))
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
             if frozen_message_count is not None:
+                frozen_message_count = view_count(body, frozen_message_count)
                 pipeline_kwargs["frozen_message_count"] = frozen_message_count
 
             # Sidecar session pre-work: swap in previously-computed compressed
@@ -11728,7 +11795,7 @@ class OpenAIHandlerMixin:
                         shared.publish(self.session_tracker_store, _session_key, session_tracker)
                     info = {
                         "id": session_id,
-                        "frozen_message_count": session_frozen,
+                        "frozen_message_count": native_count(body, session_frozen),
                         "cached_prefix_replayed": turn.replayed,
                     }
                     return result, final, raw_tokens_before, final_tokens_after, info
