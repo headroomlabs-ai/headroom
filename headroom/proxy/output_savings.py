@@ -333,6 +333,37 @@ def register_modelled_factors(level: int, conservative: float, optimistic: float
     MODELLED_REDUCTION[level] = (conservative, optimistic)
 
 
+def _shaped_level(labels: Any) -> int | None:
+    """The verbosity level a request was shaped at, or ``None`` if it was not."""
+    for label in labels or ():
+        text = str(label)
+        if not text.startswith(_SHAPED_LABEL_PREFIX + "L"):
+            continue
+        try:
+            return int(text[len(_SHAPED_LABEL_PREFIX) + 1 :])
+        except ValueError:
+            continue
+    return None
+
+
+def modelled_request_savings(labels: Any, output_tokens: int) -> tuple[int, int]:
+    """Output tokens one shaped request saved, from its level's benchmark factors.
+
+    ``(low, high)`` at the conservative and optimistic factor, using the same
+    inversion as :meth:`SavingsLedger.estimate_from_model`: observed output is
+    already shaped, so ``saved = observed * r / (1 - r)``. ``(0, 0)`` when the
+    request was not shaped or its level has no registered factors.
+    """
+    level = _shaped_level(labels)
+    if output_tokens <= 0 or level is None:
+        return 0, 0
+    factors = MODELLED_REDUCTION.get(level)
+    if factors is None:
+        return 0, 0
+    low, high = (int(round(output_tokens * r / (1.0 - r))) for r in factors)
+    return low, high
+
+
 @dataclass
 class SavingsEstimate:
     """Result of an estimation pass."""
@@ -637,21 +668,48 @@ class SavingsLedger:
         reported, since it displaces nothing, but only while it covers the
         traffic: a corner of it is not a headline either way.
         """
+        return self.select_tier(level)[0]
+
+    def select_tier(self, level: int | None = None) -> tuple[SavingsEstimate, int | None]:
+        """:meth:`best_estimate`, plus the cluster gate the measured tier used.
+
+        The second element is the ``min_clusters`` that qualified the measured
+        estimate, or ``None`` for any other tier. A per-request booking needs
+        it to tell whether the request's own stratum is part of the
+        measurement; the headline excludes strata that are not.
+        """
         measured = self.estimate_from_holdout(min_clusters=MEASURED_SUPERSEDE_MIN_CLUSTERS)
         labelled = sum(t.qn for t in self.treatment.values())
         if measured is not None and _measured_supersedes(measured, labelled):
-            return measured
+            return measured, MEASURED_SUPERSEDE_MIN_CLUSTERS
         estimated = self.estimate_from_baseline()
         if estimated.n_requests > 0:
-            return estimated
+            return estimated, None
         measured = self.estimate_from_holdout()
         if measured is not None and _measured_covers(measured, labelled):
-            return measured
+            return measured, MEASURED_MIN_CLUSTERS
         if level is not None:
             modelled = self.estimate_from_model(level)
             if modelled is not None:
-                return modelled
-        return estimated
+                return modelled, None
+        return estimated, None
+
+    def measured_stratum_saving(
+        self, key: str, output_tokens: int, min_clusters: int
+    ) -> int | None:
+        """Tokens one request in ``key`` saved, from that stratum's own A/B.
+
+        ``None`` when the stratum is not part of the measurement at
+        ``min_clusters`` -- the same qualification :meth:`estimate_from_holdout`
+        applies, so a stratum the headline excludes is never credited.
+        """
+        t = self.treatment.get(key)
+        c = self.control.get(key)
+        if t is None or c is None or c.qn == 0 or t.qn == 0:
+            return None
+        if c.n_clusters < min_clusters or t.n_clusters < min_clusters:
+            return None
+        return max(0, int(round(c.qmean - output_tokens)))
 
     # ---- persistence -----------------------------------------------------
 
@@ -827,6 +885,64 @@ class SavingsRecorder:
                 mean, _var, n = self._ledger.baseline.lookup(key)
             return max(0, int(round(mean - output_tokens))) if n > 0 else 0
         return 0
+
+    def request_savings_range(self, labels: Any, output_tokens: int) -> tuple[int, int]:
+        """Per-request output tokens saved as ``(low, high)``, for the rollup.
+
+        Only a request that was actually shaped saves anything: the treatment
+        stratum label is attached before shaping is attempted, so the
+        ``output_shaper:verbosity:L<n>`` label is the proof, as in
+        :meth:`record_from_labels`. A holdout (control) request saved nothing.
+
+        The tier is whatever :meth:`SavingsLedger.best_estimate` picks for the
+        request's level, so the lifetime dollars always come from the same
+        tier the dashboard's percentage does:
+
+        * measured -> this stratum's own control mean minus the observed
+          output, low = high, and only if the stratum is part of the
+          measurement (0 otherwise: the headline excludes it too);
+        * estimated -> the learned baseline for this request's stratum,
+          low = high (0 where the stratum has no baseline);
+        * modelled -> the level's benchmark factors, a low-high band.
+
+        With no factors registered (plain OSS) the modelled tier never
+        appears, so nothing changes there.
+        """
+        # Zero output means the provider reported no usage, not a silent
+        # reply: every tier would otherwise book the whole baseline as saved.
+        if output_tokens <= 0:
+            return 0, 0
+        label_strings = [str(label) for label in labels or ()]
+        level = _shaped_level(label_strings)
+        if level is None:
+            return 0, 0
+        key = None
+        for text in label_strings:
+            parsed = parse_stratum_label(text)
+            if parsed is None:
+                continue
+            arm, key = parsed
+            if arm != "treatment":
+                return 0, 0
+            break
+        n = 0
+        mean = 0.0
+        measured_point: int | None = None
+        with self._lock:
+            tier, min_clusters = self._ledger.select_tier(level)
+            if tier.kind == "estimated" and key is not None:
+                mean, _var, n = self._ledger.baseline.lookup(key)
+            if min_clusters is not None and key is not None:
+                measured_point = self._ledger.measured_stratum_saving(
+                    key, output_tokens, min_clusters
+                )
+        if tier.kind == "modelled":
+            return modelled_request_savings(label_strings, output_tokens)
+        if tier.kind == "measured":
+            point = measured_point or 0
+            return point, point
+        point = max(0, int(round(mean - output_tokens))) if n > 0 else 0
+        return point, point
 
     def _reload_baseline_locked(self) -> None:
         """Adopt the on-disk baseline written by ``learn --verbosity --apply``.
