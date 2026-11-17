@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.log_safety import safe_id
 from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.deepseek_tiers import (
     LEGACY_MODEL_IDS,
@@ -914,7 +915,7 @@ class AnthropicProvider(Provider):
         if model not in _UNKNOWN_MODEL_WARNINGS:
             _UNKNOWN_MODEL_WARNINGS.add(model)
             logger.warning(
-                f"Unknown Anthropic model '{model}': {reason} ({limit:,} tokens). "
+                f"Unknown Anthropic model {safe_id(model)}: {reason} ({limit:,} tokens). "
                 f"To configure explicitly, set HEADROOM_MODEL_LIMITS env var or "
                 f"add to ~/.headroom/models.json"
             )

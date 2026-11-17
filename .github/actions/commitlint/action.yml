@@ -1,0 +1,41 @@
+name: Commit Linter
+description: Lints Pull Request commit messages with commitlint
+author: Wagner Santos
+inputs:
+  configFile:
+    description: Commitlint config file. If the file doesn't exist, config-conventional settings will be
+      loaded as a fallback.
+    default: ./commitlint.config.mjs
+    required: false
+  failOnWarnings:
+    description: Whether you want to fail on warnings or not
+    default: "false"
+    required: false
+  failOnErrors:
+    description: Whether you want to fail on errors or not
+    default: "true"
+    required: true
+  helpURL:
+    description: Link to a page explaining your commit message convention
+    default: https://github.com/conventional-changelog/commitlint/#what-is-commitlint
+    required: false
+  commitDepth:
+    description: When set to a valid Integer value - X, considers only the latest X number of commits.
+    default: ""
+    required: false
+  token:
+    description: >
+      Personal access token (PAT) used to interact with the GitHub API. By default, the automatic
+      token provided by GitHub is used. You can see more info about GitHub's default token here:
+      https://docs.github.com/en/actions/configuring-and-managing-workflows/authenticating-with-the-github_token
+    default: ${{ github.token }}
+    required: false
+outputs:
+  results:
+    description: The error and warning messages for each one of the analyzed commits
+runs:
+  using: docker
+  image: docker://wagoid/commitlint-github-action@sha256:86a04e0a99128551a7555c269d2b675c3c85f61358cf7dd558f6b873b66f561a
+branding:
+  icon: check-square
+  color: blue
