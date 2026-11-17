@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -87,7 +88,7 @@ class SemanticCacheConfig:
     # Similarity threshold for cache hit (0.0 - 1.0)
     similarity_threshold: float = 0.95
 
-    # Maximum entries in cache
+    # Maximum entries in cache (must be positive)
     max_entries: int = 1000
 
     # TTL in seconds (0 = no expiry)
@@ -123,6 +124,7 @@ class SemanticCache:
         """
         self.config = config or SemanticCacheConfig()
         self._embedding_fn = embedding_fn
+        self._lock = threading.RLock()
 
         # LRU cache: key -> CacheEntry
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
@@ -153,23 +155,39 @@ class SemanticCache:
         Returns:
             CacheEntry if found, None otherwise
         """
-        self._cleanup_expired()
+        with self._lock:
+            self._cleanup_expired()
 
-        # Try exact hash match first
-        if messages_hash and self.config.use_exact_matching:
-            index_key = self._combined_key(namespace, messages_hash)
-            key = self._hash_index.get(index_key)
-            if key and key in self._cache:
-                entry = self._cache[key]
-                # Verify the stored entry really belongs to this request and
-                # namespace. Guards against a stale index mapping ever pointing
-                # at an entry that was overwritten by a different conversation
-                # sharing the same key, and against replaying a cached response
-                # across provider/model/metadata contexts.
-                if entry.messages_hash == messages_hash and entry.namespace == namespace:
+            # Try exact hash match first
+            if messages_hash and self.config.use_exact_matching:
+                index_key = self._combined_key(namespace, messages_hash)
+                key = self._hash_index.get(index_key)
+                if key and key in self._cache:
+                    entry = self._cache[key]
+                    # Verify the stored entry really belongs to this request and
+                    # namespace. Guards against a stale index mapping ever pointing
+                    # at an entry that was overwritten by a different conversation
+                    # sharing the same key, and against replaying a cached response
+                    # across provider/model/metadata contexts.
+                    if entry.messages_hash == messages_hash and entry.namespace == namespace:
+                        self._touch(key)
+                        self._hits += 1
+                        return entry
+            elif self.config.use_exact_matching and query.strip():
+                # put() uses a query-derived key when no context hash is supplied.
+                # Only read entries stored the same way; a context-keyed response
+                # must never become a query-only hit, even if the keys coincide.
+                key = self._combined_key(namespace, self._generate_key(query))
+                query_entry = self._cache.get(key)
+                if (
+                    query_entry is not None
+                    and not query_entry.messages_hash
+                    and query_entry.namespace == namespace
+                    and query_entry.query == query
+                ):
                     self._touch(key)
                     self._hits += 1
-                    return entry
+                    return query_entry
 
         # Try semantic similarity if we have embedding function.
         #
@@ -184,14 +202,20 @@ class SemanticCache:
         # messages_hash above, which is context-complete and safe.
         if self._embedding_fn and query.strip():
             query_embedding = self._embedding_fn(query)
-            best_match, best_similarity = self._find_similar(query_embedding, namespace)
+            with self._lock:
+                # The embedding callback may have taken time while other
+                # callers changed the cache. Scan and touch one current state.
+                self._cleanup_expired()
+                best_match, best_similarity = self._find_similar(query_embedding, namespace)
 
-            if best_similarity >= self.config.similarity_threshold:
-                self._touch(best_match)
-                self._hits += 1
-                return self._cache[best_match]
+                if best_similarity >= self.config.similarity_threshold:
+                    entry = self._cache[best_match]
+                    self._touch(best_match)
+                    self._hits += 1
+                    return entry
 
-        self._misses += 1
+        with self._lock:
+            self._misses += 1
         return None
 
     def put(
@@ -212,8 +236,15 @@ class SemanticCache:
 
         Returns:
             Cache key for the entry
+
+        Raises:
+            ValueError: If max_entries is not positive.
         """
-        self._cleanup_expired()
+        if self.config.max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+
+        with self._lock:
+            self._cleanup_expired()
 
         # Create cache key. Prefer the full-context hash: two requests that share
         # a trailing user message ("continue", "yes", "run the tests") but differ
@@ -224,15 +255,6 @@ class SemanticCache:
         # metadata contexts never share a slot.
         base = messages_hash or self._generate_key(query)
         key = self._combined_key(namespace, base)
-
-        # Evict if adding a NEW key would exceed capacity. Overwriting a key that
-        # is already present is an in-place update that does not grow the map, so
-        # it must NOT evict — the old code ran the eviction loop before computing
-        # the key, so re-storing an existing entry at capacity dropped an
-        # unrelated live entry and turned a later lookup for it into a false miss.
-        # (Mirrors CompressionCache.store_compressed, which deletes-then-inserts.)
-        while key not in self._cache and len(self._cache) >= self.config.max_entries:
-            self._evict_oldest()
 
         # Generate embedding if available — but never for an empty/blank query.
         # A stored empty-query entry with an embedding would be a false-match
@@ -254,41 +276,60 @@ class SemanticCache:
             namespace=namespace,
         )
 
-        self._cache[key] = entry
+        # Evict if adding a NEW key would exceed capacity. Overwriting a key that
+        # is already present is an in-place update that does not grow the map, so
+        # it must NOT evict — the old code ran the eviction loop before computing
+        # the key, so re-storing an existing entry at capacity dropped an
+        # unrelated live entry and turned a later lookup for it into a false miss.
+        # (Mirrors CompressionCache.store_compressed, which deletes-then-inserts.)
+        # The embedding call above may raise, so evict only once the new entry is
+        # built — never before, or a failed store would drop a live entry without
+        # replacing it.
+        with self._lock:
+            while key not in self._cache and len(self._cache) >= self.config.max_entries:
+                self._evict_oldest()
 
-        # Index by hash for fast exact matching
-        if messages_hash:
-            self._hash_index[self._combined_key(namespace, messages_hash)] = key
+            self._cache[key] = entry
+            self._cache.move_to_end(key)
+
+            # Index by hash for fast exact matching
+            if messages_hash:
+                self._hash_index[self._combined_key(namespace, messages_hash)] = key
 
         return key
 
     def invalidate(self, key: str) -> bool:
         """Invalidate a cache entry by key."""
-        if key in self._cache:
-            entry = self._cache.pop(key)
-            if entry.messages_hash:
-                self._hash_index.pop(self._combined_key(entry.namespace, entry.messages_hash), None)
-            return True
-        return False
+        with self._lock:
+            if key in self._cache:
+                entry = self._cache.pop(key)
+                if entry.messages_hash:
+                    self._hash_index.pop(
+                        self._combined_key(entry.namespace, entry.messages_hash), None
+                    )
+                return True
+            return False
 
     def clear(self) -> None:
         """Clear all cache entries."""
-        self._cache.clear()
-        self._hash_index.clear()
+        with self._lock:
+            self._cache.clear()
+            self._hash_index.clear()
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
-        total = self._hits + self._misses
-        hit_rate = self._hits / total if total > 0 else 0.0
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = self._hits / total if total > 0 else 0.0
 
-        return {
-            "entries": len(self._cache),
-            "max_entries": self.config.max_entries,
-            "hits": self._hits,
-            "misses": self._misses,
-            "hit_rate": hit_rate,
-            "evictions": self._evictions,
-        }
+            return {
+                "entries": len(self._cache),
+                "max_entries": self.config.max_entries,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": hit_rate,
+                "evictions": self._evictions,
+            }
 
     def _find_similar(
         self,
@@ -435,9 +476,9 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: never share cached responses across contexts,
-        # so skip the cache and just delegate to the provider optimizer.
-        if namespace is None:
+        # Failed serialization is an unknown identity, not a query-only request.
+        # Skip both exact and semantic lookup when the full context cannot hash.
+        if namespace is None or not messages_hash:
             return self.provider_optimizer.optimize(messages, context, config)
 
         # Check semantic cache
@@ -486,9 +527,8 @@ class SemanticCacheLayer:
         messages_hash = self._compute_messages_hash(messages)
         namespace = self._compute_namespace(context)
 
-        # Unserializable context: don't store anything that could be replayed
-        # for a different provider/model/metadata.
-        if namespace is None:
+        # Refuse incomplete identities instead of creating a query-only entry.
+        if namespace is None or not messages_hash:
             return ""
 
         return self.cache.put(query, response, messages_hash, namespace)
