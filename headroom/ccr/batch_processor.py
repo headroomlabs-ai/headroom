@@ -307,6 +307,19 @@ class BatchResultProcessor:
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
+    def _continuation_base_url(self, provider: str, batch_context: BatchContext) -> str:
+        """Base URL for a continuation call.
+
+        The proxy records the resolved provider target (``ANTHROPIC_TARGET_API_URL``,
+        ``GEMINI_TARGET_API_URL``) in ``BatchContext.api_base_url`` when it submits
+        the batch, and the stored credential belongs to that target. A continuation
+        that ignores it sends the credential, the conversation and the retrieved CCR
+        originals to the public provider host instead. The public host is only the
+        fallback for a context that never recorded a target.
+        """
+        base = batch_context.api_base_url or self.api_urls[provider]
+        return base.rstrip("/")
+
     async def _anthropic_continuation(
         self,
         messages: list[dict[str, Any]],
@@ -315,7 +328,7 @@ class BatchResultProcessor:
         batch_context: BatchContext,
     ) -> dict[str, Any]:
         """Make Anthropic continuation call."""
-        url = f"{self.api_urls['anthropic']}/v1/messages"
+        url = f"{self._continuation_base_url('anthropic', batch_context)}/v1/messages"
 
         headers = {
             "Content-Type": "application/json",
@@ -368,7 +381,7 @@ class BatchResultProcessor:
         batch_context: BatchContext,
     ) -> dict[str, Any]:
         """Make OpenAI continuation call."""
-        url = f"{self.api_urls['openai']}/v1/chat/completions"
+        url = f"{self._continuation_base_url('openai', batch_context)}/v1/chat/completions"
 
         headers = {
             "Content-Type": "application/json",
@@ -406,12 +419,14 @@ class BatchResultProcessor:
         and 'parts' format for messages. Tools are already native Google Tool objects.
         """
         model = request_context.model
-        url = f"{self.api_urls['google']}/v1beta/models/{model}:generateContent"
-
-        if batch_context.api_key:
-            url = f"{url}?key={batch_context.api_key}"
+        base = self._continuation_base_url("google", batch_context)
+        url = f"{base}/v1beta/models/{model}:generateContent"
 
         headers = {"Content-Type": "application/json"}
+        if batch_context.api_key:
+            # A header, not `?key=`: a key in the URL lands in request logs and in
+            # the text of the HTTPStatusError raised below.
+            headers["x-goog-api-key"] = batch_context.api_key
 
         # Convert messages to Google format (contents with parts)
         contents = self._messages_to_google_contents(messages)

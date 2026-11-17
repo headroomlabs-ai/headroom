@@ -634,3 +634,34 @@ class ProxyConfig:
             cloudcode=self.cloudcode_api_url,
             vertex=self.vertex_api_url,
         )
+
+
+# ProxyConfig fields that hold a credential. Whatever serialises a config into
+# a file, a manifest or another process's environment masks or moves these.
+PROXY_CONFIG_SECRET_FIELDS: frozenset[str] = frozenset(
+    {
+        "memory_qdrant_api_key",
+        "memory_neo4j_password",
+        "license_key",
+        "proxy_token",
+        "anthropic_extra_headers",
+        "openai_extra_headers",
+    }
+)
+PROXY_CONFIG_REDACTED = "[REDACTED]"
+
+
+def redact_proxy_config_secrets(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a serialised ProxyConfig with every credential masked.
+
+    Header maps keep their header names so a manifest still shows which
+    headers are configured.
+    """
+    out = dict(payload)
+    for name in PROXY_CONFIG_SECRET_FIELDS:
+        value = out.get(name)
+        if isinstance(value, dict):
+            out[name] = dict.fromkeys(value, PROXY_CONFIG_REDACTED)
+        elif value:
+            out[name] = PROXY_CONFIG_REDACTED
+    return out
