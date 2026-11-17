@@ -188,7 +188,7 @@ async def sync(
         prev = state.get(adapter_key, {})
 
         current_agent_fp = adapter.fingerprint()
-        all_memories = await backend.get_user_memories(user_id, limit=500)
+        all_memories = await backend.get_user_memories(user_id, limit=None)
         current_db_fp = _db_fingerprint(all_memories)
 
         if (
@@ -201,7 +201,7 @@ async def sync(
             )
             return result
     else:
-        all_memories = await backend.get_user_memories(user_id, limit=500)
+        all_memories = await backend.get_user_memories(user_id, limit=None)
 
     # --- Phase 1: Import (agent files → DB) ---
     result.imported = await sync_import(backend, adapter, user_id, all_memories)
@@ -209,7 +209,7 @@ async def sync(
     # --- Phase 2: Export (DB → agent files) ---
     # Re-fetch if imports happened (new entries)
     if result.imported > 0:
-        all_memories = await backend.get_user_memories(user_id, limit=500)
+        all_memories = await backend.get_user_memories(user_id, limit=None)
     result.exported = await sync_export(backend, adapter, user_id, all_memories)
 
     # --- Update sync state ---
@@ -245,7 +245,7 @@ async def sync_import(
 
     # Build set of existing content hashes for dedup
     if existing_memories is None:
-        existing_memories = await backend.get_user_memories(user_id, limit=500)
+        existing_memories = await backend.get_user_memories(user_id, limit=None)
 
     existing_hashes: set[str] = set()
     for mem in existing_memories:
@@ -290,7 +290,7 @@ async def sync_export(
 ) -> int:
     """Export: DB → agent files. Returns count exported."""
     if existing_memories is None:
-        existing_memories = await backend.get_user_memories(user_id, limit=500)
+        existing_memories = await backend.get_user_memories(user_id, limit=None)
 
     if not existing_memories:
         return 0

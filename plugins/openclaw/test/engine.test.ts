@@ -365,6 +365,106 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
       expect.stringContaining("Circuit breaker opened"),
     );
   });
+
+  // Regression: engine.ts used to pass `fallback: true`, so the SDK resolved a
+  // connection error, timeout or 5xx to a zero-token stub instead of throwing.
+  // That stub looked like a successful no-op, so every assemble() reset the
+  // breaker and it could never open on an unhealthy proxy.
+  it("passes fallback: false so proxy failures reach the circuit breaker", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine({ minContextChars: 0 });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages: [{ role: "user", content: "hello" }] });
+
+    expect(vi.mocked(compress).mock.calls[0][1]).toMatchObject({ fallback: false });
+  });
+
+  it("opens the circuit on zero-token results, even if the SDK swallows the error", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const messages = [{ role: "user", content: "hello" }];
+    const engine = new HeadroomContextEngine({
+      minContextChars: 0,
+      circuitBreakerThreshold: 2,
+      circuitBreakerCooldownMs: 60_000,
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages });
+    await engine.assemble({ sessionId: "session-1", messages });
+    await expect(engine.assemble({ sessionId: "session-1", messages })).resolves.toEqual({
+      messages,
+      estimatedTokens: 0,
+    });
+
+    // The third call is served from the open circuit, not the proxy.
+    expect(compress).toHaveBeenCalledTimes(2);
+    expect(mocked.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Circuit breaker opened"),
+    );
+  });
+
+  it("does not count an empty context as a failure", async () => {
+    // The proxy answers 200 with tokens_before: 0 for an empty message list, so
+    // zero tokens there is a real answer, not a failure.
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine({
+      minContextChars: 0,
+      circuitBreakerThreshold: 1,
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages: [] });
+    await engine.assemble({ sessionId: "session-1", messages: [] });
+
+    // The breaker must stay closed, so the next call still reaches the proxy.
+    expect(compress).toHaveBeenCalledTimes(2);
+    expect(mocked.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("Circuit breaker opened"),
+    );
+  });
+
+  it("does not count a genuine no-savings result as a failure", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: 5,
+      tokensAfter: 5,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine({
+      minContextChars: 0,
+      circuitBreakerThreshold: 1,
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages: [{ role: "user", content: "hello" }] });
+    await engine.assemble({ sessionId: "session-1", messages: [{ role: "user", content: "hello" }] });
+
+    // Nothing was saved, but the proxy answered — the breaker must stay closed.
+    expect(compress).toHaveBeenCalledTimes(2);
+    expect(mocked.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("Circuit breaker opened"),
+    );
+  });
 });
 
 describe("HeadroomContextEngine transcriptSemantics contract", () => {

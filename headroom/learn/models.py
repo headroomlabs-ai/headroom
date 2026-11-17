@@ -62,17 +62,25 @@ class ToolCall:
     @property
     def input_summary(self) -> str:
         """Short summary of tool input for display."""
+        data = self.input_data if isinstance(self.input_data, dict) else {}
         if self.name in ("Bash", "bash"):
-            cmd: str = self.input_data.get("command", "")
+            cmd = data.get("command", "")
+            if not isinstance(cmd, str):
+                # Session files are written by other processes and can hold
+                # malformed inputs (a real opencode v2 session stored
+                # ``{"command": true}``). The digest formatter and loop
+                # sampler both read this during a scan, so a non-string must
+                # render instead of raising.
+                cmd = "" if cmd is None else str(cmd)
             return cmd[:100] + "..." if len(cmd) > 100 else cmd
         if self.name in ("Read", "read"):
-            return str(self.input_data.get("file_path", "?"))
+            return str(data.get("file_path", "?"))
         if self.name in ("Grep", "grep", "Glob", "glob"):
-            pattern = self.input_data.get("pattern", "?")
-            path = self.input_data.get("path", "?")
+            pattern = data.get("pattern", "?")
+            path = data.get("path", "?")
             return f"{pattern} in {path}"
         if self.name in ("Edit", "edit", "Write", "write"):
-            return str(self.input_data.get("file_path", "?"))
+            return str(data.get("file_path", "?"))
         return str(self.input_data)[:80]
 
 
