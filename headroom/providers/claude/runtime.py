@@ -159,6 +159,24 @@ def remote_control_gate_message(source: str, *, version: tuple[int, int, int] | 
     )
 
 
+def remote_control_gate_short_message(*, version: tuple[int, int, int] | None = None) -> str:
+    """One-line Remote Control notice for the default ``wrap claude`` banner (#3426).
+
+    Same accuracy rule as :func:`remote_control_gate_message` (issue #1779):
+    with a known gated version state the disable as fact; with an unknown
+    version name the threshold rather than assert the user's build.
+    """
+    scope = (
+        ""
+        if version is not None and version >= REMOTE_CONTROL_GATED_MIN_VERSION
+        else f" on Claude Code {_version_str(REMOTE_CONTROL_GATED_MIN_VERSION)}+"
+    )
+    return (
+        f"{REMOTE_CONTROL_FEATURE} (/rc) is disabled{scope} while routed through "
+        "Headroom — run `claude` directly (no wrap) for sessions that need it."
+    )
+
+
 def is_custom_anthropic_base_url(value: str | None) -> bool:
     """Return whether ANTHROPIC_BASE_URL is custom from Claude's Remote Control gate view.
 
@@ -209,6 +227,24 @@ def remote_control_applies_to_auth(environ: Mapping[str, object]) -> bool:
     )
 
 
+def claude_effective_env(
+    *layers: tuple[str, Mapping[str, object]],
+) -> dict[str, tuple[str, str]]:
+    """``{key: (value, source)}`` after overlaying ``layers``, lowest precedence first.
+
+    An empty value clears an inherited one, as in Claude Code's own overlay.
+    """
+    effective: dict[str, tuple[str, str]] = {}
+    for source, values in layers:
+        for key, raw in values.items():
+            value = str(raw or "").strip()
+            if value:
+                effective[key] = (value, source)
+            else:
+                effective.pop(key, None)
+    return effective
+
+
 def claude_auth_conflict_sources(
     *layers: tuple[str, Mapping[str, object]],
 ) -> dict[str, str] | None:
@@ -218,21 +254,9 @@ def claude_auth_conflict_sources(
     inherited value, matching environment overlay semantics. Credential values
     are deliberately never returned so callers cannot leak them in diagnostics.
     """
-    effective: dict[str, str] = {}
-    sources: dict[str, str] = {}
-    for source, values in layers:
-        for key in CLAUDE_AUTH_KEYS:
-            if key not in values:
-                continue
-            value = str(values.get(key) or "").strip()
-            if value:
-                effective[key] = value
-                sources[key] = source
-            else:
-                effective.pop(key, None)
-                sources.pop(key, None)
+    effective = claude_effective_env(*layers)
     if all(key in effective for key in CLAUDE_AUTH_KEYS):
-        return {key: sources[key] for key in CLAUDE_AUTH_KEYS}
+        return {key: effective[key][1] for key in CLAUDE_AUTH_KEYS}
     return None
 
 

@@ -20,11 +20,13 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 
 from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
+from headroom.install.models import DeploymentManifest
 from headroom.install.paths import (
     claude_settings_path,
     codex_config_path,
@@ -45,7 +47,7 @@ from headroom.providers.claude import (
 )
 
 from .main import get_version, main
-from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez
+from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez, loopback_port
 from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
@@ -53,9 +55,62 @@ WARN = "warn"
 FAIL = "fail"
 SKIP = "skip"
 
-_LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
+DEFAULT_PROXY_PORT = 8787
+
+# The loopback host forms a proxy URL can take: IPv4, the ``localhost`` alias,
+# and the IPv6 literal ``::1`` (``urlsplit`` strips the ``[...]`` brackets and
+# lowercases the host, so ``HTTP://Localhost`` and ``http://[::1]`` normalize
+# into this set).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Codex TOML routes via a quoted ``base_url``. Capture the quoted value only and
+# classify it with the shared URL parser below — a prefix/regex match on the URL
+# would accept userinfo and hostname-suffix lookalikes such as
+# ``http://localhost:8787@evil.example`` as loopback. Anchored to a line start so
+# an indented key is matched consistently, and paired with the active
+# ``model_provider`` so only the routed provider's block is inspected.
 _CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
 _CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
+_CODEX_OPENAI_BASE_URL_RE = re.compile(r'(?m)^[ \t]*openai_base_url\s*=\s*"([^"\r\n]+)"')
+
+
+def _loopback_route_port(url: str) -> int | None:
+    """Return the port if ``url`` is a well-formed loopback proxy route.
+
+    Classifies by parsing the URL rather than prefix-matching it: the scheme
+    must be http(s), there must be no userinfo, the host must be *exactly* a
+    loopback literal, and the port must be present and valid. This is what makes
+    ``doctor`` a URL classifier rather than a string matcher, so lookalikes that
+    a prefix match accepts are correctly rejected:
+
+    * userinfo — ``http://localhost:8787@evil.example/v1`` parses to host
+      ``evil.example`` (the ``localhost:8787`` is credentials), and any URL
+      carrying userinfo is refused outright;
+    * hostname suffix — ``http://localhost.evil.example:8787`` and
+      ``http://127.0.0.1.evil.example:8787`` are not exact loopback hosts.
+
+    A correctly-routed loopback URL (including ``[::1]`` and an upper-cased
+    scheme/host) still classifies, preserving the #3205 / #3213 fix.
+    """
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https"):
+        return None
+    # Reject any credentials in the authority: a real Headroom route never
+    # carries userinfo, and userinfo is the vector that masks the true host.
+    if parts.username is not None or parts.password is not None:
+        return None
+    try:
+        host = parts.hostname  # lowercased, brackets stripped
+        port = parts.port  # raises ValueError on an out-of-range port
+    except ValueError:
+        return None
+    if host is None or host not in _LOOPBACK_HOSTS or port is None:
+        return None
+    return port
+
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -316,7 +371,7 @@ def check_version_drift(livez: dict[str, Any] | None, installed: str) -> CheckRe
 
 
 def _claude_base_url_in(path: Path) -> tuple[str, CheckResult | None]:
-    """Read ``env.ANTHROPIC_BASE_URL`` from one Claude settings file.
+    """Read the active Claude routing URL from one settings file.
 
     Returns ``(base_url, error)``. A parse problem comes back as a WARN so the
     caller surfaces it verbatim instead of skipping the file and reporting the
@@ -340,7 +395,10 @@ def _claude_base_url_in(path: Path) -> tuple[str, CheckResult | None]:
         )
     env_block = payload.get("env")
     if isinstance(env_block, dict):
-        return str(env_block.get("ANTHROPIC_BASE_URL", "") or ""), None
+        base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
+        if not base_url and str(env_block.get("CLAUDE_CODE_USE_FOUNDRY", "") or ""):
+            base_url = str(env_block.get("ANTHROPIC_FOUNDRY_BASE_URL", "") or "")
+        return base_url, None
     return "", None
 
 
@@ -567,7 +625,19 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
 
 def codex_active_base_url(text: str) -> tuple[str, str | None]:
     """Return ``(provider_id, base_url)`` for the active Codex provider in ``text``."""
-    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
+    first_table = re.search(r"(?m)^[ \t]*\[", text)
+    root = text[: first_table.start()] if first_table is not None else text
+    # Only a root `model_provider` picks the default session's provider; one
+    # under `[profiles.*]` applies only when that profile is selected.
+    active_match = _CODEX_MODEL_PROVIDER_RE.search(root)
+    if active_match is None or active_match.group(1) == "openai":
+        # A root `openai_base_url` re-points Codex's built-in `openai` provider
+        # (the default when `model_provider` is unset), so it beats an inactive
+        # `[model_providers.headroom]` table. Headroom Desktop routes this way
+        # because the ChatGPT app hides features for any other provider.
+        root_url = _CODEX_OPENAI_BASE_URL_RE.search(root)
+        if root_url is not None:
+            return "openai", root_url.group(1)
     provider_id = active_match.group(1) if active_match else "headroom"
     return provider_id, _codex_provider_base_url(text, provider_id)
 
@@ -623,7 +693,13 @@ def check_codex_routing(
             summary="not routed (no active provider base_url in config.toml)",
             hint="wrap it: headroom wrap codex",
         )
+
     config_path, text, provider_id, base_url = found
+
+    # base_url is the active provider's, already extracted and None-checked
+    # above. Classify it through the shared URL parser so a lookalike or remote
+    # base_url (userinfo, hostname suffix, non-loopback) is a WARN, not a PASS.
+
     routing = _classify_routing_url(name, base_url, port, source=str(config_path))
     if routing.status != PASS:
         return routing
@@ -653,6 +729,24 @@ def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
         section = section[: next_section.start()]
     base_url_match = _CODEX_BASE_URL_RE.search(section)
     return base_url_match.group(1) if base_url_match else None
+
+
+def _configured_client_ports(
+    claude_paths: Sequence[Path], codex_paths: Sequence[Path]
+) -> list[int]:
+    """Loopback ports the Claude Code and Codex configs (project and user) send traffic to.
+
+    Headroom Desktop (port 6767) and ``wrap --port N`` leave no deployment
+    manifest, so without these a bare ``doctor`` only ever finds 8787.
+    """
+    urls = [_claude_base_url_in(path)[0] for path in claude_paths]
+    for path in codex_paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        urls.append(codex_active_base_url(text)[1] or "")
+    return [port for port in map(loopback_port, urls) if port is not None]
 
 
 def _codex_block_missing_openai_auth(
@@ -837,6 +931,28 @@ def run_network_probes(extra_urls: Sequence[str]) -> tuple[list[Any], set[str]]:
     return reports, required
 
 
+def network_checks(extra_urls: Sequence[str]) -> list[CheckResult]:
+    """The ``--network`` rows, or one skipped row when ``HEADROOM_OFFLINE`` is set.
+
+    Every probe here dials an internet host, so under the air-gap switch none
+    of them runs; saying so beats a page of "unreachable" failures.
+    """
+    from headroom.offline import OFFLINE_ENV, OfflineEgressBlocked
+
+    try:
+        reports, required = run_network_probes(extra_urls)
+    except OfflineEgressBlocked as blocked:
+        return [
+            CheckResult(
+                name="network",
+                status=SKIP,
+                summary=f"skipped: {OFFLINE_ENV} is set, no endpoint was contacted",
+                hint=str(blocked),
+            )
+        ]
+    return check_network_endpoints(reports, required)
+
+
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
     """Is the *current shell* pointed at the proxy for ad-hoc runs?"""
     name = "shell env"
@@ -853,14 +969,13 @@ def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
 
 
 def _classify_routing_url(name: str, url: str, port: int, *, source: str) -> CheckResult:
-    match = _LOOPBACK_URL_RE.match(url.strip())
-    if match is None:
+    found_port = _loopback_route_port(url)
+    if found_port is None:
         return CheckResult(
             name=name,
             status=WARN,
             summary=f"points at {url}, not the local Headroom proxy ({source})",
         )
-    found_port = int(match.group(1))
     if found_port != port:
         if found_port == _OLLAMA_DEFAULT_PORT:
             # Not a mis-probed Headroom port — this is Ollama's endpoint, so
@@ -1096,14 +1211,53 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
         console.print("\n[green bold]all checks passed[/green bold]")
 
 
+def resolve_probe_port(
+    requested: int | None,
+    manifests: Sequence[DeploymentManifest],
+) -> int:
+    """Resolve the port `doctor` should probe.
+
+    Precedence: an explicit ``--port`` (or ``HEADROOM_PORT``) wins, then the
+    port a managed deployment recorded, then the built-in default.
+
+    The manifest tier matters because ``headroom deploy --port N`` writes N
+    into the deployment's own environment, not into the shell `doctor` later
+    runs in. Without it a healthy non-default deployment is reported as
+    unreachable, and the remediation hints point at the wrong port.
+
+    A deployment is only consulted when it is unambiguous: the ``default``
+    profile, or a lone profile under another name. With several named profiles
+    and no explicit request there is no non-arbitrary choice, so the built-in
+    default is used and the per-deployment section reports each one instead.
+
+    Args:
+        requested: Port supplied on the command line or via the environment.
+        manifests: Deployment manifests to consider.
+
+    Returns:
+        The port to probe.
+    """
+    if requested is not None:
+        return requested
+    default_profile = next((m for m in manifests if m.profile == "default"), None)
+    if default_profile is not None:
+        return default_profile.port
+    if len(manifests) == 1:
+        return manifests[0].port
+    return DEFAULT_PROXY_PORT
+
+
 @main.command()
 @click.option(
     "--port",
     "-p",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
-    help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
+    help=(
+        "Proxy port to check (env: HEADROOM_PORT). Defaults to the port of a "
+        f"single managed deployment, else {DEFAULT_PROXY_PORT}."
+    ),
 )
 @click.option("--json", "emit_json", is_flag=True, help="Emit JSON instead of formatted output.")
 @click.option(
@@ -1122,7 +1276,12 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     metavar="URL",
     help="Extra upstream URL to test with --network (repeatable), e.g. a custom gateway.",
 )
-def doctor(port: int, emit_json: bool, network: bool, network_urls: tuple[str, ...]) -> None:
+def doctor(
+    port: int | None,
+    emit_json: bool,
+    network: bool,
+    network_urls: tuple[str, ...],
+) -> None:
     """Check that the Headroom proxy and client routing are working.
 
     \b
@@ -1131,27 +1290,33 @@ def doctor(port: int, emit_json: bool, network: bool, network_urls: tuple[str, .
         1  warnings only (working, but not optimally wired)
         2  at least one failure (proxy down / deployment down)
     """
+    manifests = list_manifests()
+    port = resolve_probe_port(port, manifests)
     base_url = f"http://127.0.0.1:{port}"
     livez = probe_json(f"{base_url}/livez")
     readyz = probe_json(f"{base_url}/readyz", timeout=3.0) if livez else None
     health = probe_json(f"{base_url}/health", timeout=5.0) if livez else None
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
-    manifests = list_manifests()
+    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
+    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     live_elsewhere = None
     if livez is None:
         # Cheap, bounded: only ports Headroom recorded (HEADROOM_PORT, 8787,
-        # deployment manifests, the project's wrap marker), probed in parallel.
+        # deployment manifests, project wrap markers, live client markers, and
+        # ports agents are configured for), probed in parallel.
         live_elsewhere = find_live_proxy_elsewhere(
             port,
             manifests=manifests,
+            extra=_configured_client_ports(
+                [project_local_claude_settings, project_claude_settings, claude_settings_path()],
+                [codex_project_config_path(), codex_config_path()],
+            ),
             probe=lambda p: is_headroom_livez(
                 probe_json(f"http://127.0.0.1:{p}/livez", timeout=0.5)
             ),
         )
 
-    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
-    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     checks = [
         note_live_proxy_elsewhere(check_proxy_liveness(livez, base_url), live_elsewhere),
         check_proxy_readiness(livez, readyz, base_url),
@@ -1182,8 +1347,7 @@ def doctor(port: int, emit_json: bool, network: bool, network_urls: tuple[str, .
     if proxy_env_check is not None:
         checks.append(proxy_env_check)
     if network or network_urls:
-        reports, required = run_network_probes(network_urls)
-        checks.extend(check_network_endpoints(reports, required))
+        checks.extend(network_checks(network_urls))
     auth_conflict_check = check_claude_auth_conflict(
         claude_settings_path(),
         project_claude_settings,

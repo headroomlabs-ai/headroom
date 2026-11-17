@@ -105,6 +105,26 @@ def test_invalid_json_is_400(headroom_client) -> None:
 
 
 @pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (b"nope", "malformed JSON"),
+        (b"[1, 2]", "must be a JSON object"),
+        (b"\xff\xfe{}", "not valid UTF-8"),
+    ],
+    ids=["malformed", "not-object", "not-utf8"],
+)
+def test_invalid_body_400_says_why(headroom_client, content: bytes, reason: str) -> None:
+    """The 400 names the reason, like every other handler's body errors."""
+    resp = headroom_client.post(
+        RESPONSE_HALF, content=content, headers={"content-type": "application/json"}
+    )
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["type"] == "invalid_request"
+    assert reason in error["message"]
+
+
+@pytest.mark.parametrize(
     "extra",
     [
         {"response": "not-an-object"},
@@ -375,7 +395,10 @@ def test_outcome_anthropic_cache_fields(headroom_client, outcome_spy) -> None:
     assert o.output_tokens == 12
     assert o.cache_read_tokens == 2000
     assert o.cache_write_tokens == 500
-    assert o.provider_input_tokens == 300
+    # Anthropic's input_tokens is the uncached remainder; the billed prompt is
+    # that plus both cache buckets, as the direct handler has always recorded.
+    assert o.provider_input_tokens == 2800
+    assert o.uncached_input_tokens == 300
 
 
 def test_outcome_recorded_immediately_without_relay(headroom_client, outcome_spy) -> None:

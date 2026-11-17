@@ -19,8 +19,10 @@ Env vars:
     HEADROOM_BINARIES_CACHE    override cache dir
     HEADROOM_BINARIES_OFFLINE  if set, never reach the network
     HEADROOM_BINARIES_ALLOW_UNVERIFIED
-        Escape hatch: if set, skip SHA-256 verification entirely and accept
-        whatever the mirror served. This disables Headroom's only defence
+        Escape hatch: only 1, true, yes, or on (case-insensitive, with surrounding
+        whitespace ignored) skip SHA-256 verification and accept whatever the
+        mirror served. Unset, false, and unrecognized values retain verification.
+        This disables Headroom's only defence
         against a tampered or substituted binary, so it is announced on
         stderr every time it takes effect. Intended for developers testing a
         locally built asset or an off-registry version; never set it in CI or
@@ -48,11 +50,28 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import ssl
 
 from headroom._subprocess import run
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
+
+# Affirmative values for the sha256-verification bypass. This is a security
+# control (supply-chain integrity), so it must fail CLOSED: only an explicit
+# affirmative disables verification. A bare presence check treated
+# `HEADROOM_BINARIES_ALLOW_UNVERIFIED=0` / `=false` — the natural way to say
+# "keep verifying" — as truthy and silently skipped verification.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _allow_unverified_binaries() -> bool:
+    """Whether sha256 verification of fetched binaries is bypassed."""
+    return os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED", "").strip().lower() in _TRUTHY
+
 
 __all__ = [
     "BinaryError",
@@ -263,9 +282,33 @@ def _mirror_url(url: str) -> str:
 # ---------- Download + verify --------------------------------------------- #
 
 
+def _ssl_context() -> ssl.SSLContext | None:
+    """Return Headroom's configured SSL context for urllib.request.urlopen, or
+    ``None`` (urlopen's default) when the trust helper cannot be loaded.
+
+    This ensures binary downloads from GitHub releases (and any configured
+    mirror) trust the same roots as the proxy — including corporate
+    TLS-inspection roots installed in the OS store and bundles referenced via
+    ``HEADROOM_CA_BUNDLE`` / ``SSL_CERT_FILE``. Without this, ``uv tool``
+    installs (where certifi may not yet be wired to the stdlib path) raise
+    ``CERTIFICATE_VERIFY_FAILED`` even though certifi is already a dependency.
+    """
+    try:
+        from headroom.proxy.ssl_context import build_urlopen_context
+    except ImportError:
+        return None
+
+    return build_urlopen_context()
+
+
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if os.environ.get("HEADROOM_BINARIES_OFFLINE"):
         raise OfflineError(f"offline mode (HEADROOM_BINARIES_OFFLINE=1) but fetch required: {url}")
+    # HEADROOM_BINARIES_OFFLINE above is the narrow, binaries-only switch; this
+    # is the deployment-wide one. An operator who set the air-gap switch should
+    # not have to also discover a second, differently-named flag to stop
+    # Headroom fetching release assets from GitHub at install time.
+    guard_egress("release binary download", url)
     if not _has_writable_existing_parent(dest.parent):
         raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -275,10 +318,18 @@ def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if not final_url.startswith("https://"):
         raise BinaryFetchError(f"refusing non-https download URL: {final_url!r}")
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
+    try:
+        ctx = _ssl_context()
+    except Exception as e:
+        raise BinaryFetchError(f"failed to configure TLS trust for binary download: {e}") from e
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (https)
+            if ctx is not None:
+                resp = urllib.request.urlopen(req, timeout=60, context=ctx)  # noqa: S310 (https)
+            else:
+                resp = urllib.request.urlopen(req, timeout=60)  # noqa: S310 (https)
+            with resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 _stream_to(resp, dest, total, label=dest.name, show_progress=progress)
             return
@@ -349,7 +400,7 @@ def _allow_unverified(name: str) -> bool:
     when ``lastResort`` will not fire, and when the log may be going somewhere
     an operator is not watching, such as a file.
     """
-    if not os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED"):
+    if not _allow_unverified_binaries():
         return False
     message = (
         f"headroom: WARNING: accepting {name} WITHOUT sha256 verification "
@@ -363,6 +414,7 @@ def _allow_unverified(name: str) -> bool:
 
 
 def _verify_sha256(path: Path, expected: str | None) -> None:
+
     if _allow_unverified(path.name):
         return
     if not expected:
@@ -403,6 +455,7 @@ def verify_download_bytes(data: bytes, *, url: str, name: str) -> None:
     Sha256Mismatch if the bytes do not match it. Setting
     HEADROOM_BINARIES_ALLOW_UNVERIFIED=1 skips both checks.
     """
+
     if _allow_unverified(name):
         return
     expected = sha256_for_url(url)
@@ -495,6 +548,69 @@ def _in_registry(tool: str) -> bool:
     return tool in _registry().get("tools", {})
 
 
+_WARNED_CWD_HITS: set[str] = set()
+
+
+def _in_cwd(found: str) -> bool:
+    """True if a ``shutil.which`` hit came from a relative PATH entry or the cwd."""
+    if not os.path.isabs(found):
+        return True
+    try:
+        return os.path.samefile(os.path.dirname(found), os.getcwd())
+    except OSError:
+        return False
+
+
+def _which_outside_cwd(name: str) -> Path | None:
+    """``shutil.which(name)``, skipping any hit in the current directory.
+
+    On Windows ``shutil.which`` looks in the current directory before PATH
+    unless ``NoDefaultCurrentDirectoryInExePath`` is set, and on any OS a
+    relative PATH entry (``.``, empty, ``bin``) resolves against the cwd. The
+    cwd is usually the project being worked on, so a same-named file there
+    would run instead of the real tool. Such a hit is skipped and the search
+    continues through the absolute PATH entries; with no other hit the caller
+    falls back to the interpreter's Scripts dir or the verified cache. This also
+    applies when the cwd is itself an absolute PATH entry (e.g. ``~/.local/bin``).
+    """
+    found = shutil.which(name)
+    if not found:
+        return None
+    if not _in_cwd(found):
+        return Path(found)
+    ignored = os.path.abspath(found)
+    # resolve() runs per tool result in the proxy; say it once per file.
+    if ignored not in _WARNED_CWD_HITS:
+        _WARNED_CWD_HITS.add(ignored)
+        logger.warning("Ignoring %s in the current directory (%s)", name, ignored)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        hit = _executable_in(entry, name)
+        if hit and not _in_cwd(hit):
+            return Path(hit)
+    return None
+
+
+def _executable_in(directory: str, name: str) -> str | None:
+    """Look for `name` in one directory only, like ``shutil.which`` minus its cwd step.
+
+    ``shutil.which(name, path=directory)`` still searches the current directory
+    first on Windows, so it cannot be used to skip a hit there. PATHEXT is
+    honoured the same way ``shutil.which`` does.
+    """
+    names = [name]
+    if sys.platform.startswith("win"):
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+        if not any(name.lower().endswith(ext.lower()) for ext in exts):
+            names = [name + ext for ext in exts]
+    for candidate in names:
+        path = os.path.join(directory, candidate)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def _path_lookup(tool: str) -> Path | None:
     """Find `tool` on PATH or in this interpreter's Scripts/bin directory.
 
@@ -510,14 +626,15 @@ def _path_lookup(tool: str) -> Path | None:
             candidates.append(alias)
 
     for name in candidates:
-        found = shutil.which(name)
+        found = _which_outside_cwd(name)
         if found:
-            return Path(found)
+            return found
 
     scripts_dir = Path(sys.prefix) / ("Scripts" if sys.platform.startswith("win") else "bin")
     for name in candidates:
         exe = scripts_dir / (name + (".exe" if sys.platform.startswith("win") else ""))
-        if exe.exists():
+        # Same test shutil.which applies: a regular file we may execute.
+        if exe.is_file() and os.access(exe, os.X_OK):
             return exe
     return None
 
@@ -650,12 +767,11 @@ def status() -> list[dict[str, Any]]:
             "path": None,
             "state": "missing",
         }
-        # Honor PATH.
-        on_path = shutil.which(name) or (
-            shutil.which(entry["binary"]) if entry.get("binary") else None
-        )
+        # Same lookup as which()/resolve(): PATH outside the cwd, then the
+        # interpreter's Scripts dir.
+        on_path = _path_lookup(name)
         if on_path:
-            row["path"] = on_path
+            row["path"] = str(on_path)
             row["state"] = "on-path"
             out.append(row)
             continue

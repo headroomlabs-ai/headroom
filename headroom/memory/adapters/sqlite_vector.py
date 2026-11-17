@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
@@ -235,8 +236,8 @@ class SQLiteVectorIndex:
         self._init_db()
 
     def _create_conn(self) -> sqlite3.Connection:
-        """Create a SQLite connection with sqlite-vec loaded."""
-        conn = sqlite3.connect(str(self._db_path))
+        """Create a SQLite connection with sqlite-vec loaded (file owner-only)."""
+        conn = connect_private_sqlite(self._db_path, what="memory vector index")
         conn.row_factory = sqlite3.Row
 
         # Load sqlite-vec extension
@@ -648,6 +649,42 @@ class SQLiteVectorIndex:
                 conn.commit()
                 return len(rowids)
 
+    def _row_to_metadata(self, row: Any) -> VectorMetadata | None:
+        """Build ``VectorMetadata`` from a ``vec_metadata`` row, skipping a bad row.
+
+        A single row with an unparseable ``created_at`` / ``valid_until`` or
+        malformed ``entity_refs`` / ``metadata_json`` JSON (schema drift across an
+        upgrade, a partially written row) otherwise raises mid-loop and aborts
+        the *whole* search, losing every other result. #2947 healed the
+        ``entity_refs`` shape for exactly this reason ("took down whole memory
+        searches rather than the one bad row"), but ``created_at`` and
+        ``metadata_json`` in this loop were left unguarded. Return ``None`` so
+        the caller skips just the offending row.
+        """
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+            valid_until = datetime.fromisoformat(row["valid_until"]) if row["valid_until"] else None
+            entity_refs = normalize_entity_refs(json.loads(row["entity_refs"]))
+            metadata = json.loads(row["metadata_json"])
+        except (ValueError, TypeError):
+            logger.warning(
+                "Skipping unreadable vec_metadata row (memory_id=%s)",
+                row["memory_id"],
+            )
+            return None
+        return VectorMetadata(
+            memory_id=row["memory_id"],
+            user_id=row["user_id"],
+            session_id=row["session_id"],
+            agent_id=row["agent_id"],
+            importance=row["importance"],
+            created_at=created_at,
+            valid_until=valid_until,
+            entity_refs=entity_refs,
+            content=row["content"],
+            metadata=metadata,
+        )
+
     async def search(self, filter: VectorFilter) -> list[VectorSearchResult]:
         """Search for similar vectors.
 
@@ -722,23 +759,11 @@ class SQLiteVectorIndex:
                     if similarity < filter.min_similarity:
                         continue
 
-                    # Build metadata for filtering
-                    meta = VectorMetadata(
-                        memory_id=row["memory_id"],
-                        user_id=row["user_id"],
-                        session_id=row["session_id"],
-                        agent_id=row["agent_id"],
-                        importance=row["importance"],
-                        created_at=datetime.fromisoformat(row["created_at"]),
-                        valid_until=(
-                            datetime.fromisoformat(row["valid_until"])
-                            if row["valid_until"]
-                            else None
-                        ),
-                        entity_refs=json.loads(row["entity_refs"]),
-                        content=row["content"],
-                        metadata=json.loads(row["metadata_json"]),
-                    )
+                    # Build metadata for filtering. A single corrupt/legacy row
+                    # is skipped rather than aborting the whole search (#2947).
+                    meta = self._row_to_metadata(row)
+                    if meta is None:
+                        continue
 
                     # Apply filters
                     if not self._passes_filter(meta, filter):

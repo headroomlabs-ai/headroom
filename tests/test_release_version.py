@@ -11,11 +11,13 @@ import pytest
 from headroom.release_version import (
     CommitInfo,
     classify_commit_bump,
+    commit_height_since,
     compute_release_version,
     determine_bump_level,
     find_latest_release_tag,
     get_canonical_version,
     list_release_commits,
+    list_release_tags,
     normalize_release_tag,
     parse_release_tag,
 )
@@ -154,6 +156,27 @@ def test_list_release_commits_parses_empty_body_entries(
         CommitInfo(subject="feat: add capability", body=""),
         CommitInfo(subject="fix: patch bug", body="body text"),
     ]
+
+
+def test_version_detection_git_calls_are_hang_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Version-detection git subprocesses must not inherit the caller's stdin
+    and must be bounded — otherwise they hang ``headroom_compress``: the
+    compression pipeline initializes the OTel tracer, which calls
+    ``get_version()`` → ``_source_tree_version()`` → these git calls."""
+    run = Mock()
+    run.return_value = Mock(stdout="")
+    monkeypatch.setattr("headroom.release_version.run", run)
+
+    list_release_tags(ROOT)
+    list_release_commits(ROOT, "")
+    commit_height_since(ROOT, "v0.1.0")
+
+    assert len(run.call_args_list) == 3
+    for call in run.call_args_list:
+        assert call.kwargs["stdin"] == subprocess.DEVNULL
+        assert call.kwargs["timeout"] == 10
 
 
 def test_release_version_script_runs_directly_without_importing_headroom_package(

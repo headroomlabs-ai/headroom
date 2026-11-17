@@ -29,10 +29,10 @@ from headroom.proxy.image_compression_decision import ImageCompressionDecision
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-def _config(*, image_optimize: bool = True) -> Any:
-    """Minimal stand-in for ``HeadroomConfig`` — only the field the
+def _config(*, image_optimize: bool = True, compressors: set[str] | None = None) -> Any:
+    """Minimal stand-in for ``HeadroomConfig`` — only the fields the
     decision reads."""
-    return SimpleNamespace(image_optimize=image_optimize)
+    return SimpleNamespace(image_optimize=image_optimize, compressors=compressors)
 
 
 def _msgs(n: int = 1) -> list[dict[str, str]]:
@@ -103,6 +103,49 @@ def test_image_optimize_disabled_is_skip() -> None:
     )
     assert d.should_compress is False
     assert d.passthrough_reason == "image_optimize_disabled"
+
+
+def test_selection_without_image_is_skip() -> None:
+    """A ``--compressor`` selection that leaves out ``image`` (#4613)."""
+    d = ImageCompressionDecision.decide(
+        headers={}, config=_config(compressors={"smart_crusher"}), messages=_msgs()
+    )
+    assert d.should_compress is False
+    assert d.passthrough_reason == "image_not_selected"
+    assert d.image_selected is False
+    assert d.image_optimize_enabled is True
+
+
+def test_selection_with_image_or_wildcard_compresses() -> None:
+    for compressors in ({"image"}, {"smart_crusher", " image "}, {"*"}, set(), {" "}):
+        d = ImageCompressionDecision.decide(
+            headers={}, config=_config(compressors=compressors), messages=_msgs()
+        )
+        assert d.should_compress is True, compressors
+        assert d.image_selected is True
+
+
+def test_config_without_compressors_attribute_compresses() -> None:
+    d = ImageCompressionDecision.decide(
+        headers={}, config=SimpleNamespace(image_optimize=True), messages=_msgs()
+    )
+    assert d.should_compress is True
+
+
+def test_image_optimize_disabled_beats_image_not_selected() -> None:
+    d = ImageCompressionDecision.decide(
+        headers={},
+        config=_config(image_optimize=False, compressors={"smart_crusher"}),
+        messages=_msgs(),
+    )
+    assert d.passthrough_reason == "image_optimize_disabled"
+
+
+def test_image_not_selected_beats_no_messages() -> None:
+    d = ImageCompressionDecision.decide(
+        headers={}, config=_config(compressors={"smart_crusher"}), messages=[]
+    )
+    assert d.passthrough_reason == "image_not_selected"
 
 
 def test_no_messages_is_skip() -> None:
@@ -226,6 +269,11 @@ def test_apply_to_tags_for_every_skip_reason() -> None:
         "image_optimize_disabled": {
             "headers": {},
             "config": _config(image_optimize=False),
+            "messages": _msgs(),
+        },
+        "image_not_selected": {
+            "headers": {},
+            "config": _config(compressors={"smart_crusher"}),
             "messages": _msgs(),
         },
         "no_messages": {

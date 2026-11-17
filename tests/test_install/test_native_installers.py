@@ -417,6 +417,43 @@ def test_generated_wrappers_explicitly_override_image_host_for_container_access(
     assert "dockerArgs.Add('0.0.0.0')" in powershell_source
 
 
+def test_wrappers_acknowledge_open_bind_only_with_loopback_publication() -> None:
+    """Every container launch that binds 0.0.0.0 inside the container must
+    publish on host loopback *and* acknowledge the token-less open bind, and
+    the acknowledgement must never appear without that publication.
+
+    The proxy refuses a token-less non-loopback bind unless
+    HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1 is set; the wrappers make that
+    statement only through one helper that also adds ``-p 127.0.0.1:...``.
+    """
+    ack = "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1"
+    bash_source = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell_source = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    # Bash: the publish flag and the acknowledgement live only in the helper.
+    helper = bash_source.split("append_loopback_publish_args() {", 1)[1].split("\n}\n", 1)[0]
+    assert '-p "127.0.0.1:${port}:${port}"' in helper and ack in helper
+    outside = bash_source.replace(helper, "")
+    assert '-p "127.0.0.1:' not in outside
+    assert outside.count(ack) == 0
+    # Three launch sites, three helper calls.
+    assert bash_source.count("--host 0.0.0.0") == 3
+    assert bash_source.count("append_loopback_publish_args ") == 3
+
+    # PowerShell: same shape.
+    ps_helper = powershell_source.split("function Get-LoopbackPublishArgs {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert "127.0.0.1`:$Port`:$Port" in ps_helper and ack in ps_helper
+    # Without the unary comma PowerShell unrolls the array to object[], and
+    # List[string].AddRange rejects it at runtime.
+    assert "return ,[string[]]@(" in ps_helper
+    ps_outside = powershell_source.replace(ps_helper, "")
+    assert "'-p'," not in ps_outside.replace("Get-LoopbackPublishArgs", "")
+    assert ps_outside.count(ack) == 0
+    assert powershell_source.count("Get-LoopbackPublishArgs -Port") == 3
+
+
 @pytest.mark.skipif(
     os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
     reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
@@ -893,6 +930,104 @@ def test_path_scope_rejects_machine_and_invalid_values(tmp_path: Path) -> None:
         out = _invoke_scope_harness(bad, tmp_path)
         assert out.startswith("ERR:"), f"scope {bad!r} was not rejected: {out!r}"
         assert "User" in out and "Process" in out, out
+
+
+# AST-extract the two functions Start-PersistentDockerInstall uses to build the
+# dashboard allowlist env and run them in the same order: the passthrough
+# enumerates Env: before Add-DashboardGatewayEnv checks for an explicit value.
+# Both live in the generated wrapper, i.e. inside install.ps1's single-quoted
+# here-string template, so that template is parsed in turn. `docker` is stubbed
+# so no real daemon is queried. Prints one docker arg per line.
+_DASHBOARD_GATEWAY_HARNESS = r"""
+param([string]$InstallScript)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $InstallScript, [ref]$null, [ref]$null)
+$template = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+    $n.StringConstantType -eq 'SingleQuotedHereString' -and
+    $n.Value.Contains('function Add-DashboardGatewayEnv')
+}, $true) | Select-Object -First 1
+if (-not $template) { Write-Output 'NOTEMPLATE'; exit 3 }
+$ast = [System.Management.Automation.Language.Parser]::ParseInput(
+    $template.Value, [ref]$null, [ref]$null)
+$functions = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $true)
+foreach ($name in 'Get-PassthroughEnvArgs', 'Add-DashboardGatewayEnv') {
+    $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if (-not $fn) { Write-Output "NOFUNC:$name"; exit 3 }
+    Invoke-Expression $fn.Extent.Text
+}
+function docker { $global:LASTEXITCODE = 0; '172.17.0.1' }
+$dockerArgs = New-Object System.Collections.Generic.List[string]
+$dockerArgs.AddRange([string[]](Get-PassthroughEnvArgs))
+Add-DashboardGatewayEnv -ArgsList $dockerArgs
+$dockerArgs | ForEach-Object { Write-Output $_ }
+"""
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows PowerShell coverage runs on Windows hosts only"
+)
+@pytest.mark.parametrize(
+    "shell",
+    [
+        # Windows PowerShell 5.1 ships with every Windows install and is what a
+        # plain `powershell` resolves to; pwsh is PowerShell 7+.
+        pytest.param("powershell", id="windows-powershell"),
+        pytest.param("pwsh", id="pwsh"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("configured", "expect_gateway_default"),
+    [
+        pytest.param(None, True, id="unset"),
+        pytest.param("10.20.0.0/16", False, id="configured"),
+        pytest.param("", False, id="explicitly-empty"),
+    ],
+)
+def test_powershell_dashboard_gateway_default_respects_explicit_allowlist(
+    tmp_path: Path, shell: str, configured: str | None, expect_gateway_default: bool
+) -> None:
+    """An explicit allowlist, even an empty one, must suppress the gateway default.
+
+    Windows PowerShell 5.1 stops reporting an empty variable through
+    ``Test-Path Env:`` once ``Env:`` has been enumerated, so the explicit opt-out
+    was forwarded by name *and* overridden by the trusted bridge gateway.
+    """
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(f"{shell} is not installed")
+
+    trusted_cidrs = "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS"
+    env = {key: value for key, value in os.environ.items() if key.upper() != trusted_cidrs}
+    if configured is not None:
+        env[trusted_cidrs] = configured
+
+    harness = tmp_path / "dashboard_gateway_harness.ps1"
+    harness.write_text(_DASHBOARD_GATEWAY_HARNESS, encoding="utf-8")
+    result = _run(
+        [
+            executable,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-InstallScript",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+        ],
+        env=env,
+    )
+    docker_args = result.stdout.splitlines()
+
+    gateway_default = f"{trusted_cidrs}=172.17.0.1/32"
+    assert (gateway_default in docker_args) is expect_gateway_default, docker_args
+    # Docker's name-only --env form forwards the caller's value unchanged.
+    assert (trusted_cidrs in docker_args) is (configured is not None), docker_args
 
 
 @pytest.mark.skipif(

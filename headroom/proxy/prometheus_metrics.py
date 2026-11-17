@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
+from headroom.proxy.savings_attribution import UNFOLDED_SOURCES, event_count
 from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
@@ -29,6 +30,24 @@ logger = logging.getLogger("headroom.proxy")
 # Sentinel label value that models past MAX_DISTINCT_MODELS collapse into, so
 # client-supplied model cardinality stays bounded (see record_request).
 _OTHER_MODEL = "other"
+
+# Same idea for inbound request paths (see record_inbound_request). ``path`` is
+# client-controlled and effectively unbounded — ID-bearing passthrough routes
+# such as ``/v1/files/{id}`` or ``/v1/responses/{id}`` mint a distinct key per
+# request. Past this many distinct paths, further paths collapse into
+# ``_OTHER_PATH`` so the counter (and its exported Prometheus series) can't grow
+# without bound. The cap sits well above a proxy's real route count.
+MAX_DISTINCT_PATHS = 256
+_OTHER_PATH = "other"
+
+# Same idea for savings attribution rows (see record_request). Source names come
+# from extensions and turn hooks, so one that mints a name per request would grow
+# savings_by_source, and its three exported series, without bound. Past this many
+# rows, new sources are summed into ``_OTHER_SOURCE``: only the name is lost,
+# never a token or a dollar. As in the per-request ledger, ``UNFOLDED_SOURCES``
+# never fold: the documented headline query selects ``source="tool_search"``.
+MAX_DISTINCT_SAVINGS_ROWS = 256
+_OTHER_SOURCE = "other"
 
 # Closed label set for headroom_requests_rate_limited_total{source}. Two 429s
 # mean opposite things to an operator: "headroom" is OUR limiter refusing the
@@ -152,9 +171,18 @@ class PrometheusMetrics:
         self.inbound_requests_active = 0
         self.inbound_requests_by_method: dict[str, int] = defaultdict(int)
         self.inbound_requests_by_path: dict[str, int] = defaultdict(int)
+        self._path_cardinality_warned = False
         self.inbound_responses_by_status: dict[str, int] = defaultdict(int)
 
         self.tokens_input_total = 0
+        # Of tokens_input_total: how much is the provider's own billed count
+        # versus Headroom's local tokenizer estimate (provider reported no
+        # usage, or the path never parsed it). Reported beside every input
+        # total so nobody reads an estimate as the bill.
+        self.tokens_input_provider_reported_total = 0
+        self.tokens_input_estimated_total = 0
+        self.requests_input_provider_reported = 0
+        self.requests_input_estimated = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
         # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
@@ -190,6 +218,7 @@ class PrometheusMetrics:
         self.extension_savings: dict[str, int] = defaultdict(int)
         # Named savings attribution; realized and projected rows stay separate.
         self.savings_by_source: dict[str, dict[str, str | int | float | bool]] = {}
+        self._savings_source_cardinality_warned = False
 
         # Fail-open compression failures, keyed by reason ("timeout",
         # "error"). The proxy fails open on any optimization error so the
@@ -413,9 +442,14 @@ class PrometheusMetrics:
             self.inbound_requests_active = 0
             self.inbound_requests_by_method.clear()
             self.inbound_requests_by_path.clear()
+            self._path_cardinality_warned = False
             self.inbound_responses_by_status.clear()
 
             self.tokens_input_total = 0
+            self.tokens_input_provider_reported_total = 0
+            self.tokens_input_estimated_total = 0
+            self.requests_input_provider_reported = 0
+            self.requests_input_estimated = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
             self.tool_search_saved_total = 0
@@ -425,6 +459,7 @@ class PrometheusMetrics:
             self.tokens_saved_by_strategy.clear()
             self.extension_savings.clear()
             self.savings_by_source.clear()
+            self._savings_source_cardinality_warned = False
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
                 self.upstream_connection_errors_by_provider.clear()
@@ -631,6 +666,24 @@ class PrometheusMetrics:
         if saved > 0:
             self.extension_savings[key] += saved
 
+    def extension_savings_by_source(self) -> dict[str, int]:
+        """Measured savings per source, as ``/stats`` reports ``extension_savings``.
+
+        Realized savings attribution rows (``ctx.record_savings`` from a turn
+        hook, ``record_scope_savings``) plus ``record_extension_savings`` totals.
+        A source reported through both APIs (``headroom-hdr`` does, per request)
+        shows the larger of the two totals rather than their sum: nothing ties an
+        attribution row to a ``record_extension_savings`` call, so summing would
+        double-count it. Estimated rows (``realized=False``) stay in
+        ``savings.by_source`` only.
+        """
+        out = dict(self.extension_savings)
+        for row in list(self.savings_by_source.values()):
+            source, tokens = str(row["source"]), int(row["tokens"])
+            if row["realized"] and tokens > out.get(source, 0):
+                out[source] = tokens
+        return out
+
     def record_compression_failed(self, reason: str) -> None:
         """Record one fail-open compression failure, bucketed by ``reason``.
 
@@ -773,7 +826,23 @@ class PrometheusMetrics:
         self.inbound_requests_total += 1
         self.inbound_requests_active += 1
         self.inbound_requests_by_method[method.upper()] += 1
-        self.inbound_requests_by_path[path] += 1
+        # Cap client-controlled path cardinality, mirroring the model cap in
+        # record_request. A membership test (never a defaultdict index) keeps an
+        # over-cap path from materializing a new key and defeating the bound.
+        if path in self.inbound_requests_by_path or (
+            len(self.inbound_requests_by_path) < MAX_DISTINCT_PATHS
+        ):
+            bounded_path = path
+        else:
+            bounded_path = _OTHER_PATH
+            if not self._path_cardinality_warned:
+                self._path_cardinality_warned = True
+                logger.warning(
+                    "metrics.record: inbound path cardinality cap (%d) reached; "
+                    'bucketing further paths into "other"',
+                    MAX_DISTINCT_PATHS,
+                )
+        self.inbound_requests_by_path[bounded_path] += 1
 
     def record_inbound_response(self, *, status_code: int | str) -> None:
         self.inbound_requests_completed += 1
@@ -827,6 +896,10 @@ class PrometheusMetrics:
         # ``CacheMix.normalized``. Defaults False, preserving behaviour for the
         # providers that report disjoint buckets.
         cache_inferred: bool = False,
+        # True when ``input_tokens`` is the provider's own billed count, False
+        # when it is Headroom's local estimate. None (callers predating the
+        # split) records nothing in either bucket.
+        input_provider_reported: bool | None = None,
     ):
         """Record metrics for a request.
 
@@ -841,6 +914,10 @@ class PrometheusMetrics:
         from headroom.telemetry.context import MAX_DISTINCT_MODELS
 
         ledger_input_tokens = input_tokens if local_input_tokens is None else local_input_tokens
+        # An inferred write is the uncached slice under another name (see
+        # ``cache_inferred``), so it adds neither new input nor a billed write.
+        billed_write_tokens = 0 if cache_inferred else cache_write_tokens
+        new_input_tokens = int(uncached_input_tokens) + int(billed_write_tokens)
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original — handlers revert any inflation before sending
         # (verified clean on the wire). So compression savings are >= 0; a negative
@@ -866,6 +943,7 @@ class PrometheusMetrics:
             compression_tokens_saved=tokens_saved,
             tool_schema_tokens_saved=tool_search_saved,
             output_tokens_saved=output_tokens_saved,
+            output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_write_5m_tokens=cache_write_5m_tokens,
@@ -904,6 +982,12 @@ class PrometheusMetrics:
                 self.requests_cached += 1
 
             self.tokens_input_total += input_tokens
+            if input_provider_reported is True:
+                self.tokens_input_provider_reported_total += input_tokens
+                self.requests_input_provider_reported += 1
+            elif input_provider_reported is False and input_tokens > 0:
+                self.tokens_input_estimated_total += input_tokens
+                self.requests_input_estimated += 1
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
             self.tool_search_saved_total += max(0, int(tool_search_saved))
@@ -911,6 +995,19 @@ class PrometheusMetrics:
                 source = str(item.get("source") or "other")[:64]
                 realized = bool(item.get("realized", True))
                 key = f"{source}:{int(realized)}"
+                if (
+                    key not in self.savings_by_source
+                    and source not in UNFOLDED_SOURCES
+                    and len(self.savings_by_source) >= MAX_DISTINCT_SAVINGS_ROWS
+                ):
+                    source, key = _OTHER_SOURCE, f"{_OTHER_SOURCE}:{int(realized)}"
+                    if not self._savings_source_cardinality_warned:
+                        self._savings_source_cardinality_warned = True
+                        logger.warning(
+                            "metrics.record: savings source cardinality cap (%d) reached; "
+                            'summing further sources into "other"',
+                            MAX_DISTINCT_SAVINGS_ROWS,
+                        )
                 row = self.savings_by_source.setdefault(
                     key,
                     {
@@ -921,7 +1018,7 @@ class PrometheusMetrics:
                         "usd": 0.0,
                     },
                 )
-                row["events"] = int(row["events"]) + 1
+                row["events"] = int(row["events"]) + event_count(item)
                 row["tokens"] = int(row["tokens"]) + max(0, int(item.get("tokens", 0) or 0))
                 row["usd"] = round(
                     float(row["usd"]) + float(item.get("usd", 0.0) or 0.0),
@@ -933,14 +1030,14 @@ class PrometheusMetrics:
 
             # New-input cohort, on the same predicate the ledger uses below.
             if uncached_input_tokens > 0 or cache_write_tokens > 0:
-                self.new_input_tokens_total += uncached_input_tokens + cache_write_tokens
+                self.new_input_tokens_total += new_input_tokens
                 self.new_input_saved_tokens_total += max(0, int(tokens_saved))
 
             # Track provider-specific prefix cache metrics
             if cache_read_tokens > 0 or cache_write_tokens > 0:
                 pc = self.cache_by_provider[provider]
                 pc["cache_read_tokens"] += cache_read_tokens
-                pc["cache_write_tokens"] += cache_write_tokens
+                pc["cache_write_tokens"] += billed_write_tokens
                 pc["cache_write_5m_tokens"] += cache_write_5m_tokens
                 pc["cache_write_1h_tokens"] += cache_write_1h_tokens
                 if cache_write_5m_tokens > 0:
@@ -1038,6 +1135,7 @@ class PrometheusMetrics:
                 # saved next to "0 tokens saved".
                 tool_search_saved=tool_search_saved,
                 provider=provider,
+                agent=client,
                 project=project,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
@@ -1130,9 +1228,7 @@ class PrometheusMetrics:
                 # show the same new-input rate the dashboard headline does.
                 # Omitted when there is no cache breakdown (e.g. Bedrock), so
                 # the ledger never divides savings by themselves.
-                new_input_tokens=(
-                    int(uncached_input_tokens) + int(cache_write_tokens) if has_new_input else None
-                ),
+                new_input_tokens=new_input_tokens if has_new_input else None,
                 deferred_tokens=deferral_saved,
             )
 
@@ -1786,6 +1882,45 @@ class PrometheusMetrics:
                         f'headroom_stage_timing_ms_max{{path="{_escape_label_value(path_label)}",stage="{_escape_label_value(stage)}"}} {round(max_value, 2)}'
                     )
                 lines.append("")
+
+            # Shared Redis store availability (lazy import: module must not
+            # require the redis package at import time). ``headroom_redis_checked``
+            # is emitted for every configured feature so a store that has not
+            # been called yet (or not built yet) stays visible;
+            # ``headroom_redis_available`` is emitted only for observed ones (1
+            # when available, 0 during an outage or backoff), so an unknown
+            # store does not advertise connectivity.
+            from headroom.cache.redis_client import states as _redis_states
+
+            _states = _redis_states()
+            if _states:
+                lines.extend(
+                    [
+                        "# HELP headroom_redis_checked 1 when the shared Redis store has been called at least once, 0 when unobserved",
+                        "# TYPE headroom_redis_checked gauge",
+                    ]
+                )
+                for _label in sorted(_states):
+                    lines.append(
+                        f'headroom_redis_checked{{feature="{_escape_label_value(_label)}"}}'
+                        f" {int(_states[_label] != 'unknown')}"
+                    )
+                lines.append("")
+
+                _observed = [_label for _label in sorted(_states) if _states[_label] != "unknown"]
+                if _observed:
+                    lines.extend(
+                        [
+                            "# HELP headroom_redis_available 1 when the shared Redis store answered its last call, 0 during an outage or backoff",
+                            "# TYPE headroom_redis_available gauge",
+                        ]
+                    )
+                    for _label in _observed:
+                        lines.append(
+                            f'headroom_redis_available{{feature="{_escape_label_value(_label)}"}}'
+                            f" {int(_states[_label] == 'available')}"
+                        )
+                    lines.append("")
 
             # Unit 3: WS session lifecycle gauges + duration histogram.
             lines.extend(

@@ -12,11 +12,11 @@ MODEL = "claude-haiku-4-5"
 
 
 def test_semantic_cache_key_distinguishes_response_shaping_fields() -> None:
-    assert compute_semantic_cache_key(MESSAGES, MODEL, system="French") != (
-        compute_semantic_cache_key(MESSAGES, MODEL, system="English")
+    assert compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", system="French") != (
+        compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", system="English")
     )
-    assert compute_semantic_cache_key(MESSAGES, MODEL, temperature=0.0) != (
-        compute_semantic_cache_key(MESSAGES, MODEL, temperature=1.0)
+    assert compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", temperature=0.0) != (
+        compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", temperature=1.0)
     )
 
 
@@ -24,8 +24,12 @@ def test_semantic_cache_key_ignores_moved_cache_control() -> None:
     with_cache_control = [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]
     without_cache_control = [{"type": "text", "text": "sys"}]
 
-    assert compute_semantic_cache_key(MESSAGES, MODEL, system=with_cache_control) == (
-        compute_semantic_cache_key(MESSAGES, MODEL, system=without_cache_control)
+    assert compute_semantic_cache_key(
+        MESSAGES, MODEL, partition="p_test", system=with_cache_control
+    ) == (
+        compute_semantic_cache_key(
+            MESSAGES, MODEL, partition="p_test", system=without_cache_control
+        )
     )
 
 
@@ -38,8 +42,8 @@ def test_semantic_cache_key_ignores_moved_message_cache_control() -> None:
         }
     ]
     messages_without_cc = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
-    assert compute_semantic_cache_key(messages_with_cc, MODEL) == (
-        compute_semantic_cache_key(messages_without_cc, MODEL)
+    assert compute_semantic_cache_key(messages_with_cc, MODEL, partition="p_test") == (
+        compute_semantic_cache_key(messages_without_cc, MODEL, partition="p_test")
     )
 
 

@@ -5,6 +5,8 @@ import {
   HeadroomConnectionError,
   HeadroomAuthError,
   HeadroomCompressError,
+  ConfigurationError,
+  ValidationError,
 } from "../src/types.js";
 
 const mockFetch = vi.fn();
@@ -117,6 +119,23 @@ describe("HeadroomClient", () => {
 
     const [url] = mockFetch.mock.calls[0];
     expect(url).toBe("http://localhost:8787/v1/compress");
+  });
+
+  it("handles long runs of slashes in baseUrl in linear time", async () => {
+    // The previous /\/+$/ regex backtracked quadratically on a long run of
+    // "/" that is not at the end of the string (CodeQL js/polynomial-redos).
+    const slashes = "/".repeat(100_000);
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+
+    const start = performance.now();
+    const client = new HeadroomClient({
+      baseUrl: `http://localhost:8787${slashes}x${slashes}`,
+    });
+    expect(performance.now() - start).toBeLessThan(1000);
+
+    await client.compress(sampleMessages, { model: "gpt-4o" });
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe(`http://localhost:8787${slashes}x/v1/compress`);
   });
 
   it("throws HeadroomAuthError on 401 (always, even with fallback)", async () => {
@@ -252,6 +271,50 @@ describe("HeadroomClient", () => {
     ).rejects.toThrow(HeadroomCompressError);
 
     expect(mockFetch).toHaveBeenCalledTimes(1); // no retries
+  });
+
+  it.each([
+    ["configuration_error", ConfigurationError],
+    ["validation_error", ValidationError],
+  ])(
+    "throws typed %s 4xx errors without retry or fallback",
+    async (type, ErrorClass) => {
+      mockFetch.mockImplementation(async () =>
+        errorResponse(400, { error: { type, message: "Bad request" } }),
+      );
+
+      const client = new HeadroomClient({
+        baseUrl: "http://localhost:8787",
+        retries: 1,
+        fallback: true, // fallback doesn't apply to client errors
+      });
+
+      await expect(
+        client.compress(sampleMessages, { model: "gpt-4o" }),
+      ).rejects.toThrow(ErrorClass);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1); // no retries
+    },
+  );
+
+  it("still retries typed 5xx errors", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        errorResponse(502, {
+          error: { type: "provider_error", message: "Upstream failed" },
+        }),
+      )
+      .mockResolvedValueOnce(okResponse(sampleProxyResponse));
+
+    const client = new HeadroomClient({
+      baseUrl: "http://localhost:8787",
+      retries: 1,
+      fallback: false,
+    });
+    const result = await client.compress(sampleMessages, { model: "gpt-4o" });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(result.compressed).toBe(true);
   });
 
   it("defaults model to gpt-4o when not provided", async () => {

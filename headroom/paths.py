@@ -125,6 +125,46 @@ def process_is_stateless() -> bool:
     return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
 
 
+# Purposes for which a "skipped because stateless" notice has already been
+# logged, so a busy proxy says it once per persister, not once per turn.
+_PERSISTENCE_NOTICED: set[str] = set()
+
+
+def persistence_allowed(purpose: str) -> bool:
+    """Whether a runtime persister may write *purpose* to the workspace now.
+
+    This is the one predicate every on-disk store consults before it creates or
+    writes a file under the workspace: the CCR retrieval store, the licence
+    cache, MCP session stats, the savings ledger, subscription state, memory
+    sync state, the update-check cache. Returns ``False`` in stateless mode
+    (``--stateless`` or ``HEADROOM_STATELESS``), in which case the caller keeps
+    its in-memory state and skips the write. The first refusal for each
+    *purpose* is logged at INFO so an operator can see what stateless mode
+    turned off; later refusals are silent.
+
+    Use this rather than checking :func:`process_is_stateless` inline so the
+    stateless guarantee ("writes nothing to the workspace") is enforced in one
+    place and its coverage can be read off the call sites.
+    """
+
+    if not process_is_stateless():
+        return True
+    if purpose not in _PERSISTENCE_NOTICED:
+        _PERSISTENCE_NOTICED.add(purpose)
+        import logging
+
+        logging.getLogger(__name__).info(
+            "Stateless mode: not persisting %s to disk (kept in memory only).", purpose
+        )
+    return False
+
+
+def _reset_persistence_notices() -> None:
+    """Forget which stateless notices were logged. For tests."""
+
+    _PERSISTENCE_NOTICED.clear()
+
+
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
     """Apply the standard precedence: explicit > env > derived.
 
@@ -441,6 +481,7 @@ __all__ = [
     "HEADROOM_SETTINGS_PATH_ENV",
     "set_process_stateless",
     "process_is_stateless",
+    "persistence_allowed",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",

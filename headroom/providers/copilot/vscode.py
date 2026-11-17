@@ -108,13 +108,16 @@ def _strip_jsonc_comments(value: str) -> str:
     return "".join(result)
 
 
-def _validate_settings(raw: str, path: Path) -> None:
+def _parse_settings(raw: str) -> object:
     candidate = _strip_jsonc_comments(raw)
     if candidate.startswith("\ufeff"):
         candidate = candidate[1:]
-    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    return json.loads(re.sub(r",\s*([}\]])", r"\1", candidate))
+
+
+def _validate_settings(raw: str, path: Path) -> None:
     try:
-        parsed = json.loads(candidate)
+        parsed = _parse_settings(raw)
     except json.JSONDecodeError as exc:
         raise click.ClickException(
             f"Could not safely parse {path}: {exc}. Headroom did not overwrite it."
@@ -198,3 +201,43 @@ def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
     _validate_settings(updated, path)
     fsutil.write_text(path, updated)
     return "updated" if had_managed_block else "added"
+
+
+def unrouted_vscode_profiles(user_dir: Path) -> list[tuple[str, Path]]:
+    """Return ``(name, settings.json)`` for profiles that ignore ``user_dir/settings.json``.
+
+    A window in a profile with its own settings reads only that profile's
+    settings.json, and Copilot takes its endpoint overrides from user settings
+    alone, so overrides in the user directory's settings.json never reach it.
+    A directory that is not a VS Code user directory has no profiles.
+    """
+    try:
+        state = json.loads(
+            (user_dir / "globalStorage" / "storage.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return []
+    profiles = state.get("userDataProfiles") if isinstance(state, dict) else None
+    unrouted: list[tuple[str, Path]] = []
+    for profile in profiles if isinstance(profiles, list) else []:
+        if not isinstance(profile, dict):
+            continue
+        flags = profile.get("useDefaultFlags")
+        location = profile.get("location")
+        # VS Code names local profile folders hash(uuid).toString(16); any other
+        # location (a remote URI) is not a folder under profiles/.
+        if (isinstance(flags, dict) and flags.get("settings")) or not (
+            isinstance(location, str) and re.fullmatch(r"[\w-]+", location)
+        ):
+            continue
+        path = user_dir / "profiles" / location / "settings.json"
+        try:
+            settings = _parse_settings(_read_settings(path))
+        except (OSError, ValueError, click.ClickException):
+            settings = None
+        # Only live settings count: the managed-block marker is itself a comment.
+        if isinstance(settings, dict) and _PROXY_KEY in settings and _CAPI_KEY in settings:
+            continue
+        name = profile.get("name")
+        unrouted.append((name if isinstance(name, str) else location, path))
+    return unrouted

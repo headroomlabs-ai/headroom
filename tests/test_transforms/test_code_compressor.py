@@ -9,12 +9,19 @@ Comprehensive tests covering:
 - Edge cases: Empty content, unavailable dependency, fallbacks
 """
 
+import decimal
+import sys
 import textwrap
 from unittest.mock import patch
 
 import pytest
 
 import headroom.transforms.code_compressor as cc
+from headroom.cache.compression_store import (
+    CompressionStore,
+    clear_request_compression_store,
+    set_request_compression_store,
+)
 from headroom.transforms.code_compressor import (
     CodeAwareCompressor,
     CodeCompressionResult,
@@ -208,6 +215,46 @@ def generate_go_code(n_functions: int = 3) -> str:
         )
 
     return "\n".join(lines)
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter not installed")
+@pytest.mark.parametrize(
+    ("language", "code", "comment_prefix"),
+    [
+        pytest.param("python", generate_python_code(), "#", id="python"),
+        pytest.param("javascript", generate_javascript_code(), "//", id="javascript"),
+        pytest.param("typescript", generate_javascript_code(), "//", id="typescript"),
+        pytest.param("go", generate_go_code(), "//", id="go"),
+    ],
+)
+def test_ccr_marker_preserves_code_syntax(language, code, comment_prefix):
+    """CCR metadata must be a comment in the final output, not just before storage."""
+    store = CompressionStore()
+    set_request_compression_store(store)
+    try:
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=10,
+                enable_ccr=True,
+                fallback_to_kompress=False,
+            )
+        )
+        result = compressor.compress(code, language=language)
+
+        assert result.cache_key is not None
+        assert result.syntax_valid
+        # Parse the returned source, including the marker appended after the
+        # compressor's internal syntax check (#4478, item 4).
+        assert compressor._verify_syntax(result.compressed, CodeLanguage(language))
+        marker = result.compressed.splitlines()[-1]
+        assert marker.startswith(f"{comment_prefix} [")
+        assert f"Retrieve more: hash={result.cache_key}." in marker
+        assert "Expires in 5m.]" in marker
+        entry = store.retrieve(result.cache_key)
+        assert entry is not None
+        assert entry.original_content == code
+    finally:
+        clear_request_compression_store()
 
 
 # =============================================================================
@@ -1804,6 +1851,72 @@ class TestRealASTRuns:
 
 
 @pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestMultiLineClassHeaders:
+    """Keep the opening brace when a multi-line signature shares its last
+    line with it (``impl<T> Foo<T> where T: Debug {``, ``class Foo
+    implements Bar {``). Dropping that line leaves the rebuilt header
+    without a brace, so the compressed output no longer parses and the
+    compressor falls back to the original.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=2,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("language", "code", "expected_header"),
+        [
+            (
+                "rust",
+                (
+                    "impl<T> Wrapper<T>\n"
+                    "where T: Debug + Clone {\n"
+                    "    pub fn total(&self) -> u64 {\n"
+                    "        let mut acc = 0;\n"
+                    "        for item in &self.items {\n"
+                    "            acc += item.id;\n"
+                    "        }\n"
+                    "        acc\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "where T: Debug + Clone {",
+            ),
+            (
+                "java",
+                (
+                    "public class Calc\n"
+                    "    extends Base\n"
+                    "    implements Runnable {\n"
+                    "    public int compute(int x) {\n"
+                    "        int a = x + 1;\n"
+                    "        int b = a * 2;\n"
+                    "        int c = b - 3;\n"
+                    "        return c;\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "implements Runnable {",
+            ),
+        ],
+    )
+    def test_opening_brace_line_survives_compression(self, language, code, expected_header):
+        result = self._compressor().compress(code, language=language)
+
+        assert result.language == CodeLanguage(language)
+        # A ratio of 1.0 means the syntax check rejected the output and the
+        # compressor returned the original untouched.
+        assert result.compression_ratio < 1.0
+        assert expected_header in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
 class TestCSharpSupport:
     """C# (``csharp`` grammar) parity with Java/C++/Rust: signatures preserved
     verbatim, method/constructor bodies compressed, block-scoped namespaces
@@ -2210,3 +2323,251 @@ class TestPhpSupport:
         code = "<?php\nclass Broken {\n    public function oops( {\n"
         result = self._compressor().compress(code, language="php")
         assert result.compressed == code
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestRustAttributeAttachment:
+    """Rust outer attributes (``#[derive(...)]``, ``#[inline]``, ``#[cfg(...)]``)
+    are siblings of the item they decorate, like doc comments. Left
+    uncaptured, they fall through to the leftover sweep and drift away from
+    the item — commonly after the compressed function, which rustc rejects
+    with ``expected item after attributes``.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+
+    def test_attributes_stay_attached_to_their_items(self):
+        code = (
+            "#[derive(Debug, Clone, PartialEq)]\n"
+            "pub struct Item {\n"
+            "    pub id: u64,\n"
+            "    pub name: String,\n"
+            "}\n"
+            "\n"
+            "#[inline]\n"
+            '#[cfg(feature = "extra")]\n'
+            "pub fn log_item(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "    sink.push(item.id + 3);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert "#[derive(Debug, Clone, PartialEq)]\npub struct Item {" in result.compressed
+        assert '#[inline]\n#[cfg(feature = "extra")]\npub fn log_item' in result.compressed
+
+    def test_doc_comment_stays_ahead_of_attributes(self):
+        code = (
+            "/// Records one item.\n"
+            "#[inline]\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert "/// Records one item.\n#[inline]\npub fn record" in result.compressed
+
+    def test_attribute_attaches_across_blank_line(self):
+        """Rust allows whitespace between an outer attribute and its item."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")
+
+    def test_attribute_attaches_through_detached_comment(self):
+        """A comment between an attribute and its item must not detach it."""
+        code = (
+            "pub struct Item { pub id: u64 }\n"
+            "\n"
+            "#[inline]\n"
+            "\n"
+            "// Keep with the function below.\n"
+            "\n"
+            "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n"
+            "    sink.push(item.id);\n"
+            "    sink.push(item.id + 1);\n"
+            "    sink.push(item.id + 2);\n"
+            "    sink.push(item.id + 3);\n"
+            "}\n"
+        )
+
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.compression_ratio < 1.0
+        assert result.syntax_valid is True
+        assert "#[inline]\npub fn record" in result.compressed
+        assert not result.compressed.rstrip().endswith("#[inline]")
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter-languages not installed")
+class TestSemicolonSeparatedStatements:
+    """``a = 1; b = 2`` must not corrupt or duplicate the compressed output."""
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=5,
+                enable_ccr=False,
+            )
+        )
+
+    def test_top_level_separator_does_not_become_a_bare_line(self):
+        """Python exposes the ``;`` as a root-level token; emitting it as a
+        standalone fragment puts a bare ``;`` on its own line and makes the
+        whole result invalid, so compression falls back to the original."""
+        code = (
+            "import json\n"
+            "B='/tmp/'\n"
+            "v=json.load(open(B+'v.json')); m=json.load(open(B+'m.json'))\n"
+            "print('oe', m['order_expire']); print('pay', m['pay_url'])\n"
+        )
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed != code
+        assert [line for line in result.compressed.splitlines() if line.strip() == ";"] == []
+        assert "v=json.load(open(B+'v.json'))" in result.compressed
+        assert "m=json.load(open(B+'m.json'))" in result.compressed
+
+    def test_class_body_statement_is_not_duplicated(self):
+        code = "class C:\n    x=1; y=2\n    z=3\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed.count("x=1; y=2") == 1
+
+    def test_class_body_statement_continuation_is_kept(self):
+        """The second statement starts on the already-emitted row and
+        continues on the next one; trimming the shared row must not drop
+        the continuation line."""
+        code = "class C:\n    x=1; y=(2 +\n            3)\n    z=4\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed.count("x=1; y=(2 +") == 1
+        assert result.compressed.count("            3)") == 1
+        assert result.compressed.count("z=4") == 1
+
+    def test_import_after_statement_keeps_source_order(self, tmp_path):
+        """Imports are hoisted to the top of the output, but an import that
+        follows executable code must not jump above it: importing the plugin
+        before the path update fails at runtime."""
+        vendor = tmp_path / "vendor"
+        vendor.mkdir()
+        module_name = "semicolon_order_plugin"
+        (vendor / f"{module_name}.py").write_text("VALUE = 42\n")
+        code = f"import sys; sys.path.insert(0, {str(vendor)!r}); import {module_name}\n"
+
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed != code
+        assert (
+            result.compressed.index("import sys")
+            < result.compressed.index("sys.path.insert")
+            < result.compressed.index(f"import {module_name}")
+        )
+
+        saved_path = list(sys.path)
+        saved_modules = set(sys.modules)
+        try:
+            exec(result.compressed, {})
+            assert module_name in sys.modules
+        finally:
+            sys.path[:] = saved_path
+            for name in set(sys.modules) - saved_modules:
+                del sys.modules[name]
+
+    def test_declaration_after_top_level_code_keeps_source_order(self):
+        """Declarations are assembled before the top-level code bucket, so a
+        class defined after executable code would move ahead of it. Safe
+        reassembly cannot be guaranteed, so the original snippet is kept."""
+        code = "import sys; marker = 1; import decimal\nclass Money(decimal.Decimal):\n    pass\n"
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed == code
+        namespace: dict[str, object] = {}
+        exec(result.compressed, namespace)
+        assert issubclass(namespace["Money"], decimal.Decimal)
+
+    def test_decorator_default_after_top_level_code_keeps_source_order(self):
+        """A decorator and a default expression are evaluated when the
+        function is defined, so they cannot move ahead of the import they
+        use."""
+        code = (
+            "import sys; marker = 1; import functools\n"
+            "@functools.lru_cache(maxsize=None)\n"
+            "def compute(value=marker):\n"
+            "    return value\n"
+        )
+        result = self._compressor().compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compressed == code
+        namespace: dict[str, object] = {}
+        exec(result.compressed, namespace)
+        assert namespace["compute"]() == 1
+
+    def test_function_body_keeps_each_line_once(self):
+        """Both statements share one physical line. The line slice already
+        carries the whole line, so adding the second statement's range again
+        duplicates it; dropping it instead would lose a continuation line."""
+        code = (
+            "def f():\n"
+            "    x=1; y=(2 +\n"
+            "            3)\n"
+            "    a=3\n"
+            "    b=4\n"
+            "    c=5\n"
+            "    d=6\n"
+            "    e=7\n"
+            "    return x+y\n"
+        )
+        compressor = self._compressor()
+        parser = cc._get_parser("python")
+        root = parser.parse(code.encode("utf-8")).root_node
+        analysis = compressor._analyze_symbol_importance(root, code, CodeLanguage.PYTHON, "")
+        compressed = compressor._compress_function_ast(
+            root.children[0],
+            code,
+            CodeLanguage.PYTHON,
+            cc._LANG_CONFIGS[CodeLanguage.PYTHON],
+            {},
+            analysis,
+        )
+
+        assert compressed.count("x=1; y=(2 +") == 1
+        assert compressed.count("            3)") == 1
