@@ -93,8 +93,6 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or _env_overrides.get("GEMINI_API_
 
 apply_dotenv = autouse_apply_env(_env_overrides)
 
-pytestmark = pytest.mark.live
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -189,6 +187,7 @@ def _resolve_anthropic_model(client: TestClient, api_key: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not ANTHROPIC_KEY, reason="ANTHROPIC_API_KEY not set")
 def test_anthropic_cache_hit_across_two_turns(proxy_client: TestClient) -> None:
     """A2/A6/E — sending identical cache_control'd system+messages twice
@@ -275,6 +274,7 @@ def test_anthropic_cache_hit_across_two_turns(proxy_client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not ANTHROPIC_KEY, reason="ANTHROPIC_API_KEY not set")
 def test_anthropic_cache_stable_when_live_zone_compresses(
     proxy_client: TestClient,
@@ -375,6 +375,7 @@ def test_anthropic_cache_stable_when_live_zone_compresses(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not ANTHROPIC_KEY, reason="ANTHROPIC_API_KEY not set")
 def test_anthropic_cache_control_passthrough_byte_faithful(
     proxy_client: TestClient,
@@ -469,6 +470,7 @@ def test_anthropic_cache_control_passthrough_byte_faithful(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not OPENAI_KEY, reason="OPENAI_API_KEY not set")
 def test_openai_chat_completions_multi_turn_through_proxy(
     proxy_client: TestClient,
@@ -555,6 +557,7 @@ def test_openai_chat_completions_multi_turn_through_proxy(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not OPENAI_KEY, reason="OPENAI_API_KEY not set")
 def test_openai_streaming_sse_chunks_arrive_in_order(
     proxy_client: TestClient,
@@ -627,6 +630,7 @@ def test_openai_streaming_sse_chunks_arrive_in_order(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not GEMINI_KEY, reason="GEMINI_API_KEY not set")
 def test_gemini_multi_turn_through_proxy(proxy_client: TestClient) -> None:
     """Gemini handler reachability — two-turn conversation through the
@@ -662,6 +666,7 @@ def test_gemini_multi_turn_through_proxy(proxy_client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not ANTHROPIC_KEY, reason="ANTHROPIC_API_KEY not set")
 def test_ccr_marker_round_trip_live() -> None:
     """B7 — CCR round-trip across the live proxy.
@@ -860,6 +865,7 @@ def test_ccr_marker_round_trip_live() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not ANTHROPIC_KEY, reason="ANTHROPIC_API_KEY not set")
 def test_memory_tail_injection_does_not_modify_system_prompt_live(
     proxy_client: TestClient,
