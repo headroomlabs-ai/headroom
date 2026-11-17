@@ -17,14 +17,18 @@ required by MemorySystem, enabling Mem0 to be used with the memory tools system.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 import warnings
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.log_safety import safe_id
 from headroom.memory.backends.mem0 import Mem0Backend, Mem0Config
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -340,21 +344,27 @@ class Mem0SystemAdapter:
         Args:
             memory_id: ID of the memory to delete.
             reason: Reason for deletion (for audit trail).
-            user_id: User ID for validation (optional).
+            user_id: When given, only a memory confirmed to belong to this user
+                is deleted; any other id, or one whose owner cannot be read, is
+                treated as not found.
 
         Returns:
             True if deleted, False if not found.
         """
         client = await self._backend._ensure_client()
 
-        # Validate user if needed
         if user_id:
             try:
                 existing = await asyncio.to_thread(client.get, memory_id=memory_id)
-                if existing and existing.get("user_id") and existing["user_id"] != user_id:
-                    return False
-            except Exception:
-                pass
+            except (ValueError, OSError) as e:
+                logger.warning(
+                    "Mem0SystemAdapter: delete_memory(%s) not run: owner lookup failed (%s)",
+                    safe_id(memory_id),
+                    type(e).__name__,
+                )
+                return False
+            if not existing or existing.get("user_id") != user_id:
+                return False
 
         try:
             await asyncio.to_thread(client.delete, memory_id=memory_id)
