@@ -17,24 +17,29 @@ The rule here is the one ``copilot_auth.is_copilot_upstream_url`` already applie
 to Headroom's own Copilot token, generalized: **a secret only travels to a host
 the operator designated.** Designated means one of
 
-* a host in the resolved provider API targets (``ANTHROPIC_TARGET_API_URL``,
+* the origin of a resolved provider API target (``ANTHROPIC_TARGET_API_URL``,
   ``OPENAI_TARGET_API_URL``, and the Gemini/Vertex/Cloud Code equivalents), or
-* a host listed in ``HEADROOM_UPSTREAM_ALLOWED_HOSTS`` (comma-separated).
+* an entry in ``HEADROOM_UPSTREAM_ALLOWED_HOSTS`` (comma-separated bare hosts,
+  ``host:port`` or full URLs).
 
 Anything else still gets proxied — the request is not blocked — it just does not
 get the operator's headers.
 
-Matching is on the parsed hostname, never the URL string: comparing whole strings
-lets ``https://api.anthropic.com@evil.example`` and ``https://api.anthropic.com.evil.example``
-through, and a base URL matches while base+path does not. Exact hostname equality
-only; no wildcards, because a suffix rule that forgets the label boundary is the
-usual way this class of check fails open.
+Matching is on the parsed origin (scheme, hostname, port), never the URL string:
+comparing whole strings lets ``https://api.anthropic.com@evil.example`` and
+``https://api.anthropic.com.evil.example`` through, and a base URL matches while
+base+path does not. Scheme and port are part of the match, so ``http://`` or another
+port of a designated host is not designated. A designation without a scheme means
+https, and one without a port means the scheme's default port. Exact hostname
+equality only; no wildcards, because a suffix rule that forgets the label boundary
+is the usual way this class of check fails open.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -55,6 +60,17 @@ _API_URL_ATTRS = (
     "omlx_target_api_url",
 )
 
+#: Each provider's extra headers are scoped to that provider's own targets: the
+#: OpenAI extras are not for Anthropic's API, and the reverse.
+_PROVIDER_API_URL_ATTRS = {
+    "anthropic": ("anthropic_api_url", "omlx_target_api_url"),
+    "openai": ("openai_api_url",),
+}
+_PROVIDER_DEFAULT_HOSTS = {
+    "anthropic": "api.anthropic.com",
+    "openai": "api.openai.com",
+}
+
 # Hosts that are always operator-designated: they are what the provider targets
 # resolve to when nothing is overridden, so omitting them would refuse the
 # headers on a completely default install.
@@ -65,9 +81,9 @@ _DEFAULT_HOSTS = frozenset(
     }
 )
 
-# Warn once per destination rather than once per request; a client looping on a
+# Warn once per origin rather than once per request; a client looping on a
 # rejected host would otherwise flood the log.
-_warned_hosts: set[str] = set()
+_warned_origins: set[str] = set()
 
 
 def url_host(value: str | None) -> str | None:
@@ -90,60 +106,94 @@ def url_host(value: str | None) -> str | None:
     return host.lower() if host else None
 
 
-def _env_allowed_hosts() -> set[str]:
-    raw = os.environ.get(ALLOWED_HOSTS_ENV, "")
-    hosts: set[str] = set()
-    for entry in raw.split(","):
-        # Accept a bare host or a full URL, so operators can paste either.
-        host = url_host(entry) if entry.strip() else None
-        if host:
-            hosts.add(host)
-    return hosts
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+Origin = tuple[str, str, int]
 
 
-def trusted_upstream_hosts(config: Any = None) -> frozenset[str]:
-    """Hosts permitted to receive operator-configured secret headers."""
+def _origin(value: str | None) -> Origin | None:
+    """Return ``(scheme, host, port)`` for ``value``, or ``None`` without a usable host.
 
-    hosts = set(_DEFAULT_HOSTS)
-    for attr in _API_URL_ATTRS:
-        host = url_host(getattr(config, attr, None))
-        if host:
-            hosts.add(host)
-    omlx_env_host = url_host(resolve_omlx_target_api_url(environ=os.environ))
-    if omlx_env_host:
-        hosts.add(omlx_env_host)
-    hosts |= _env_allowed_hosts()
-    return frozenset(hosts)
+    No scheme means https and no port means the scheme's default, so a bare
+    ``llm.corp`` designates ``https://llm.corp:443`` and ``llm.corp:8443``
+    designates ``https://llm.corp:8443``.
+    """
+
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    try:
+        parsed = urlparse(candidate)
+        if not parsed.hostname and "//" not in candidate:
+            parsed = urlparse(f"//{candidate}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        # A malformed port or bracketed host.
+        return None
+    if not host:
+        return None
+    scheme = (parsed.scheme or "https").lower()
+    return scheme, host.lower(), port if port is not None else _DEFAULT_PORTS.get(scheme, 0)
 
 
-def is_trusted_upstream(url: str | None, config: Any = None) -> bool:
-    """True when ``url`` is a destination the operator designated.
+def trusted_upstream_origins(config: Any = None, provider: str | None = None) -> frozenset[Origin]:
+    """Origins (scheme, host, port) permitted to receive operator-configured secret headers.
+
+    With ``provider`` (``"openai"`` or ``"anthropic"``) only that provider's own
+    targets count, plus ``HEADROOM_UPSTREAM_ALLOWED_HOSTS``; without it, every
+    configured target does.
+    """
+
+    if provider is None:
+        hosts: Iterable[str] = _DEFAULT_HOSTS
+        attrs: Iterable[str] = _API_URL_ATTRS
+    else:
+        hosts = (_PROVIDER_DEFAULT_HOSTS[provider],)
+        attrs = _PROVIDER_API_URL_ATTRS[provider]
+    origins: set[Origin] = {("https", host, 443) for host in hosts}
+    candidates = [getattr(config, attr, None) for attr in attrs]
+    if provider in (None, "anthropic"):
+        candidates.append(resolve_omlx_target_api_url(environ=os.environ))
+    candidates.extend(os.environ.get(ALLOWED_HOSTS_ENV, "").split(","))
+    for candidate in candidates:
+        origin = _origin(candidate) if isinstance(candidate, str) else None
+        if origin:
+            origins.add(origin)
+    return frozenset(origins)
+
+
+def is_trusted_upstream(url: str | None, config: Any = None, provider: str | None = None) -> bool:
+    """True when ``url`` is on an origin the operator designated.
 
     ``None``/empty means "no per-request override" — the handler is going to the
-    configured target — so it is trusted.
+    configured target — so it is trusted. ``http://api.openai.com`` and
+    ``https://api.openai.com:8443`` are not ``https://api.openai.com``.
     """
 
     if not url:
         return True
-    host = url_host(url)
-    if not host:
+    origin = _origin(url)
+    if not origin:
         # Unparseable destination: refuse rather than guess.
         return False
-    return host in trusted_upstream_hosts(config)
+    return origin in trusted_upstream_origins(config, provider)
 
 
 def warn_untrusted_once(url: str | None, *, request_id: str | None = None) -> None:
-    """Log the refusal once per host, with the remedy in the message."""
+    """Log the refusal once per origin, with the remedy in the message."""
 
-    host = url_host(url) or "<unparseable>"
-    if host in _warned_hosts:
+    origin = _origin(url)
+    host = f"{origin[0]}://{origin[1]}:{origin[2]}" if origin else "<unparseable>"
+    if host in _warned_origins:
         return
-    _warned_hosts.add(host)
+    _warned_origins.add(host)
     prefix = f"[{request_id}] " if request_id else ""
     logger.warning(
         "%supstream_extra_headers_withheld host=%s reason=not_operator_designated. "
         "The configured extra headers are secret and were NOT sent to this host. "
-        "If this upstream is legitimate, add it to %s (comma-separated hosts).",
+        "If this upstream is legitimate, add it to %s (comma-separated; a bare host "
+        "means https on port 443, otherwise give host:port or the full URL).",
         prefix,
         host,
         ALLOWED_HOSTS_ENV,
@@ -153,4 +203,4 @@ def warn_untrusted_once(url: str | None, *, request_id: str | None = None) -> No
 def reset_warning_state() -> None:
     """Test hook: clear the once-per-host warning memo."""
 
-    _warned_hosts.clear()
+    _warned_origins.clear()
