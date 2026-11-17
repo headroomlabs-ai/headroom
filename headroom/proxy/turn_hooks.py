@@ -31,6 +31,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from headroom.log_safety import describe_exception
 from headroom.proxy.tool_schema_savings_policy import (
+    HOOK_TOOL_DETAIL,
     deferred_booking,
     hook_tool_counts,
     loading_history,
@@ -374,7 +375,7 @@ def run_request_hooks(
             net_saved = message_saved + system_saved + tool_saved
             sequence_net += net_saved
             system_net += system_saved
-            details = {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved}
+            details = {"message_tokens_saved": message_saved, HOOK_TOOL_DETAIL: tool_saved}
             if system_saved:
                 details["system_tokens_saved"] = system_saved
             gains.append(
@@ -413,8 +414,8 @@ def run_request_hooks(
             # ``tokens`` (the tool part takes the rounding). The uncapped
             # deltas stay for diagnosis.
             capped = {key: round(value * tokens / net_saved) for key, value in details.items()}
-            capped["tool_tokens_saved"] = tokens - sum(
-                value for key, value in capped.items() if key != "tool_tokens_saved"
+            capped[HOOK_TOOL_DETAIL] = tokens - sum(
+                value for key, value in capped.items() if key != HOOK_TOOL_DETAIL
             )
             details = {**capped, **{f"uncapped_{key}": value for key, value in details.items()}}
         try:

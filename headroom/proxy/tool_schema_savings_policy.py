@@ -103,6 +103,15 @@ def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[s
 # its bare name, which is what a ``tool_reference`` names.
 _NAMESPACE_SEP = "\x1f"
 
+# The detail key every turn-hook ledger row carries (turn_hooks.run_request_hooks);
+# :func:`_debit_hook_rows` finds the hooks' rows by it.
+HOOK_TOOL_DETAIL = "tool_tokens_saved"
+
+
+def _member_prefix(group: dict[str, Any]) -> str:
+    """The prefix a ``namespace`` group gives its members' identities."""
+    return f"{group.get('name')}{_NAMESPACE_SEP}"
+
 
 def _tool_ids(tools: object, *, deferred_only: bool = False) -> frozenset[str]:
     """The identity of every named tool in ``tools``, ``namespace`` members
@@ -115,8 +124,7 @@ def _tool_ids(tools: object, *, deferred_only: bool = False) -> frozenset[str]:
             continue
         members = [("", tool)]
         if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
-            prefix = f"{tool.get('name')}{_NAMESPACE_SEP}"
-            members += [(prefix, m) for m in tool["tools"] if isinstance(m, dict)]
+            members += [(_member_prefix(tool), m) for m in tool["tools"] if isinstance(m, dict)]
         for prefix, member in members:
             if member.get("name") and (member.get("defer_loading") or not deferred_only):
                 ids.add(f"{prefix}{member['name']}")
@@ -138,9 +146,7 @@ def _measured_view(tools: object, excluded: frozenset[str], prefix: str = "") ->
             if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
                 tool = {
                     **tool,
-                    "tools": _measured_view(
-                        tool["tools"], excluded, f"{tool.get('name')}{_NAMESPACE_SEP}"
-                    ),
+                    "tools": _measured_view(tool["tools"], excluded, _member_prefix(tool)),
                 }
         view.append(tool)
     return view
@@ -328,7 +334,7 @@ def _debit_hook_rows(tags: dict[str, Any], amount: int) -> None:
     """Lower the turn hooks' realized ledger rows by ``amount``, latest first.
 
     A hook row is one :func:`~headroom.proxy.turn_hooks.run_request_hooks`
-    booked: its details split the saving into ``tool_tokens_saved`` and the rest.
+    booked: its details split the saving into :data:`HOOK_TOOL_DETAIL` and the rest.
     That split stays as booked; ``proxy_cost_tokens`` says what came off it.
     """
     from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
@@ -338,7 +344,7 @@ def _debit_hook_rows(tags: dict[str, Any], amount: int) -> None:
         if amount <= 0:
             return
         details = row.get("details") if isinstance(row, dict) else None
-        if not (isinstance(details, dict) and "tool_tokens_saved" in details):
+        if not (isinstance(details, dict) and HOOK_TOOL_DETAIL in details):
             continue
         if not row.get("realized") or row.get("estimated"):
             continue

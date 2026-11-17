@@ -214,10 +214,12 @@ def test_a_translating_backend_bills_a_deferred_tool_so_condensing_it_saves(monk
 
 def test_the_retrieve_tool_the_proxy_declares_is_netted_out(monkeypatch) -> None:
     from headroom.ccr import CCR_TOOL_NAME
+    from headroom.proxy.savings_attribution import from_tags
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
 
     register_turn_hook(_DropResident())
     # A headroom_retrieve call in the history makes the proxy declare the tool.
-    tags, upstream = _send(
+    outcome, upstream = _send_outcome(
         monkeypatch,
         {
             "messages": [
@@ -242,8 +244,12 @@ def test_the_retrieve_tool_the_proxy_declares_is_netted_out(monkeypatch) -> None
         },
         optimize=True,
     )
+    tags = outcome.tags
     (retrieve,) = [t for t in upstream["tools"] if t.get("name") == CCR_TOOL_NAME]
     assert tags["turn_hook_tools_saved_tokens"] == _resident_saving() - _count_tools([retrieve])
+    # The retrieve tool is sent after the hook booked its row: it comes off the row too.
+    headline = headline_tokens_saved(outcome.tokens_saved, tags)
+    assert sum(r["tokens"] for r in from_tags(tags) if r["realized"]) == headline
 
 
 def test_the_output_shaper_steering_block_is_netted_out(monkeypatch) -> None:
