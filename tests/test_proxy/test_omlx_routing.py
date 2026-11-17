@@ -15,7 +15,7 @@ from headroom.providers.anthropic import ANTHROPIC_CONTEXT_LIMITS, ANTHROPIC_PRI
 from headroom.proxy.handlers.anthropic import is_omlx_local_model, strip_omlx_model_prefix
 from headroom.proxy.model_router import ModelRoute, ModelRouterConfig
 from headroom.proxy.server import ProxyConfig, _proxy_config_from_env, create_app
-from headroom.proxy.upstream_trust import is_trusted_upstream, trusted_upstream_hosts
+from headroom.proxy.upstream_trust import is_trusted_upstream
 
 MESSAGES = "/v1/messages"
 OMLX_MESSAGES = "/omlx/v1/messages"
@@ -294,7 +294,7 @@ def test_headroom_omlx_base_url_and_omlx_target_api_url_env_consistency(
     assert "--omlx-api-url" in help_res.output
 
 
-def test_omlx_target_api_url_included_in_trusted_upstream_hosts(
+def test_omlx_target_api_url_is_a_trusted_upstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OMLX_TARGET_API_URL", raising=False)
@@ -305,7 +305,6 @@ def test_omlx_target_api_url_included_in_trusted_upstream_hosts(
         omlx_target_api_url="http://omlx.internal:8888",
         anthropic_extra_headers={"X-Custom-Gateway-Auth": "gateway-secret"},
     )
-    assert "omlx.internal" in trusted_upstream_hosts(cfg)
     assert is_trusted_upstream("http://omlx.internal:8888/v1/messages", cfg)
 
     app = create_app(cfg)

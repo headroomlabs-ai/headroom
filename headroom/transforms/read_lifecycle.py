@@ -106,6 +106,14 @@ def _rejected_before_running(content: Any) -> bool:
     return isinstance(content, str) and content.lstrip().startswith("<tool_use_error>")
 
 
+_NOTICE_PREFIXES = ("[Read content stale: ", "[Read content superseded: ")
+
+
+def is_lifecycle_notice(content: str) -> bool:
+    """True when ``content`` is a Read this pass already replaced."""
+    return content.startswith(_NOTICE_PREFIXES)
+
+
 class ReadLifecycleManager:
     """Event-driven Read lifecycle management.
 
@@ -117,9 +125,15 @@ class ReadLifecycleManager:
         self,
         config: ReadLifecycleConfig,
         compression_store: Any | None = None,
+        *,
+        retrieval_markers: bool = True,
     ):
+        """``retrieval_markers=False`` is for callers that cannot resolve a
+        ``Retrieve original: hash=`` pointer: a replaced Read then gets the
+        stale/superseded notice alone, and nothing is written to the store."""
         self.config = config
         self.store = compression_store
+        self.retrieval_markers = retrieval_markers
 
     def apply(
         self,
@@ -521,6 +535,10 @@ class ReadLifecycleManager:
         if content_bytes < self.config.min_size_bytes:
             return False, content, None
 
+        file_display = classification.file_path or "unknown"
+        if not self.retrieval_markers:
+            return True, self._notice(classification.state, file_display, None), None
+
         # Best-effort CCR persistence (mirrors read_maturation.py): a store
         # failure must not break compress(), and keeps the Read verbatim — a
         # marker would point at an original nobody stored.
@@ -543,22 +561,22 @@ class ReadLifecycleManager:
                 )
                 return False, content, None
 
-        file_display = classification.file_path or "unknown"
+        return True, self._notice(classification.state, file_display, ccr_hash), ccr_hash
 
+    @staticmethod
+    def _notice(state: ReadState, file_display: str, ccr_hash: str | None) -> str:
         # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
         # the compression-pinning checks in ContentRouter and the
-        # marker-preserving regex in compression_units.py match on it.
-        if classification.state == ReadState.STALE:
-            marker = (
+        # marker-preserving regex in compression_units.py match on it. The
+        # hashless form is not pinned: it stays intact because Read is in
+        # DEFAULT_EXCLUDE_TOOLS and the notice is far below any size floor.
+        retrieve = f" Retrieve original: hash={ccr_hash}" if ccr_hash else ""
+        if state == ReadState.STALE:
+            return (
                 f"[Read content stale: {file_display} was modified after this read — "
-                f"re-read the file for current content. "
-                f"Retrieve original: hash={ccr_hash}]"
+                f"re-read the file for current content.{retrieve}]"
             )
-        else:  # SUPERSEDED
-            marker = (
-                f"[Read content superseded: {file_display} was re-read later — "
-                f"re-read the file if needed. "
-                f"Retrieve original: hash={ccr_hash}]"
-            )
-
-        return True, marker, ccr_hash
+        return (
+            f"[Read content superseded: {file_display} was re-read later — "
+            f"re-read the file if needed.{retrieve}]"
+        )
