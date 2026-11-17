@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import ssl
 import threading
 import time
 import warnings
@@ -338,6 +339,9 @@ FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
     "transfer-encoding",
     "connection",
     "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
     "server",
 )
 
@@ -351,11 +355,18 @@ def sanitize_forwarded_response_headers(
     Pass any additional header names to strip as ``extra_names`` (for
     example ``"content-type"`` when the caller sets its own media type).
 
+    Header names listed in the ``Connection`` value are connection-local
+    (RFC 9110 section 7.6.1) and are dropped too.
+
     Matching is case-insensitive, but the casing of the headers that
     survive is left untouched.
     """
+    items = dict(headers)
     drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
-    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+    for key, value in items.items():
+        if key.lower() == "connection":
+            drop.update(token.strip().lower() for token in str(value).split(",") if token.strip())
+    return {key: value for key, value in items.items() if key.lower() not in drop}
 
 
 def _path_for_log(path: str) -> str:
@@ -1757,6 +1768,30 @@ def overload_retry_is_futile(response: httpx.Response, max_ms: int, retries_left
 RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
 
 
+class RequestWriteTrace:
+    """httpcore ``trace`` extension that records a failed request write.
+
+    httpcore maps an ``ssl.SSLError`` to ``ConnectError`` only during the
+    handshake. Later, a corrupt TLS record surfaces as a raw ``ssl.SSLError``
+    that says nothing about whether upstream received the request. It is safe
+    to retry only when it was raised while the request was still being written
+    (``send_request_headers`` / ``send_request_body`` failed): upstream then
+    never had a complete request to run. Raised after the write, upstream may
+    already have accepted, and billed, the POST, so it is not replayed.
+    """
+
+    def __init__(self) -> None:
+        self.write_failed = False
+
+    async def __call__(self, event: str, info: dict[str, Any]) -> None:
+        if event.endswith((".send_request_headers.failed", ".send_request_body.failed")):
+            self.write_failed = True
+
+    def forbids_retry(self, exc: BaseException) -> bool:
+        """True for a raw TLS error raised after the request was fully written."""
+        return isinstance(exc, ssl.SSLError) and not self.write_failed
+
+
 async def request_with_transient_retry(
     client: httpx.AsyncClient,
     *,
@@ -2173,6 +2208,7 @@ def merge_extra_headers(
     *,
     upstream_url: str | None,
     config: Any = None,
+    provider: str | None = None,
 ) -> dict[str, str]:
     """Merge configured extra headers into ``headers``, overriding same-named keys.
 
@@ -2191,14 +2227,16 @@ def merge_extra_headers(
     Pass ``None`` when the caller is going to its configured target with no
     per-request override. Anything else is checked against
     ``upstream_trust.is_trusted_upstream``; an undesignated host still gets its
-    request proxied, just without these headers.
+    request proxied, just without these headers. ``provider`` (``"openai"`` or
+    ``"anthropic"``) limits the designated origins to that provider's own, so
+    one provider's extras never go to the other's API.
     """
     if not extra:
         return headers
     if upstream_url is not None:
         from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
 
-        if not is_trusted_upstream(upstream_url, config):
+        if not is_trusted_upstream(upstream_url, config, provider):
             warn_untrusted_once(upstream_url)
             return headers
     # HTTP header names are case-insensitive: drop any existing key that
@@ -3214,7 +3252,7 @@ def _zstd_bounded(raw: bytes) -> bytes:
 
 
 def _brotli_bounded(raw: bytes) -> bytes:
-    """Feed brotli input in slices, checking the cap after each one."""
+    """Feed brotli input in slices, pulling at most one chunk of output per step."""
     import brotli
 
     decompressor_cls = getattr(brotli, "Decompressor", None)
@@ -3227,16 +3265,36 @@ def _brotli_bounded(raw: bytes) -> bytes:
         )
 
     decompressor = decompressor_cls()
+    can_accept_more = getattr(decompressor, "can_accept_more_data", None)
+    if can_accept_more is None:
+        # Before brotli 1.2.0, process() has no output limit: one small input
+        # slice can expand without bound before the size check runs.
+        raise ValueError(
+            "Installed 'brotli' cannot bound decompressed output "
+            "(needs brotli>=1.2.0); upgrade it to accept br request bodies."
+        )
     out = bytearray()
-    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
-        out += decompressor.process(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+
+    def pull(data: bytes) -> bytes:
+        chunk: bytes = decompressor.process(data, output_buffer_limit=_DECOMPRESS_CHUNK_SIZE)
+        out.extend(chunk)
         if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
             raise RequestBodyTooLarge(
                 f"Decompressed brotli request body exceeds "
                 f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
             )
-    is_finished = getattr(decompressor, "is_finished", None)
-    if is_finished is not None and not is_finished():
+        return chunk
+
+    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
+        pull(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+        # While the decompressor holds unprocessed input it accepts only empty
+        # input; drain its output before feeding the next slice.
+        while not can_accept_more() and pull(b""):
+            pass
+    # All input is in, but output beyond the per-call limit is still pending.
+    while not decompressor.is_finished() and pull(b""):
+        pass
+    if not decompressor.is_finished():
         raise ValueError("Failed to decompress brotli request body: truncated stream")
     return bytes(out)
 
@@ -4717,7 +4775,16 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
 
 _OPENAI_TOOL_SEARCH_TYPE = _RESPONSES_TOOL_SEARCH_TYPE
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
-_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+_OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset(
+    {
+        "terminal",
+        "file_search",
+        "web_search",
+        "code_interpreter",
+        "computer",
+        "image_generation",
+    }
+)
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in

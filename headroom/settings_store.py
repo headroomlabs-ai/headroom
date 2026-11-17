@@ -151,6 +151,16 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="basic",
     ),
     SettingField(
+        "HEADROOM_NO_CCR_RESPONSE_HANDLING",
+        "no_ccr_response_handling",
+        "Disable CCR response handling",
+        "Compression",
+        "bool",
+        default=False,
+        help="Disable CCR response buffering while preserving retrieval tool and marker settings.",
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_CCR_INLINE_RESOLVE",
         "ccr_inline_resolve",
         "Resolve CCR markers inline",
@@ -175,6 +185,19 @@ SETTINGS: tuple[SettingField, ...] = (
         help=(
             "Answer retrieval calls on streaming Chat Completions by buffering "
             "turns that carry CCR markers. Buffered text arrives all at once."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS",
+        "ccr_inject_system_instructions",
+        "Inject CCR system instructions",
+        "Compression",
+        "bool",
+        default=False,
+        help=(
+            "Append compressed context instructions to the system message "
+            "listing active CCR retrieval hashes."
         ),
         tier="advanced",
     ),

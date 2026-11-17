@@ -740,6 +740,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     total_input_tokens = 0
     total_input_cost_usd = 0.0
     output_tokens_saved = 0
+    output_tokens = 0
     output_savings_usd = 0.0
     tool_tokens_saved = 0
     tool_schema_savings_usd = 0.0
@@ -760,6 +761,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         total_input_tokens = _coerce_int(entry.get("total_input_tokens"))
         total_input_cost_usd = _coerce_float(entry.get("total_input_cost_usd"))
         output_tokens_saved = _coerce_int(entry.get("output_tokens_saved"))
+        output_tokens = _coerce_int(entry.get("output_tokens"))
         output_savings_usd = _coerce_float(entry.get("output_savings_usd"))
         tool_tokens_saved = _coerce_int(entry.get("tool_tokens_saved"))
         tool_schema_savings_usd = _coerce_float(entry.get("tool_schema_savings_usd"))
@@ -794,6 +796,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "total_input_tokens": total_input_tokens,
         "total_input_cost_usd": round(total_input_cost_usd, 6),
         "output_tokens_saved": output_tokens_saved,
+        "output_tokens": output_tokens,
         "output_savings_usd": round(output_savings_usd, 6),
         "tool_tokens_saved": tool_tokens_saved,
         "tool_schema_savings_usd": round(tool_schema_savings_usd, 6),
@@ -1014,6 +1017,9 @@ class SavingsTracker:
         self._needs_schema_save = False
         self._state = self._load_state()
         self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
+        if self._needs_schema_save and not self._stateless:
+            with self._lock:
+                self._save_locked()
         # Negative-savings warning state. A deployment that loses money loses it
         # on most turns, not one, so warning per turn would bury the signal in
         # its own repetition. Accumulate instead and emit a summary no more than
@@ -1149,6 +1155,10 @@ class SavingsTracker:
         # message-only while per-model dollars did not.
         tool_search_saved: int = 0,
         output_tokens_saved: int = 0,
+        # High end of a modelled output-savings range (benchmark factors give a
+        # band, not a point); ``None`` means the saving is a point estimate and
+        # the high end equals ``output_tokens_saved``. Lifetime-only.
+        output_tokens_saved_high: int | None = None,
         # Tokens the model actually emitted, DISJOINT from
         # ``output_tokens_saved`` (which counts the ones it did not). Priced
         # into ``lifetime["total_output_cost_usd"]``; see the delta below.
@@ -1182,6 +1192,12 @@ class SavingsTracker:
         delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
+        delta_output_tokens_saved_high = (
+            delta_output_tokens_saved
+            if output_tokens_saved_high is None
+            else max(_coerce_int(output_tokens_saved_high), delta_output_tokens_saved)
+        )
+        delta_output_tokens = max(_coerce_int(output_tokens), 0)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
         priced = estimated_savings_usd
         # ``estimate_request_savings_usd`` prices FOUR buckets, but this method
@@ -1244,6 +1260,10 @@ class SavingsTracker:
             max(_coerce_float(priced.get("output_shaping")), 0.0)
             if priced is not None
             else _estimate_output_savings_usd(model, delta_output_tokens_saved)
+        )
+        # Same per-token rate table that priced the low end.
+        delta_output_savings_usd_high = _estimate_output_savings_usd(
+            model, delta_output_tokens_saved_high
         )
         # Completion spend. ``total_input_cost_usd`` has never had an output
         # counterpart, so anything answering "what share of my bill did
@@ -1336,11 +1356,24 @@ class SavingsTracker:
                 lifetime.get("output_savings_usd", 0.0) + delta_output_savings_usd,
                 6,
             )
+            # High end of the output-savings range; equals the low end for
+            # point estimates. Both state builders always write these keys.
+            lifetime["output_tokens_saved_high"] += delta_output_tokens_saved_high
+            lifetime["output_savings_usd_high"] = round(
+                lifetime["output_savings_usd_high"] + delta_output_savings_usd_high,
+                6,
+            )
             lifetime["tool_tokens_saved"] += delta_tool_tokens_saved
             lifetime["tool_schema_savings_usd"] = round(
                 lifetime["tool_schema_savings_usd"] + delta_tool_savings_usd,
                 6,
             )
+            # Actual output tokens emitted (not saved): the cumulative the
+            # history checkpoints need so a per-bucket output-reduction rate
+            # (saved / (saved + actual)) can be diffed out of consecutive
+            # checkpoints, exactly like cache_read_tokens. Lazy key, same
+            # legacy-tolerant shape as output_tokens_saved above.
+            lifetime["output_tokens"] = lifetime.get("output_tokens", 0) + delta_output_tokens
             lifetime["total_output_cost_usd"] = round(
                 lifetime.get("total_output_cost_usd", 0.0) + delta_output_cost_usd,
                 6,
@@ -1417,12 +1450,18 @@ class SavingsTracker:
             # not lossy-compressed, to keep Bedrock's prompt cache warm. Gating
             # on tokens_saved alone silently dropped every history point on
             # those requests even though real cache-read savings occurred.
-            # Append whenever any savings mechanism produced a saving.
+            # Append whenever any savings mechanism produced a saving. Actual
+            # output activity must also emit: consumers derive per-bucket
+            # output-reduction rates by diffing consecutive checkpoints, so an
+            # output-only request that only bumped lifetime["output_tokens"]
+            # would otherwise be invisible to the window it lands in and
+            # overstate the reduction rate.
             if (
                 delta_tokens_saved > 0
                 or delta_cache_read_tokens > 0
                 or delta_output_tokens_saved > 0
                 or delta_tool_tokens_saved > 0
+                or delta_output_tokens > 0
             ):
                 self._state["history"].append(
                     {
@@ -1437,6 +1476,7 @@ class SavingsTracker:
                         "total_input_tokens": lifetime["total_input_tokens"],
                         "total_input_cost_usd": lifetime["total_input_cost_usd"],
                         "output_tokens_saved": lifetime.get("output_tokens_saved", 0),
+                        "output_tokens": lifetime.get("output_tokens", 0),
                         "output_savings_usd": lifetime.get("output_savings_usd", 0.0),
                         "tool_tokens_saved": lifetime["tool_tokens_saved"],
                         "tool_schema_savings_usd": lifetime["tool_schema_savings_usd"],
@@ -1831,6 +1871,9 @@ class SavingsTracker:
                 "total_input_cost_usd": 0.0,
                 "output_tokens_saved": 0,
                 "output_savings_usd": 0.0,
+                "output_tokens_saved_high": 0,
+                "output_savings_usd_high": 0.0,
+                "output_tokens": 0,
                 "total_output_cost_usd": 0.0,
             },
             "display_session": _empty_display_session(),
@@ -1902,6 +1945,9 @@ class SavingsTracker:
         is_v6_lifetime = False
         lifetime_output_tokens_saved = 0
         lifetime_output_savings_usd = 0.0
+        lifetime_output_tokens_saved_high: int | None = None
+        lifetime_output_savings_usd_high: float | None = None
+        lifetime_output_tokens = 0
         lifetime_output_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
@@ -1922,6 +1968,15 @@ class SavingsTracker:
                 lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
             lifetime_output_tokens_saved = _coerce_int(lifetime_raw.get("output_tokens_saved"))
             lifetime_output_savings_usd = _coerce_float(lifetime_raw.get("output_savings_usd"))
+            if "output_tokens_saved_high" in lifetime_raw:
+                lifetime_output_tokens_saved_high = _coerce_int(
+                    lifetime_raw.get("output_tokens_saved_high")
+                )
+            if "output_savings_usd_high" in lifetime_raw:
+                lifetime_output_savings_usd_high = _coerce_float(
+                    lifetime_raw.get("output_savings_usd_high")
+                )
+            lifetime_output_tokens = _coerce_int(lifetime_raw.get("output_tokens"))
             lifetime_output_cost_usd = _coerce_float(lifetime_raw.get("total_output_cost_usd"))
 
         if normalized_history:
@@ -1975,6 +2030,10 @@ class SavingsTracker:
                 lifetime_output_savings_usd,
                 _coerce_float(last.get("output_savings_usd")),
             )
+            lifetime_output_tokens = max(
+                lifetime_output_tokens,
+                _coerce_int(last.get("output_tokens")),
+            )
             lifetime_output_cost_usd = max(
                 lifetime_output_cost_usd,
                 _coerce_float(last.get("total_output_cost_usd")),
@@ -2017,6 +2076,15 @@ class SavingsTracker:
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
                 "output_tokens_saved": lifetime_output_tokens_saved,
                 "output_savings_usd": round(lifetime_output_savings_usd, 6),
+                # A high end below the low end can only come from the history
+                # repair above raising the low end; never let the band invert.
+                "output_tokens_saved_high": max(
+                    lifetime_output_tokens_saved_high or 0, lifetime_output_tokens_saved
+                ),
+                "output_savings_usd_high": round(
+                    max(lifetime_output_savings_usd_high or 0.0, lifetime_output_savings_usd), 6
+                ),
+                "output_tokens": lifetime_output_tokens,
                 "total_output_cost_usd": round(lifetime_output_cost_usd, 6),
             },
             "display_session": _normalize_display_session(raw.get("display_session")),

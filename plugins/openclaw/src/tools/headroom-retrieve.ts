@@ -12,6 +12,11 @@ export interface RetrieveToolConfig {
   proxyUrl: string;
 }
 
+function retrievalResult(details: unknown) {
+  const text = typeof details === "string" ? details : JSON.stringify(details);
+  return { content: [{ type: "text" as const, text }], details };
+}
+
 export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
   const proxyOrigin = normalizeAndValidateProxyUrl(config.proxyUrl);
 
@@ -39,13 +44,14 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
     execute: async (
       toolCallIdOrArgs: string | { hash: string },
       params?: { hash: string },
-    ): Promise<string> => {
+    ) => {
       const args = typeof toolCallIdOrArgs === "string" ? params : toolCallIdOrArgs;
       const hash = typeof args?.hash === "string" ? args.hash : "";
 
       // Validate hash format
       if (!/^(?:[a-f0-9]{12}|[a-f0-9]{24})$/i.test(hash)) {
-        return JSON.stringify({
+        return retrievalResult({
+          status: "error",
           error: "Invalid hash format. Expected 12 or 24 hex characters.",
         });
       }
@@ -62,16 +68,17 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
 
         if (!resp.ok) {
           const body = await resp.text().catch(() => "");
-          return JSON.stringify({
+          return retrievalResult({
+            status: "error",
             error: `Retrieval failed: HTTP ${resp.status}`,
             details: body,
           });
         }
 
-        const data = await resp.json();
-        return typeof data === "string" ? data : JSON.stringify(data);
+        return retrievalResult(await resp.json());
       } catch (error) {
-        return JSON.stringify({
+        return retrievalResult({
+          status: "error",
           error: `Retrieval failed: ${error}`,
           hint: "The compressed content may have expired (default TTL: 30 minutes)",
         });

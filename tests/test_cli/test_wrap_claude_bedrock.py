@@ -122,7 +122,9 @@ def _run_claude_wrap(monkeypatch, tmp_path, env: dict[str, str]):
     return result, captured
 
 
-def test_bedrock_mode_sets_bedrock_base_url(monkeypatch, tmp_path):
+def test_bedrock_mode_routes_via_anthropic_mode_proxy(monkeypatch, tmp_path):
+    import json
+
     result, captured = _run_claude_wrap(
         monkeypatch,
         tmp_path,
@@ -131,14 +133,17 @@ def test_bedrock_mode_sets_bedrock_base_url(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     launch_env = captured["launch_env"]
-    # The whole point: Bedrock mode routes via ANTHROPIC_BEDROCK_BASE_URL, and
-    # must NOT set ANTHROPIC_BASE_URL (which Claude Code ignores in Bedrock mode).
-    assert launch_env["ANTHROPIC_BEDROCK_BASE_URL"].startswith("http://127.0.0.1:8787")
-    assert "ANTHROPIC_BASE_URL" not in launch_env
-    # Proxy started in re-signing mode, with the resolved region.
-    assert captured["ensure_kwargs"]["bedrock_sign"] is True
+    # Bedrock-mode wrap switches Claude Code to Anthropic mode: the proxy runs
+    # on the bedrock backend and signs with AWS credentials, so the session's
+    # route goes in a --settings override (settings files outrank the shell).
+    assert launch_env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:8787")
+    assert captured["ensure_kwargs"]["backend"] == "bedrock"
     assert captured["ensure_kwargs"]["region"] == "us-west-2"
     assert "Bedrock mode" in result.output
+    settings_idx = captured["launch_cmd"].index("--settings") + 1
+    session_env = json.loads(captured["launch_cmd"][settings_idx])["env"]
+    assert session_env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:8787")
+    assert session_env["CLAUDE_CODE_USE_BEDROCK"] == "0"
 
 
 def test_non_bedrock_mode_keeps_anthropic_base_url(monkeypatch, tmp_path):
@@ -148,4 +153,5 @@ def test_non_bedrock_mode_keeps_anthropic_base_url(monkeypatch, tmp_path):
     launch_env = captured["launch_env"]
     assert launch_env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:8787")
     assert "ANTHROPIC_BEDROCK_BASE_URL" not in launch_env
-    assert captured["ensure_kwargs"]["bedrock_sign"] is False
+    assert captured["ensure_kwargs"]["backend"] is None
+    assert "Bedrock mode" not in result.output

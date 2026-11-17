@@ -142,6 +142,62 @@ def test_extract_user_query_latest_user_turn_only() -> None:
     assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
 
 
+def test_extract_user_query_skips_tool_search_load_note() -> None:
+    """Claude Code answers a ToolSearch call with ``tool_reference`` blocks plus a
+    "Tool loaded." text block; that note is not the user's question."""
+    messages = [
+        {"role": "user", "content": "Who opened issue #4475?"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ToolSearch"}]},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": "mcp__gh__list_issues"}],
+                },
+                {"type": "text", "text": "Tool loaded."},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "list"}]},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "[]"}],
+        },
+    ]
+
+    assert utils.extract_user_query(messages) == "Who opened issue #4475?"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
+def test_extract_user_query_keeps_user_text_beside_tool_search_load() -> None:
+    """Only the "Tool loaded." note is dropped; real text in that turn still counts."""
+    messages = [
+        {"role": "user", "content": "older question"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": "mcp__gh__list_issues"}],
+                },
+                {"type": "text", "text": "Tool loaded."},
+                {"type": "text", "text": "only open issues please"},
+            ],
+        },
+    ]
+
+    assert utils.extract_user_query(messages) == "only open issues please"
+
+
+def test_extract_user_query_keeps_tool_loaded_text_without_tool_reference() -> None:
+    """Outside a ToolSearch turn, "Tool loaded." is ordinary user text."""
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Tool loaded."}]}]
+
+    assert utils.extract_user_query(messages) == "Tool loaded."
+
+
 def test_extract_user_query_latest_turn_only_agrees_on_normal_turns() -> None:
     """With text present on the newest user turn, the flag changes nothing."""
     messages = [
