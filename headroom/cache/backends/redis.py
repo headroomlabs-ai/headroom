@@ -34,7 +34,18 @@ class RedisBackend:
     def __init__(self, url: str, client: Any = None) -> None:
         self._client = client if client is not None else connect(url, setting="HEADROOM_REDIS_URL")
         self._prefix = f"{key_prefix()}:ccr:"
-        self._guard = Guard("CCR store")
+        self._guard = Guard("CCR store", "ccr")
+
+    def close(self) -> None:
+        """Unregister the guard and close the Redis client."""
+        if hasattr(self, "_guard"):
+            self._guard.close()
+        client = getattr(self, "_client", None)
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _key(self, hash_key: str) -> str:
         return self._prefix + hash_key

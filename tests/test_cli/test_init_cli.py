@@ -1767,6 +1767,21 @@ def test_local_profile_accepts_non_ascii_directory_names(monkeypatch, tmp_path, 
     assert profile.startswith("init-")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX paths can hold non-UTF-8 bytes")
+def test_local_profile_handles_non_utf8_directory_names(monkeypatch) -> None:
+    """A directory name that is not valid UTF-8 must not crash profile derivation (#4267)."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    first = Path(os.fsdecode(b"/headroom-nonexistent/proj-\xff"))
+    second = Path(os.fsdecode(b"/headroom-nonexistent/proj-\xfe"))
+
+    first_profile = init_cli._local_profile(first)
+    second_profile = init_cli._local_profile(second)
+
+    assert PROFILE_RE.fullmatch(first_profile), first_profile
+    assert PROFILE_RE.fullmatch(second_profile), second_profile
+    assert first_profile != second_profile
+
+
 def test_local_profile_is_unchanged_for_ascii_directory_names(monkeypatch, tmp_path) -> None:
     """The ASCII slug path keeps its existing output."""
     init_cli, _ = _load_init_module(monkeypatch)

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="256" height="256" role="img" aria-label="Headroom logomark">
+  <rect width="32" height="32" rx="6" fill="#070A0F"/>
+  <g stroke-linecap="square">
+    <path d="M 11 8 L 7 8 L 7 24 L 11 24" fill="none" stroke="#00F0B5" stroke-width="2"/>
+    <path d="M 21 8 L 25 8 L 25 24 L 21 24" fill="none" stroke="#00F0B5" stroke-width="2"/>
+    <rect x="11" y="14" width="10" height="2" fill="#00F0B5"/>
+    <rect x="13" y="18" width="6" height="2" fill="#00F0B5"/>
+  </g>
+</svg>
