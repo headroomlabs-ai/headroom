@@ -54,6 +54,65 @@ def _legacy_aggregate(ttl: int) -> dict:
 
 
 class TestEstimateTtls:
+    def test_cold_starts_do_not_supply_hit_evidence(self):
+        # The real tracker reports cold_start with is_miss=False: nothing was
+        # cached last turn, so this is neither a miss nor proof of a live cache.
+        from headroom.cache.prefix_tracker import PrefixCacheTracker
+
+        tracker = PrefixCacheTracker("openai")
+        rows = []
+        for idle in (120, 200, 240):
+            attribution = tracker.classify_cache_miss(0, [], idle_seconds=idle)
+            assert attribution.reason == "cold_start" and not attribution.is_miss
+            rows.append(_row(idle=idle, hit=not attribution.is_miss, reason=attribution.reason))
+        rows += _corpus([], [600, 700, 800])
+        assert estimate_ttls(rows) == {}
+
+    def test_cold_starts_cannot_top_up_the_hit_sample_floor(self):
+        rows = _corpus([120, 240], [600, 700, 800])
+        rows.append(_row(idle=180, hit=True, reason="cold_start"))
+        assert estimate_ttls(rows) == {}
+
+    def test_long_cold_start_does_not_invalidate_real_hit_bounds(self):
+        rows = _corpus([120, 200, 240], [600, 700, 800])
+        rows.append(_row(idle=3600, hit=True, reason="cold_start"))
+        estimate = estimate_ttls(rows)["openai/gpt-5.5"]
+        assert estimate["ttl_seconds"] == 600
+        assert estimate["hits"] == 3
+        assert estimate["max_hit_idle"] == 240
+
+    @pytest.mark.parametrize("reason", [None, "unknown", "prefix_change", "ttl_expiry"])
+    def test_non_hit_reason_is_not_life_evidence(self, reason):
+        rows = _corpus([120, 240], [600, 700, 800])
+        row = _row(idle=180, hit=True)
+        row["reason"] = reason
+        rows.append(row)
+        assert estimate_ttls(rows) == {}
+
+    @pytest.mark.parametrize("is_miss", [None, 0, "false"])
+    def test_malformed_outcome_is_not_life_evidence(self, is_miss):
+        rows = _corpus([120, 240], [600, 700, 800])
+        row = _row(idle=180, hit=True)
+        row["is_miss"] = is_miss
+        rows.append(row)
+        assert estimate_ttls(rows) == {}
+
+    @pytest.mark.parametrize(
+        ("hit_idles", "expiry_idles", "expected"),
+        [
+            ([300.1, 300.2, 300.4], [300.8, 301.4, 302.5], 301),
+            ([0.1, 0.2, 0.4], [0.8, 1.4, 2.5], 1),
+            ([120, 300, 480], [600, 900, 1200], 600),
+        ],
+    )
+    def test_whole_second_ttl_keeps_the_observed_upper_bound(
+        self, hit_idles, expiry_idles, expected
+    ):
+        estimate = estimate_ttls(_corpus(hit_idles, expiry_idles))["openai/gpt-5.5"]
+        assert estimate["ttl_seconds"] >= min(expiry_idles)
+        assert estimate["ttl_seconds"] > max(hit_idles)
+        assert estimate["ttl_seconds"] == expected
+
     def test_upper_bound_of_interval_is_emitted(self):
         # Alive at up to 480s, first observed death beyond that at 600s
         # -> TTL estimate is the safe upper end: 600.
@@ -186,6 +245,16 @@ class TestWriteLearned:
 
 
 class TestMain:
+    def test_fractional_upper_bound_survives_cli_and_resolver(self, paths):
+        obs, out = paths
+        rows = _corpus([300.1, 300.2, 300.4], [300.8, 301.4, 302.5])
+        obs.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+        assert main([]) == 0
+
+        assert json.loads(out.read_text())["openai/gpt-5.5"]["ttl_seconds"] == 301
+        assert resolve_learned_ttl("openai", "gpt-5.5") == 301
+
     @pytest.fixture()
     def paths(self, tmp_path, monkeypatch):
         obs = tmp_path / "obs.jsonl"

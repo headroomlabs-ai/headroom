@@ -809,6 +809,163 @@ describe("round-trip: geminiToOpenAI then openAIToGemini", () => {
     expect(openAIToGemini(geminiToOpenAI(original))).toEqual(original);
   });
 });
+
+// Issue #4770: the compress round trip is Gemini -> OpenAI -> proxy -> OpenAI -> Gemini, so
+// every Gemini-only part field has to ride on the OpenAI shape and come back.
+describe("Gemini part fields survive the compress round trip (issue #4770)", () => {
+  // A thinking-enabled function-call turn exactly as Gemini 3 returns it: the thought part
+  // and the functionCall part both carry a thoughtSignature, and the call carries an id.
+  const contents = [
+    { role: "user", parts: [{ text: "What is the weather in Paris?" }] },
+    {
+      role: "model",
+      parts: [
+        { text: "Let me look that up.", thought: true, thoughtSignature: "sig-thought-1" },
+        {
+          functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } },
+          thoughtSignature: "sig-call-1",
+        },
+      ],
+    },
+    {
+      role: "user",
+      parts: [
+        {
+          functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } },
+        },
+      ],
+    },
+  ];
+
+  it("restores thought, thoughtSignature and functionCall.id on the model turn", () => {
+    const back = openAIToGemini(geminiToOpenAI(contents));
+    const model = back[1];
+    expect(model.role).toBe("model");
+    expect(model.parts[0]).toEqual({
+      text: "Let me look that up.",
+      thought: true,
+      thoughtSignature: "sig-thought-1",
+    });
+    expect(model.parts[1]).toEqual({
+      functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } },
+      thoughtSignature: "sig-call-1",
+    });
+  });
+
+  it("restores the functionResponse id and name on the tool turn", () => {
+    const back = openAIToGemini(geminiToOpenAI(contents));
+    expect(back[2]).toEqual({
+      role: "user",
+      parts: [
+        { functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } } },
+      ],
+    });
+  });
+
+  it("keeps the real call id so a tool result addresses the call Gemini issued", () => {
+    const openai = geminiToOpenAI(contents);
+    const call = openai[1].tool_calls?.[0];
+    expect(call?.id).toBe("call_abc123");
+    expect(openai[2].role === "tool" && openai[2].tool_call_id).toBe("call_abc123");
+  });
+
+  it("still reproduces the whole conversation exactly through detection and conversion", () => {
+    expect(detectFormat(contents)).toBe("gemini");
+    expect(fromOpenAI(toOpenAI(contents), "gemini")).toEqual(contents);
+  });
+
+  it("leaves a plain turn with no extras byte-identical (no private key leaks)", () => {
+    const plain = [{ role: "model", parts: [{ text: "just text" }, { text: "and more" }] }];
+    const openai = geminiToOpenAI(plain);
+    expect(openai).toEqual([{ role: "assistant", content: "just text\nand more" }]);
+    expect(openAIToGemini(openai)).toEqual([{ role: "model", parts: [{ text: "just text\nand more" }] }]);
+  });
+
+  it("keeps a signature-bearing user text part as its own part", () => {
+    const signed = [
+      { role: "user", parts: [{ text: "first", thoughtSignature: "sig-u1" }, { text: "second" }] },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(signed))).toEqual([
+      { role: "user", parts: [{ text: "first", thoughtSignature: "sig-u1" }, { text: "second" }] },
+    ]);
+  });
+
+  it("pairs a functionResponse that omits its id with the call it answers", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [{ functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } } }],
+      },
+      {
+        // Gemini omits the id here; the response still answers "call_abc123".
+        role: "user",
+        parts: [{ functionResponse: { name: "get_weather", response: { tempC: 21 } } }],
+      },
+    ];
+    const openai = geminiToOpenAI(contents);
+    expect(openai[0].tool_calls?.[0].id).toBe("call_abc123");
+    expect(openai[1].role === "tool" && openai[1].tool_call_id).toBe("call_abc123");
+
+    // Two calls of the same name are answered in order.
+    const twice = geminiToOpenAI([
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "read", args: { p: "a" } } },
+          { functionCall: { id: "call_2", name: "read", args: { p: "b" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "read", response: { a: 1 } } },
+          { functionResponse: { name: "read", response: { b: 2 } } },
+        ],
+      },
+    ]);
+    expect(twice.filter((m) => m.role === "tool").map((m) => (m as any).tool_call_id)).toEqual([
+      "call_1",
+      "call_2",
+    ]);
+
+    // An explicitly answered call is not reused by a later id-less response.
+    const outOfOrder = geminiToOpenAI([
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "read", args: { p: "a" } } },
+          { functionCall: { id: "call_2", name: "read", args: { p: "b" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { id: "call_2", name: "read", response: { b: 2 } } },
+          { functionResponse: { name: "read", response: { a: 1 } } },
+        ],
+      },
+    ]);
+    expect(outOfOrder.filter((m) => m.role === "tool").map((m) => (m as any).tool_call_id)).toEqual([
+      "call_2",
+      "call_1",
+    ]);
+  });
+
+  it("restores a thoughtSignature carried on a functionResponse part", () => {
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } },
+            thoughtSignature: "sig-response-1",
+          },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+});
 describe("openAIToVercel tool names", () => {
   it("carries the tool name from the matching tool-call onto the tool-result part", () => {
     const msgs: OpenAIMessage[] = [
@@ -1668,5 +1825,97 @@ describe("Vercel tool messages with several results carry message-level provider
     expect((converted[1] as any).messageProviderOptions).toEqual({ anthropic: { cacheControl: { type: "ephemeral" } } });
     const back = openAIToVercel(converted);
     expect(back.map((m: any) => m.providerOptions)).toEqual([undefined, { anthropic: { cacheControl: { type: "ephemeral" } } }]);
+  });
+});
+
+describe("Vercel tool-result output kinds survive the round trip", () => {
+  // The result's value travels as the OpenAI tool message content, so the proxy still compresses
+  // it; the rest of the output object rides beside it and brings the kind back on the way out.
+  const turn = (output: any) => [
+    { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_1", toolName: "deploy", input: {} }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "call_1", toolName: "deploy", output }] },
+  ];
+  const roundTrip = (output: any) => openAIToVercel(vercelToOpenAI(turn(output)))[1].content[0].output;
+
+  it("keeps an error-text result an error", () => {
+    expect(roundTrip({ type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" })).toEqual({ type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" });
+  });
+
+  it("keeps an error-json result an error", () => {
+    expect(roundTrip({ type: "error-json", value: { code: 7 } })).toEqual({ type: "error-json", value: { code: 7 } });
+  });
+
+  it("restores an execution-denied result with its reason and no value", () => {
+    expect(roundTrip({ type: "execution-denied", reason: "Not from CI." })).toEqual({ type: "execution-denied", reason: "Not from CI." });
+    expect(roundTrip({ type: "execution-denied" })).toEqual({ type: "execution-denied" });
+  });
+
+  it("keeps a text result whose body parses as JSON a text result", () => {
+    expect(roundTrip({ type: "text", value: "42" })).toEqual({ type: "text", value: "42" });
+  });
+
+  it("keeps a json result whose value is a string a json result", () => {
+    expect(roundTrip({ type: "json", value: "ok" })).toEqual({ type: "json", value: "ok" });
+  });
+
+  it("keeps the output's own providerOptions", () => {
+    const output = { type: "text", value: "ok", providerOptions: { openai: { approvalId: "apr_1" } } };
+    expect(roundTrip(output)).toEqual(output);
+  });
+
+  it("keeps a content result's members: text as text, file and custom parts verbatim", () => {
+    const output = {
+      type: "content",
+      value: [
+        { type: "text", text: "Dashboard at 12:00.", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } },
+        { type: "file", data: { type: "data", data: "iVBORw0KGgo=" }, mediaType: "image/png", filename: "shot.png", providerOptions: { openai: { imageDetail: "low" } } },
+        { type: "custom", providerOptions: { anthropic: { toolReference: { type: "tool_reference", toolName: "bash" } } } },
+      ],
+    };
+    expect(roundTrip(output)).toEqual(output);
+  });
+
+  it("carries LanguageModelV3 media members (image-data, file-url, file-id) the same way", () => {
+    const output = {
+      type: "content",
+      value: [
+        { type: "text", text: "Three attachments." },
+        { type: "image-data", data: "iVBORw0KGgo=", mediaType: "image/png" },
+        { type: "file-url", url: "https://example.com/report.pdf" },
+        { type: "file-id", fileId: { openai: "file-abc" } },
+      ],
+    };
+    expect(roundTrip(output)).toEqual(output);
+  });
+
+  it("sends an error-text body as the tool message content, with the kind beside it", () => {
+    const [, toolMsg] = vercelToOpenAI(turn({ type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" })) as any[];
+    expect(toolMsg.content).toBe("ECONNREFUSED 10.0.0.7:443");
+    expect(toolMsg.output).toEqual({ type: "error-text" });
+  });
+
+  it("sends a content result as the tool message's content array", () => {
+    const value = [{ type: "text", text: "Dashboard at 12:00." }, { type: "file", data: { type: "data", data: "iVBORw0KGgo=" }, mediaType: "image/png" }];
+    const [, toolMsg] = vercelToOpenAI(turn({ type: "content", value })) as any[];
+    expect(toolMsg.content).toEqual(value);
+    expect(toolMsg.output).toEqual({ type: "content" });
+  });
+
+  it("sends an execution-denied result as empty content with the reason beside it", () => {
+    const [, toolMsg] = vercelToOpenAI(turn({ type: "execution-denied", reason: "Not from CI." })) as any[];
+    expect(toolMsg.content).toBe("");
+    expect(toolMsg.output).toEqual({ type: "execution-denied", reason: "Not from CI." });
+  });
+
+  it("keeps the error flag when a compressed error-json body no longer parses", () => {
+    const converted = vercelToOpenAI(turn({ type: "error-json", value: { rows: [1, 2, 3, 4] } })) as any[];
+    converted[1].content = "[rows: 4 items, 1-4]";
+    expect(openAIToVercel(converted)[1].content[0].output).toEqual({ type: "error-text", value: "[rows: 4 items, 1-4]" });
+  });
+
+  it("returns a json result whose compressed body no longer parses as its text twin", () => {
+    const converted = vercelToOpenAI(turn({ type: "json", value: { rows: [1, 2, 3, 4] } })) as any[];
+    converted[1].content = "[rows: 4 items, 1-4]";
+    expect(openAIToVercel(converted)[1].content[0].output).toEqual({ type: "text", value: "[rows: 4 items, 1-4]" });
   });
 });

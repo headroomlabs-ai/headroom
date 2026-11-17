@@ -77,16 +77,29 @@ def _extract_tool_result_content(msg: dict) -> str | None:
 
 
 def _can_swap_tool_result_content(msg: dict) -> bool:
-    """Whether replacing extracted text preserves the OpenAI content shape.
+    """Whether replacing extracted text preserves the tool-result content shape.
 
     A joined replacement cannot be mapped back to multiple blocks without
     losing boundaries, metadata or media. All rewrite callers must check this
-    before extraction, transformation or savings accounting. Anthropic's
-    existing tool-result rewrite contract is unchanged.
+    before extraction, transformation or savings accounting. Textless Anthropic
+    results remain stable without any rewrite.
     """
-    if msg.get("role") != "tool":
-        return True
     content = msg.get("content")
+    if msg.get("role") != "tool":
+        if not isinstance(content, list):
+            return True
+        result = next(
+            (b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"),
+            None,
+        )
+        if result is None:
+            return True
+        content = result.get("content")
+        if content is None or (
+            isinstance(content, list)
+            and not any(isinstance(b, dict) and b.get("type") == "text" for b in content)
+        ):
+            return True
     if isinstance(content, str):
         return True
     return (
@@ -135,14 +148,14 @@ def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 inner = block.get("content")
-                if isinstance(inner, list):
-                    # Collapse list-of-blocks to a single text block.
-                    # The compressed content is a single string; preserving
-                    # multiple text blocks would produce a different joined
-                    # output on re-extraction (first text block replaced,
-                    # remaining text blocks still joined).
-                    block["content"] = [{"type": "text", "text": new_content}]
-                else:
+                if (
+                    isinstance(inner, list)
+                    and len(inner) == 1
+                    and isinstance(inner[0], dict)
+                    and inner[0].get("type") == "text"
+                ):
+                    inner[0]["text"] = new_content
+                elif isinstance(inner, str):
                     block["content"] = new_content
                 break
     return new_msg

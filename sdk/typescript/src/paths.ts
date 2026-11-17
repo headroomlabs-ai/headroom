@@ -248,7 +248,16 @@ export function modelsConfigPath(): string {
 // ---------------------------------------------------------------------------
 
 function assertPluginName(name: string): void {
-  if (!name || name.includes("/") || name.includes("\\")) {
+  // Same rule as the Python twin (headroom/paths.py): "." and ".." would resolve
+  // to plugins/ itself or to the parent, and NUL ends a path in POSIX APIs.
+  if (
+    !name ||
+    name === "." ||
+    name === ".." ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    name.includes("\0")
+  ) {
     throw new Error(`invalid plugin name: ${JSON.stringify(name)}`);
   }
 }

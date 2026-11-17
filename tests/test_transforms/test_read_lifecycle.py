@@ -701,6 +701,54 @@ class TestNoFilePathHandling:
         assert result.messages[1]["content"] == LARGE_CONTENT
 
 
+def _read_then_edit(read_content: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/foo.txt"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": read_content,
+                }
+            ],
+        },
+        # Edit the same file -> the Read above becomes STALE.
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "t2",
+                    "name": "Edit",
+                    "input": {"file_path": "/tmp/foo.txt"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t2",
+                    "content": "edited",
+                }
+            ],
+        },
+    ]
+
+
 class TestContentRouterIntegration:
     """Regression: ContentRouter.transform must wire a real CCR store into
     ReadLifecycleManager so STALE Read markers resolve via headroom_retrieve."""
@@ -720,51 +768,7 @@ class TestContentRouterIntegration:
         reset_compression_store()
         try:
             large_content = "source line\n" * 500  # above read_lifecycle min_size_bytes
-            messages = [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "t1",
-                            "name": "Read",
-                            "input": {"file_path": "/tmp/foo.txt"},
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "t1",
-                            "content": large_content,
-                        }
-                    ],
-                },
-                # Edit the same file -> the Read above becomes STALE.
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "t2",
-                            "name": "Edit",
-                            "input": {"file_path": "/tmp/foo.txt"},
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "t2",
-                            "content": "edited",
-                        }
-                    ],
-                },
-            ]
+            messages = _read_then_edit(large_content)
 
             result = compress(messages, model="claude-sonnet-4-5-20250929")
 
@@ -788,3 +792,15 @@ class TestContentRouterIntegration:
             # Drop the memory-backend singleton so later tests in the suite
             # see the env-driven default again.
             reset_compression_store()
+
+    def test_lossless_router_keeps_a_stale_read(self):
+        from headroom.providers import OpenAIProvider
+        from headroom.tokenizer import Tokenizer
+        from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+        tokenizer = Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
+        large_content = "source line\n" * 500
+        router = ContentRouter(ContentRouterConfig(lossless=True))
+        result = router.apply(_read_then_edit(large_content), tokenizer=tokenizer)
+
+        assert result.messages[1]["content"][0]["content"] == large_content

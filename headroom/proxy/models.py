@@ -13,6 +13,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from headroom.config import resolve_omlx_target_api_url
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -97,6 +98,12 @@ class RequestLog:
     cache_write_tokens: int = 0
     uncached_input_tokens: int = 0
 
+    # The provider's own prompt-token count, when it reported one (0 otherwise).
+    # ``input_tokens_optimized`` is the local tokenizer's count, which can differ;
+    # this is the figure the cost tracker bills, so per-request cost prices it
+    # in preference to the local count (#1079).
+    provider_input_tokens: int = 0
+
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
 
@@ -165,6 +172,9 @@ class ProxyConfig:
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    omlx_target_api_url: str | None = (
+        None  # Custom oMLX local inference API URL (e.g. http://127.0.0.1:8888)
+    )
     # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
     # JSON-object config knobs; see settings_store's anthropic_extra_headers/
     # openai_extra_headers and providers.registry.resolve_extra_headers.
@@ -189,6 +199,12 @@ class ProxyConfig:
     # session can transparently refresh STS credentials. ``None`` keeps
     # the default behavior (litellm builds its own client from env).
     bedrock_client_factory: Callable[[str | None], Any] | None = None
+    # Factory Droid upstream (`--factory-api-url` / FACTORY_TARGET_API_URL).
+    # When set, `/api/llm/a/v1/messages` is compressed and forwarded here and
+    # every other `/api/*` path is passed through verbatim; it serves `/api/*`
+    # only and never becomes the catch-all upstream. Leave unset (default) to
+    # keep `/api/*` on the normal catch-all.
+    factory_api_url: str | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or
@@ -594,6 +610,8 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
+        if self.omlx_target_api_url is None:
+            self.omlx_target_api_url = resolve_omlx_target_api_url()
         # ``read_maturation`` remains a concrete, already-resolved runtime
         # setting for programmatic/config-file callers.  The CLI composition
         # root derives it from this same snapshot before constructing the
@@ -623,3 +641,34 @@ class ProxyConfig:
             cloudcode=self.cloudcode_api_url,
             vertex=self.vertex_api_url,
         )
+
+
+# ProxyConfig fields that hold a credential. Whatever serialises a config into
+# a file, a manifest or another process's environment masks or moves these.
+PROXY_CONFIG_SECRET_FIELDS: frozenset[str] = frozenset(
+    {
+        "memory_qdrant_api_key",
+        "memory_neo4j_password",
+        "license_key",
+        "proxy_token",
+        "anthropic_extra_headers",
+        "openai_extra_headers",
+    }
+)
+PROXY_CONFIG_REDACTED = "[REDACTED]"
+
+
+def redact_proxy_config_secrets(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a serialised ProxyConfig with every credential masked.
+
+    Header maps keep their header names so a manifest still shows which
+    headers are configured.
+    """
+    out = dict(payload)
+    for name in PROXY_CONFIG_SECRET_FIELDS:
+        value = out.get(name)
+        if isinstance(value, dict):
+            out[name] = dict.fromkeys(value, PROXY_CONFIG_REDACTED)
+        elif value:
+            out[name] = PROXY_CONFIG_REDACTED
+    return out
