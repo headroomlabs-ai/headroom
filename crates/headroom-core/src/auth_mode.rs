@@ -161,7 +161,13 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
         None => "",
     };
 
-    if let Some(token) = auth.strip_prefix("Bearer ") {
+    // RFC 9110 §11.1: auth scheme names are case-insensitive; tolerate
+    // extra whitespace between scheme and token.
+    let bearer = auth
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("Bearer "))
+        .map(|_| auth[7..].trim_start());
+    if let Some(token) = bearer {
         // Order matters: the OAuth shape `sk-ant-oat*` shares a
         // prefix with `sk-ant-api*` only at `sk-ant-`, so we check
         // the OAuth shape FIRST. Real OAuth access tokens are
@@ -234,6 +240,24 @@ mod inline_tests {
         // when there's a positive non-Bearer Authorization signal.
         let headers = HeaderMap::new();
         assert_eq!(classify(&headers), AuthMode::Payg);
+    }
+
+    fn classify_auth(value: &str) -> AuthMode {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_str(value).unwrap());
+        classify(&headers)
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_token_is_trimmed() {
+        // Controls: well-formed headers keep their classification.
+        assert_eq!(classify_auth("Bearer sk-ant-api03-fake"), AuthMode::Payg);
+        assert_eq!(classify_auth("Bearer sk-ant-oat01-fake"), AuthMode::OAuth);
+        // Lowercase scheme is still Bearer -> Payg, not the non-Bearer OAuth branch.
+        assert_eq!(classify_auth("bearer sk-ant-api03-fake"), AuthMode::Payg);
+        assert_eq!(classify_auth("BEARER sk-ant-api03-fake"), AuthMode::Payg);
+        // Extra space before the token must not hide the oat prefix.
+        assert_eq!(classify_auth("Bearer  sk-ant-oat01-fake"), AuthMode::OAuth);
     }
 
     #[test]

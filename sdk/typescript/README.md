@@ -384,6 +384,7 @@ const result = await compress(messages, {
   retries: 1,                         // retry on transient failures (default)
   tokenBudget: 4000,                  // compress to fit this limit
   hooks: new MyHooks(),               // pre/post compression hooks
+  format: 'vercel',                   // declare the input format; skips autodetection
 });
 ```
 
@@ -405,6 +406,20 @@ import { parseSSE, collectStream } from 'headroom-ai';
 
 // Hook helpers
 import { extractUserQuery, countTurns, extractToolCalls } from 'headroom-ai';
+```
+
+## Building from source
+
+Use Node 24 LTS at version 24.11 or later for SDK development. The build
+toolchain also supports Node 22.18 or later in the Node 22 line, and Node 26
+or later. These are the `tsup` 9 build requirements; the SDK and optional
+provider peers retain their own runtime requirements.
+
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run build
 ```
 
 ## License

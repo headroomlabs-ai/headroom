@@ -1,0 +1,57 @@
+{
+  "opencode": "opencode v2.2.5",
+  "python": "3.12.14",
+  "started_utc": "2026-11-04T04:23:01.378019+00:00",
+  "headroom_source": "8766328a6c20909520b0a7ac7b5d487900316084",
+  "plugin_sha256": "de88ab2120df79ad67fad3f7a06f8618ea093707cfcf1180921b1ae42e7b1cea",
+  "results": [
+    {
+      "case": "baseline",
+      "rust_core": "disabled",
+      "plugin": false,
+      "base_path": "",
+      "proxy_requests": 0,
+      "upstream_requests": 2,
+      "upstream_path": "/messages",
+      "auth_preserved": true,
+      "internal_headers_at_upstream": false,
+      "client_text": "HEADROOM_RUNTIME_OK"
+    },
+    {
+      "case": "copilot-shaped",
+      "rust_core": "disabled",
+      "plugin": true,
+      "base_path": "",
+      "proxy_requests": 2,
+      "upstream_requests": 2,
+      "upstream_path": "/v1/messages",
+      "auth_preserved": true,
+      "internal_headers_at_upstream": false,
+      "client_text": "HEADROOM_RUNTIME_OK"
+    },
+    {
+      "case": "v1-gateway",
+      "rust_core": "disabled",
+      "plugin": true,
+      "base_path": "/v1",
+      "proxy_requests": 2,
+      "upstream_requests": 2,
+      "upstream_path": "/v1/messages",
+      "auth_preserved": true,
+      "internal_headers_at_upstream": false,
+      "client_text": "HEADROOM_RUNTIME_OK"
+    },
+    {
+      "case": "prefixed-gateway",
+      "rust_core": "disabled",
+      "plugin": true,
+      "base_path": "/api/coding/paas/v4",
+      "proxy_requests": 0,
+      "upstream_requests": 2,
+      "upstream_path": "/api/coding/paas/v4/messages",
+      "auth_preserved": true,
+      "internal_headers_at_upstream": false,
+      "client_text": "HEADROOM_RUNTIME_OK"
+    }
+  ]
+}

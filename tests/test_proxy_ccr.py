@@ -363,15 +363,14 @@ class TestEndToEndTOINIntegration:
         from headroom.telemetry import ToolSignature
         from headroom.transforms import SmartCrusher, TransformPipeline
 
-        # Create tool output with 100 items that will trigger compression
-        # Key: score field with varying values signals sortable data
-        # Having repetitive category values helps trigger compression
+        # Duplicate ranked rows require real keep/drop compression, so
+        # recording TOIN and caching originals cannot pass on JSON formatting.
         items = [
             {
-                "id": i,
-                "score": 1000 - i,  # Decreasing scores signal sorting
-                "category": f"cat_{i % 3}",  # Only 3 unique categories
-                "status": "active" if i % 2 == 0 else "inactive",  # Binary status
+                "id": i % 5,
+                "score": 1000 - (i % 5),
+                "category": f"cat_{i % 5}",
+                "status": "active",
             }
             for i in range(100)
         ]
@@ -434,40 +433,26 @@ class TestEndToEndTOINIntegration:
             model_limit=200000,
         )
 
-        # Verify SmartCrusher was invoked (transform name starts with smart_crush)
-        smart_crush_applied = any(
-            t.startswith("smart_crush") or t.startswith("smart:") for t in result.transforms_applied
-        )
-        assert smart_crush_applied, (
-            f"SmartCrusher should be in transforms: {result.transforms_applied}"
-        )
+        output = result.messages[2]["content"][0]["content"]
+        # The pipeline appends its retrieval notice after the JSON payload.
+        compressed, _ = json.JSONDecoder().raw_decode(output)
+        kept = [row for row in compressed if "id" in row]
+        assert len(kept) < len(items)
+        assert all(row in items for row in kept)
 
-        # Check if compression was actually performed (not skipped)
-        # Skip messages look like "smart:skip:reason(100->100)"
-        compression_was_skipped = any(
-            "skip" in t.lower() for t in result.transforms_applied if "smart:" in t.lower()
-        )
+        store = get_compression_store()
+        marker_text = compressed[-1]["_ccr_dropped"]
+        ccr_hash = marker_text[len("<<ccr:") :].split(" ", 1)[0]
+        entry = store.retrieve(ccr_hash)
+        assert entry is not None, "The rendered CCR marker must be retrievable"
+        assert json.loads(entry.original_content) == items
 
-        # If compression happened, verify TOIN and store
-        if not compression_was_skipped:
-            # Verify compression store has the entry
-            store = get_compression_store()
-            stats = store.get_stats()
-            assert stats["entry_count"] >= 1, "Should have cached entry"
-
-            # Verify TOIN recorded the compression
-            signature = ToolSignature.from_items(items)
-            pattern = fresh_toin._patterns.get(signature.structure_hash)
-            assert pattern is not None, (
-                "TOIN should have recorded compression event. "
-                "If this fails, SmartCrusher is not calling TOIN.record_compression."
-            )
-            assert pattern.total_compressions >= 1, "Should have at least 1 compression"
-        else:
-            # Compression was skipped - this is expected for some data patterns
-            # The important thing is that SmartCrusher was invoked and made a decision
-            # The other tests verify the full loop when compression does happen
-            pass
+        signature = ToolSignature.from_items(items)
+        pattern = fresh_toin.get_pattern(signature.structure_hash)
+        assert pattern is not None, "TOIN should have recorded the real compression"
+        assert pattern.total_compressions == 1
+        assert pattern.total_items_seen == len(items)
+        assert pattern.total_items_kept == len(kept)
 
     def test_retrieval_through_proxy_updates_toin_field_semantics(
         self, fresh_toin, client_with_optimization

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -138,6 +139,45 @@ def test_embedding_encode_caps_the_onnx_batch(monkeypatch) -> None:
     monkeypatch.setattr(scorer, "_get_model", lambda: FakeModel())
     assert len(scorer._encode([f"record {i}" for i in range(300)])) == 300
     assert calls == [{"batch_size": embedding.EMBED_BATCH_SIZE}]
+
+
+@pytest.mark.parametrize(
+    ("platform", "large_cache", "shrinks"),
+    [("darwin", "0", True), ("darwin", None, False), ("linux", "0", False)],
+)
+def test_embedding_encode_shrinks_the_arena_only_without_the_large_cache(
+    monkeypatch, platform, large_cache, shrinks
+) -> None:
+    # Shrinking under libmalloc's large cache re-grows the arena, so the run
+    # options are passed only on macOS with MallocLargeCache=0 (the CLI re-exec).
+    pytest.importorskip("onnxruntime")
+    seen = []
+
+    class Session:
+        def run(self, names, feed, run_options=None):
+            seen.append(
+                run_options
+                and run_options.get_run_config_entry("memory.enable_memory_arena_shrinkage")
+            )
+
+    class FakeModel:
+        model = SimpleNamespace(model=Session())
+
+        def embed(self, texts, **kwargs):
+            self.model.model.run(["out"], {})
+            return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(sys, "platform", platform)
+    if large_cache is None:
+        monkeypatch.delenv("MallocLargeCache", raising=False)
+    else:
+        monkeypatch.setenv("MallocLargeCache", large_cache)
+    model = FakeModel()
+    scorer = EmbeddingScorer()
+    monkeypatch.setattr(scorer, "_get_model", lambda: model)
+    scorer._encode(["a"])
+    scorer._encode(["b"])
+    assert seen == (["cpu:0", "cpu:0"] if shrinks else [None, None])
 
 
 def test_hybrid_constructor_alpha_variants_and_single_score_paths(monkeypatch) -> None:

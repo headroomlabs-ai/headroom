@@ -27,6 +27,7 @@ from headroom.pricing.litellm_model_resolution import (
     pricing_lookup_candidates,
     resolve_litellm_model_name,
 )
+from headroom.utils import remember_bounded
 
 # litellm calls `dotenv.load_dotenv()` during its own import, which loads
 # the project `.env` into `os.environ`. We don't want that side effect —
@@ -59,7 +60,10 @@ except ImportError:
     litellm = None  # type: ignore[assignment]
     LITELLM_AVAILABLE = False
 
+# Least-recently-used first. Keyed by the client-supplied model name, so the
+# entry count is capped (#4479); an evicted name is simply resolved again.
 _resolved_model_cache: dict[str, str] = {}
+_RESOLVED_MODEL_CACHE_MAXSIZE = 256
 
 logger = logging.getLogger("headroom.pricing")
 
@@ -113,14 +117,16 @@ def resolve_litellm_model(model: str) -> str:
     the bare-prefix rules. Shared by the live (cost.py) and persisted
     (savings_tracker) pricing paths so both figures price identically.
     """
-    if model in _resolved_model_cache:
-        return _resolved_model_cache[model]
+    cached = _resolved_model_cache.get(model)
+    if cached is not None:
+        remember_bounded(_resolved_model_cache, model, cached, _RESOLVED_MODEL_CACHE_MAXSIZE)
+        return cached
     priced: str | None = None
     alias = _static_alias_map()
     if alias:
         priced = _reduce_to_priced_key(alias.get(model, model))
     resolved = priced if priced is not None else _resolve_litellm_model_uncached(model)
-    _resolved_model_cache[model] = resolved
+    remember_bounded(_resolved_model_cache, model, resolved, _RESOLVED_MODEL_CACHE_MAXSIZE)
     return resolved
 
 
