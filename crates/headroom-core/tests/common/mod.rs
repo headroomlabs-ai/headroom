@@ -122,6 +122,26 @@ pub fn python_module_source(n: usize) -> String {
     code
 }
 
+/// Go source the tree-sitter code compressor declines (exact
+/// passthrough: the language has no elision rules), yet which the
+/// detector still classifies as `SourceCode` and which clears the
+/// 2048-byte threshold. This is the shape that used to fall through to
+/// Kompress (#4214).
+pub fn go_handlers_source(n: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut code = String::new();
+    for i in 0..n {
+        let _ = write!(
+            code,
+            "func Handle{i}(w http.ResponseWriter, r *http.Request) {{\n\t\
+             id := r.URL.Query().Get(\"id\")\n\t\
+             fmt.Fprintf(w, \"%s-{i}\", id)\n}}\n\n"
+        );
+    }
+    code
+}
+
 /// Repetitive plain prose of at least `min_bytes`, varied enough to
 /// classify as `PlainText`.
 pub fn plain_prose(min_bytes: usize) -> String {
