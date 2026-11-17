@@ -6,12 +6,19 @@ every in-flight request. Those are transport errors, so the proxy must retry
 them (dropping the bad connection and re-sending on a fresh one) instead of
 collapsing to a 502. These tests drive the real `_retry_request` and
 `_stream_response` paths.
+
+A corrupt TLS record surfaces as a raw `ssl.SSLError`, not an
+`httpx.TransportError`. It is retried only when it hit while the request was
+still being written. After the write, upstream may already have accepted and
+billed the POST, so the error propagates and the POST is sent once.
 """
 
 from __future__ import annotations
 
+import ssl
 from unittest.mock import AsyncMock, MagicMock
 
+import httpcore
 import httpx
 import pytest
 
@@ -177,3 +184,134 @@ async def test_successful_stream_still_returns_200():
 
     assert result.status_code == 200
     proxy.metrics.record_upstream_connection_error.assert_not_called()
+
+
+def _bad_record() -> ssl.SSLError:
+    # What httpx raises on a connection whose next TLS record is corrupt.
+    return ssl.SSLError(1, "[SSL] record layer failure (_ssl.c:2580)")
+
+
+_SSE_STOP = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+_SSE_OK = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: %d\r\n\r\n%s" % (
+    len(_SSE_STOP),
+    _SSE_STOP,
+)
+
+
+class _Upstream(httpcore.AsyncNetworkBackend):
+    """Real httpcore over fake sockets: one failure mode per connection.
+
+    ``"write"``: the TLS error hits while the request is written (never sent).
+    ``"read"``: upstream receives the whole POST, then the TLS error hits.
+    ``None``: a healthy connection that answers with an SSE stream.
+    """
+
+    def __init__(self, *modes: str | None) -> None:
+        self.modes = list(modes)
+        self.received = b""
+
+    @property
+    def posts(self) -> int:
+        return self.received.count(b"POST /v1/messages")
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        return _UpstreamStream(self, self.modes.pop(0))
+
+
+class _UpstreamStream(httpcore.AsyncNetworkStream):
+    def __init__(self, upstream: _Upstream, mode: str | None) -> None:
+        self.upstream, self.mode, self.replied = upstream, mode, False
+
+    async def write(self, buffer, timeout=None):
+        if self.mode == "write":
+            raise _bad_record()
+        self.upstream.received += buffer
+
+    async def read(self, max_bytes, timeout=None):
+        if self.mode == "read":
+            raise _bad_record()
+        reply, self.replied = (b"" if self.replied else _SSE_OK), True
+        return reply
+
+    async def aclose(self):
+        pass
+
+    async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        return self
+
+
+def _proxy_over(upstream: _Upstream):
+    proxy = _mock_proxy()
+    transport = httpx.AsyncHTTPTransport()
+    # Same hook upstream_pinning uses: swap the pool's network backend.
+    transport._pool._network_backend = upstream
+    proxy.http_client = httpx.AsyncClient(transport=transport)
+    return proxy
+
+
+async def _retry_post(proxy):
+    return await proxy._retry_request(
+        "POST",
+        "https://api.anthropic.com/v1/messages",
+        {"x-api-key": "sk-test"},
+        {"model": "claude-sonnet-4-20250514", "messages": []},
+    )
+
+
+async def test_retry_request_does_not_replay_a_post_upstream_received():
+    upstream = _Upstream("read", None)
+
+    with pytest.raises(ssl.SSLError):
+        await _retry_post(_proxy_over(upstream))
+
+    assert upstream.posts == 1
+
+
+async def test_retry_request_retries_ssl_error_while_writing_the_request():
+    upstream = _Upstream("write", None)
+
+    result = await _retry_post(_proxy_over(upstream))
+
+    assert result.status_code == 200
+    assert upstream.posts == 1
+    assert upstream.modes == []
+
+
+async def test_stream_does_not_replay_a_post_upstream_received():
+    upstream = _Upstream("read", None)
+
+    result = await _run_stream(_proxy_over(upstream))
+    body = b"".join([chunk async for chunk in result.body_iterator])
+
+    assert upstream.posts == 1
+    assert result.status_code == 502
+    assert b"upstream_tls_error" in body
+
+
+async def test_stream_retries_ssl_error_while_writing_the_request():
+    upstream = _Upstream("write", None)
+
+    result = await _run_stream(_proxy_over(upstream))
+    body = b"".join([chunk async for chunk in result.body_iterator])
+
+    assert result.status_code == 200
+    assert _SSE_STOP in body
+    assert upstream.posts == 1
+    assert upstream.modes == []
+
+
+async def test_ssl_error_without_write_evidence_is_not_retried():
+    # The review's harness: the transport accepts the POST, then raises. It
+    # emits no httpcore trace events, so nothing shows the POST went unsent.
+    seen: list[httpx.Request] = []
+
+    def accept_then_fail(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raise _bad_record()
+
+    proxy = _mock_proxy()
+    proxy.http_client = httpx.AsyncClient(transport=httpx.MockTransport(accept_then_fail))
+
+    with pytest.raises(ssl.SSLError):
+        await _retry_post(proxy)
+    assert len(seen) == 1
