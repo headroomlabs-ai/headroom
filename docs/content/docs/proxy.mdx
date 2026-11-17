@@ -362,6 +362,7 @@ By default Headroom stores originals so the model can recover them via `headroom
 | `--no-ccr` / `HEADROOM_NO_CCR` | CCR on | Disable retrieval markers **and** the injected `headroom_retrieve` tool. |
 | `--lossless` / `HEADROOM_LOSSLESS` | `false` | Format-native lossless compaction only — no CCR marker, no retrieval tool. |
 | `--ccr-buffered-chat-streaming` / `HEADROOM_CCR_BUFFERED_CHAT_STREAMING` | `false` | Answer `headroom_retrieve` on streaming `/v1/chat/completions`. A turn carrying a redeemable marker runs as `stream: false` upstream and is re-emitted as `chat.completion.chunk` frames, so its text arrives all at once; other turns keep their real stream |
+| `--ccr-inject-system-instructions` / `HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS` | `false` | Append compressed context instructions to the system message listing active retrieval hashes (disabled under `--no-ccr`/`--lossless`; skipped in cache mode once prefix freezes). |
 | `--no-ccr-proactive-expansion` | expansion on | Stop proactively re-expanding compressed content when the model appears to need it. |
 
 ### File-read handling
