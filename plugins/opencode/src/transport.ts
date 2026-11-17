@@ -11,6 +11,14 @@ export const BASE_URL_HEADER = "x-headroom-base-url";
 export const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 export const PROJECT_HEADER = "x-headroom-project";
 export const SESSION_TOKEN_HEADER = "x-headroom-session-token";
+
+// A header value must be a ByteString (code points up to U+00FF): Headers.set throws a
+// TypeError for any other character, so a Thai, Chinese or Cyrillic project name broke
+// every routed request. Percent-encode it as headroom/cli/wrap.py does; the proxy
+// decodes it in sanitize_project_name before storing it.
+export function projectHeaderValue(project: string): string {
+  return encodeURIComponent(project);
+}
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 export const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 export const WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
@@ -398,17 +406,23 @@ function isConfiguredWireRoot(origin: string, pathname: string, wireRoots: WireR
 //   deployment name sits between /openai/ and the endpoint
 //   (/openai/deployments/{name}/chat/completions).
 //
-// A bare /messages or /responses on a provider origin still counts: there is no
-// segment at all.
+// An endpoint with NO segment before it (/messages on the origin root) does not
+// count on its own: that is the same shape as a real non-LLM API, and becoming
+// the bare path is not evidence of a provider. MessageBird's legacy SMS API is
+// POST https://rest.messagebird.com/messages (#4781). A provider mounted at an
+// origin root is still routable, because it is a configured wire root: the base
+// URL carries no path, so isConfiguredWireRoot matches every path on that
+// origin. Unknown bare-path hosts go direct.
 //
 // The immediate segment is what keeps this tight. "api" is a root only when it
 // abuts the endpoint, so /api/chat/completions routes while Discord's
 // /api/v10/channels/123/messages (immediate segment "123") does not. For the
 // same reason a version segment counts only in that position, not anywhere.
 //
-// The residual over-match is documented, not solved: /api/v2/messages still
-// routes. Telling that apart from a provider needs the host or the body, and
-// excludeHosts already covers any host a user controls.
+// The residual over-match is documented, not solved: /api/v2/messages and
+// /v2/responses still route. No path shape separates those from a gateway;
+// only the host or the body could, and excludeHosts already covers any host a
+// user controls.
 const NAMED_WIRE_ROOTS = new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
 
 // Custom OpenAI-compatible gateways commonly mount the wire directly under one
@@ -424,10 +438,8 @@ function hasWireRootBefore(body: string): boolean {
   const segments = body.split("/").filter(Boolean);
   const last = segments.at(-1);
   return (
-    last === undefined ||
-    isVersionSegment(last) ||
-    IMMEDIATE_WIRE_ROOTS.has(last) ||
-    segments.some((s) => NAMED_WIRE_ROOTS.has(s))
+    last !== undefined &&
+    (isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s)))
   );
 }
 
@@ -568,7 +580,7 @@ function mergeFetchHeaders(
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
@@ -662,7 +674,7 @@ function headersForNodeRequest(
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
