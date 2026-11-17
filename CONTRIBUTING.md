@@ -86,6 +86,13 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 
 **Review:** CI green, one maintainer review, coverage held/improved.
 
+## Posting PR/issue comments from scripts or agents
+
+A successful API call (exit 0) only proves a comment was created, not that its body is right. Scripts must:
+
+- Pass the body as a single plain string via a file (`gh pr comment --body-file`, `gh issue comment --body-file`, or `gh api --input <json-file>`). Avoid inline multi-line strings, which differ across shells, and never pass a collection or object as a field value (`-f body=...`).
+- Re-fetch the posted comment and confirm the body reads as intended before reporting success.
+- If the body is a bare type name (e.g. `System.Collections.Hashtable`) or otherwise garbled, delete it and repost: `gh api -X DELETE repos/<owner>/<repo>/pulls/comments/<id>` for review comments, `.../issues/comments/<id>` for issue and top-level PR comments.
 ## Development setup
 
 ```bash
@@ -101,6 +108,13 @@ python -m pytest
 Headroom uses a `pyproject.toml`/`maturin` build backend. Older `pip`
 versions may fail editable installs by looking for `setup.py`; upgrade `pip`
 first or use `uv sync --extra dev`.
+
+Handler tests that read request bodies should use a real Starlette `Request`
+with ASGI receive messages, including streamed chunks, rather than patching the
+body reader. Size-limit regressions must configure an explicit test ceiling;
+the production ceiling is independent of the compression admission threshold.
+Avoid replacing imported proxy packages in `sys.modules`: it can split live
+helper and exception identities across full-suite test orderings.
 
 ### Dev Containers
 
@@ -123,6 +137,11 @@ Enable or disable automatic Copilot review in **Settings → Rules → Rulesets 
 - Type hints on public functions; Google-style docstrings.
 - Cover new behavior + edge cases; aim >80% coverage on new code.
 - Python 3.11+. Optional features go behind extras.
+- For an optional-integration change, run its owner tests and `mypy headroom`
+  with the relevant extra installed. A hook environment without that dependency
+  does not check the imported library's types.
+  CI lint installs `langchain-core` for its normal mypy run; keep typechecking
+  there rather than launching a second mypy subprocess from pytest.
 - **Headroom writes LF and normalizes on read, on every platform.** Pass
   `newline="\n"` to every `write_text`/`open` that writes a context, memory,
   or state file, and normalize `\r\n`/`\r` when you read one back. Without

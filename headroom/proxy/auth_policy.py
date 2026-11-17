@@ -87,7 +87,9 @@ def classify_auth_signals(signals: AuthSignals) -> AuthMode:
     # Only the scheme is case-folded; the credential itself stays case-sensitive.
     scheme, sep, credentials = auth.partition(" ")
     if sep and scheme.lower() == "bearer":
-        token = credentials
+        # RFC 9110 §11.4 allows one or more spaces between the scheme and the
+        # credentials; trim them so `Bearer  sk-ant-oat...` still matches.
+        token = credentials.lstrip(" ")
         if token.startswith("sk-ant-oat"):
             return AuthMode.OAUTH
         if token.startswith("sk-ant-api") or token.startswith("sk-"):

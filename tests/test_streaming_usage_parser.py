@@ -1,60 +1,97 @@
-"""Unit tests for the online SSE usage parser used by the
-OpenAI-via-backend streaming path.
+"""Final provider usage must survive progressive and partial backend frames.
 
-These tests pin the per-chunk parsing contract so streaming memory
-stays O(1) regardless of stream length — the prior implementation
-buffered the entire response just to scan the trailing usage frame.
+The OpenAI-via-backend stream path is fed cumulative usage snapshots: a
+provider may repeat `usage` on several content chunks with climbing counts
+before its terminal frame. Accounting must record the LAST snapshot, not
+the first nonzero one, and a frame that omits a counter must leave that
+counter alone rather than resetting it to zero.
 """
 
-from __future__ import annotations
+import asyncio
+import json
+from types import SimpleNamespace
 
-from headroom.proxy.handlers.streaming import _parse_completion_tokens_from_sse_chunk
+import pytest
 
-
-def test_returns_completion_tokens_from_usage_frame() -> None:
-    chunk = b'data: {"id":"x","usage":{"prompt_tokens":10,"completion_tokens":42}}\n\n'
-    assert _parse_completion_tokens_from_sse_chunk(chunk) == 42
-
-
-def test_returns_none_for_content_only_chunk() -> None:
-    chunk = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
-    assert _parse_completion_tokens_from_sse_chunk(chunk) is None
+from headroom.proxy.handlers.streaming import StreamingMixin
 
 
-def test_returns_none_for_done_marker() -> None:
-    assert _parse_completion_tokens_from_sse_chunk(b"data: [DONE]\n\n") is None
+@pytest.mark.parametrize("responses", [False, True], ids=["chat", "responses"])
+@pytest.mark.parametrize(
+    ("last", "expected"),
+    [
+        (
+            {
+                "input_tokens": 13,
+                "output_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 9, "cache_write_tokens": 1},
+            },
+            (13, 5, 9, 1),
+        ),
+        ({"output_tokens": 5}, (10, 5, 2, 3)),
+        (
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            },
+            (0, 0, 0, 0),
+        ),
+        ({}, (10, 1, 2, 3)),
+    ],
+    ids=["latest-snapshot", "partial", "explicit-zero", "absent"],
+)
+def test_backend_stream_records_latest_present_usage(responses, last, expected):
+    initial = {
+        "input_tokens": 10,
+        "output_tokens": 1,
+        "input_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 3},
+    }
 
+    def frame(usage):
+        if responses:
+            data = {"response": {"usage": usage}}
+        else:
+            names = {
+                "input_tokens": "prompt_tokens",
+                "output_tokens": "completion_tokens",
+                "input_tokens_details": "prompt_tokens_details",
+            }
+            data = {"usage": {names[key]: value for key, value in usage.items()}}
+        return f"data: {json.dumps(data)}\n\n"
 
-def test_returns_none_for_invalid_json() -> None:
-    assert _parse_completion_tokens_from_sse_chunk(b"data: not-json\n\n") is None
+    class Backend:
+        name = "openai"
 
+        async def stream_openai_message(self, body, headers):
+            yield frame(initial)
+            yield 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+            yield frame(last)
+            yield "data: [DONE]\n\n"
 
-def test_returns_none_for_empty_chunk() -> None:
-    assert _parse_completion_tokens_from_sse_chunk(b"") is None
+    class Handler(StreamingMixin):
+        config = SimpleNamespace(ccr_inject_tool=False)
+        anthropic_backend = Backend()
 
+        async def _record_request_outcome(self, outcome):
+            self.outcome = outcome
 
-def test_handles_chunk_with_multiple_frames() -> None:
-    # SSE frames can batch across a single chunk write.
-    chunk = (
-        b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
-        b'data: {"choices":[{"delta":{"content":"b"}}],"usage":{"completion_tokens":7}}\n\n'
-    )
-    assert _parse_completion_tokens_from_sse_chunk(chunk) == 7
+    handler = Handler()
 
+    async def consume():
+        response = await handler._stream_openai_via_backend(
+            {"messages": []}, {}, "model", "request", 0.0, 10, 10, 0, [], {}, 0.0
+        )
+        async for _ in response.body_iterator:
+            pass
 
-def test_treats_zero_completion_tokens_as_zero_not_none() -> None:
-    chunk = b'data: {"usage":{"completion_tokens":0}}\n\n'
-    assert _parse_completion_tokens_from_sse_chunk(chunk) == 0
-
-
-def test_handles_non_dict_data_payload() -> None:
-    # Edge case: a JSON array or scalar where a dict was expected.
-    chunk = b"data: [1,2,3]\n\n"
-    assert _parse_completion_tokens_from_sse_chunk(chunk) is None
-
-
-def test_handles_invalid_utf8_bytes_without_crashing() -> None:
-    # Leading invalid UTF-8 bytes corrupt the "data: " prefix; parser
-    # should skip the malformed line and return None rather than raise.
-    chunk = b'\xff\xfedata: {"usage":{"completion_tokens":3}}\n\n'
-    assert _parse_completion_tokens_from_sse_chunk(chunk) is None
+    asyncio.run(consume())
+    outcome = handler.outcome
+    assert outcome.status_code == 200
+    assert (
+        outcome.provider_input_tokens,
+        outcome.output_tokens,
+        outcome.cache_read_tokens,
+        outcome.cache_write_tokens,
+    ) == expected
+    assert outcome.cache_inferred is False

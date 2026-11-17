@@ -12,7 +12,8 @@ Locks the following invariants:
 3. When a compression call exceeds its timeout, the awaiter unblocks with
    ``TimeoutError`` — but the worker thread keeps running (Python cannot
    preempt running CPython bytecode or in-flight Rust calls), and when the
-   work eventually completes, ``compression_leaked_threads`` increments.
+   work eventually completes, ``_compression_timed_out_workers_total``
+   increments.
 4. Jobs that time out while still queued do not leak the running gauge.
 5. ``/stats runtime.compression_executor`` surfaces the gauges + counters so
    operators can see leaked-thread rate and queue pressure.
@@ -23,7 +24,7 @@ Locks the following invariants:
 These tests also serve as documentation: anyone reading them sees that
 "timeout fired" does not mean "compression was cancelled" — it means "we
 stopped waiting; the worker is still going". A bounded pool plus the
-leaked-thread counter is how we make that visible.
+timed-out-worker counter is how we make that visible.
 """
 
 from __future__ import annotations
@@ -245,7 +246,7 @@ def test_high_water_mark_persists_after_completion() -> None:
 def test_timeout_fires_and_leaked_thread_is_counted() -> None:
     """When the compression exceeds ``timeout``, the awaiter sees
     ``TimeoutError`` immediately. The worker keeps running; when it finishes,
-    ``_compression_leaked_threads`` increments by 1.
+    ``_compression_timed_out_workers_total`` increments by 1.
     """
     proxy = _make_proxy(compression_max_workers=2)
     finished_event = threading.Event()
@@ -269,13 +270,13 @@ def test_timeout_fires_and_leaked_thread_is_counted() -> None:
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
         with proxy._compression_metrics_lock:
-            if proxy._compression_leaked_threads >= 1:
+            if proxy._compression_timed_out_workers_total >= 1:
                 break
         time.sleep(0.01)
 
     with proxy._compression_metrics_lock:
-        assert proxy._compression_leaked_threads >= 1, (
-            f"leaked_threads should be ≥ 1; got {proxy._compression_leaked_threads}. "
+        assert proxy._compression_timed_out_workers_total >= 1, (
+            f"timed-out-worker count should be ≥ 1; got {proxy._compression_timed_out_workers_total}. "
             f"The worker either didn't finish past the deadline, or the wrapper "
             f"didn't increment the counter."
         )
@@ -336,7 +337,7 @@ def test_timeout_quarantines_new_work_until_timed_out_worker_finishes() -> None:
 
         with proxy._compression_metrics_lock:
             assert proxy._compression_timed_out_in_flight == 0
-            assert proxy._compression_leaked_threads == 1
+            assert proxy._compression_timed_out_workers_total == 1
 
         # Quarantine is self-clearing: normal compression resumes after the
         # timed-out worker has genuinely left the executor.
@@ -486,7 +487,7 @@ def test_timeout_before_worker_start_does_not_leak_in_flight() -> None:
     with proxy._compression_metrics_lock:
         assert proxy._compression_queued == 0
         assert proxy._compression_in_flight == 0
-        assert proxy._compression_leaked_threads == 0
+        assert proxy._compression_timed_out_workers_total == 0
         assert proxy._compression_timed_out_in_flight == 0
         assert proxy._compression_quarantine_activations == 0
         assert proxy._compression_quarantine_skips == 0
@@ -587,6 +588,9 @@ def test_compression_executor_metrics_appear_in_runtime_payload() -> None:
         assert ce["queue_wait_seconds_total"] == 0.0
         assert ce["run_seconds_total"] == 0.0
         assert ce["leaked_threads_total"] == 0
+        # Deprecated alias must track the canonical counter (#3653).
+        assert ce["timed_out_workers_total"] == 0
+        assert ce["timed_out_workers_total"] == ce["leaked_threads_total"]
         assert ce["quarantine_active"] is False
         assert ce["timed_out_workers"] == 0
         assert ce["timed_out_workers_max"] == 0
