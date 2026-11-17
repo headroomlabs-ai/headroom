@@ -15,7 +15,7 @@ from .middleware import OAuth2Middleware
 from .provider import OAuth2ClientCredentials, OAuth2Error
 
 __all__ = ["OAuth2ClientCredentials", "OAuth2Error", "OAuth2Middleware", "install", "parse_headers"]
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 log = logging.getLogger("headroom_oauth2")
 
 
@@ -159,3 +159,12 @@ def install(app: Any, config: Any) -> None:
         _redact_url(provider.token_url),
         provider.auth_style,
     )
+
+
+# Core would otherwise log a failed install and serve the proxy WITHOUT this
+# middleware, relaying the client's own Authorization upstream unchanged. This
+# extension exists to stop that, so a bad config must abort startup (issue
+# #4737). Honoured by cores that support the `fail_closed` marker -- see
+# headroom/proxy/extensions.py "Failing closed"; older cores keep the old
+# skip-and-continue behaviour.
+install.fail_closed = True  # type: ignore[attr-defined]
