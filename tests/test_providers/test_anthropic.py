@@ -520,6 +520,10 @@ class TestAnthropicCostEstimation:
             ("claude-mythos-5-1", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
             ("claude-mythos-5", {"input": 10.00, "output": 50.00, "cached_input": 1.00}),
             ("anthropic.claude-mythos-5-2", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
+            # Dated base releases keep their own card, not the 5.2 one.
+            ("claude-fable-5-20260901", {"input": 10.00, "output": 50.00, "cached_input": 1.00}),
+            ("claude-mythos-5-20260901", {"input": 10.00, "output": 50.00, "cached_input": 1.00}),
+            ("claude-mythos-5-2-latest", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
             ("claude-opus-5-5-20261001", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
         ],
     )
@@ -589,6 +593,14 @@ class TestAnthropicCostEstimation:
             ("claude-sonnet-4", "claude-sonnet-4-6", False),
             ("claude-sonnet-5-5", "claude-sonnet-5", False),
             ("claude-sonnet-5-5-20261001", "claude-sonnet-5", False),
+            # A dated base release is not the next point release: the "2" of
+            # the year must not read as the minor version.
+            ("claude-fable-5-20260901", "claude-fable-5-2", False),
+            ("claude-fable-5-20260901", "claude-fable-5", True),
+            ("claude-mythos-5-20260901", "claude-mythos-5-2", False),
+            ("claude-fable-5-2-20261101", "claude-fable-5-2", True),
+            ("claude-fable-5-2-latest", "claude-fable-5-2", True),
+            ("us.anthropic.claude-fable-5-2-v1:0", "claude-fable-5-2", True),
             # A bare fragment is not an alias.
             ("sonnet", "claude-3-5-sonnet-20241022", False),
         ],

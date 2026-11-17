@@ -272,7 +272,9 @@ def _is_release_of(model: str, known_model: str) -> bool:
 
     An id one version segment away is a different model and does not match:
     ``claude-haiku-5`` is not ``claude-haiku-5-5``, and ``claude-sonnet-5-5``
-    is not ``claude-sonnet-5``.
+    is not ``claude-sonnet-5``. The match must also end at a boundary, so a
+    dated base release is not read as the next point release:
+    ``claude-fable-5-20260901`` is ``claude-fable-5``, not ``claude-fable-5-2``.
     """
     if model == known_model:
         return True
@@ -281,7 +283,10 @@ def _is_release_of(model: str, known_model: str) -> bool:
     at = model.find(known_model)
     if at < 0:
         return False
-    return not _VERSION_SEGMENT_RE.match(model, at + len(known_model))
+    rest = model[at + len(known_model) :]
+    if rest[:1].isalnum():
+        return False
+    return not _VERSION_SEGMENT_RE.match(rest)
 
 
 def _apply_long_context_premium(
