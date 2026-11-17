@@ -1897,7 +1897,7 @@ mod tests {
     fn detect_language_basic() {
         let (lang, conf) = detect_language("import os\n\ndef f(x):\n    return x + 1\n");
         assert_eq!(lang, CodeLanguage::Python);
-        assert!(conf >= 0.3 && conf <= 1.0);
+        assert!((0.3..=1.0).contains(&conf));
 
         let (lang, _) = detect_language("package main\n\nfunc main() {}\n");
         assert_eq!(lang, CodeLanguage::Go);

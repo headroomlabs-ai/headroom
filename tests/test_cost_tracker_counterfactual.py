@@ -11,6 +11,7 @@ from tests._dotenv import (
     importorskip_no_env_leak,
     load_env_overrides,
 )
+from tests._pricing_models import anthropic_pricing_model
 
 _env_overrides = load_env_overrides()
 apply_dotenv = autouse_apply_env(_env_overrides)
@@ -18,12 +19,15 @@ apply_dotenv = autouse_apply_env(_env_overrides)
 importorskip_no_env_leak("litellm")
 
 
+MODEL = anthropic_pricing_model()
+
+
 def test_savings_at_list_price():
     """savings_usd = tokens_saved * model list input price."""
     from headroom.proxy.server import CostTracker
 
     ct = CostTracker()
-    model = "claude-sonnet-4-20250514"
+    model = MODEL
 
     ct.record_tokens(
         model,
@@ -54,7 +58,7 @@ def test_savings_monotonic():
     from headroom.proxy.server import CostTracker
 
     ct = CostTracker()
-    model = "claude-sonnet-4-20250514"
+    model = MODEL
 
     ct.record_tokens(model, tokens_saved=10_000, tokens_sent=5_000)
     stats1 = ct.stats()
@@ -71,7 +75,7 @@ def test_savings_zero_when_no_tokens_saved():
     from headroom.proxy.server import CostTracker
 
     ct = CostTracker()
-    model = "claude-sonnet-4-20250514"
+    model = MODEL
 
     ct.record_tokens(model, tokens_saved=0, tokens_sent=5_000)
     stats = ct.stats()
@@ -99,7 +103,7 @@ def test_multi_model_savings():
 
     ct = CostTracker()
 
-    ct.record_tokens("claude-sonnet-4-20250514", tokens_saved=50_000, tokens_sent=10_000)
+    ct.record_tokens(MODEL, tokens_saved=50_000, tokens_sent=10_000)
     ct.record_tokens("claude-haiku-4-5-20251001", tokens_saved=50_000, tokens_sent=10_000)
 
     stats = ct.stats()
@@ -117,7 +121,7 @@ def test_no_cost_without_headroom_field():
     from headroom.proxy.server import CostTracker
 
     ct = CostTracker()
-    ct.record_tokens("claude-sonnet-4-20250514", tokens_saved=10_000, tokens_sent=5_000)
+    ct.record_tokens(MODEL, tokens_saved=10_000, tokens_sent=5_000)
     stats = ct.stats()
 
     assert "cost_without_headroom_usd" not in stats
@@ -137,7 +141,7 @@ def test_budget_enforced_after_recording_costs():
 
     # ~$1.50+ of Sonnet input at list price — far over the budget
     ct.record_tokens(
-        "claude-sonnet-4-20250514",
+        MODEL,
         tokens_saved=0,
         tokens_sent=500_000,
         uncached_tokens=500_000,
@@ -158,7 +162,7 @@ def test_budget_input_cost_counted_without_usage_breakdown():
 
     ct = CostTracker(budget_limit_usd=100.0)
     ct.record_tokens(
-        "claude-sonnet-4-20250514",
+        MODEL,
         tokens_saved=0,
         tokens_sent=500_000,
     )

@@ -143,14 +143,15 @@ def test_mode_disabled_is_skip() -> None:
     assert d.skip_reason == "mode_disabled"
 
 
-def test_mode_tool_is_skip() -> None:
-    """TOOL mode: auto-injection disabled (the agent calls memory
-    tools explicitly instead). Distinct from disabled."""
+def test_mode_tool_keeps_tools_registered() -> None:
+    """TOOL mode: context auto-injection is off (see
+    MemoryHandler.search_and_format_context) but the decision stays open
+    so the memory tools are still registered for the agent."""
     d = MemoryDecision.decide(
         headers={}, memory_handler=_memory_handler(), memory_user_id="u1", mode_name="tool"
     )
-    assert d.inject is False
-    assert d.skip_reason == "mode_tool"
+    assert d.inject is True
+    assert d.skip_reason is None
 
 
 # ── Precedence ordering when multiple gates close ────────────────────
@@ -197,7 +198,7 @@ def test_mode_disabled_beats_mode_tool() -> None:
         headers={}, memory_handler=_memory_handler(), memory_user_id="u1", mode_name="tool"
     )
     assert d_dis.skip_reason == "mode_disabled"
-    assert d_tool.skip_reason == "mode_tool"
+    assert d_tool.skip_reason is None
 
 
 # ── Observability fields ─────────────────────────────────────────────
@@ -299,12 +300,6 @@ def test_apply_to_tags_for_every_skip_reason() -> None:
             "memory_handler": _memory_handler(),
             "memory_user_id": "u1",
             "mode_name": "disabled",
-        },
-        "mode_tool": {
-            "headers": {},
-            "memory_handler": _memory_handler(),
-            "memory_user_id": "u1",
-            "mode_name": "tool",
         },
     }
     for expected, kwargs in cases.items():

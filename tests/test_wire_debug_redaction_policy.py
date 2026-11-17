@@ -43,3 +43,51 @@ def test_wire_debug_key_matching_normalizes_dashes_and_case() -> None:
     assert should_redact_key("Anthropic-API-Key")
     assert should_redact_key("custom-refresh-token")
     assert not should_redact_key("token_count")
+
+
+def test_wire_debug_redacts_proxy_authorization() -> None:
+    redacted = redact_for_wire_debug(
+        {"Proxy-Authorization": "Basic dXNlcjpwYXNz", "user-agent": "codex/1.0"}
+    )
+
+    assert redacted["Proxy-Authorization"] == WIRE_DEBUG_REDACTED
+    assert redacted["user-agent"] == "codex/1.0"
+
+
+def test_wire_debug_redacts_any_token_suffix() -> None:
+    for key in (
+        "auth_token",
+        "session_token",
+        "api_token",
+        "github_token",
+        "x-amz-security-token",
+        "google_id_token",
+    ):
+        assert should_redact_key(key), key
+
+
+def test_wire_debug_redacts_credentials_and_secret_key() -> None:
+    for key in ("credentials", "aws_credentials", "secret_key", "aws_secret_key"):
+        assert should_redact_key(key), key
+
+
+def test_wire_debug_keeps_token_usage_counters_visible() -> None:
+    for key in (
+        "max_tokens",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cache_read_input_tokens",
+        "token_count",
+    ):
+        assert not should_redact_key(key), key
+
+
+def test_wire_debug_redacts_codex_attestation_header() -> None:
+    # The inbound request log line runs every header through this policy, so
+    # without it each Codex request wrote the ~4 KB signed attestation to proxy.log.
+    redacted = redact_for_wire_debug(
+        {"x-oai-attestation": '{"v":1,"s":1,"t":"signed"}', "x-codex-window-id": "w:1"}
+    )
+
+    assert redacted == {"x-oai-attestation": WIRE_DEBUG_REDACTED, "x-codex-window-id": "w:1"}

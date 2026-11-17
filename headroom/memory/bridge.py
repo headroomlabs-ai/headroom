@@ -126,6 +126,7 @@ class MemoryBridge:
             path.write_text(
                 json.dumps(self._sync_state, indent=2, default=str),
                 encoding="utf-8",
+                newline="\n",
             )
         except OSError as e:
             logger.warning(f"Bridge: Failed to save sync state to {path}: {e}")
@@ -390,7 +391,7 @@ class MemoryBridge:
         if path:
             path = Path(path).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(markdown, encoding="utf-8")
+            path.write_text(markdown, encoding="utf-8", newline="\n")
             logger.info(f"Bridge: Exported {len(memories)} memories to {path}")
 
             # Update sync state to avoid re-importing our own export
@@ -646,7 +647,7 @@ class MemoryBridge:
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(new_content, encoding="utf-8")
+            path.write_text(new_content, encoding="utf-8", newline="\n")
         except OSError as e:
             logger.error(f"Bridge: Failed to write {path}: {e}")
             return 0

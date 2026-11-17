@@ -323,7 +323,12 @@ pub fn feature_names() -> BTreeSet<&'static str> {
 
 fn digest_value(value: &Value) -> String {
     let canonical = serde_json::to_vec(value).expect("rollout provenance is serializable");
-    format!("sha256:{:x}", Sha256::digest(canonical))
+    let digest = Sha256::digest(canonical);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("sha256:{hex}")
 }
 
 #[cfg(test)]

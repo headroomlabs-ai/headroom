@@ -14,13 +14,27 @@ Supported agents:
 - Aider: Convention files referenced in .aider.conf.yml
 - Gemini: GEMINI.md
 - Generic: Plain markdown (any agent)
+
+.. deprecated::
+    Nothing in Headroom uses these writers. ``headroom learn`` writes agent
+    context files through ``headroom.learn.writer`` instead.
 """
+
+import warnings
 
 from headroom.memory.writers.base import AgentWriter, ExportResult, MemoryEntry
 from headroom.memory.writers.claude_writer import ClaudeCodeMemoryWriter
 from headroom.memory.writers.codex_writer import CodexMemoryWriter
 from headroom.memory.writers.cursor_writer import CursorMemoryWriter
 from headroom.memory.writers.generic_writer import GenericMemoryWriter
+
+warnings.warn(
+    "headroom.memory.writers is deprecated and will be removed in a future release; "
+    "it has no replacement (headroom learn writes agent context files through "
+    "headroom.learn.writer).",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 __all__ = [
     "AgentWriter",

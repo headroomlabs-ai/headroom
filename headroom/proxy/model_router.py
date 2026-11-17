@@ -47,21 +47,53 @@ class ModelRoute:
     require_no_tools: bool = False
     """Match only when the request declares no tools (a proxy for low-risk work)."""
 
+    require_tools: bool = False
+    """Match only when the request declares tools (a proxy for agentic work).
+
+    The inverse of ``require_no_tools``: lets an operator route tool-using turns
+    to a *more* capable model while keeping plain chat on a cheaper one. Setting
+    both on one rule makes it unmatchable (an AND of contradictory conditions),
+    which is a harmless operator error, not a crash."""
+
     from_models: tuple[str, ...] = ()
     """Restrict this rule to these source models. Empty = any source model."""
 
     name: str = ""
     """Human-readable label surfaced in decision logs."""
 
-    def matches(self, *, model: str, input_tokens: int, has_tools: bool) -> bool:
+    # Appended after the original fields so existing positional
+    # ``ModelRoute(...)`` calls keep their meaning.
+    max_output_tokens: int | None = None
+    """Match only when the request's own ``max_tokens`` is <= this.
+
+    The caller's declared output budget is the best "this turn is trivial"
+    signal at routing time: a tiny prompt asking for 4000 output tokens may
+    want a long answer from the strong model. A request that declares no
+    ``max_tokens`` does NOT match (an unbounded response is not a trivial
+    turn), so the rule can never widen to unbounded requests."""
+
+    def matches(
+        self,
+        *,
+        model: str,
+        input_tokens: int,
+        has_tools: bool,
+        max_tokens: int | None = None,
+    ) -> bool:
         """True when every set condition is satisfied for this request."""
         if self.from_models and model not in self.from_models:
             return False
         if self.require_no_tools and has_tools:
             return False
+        if self.require_tools and not has_tools:
+            return False
         if self.max_input_tokens is not None and input_tokens > self.max_input_tokens:
             return False
         if self.min_input_tokens is not None and input_tokens < self.min_input_tokens:
+            return False
+        if self.max_output_tokens is not None and (
+            max_tokens is None or max_tokens > self.max_output_tokens
+        ):
             return False
         # A rule whose ``to_model`` equals the current model still MATCHES (strict
         # first-match-wins): it is a no-op (``changed`` is False) that short-circuits
@@ -75,9 +107,18 @@ class ModelRouterConfig:
 
     enabled: bool = False
     routes: tuple[ModelRoute, ...] = ()
+    log_only: bool = False
+    """Shadow mode: evaluate rules and log what routing *would* do, but leave the
+    model unchanged. Lets an operator validate routes against real traffic before
+    switching them on for real."""
 
     @classmethod
-    def from_env(cls, enabled_raw: str | None, routes_raw: str | None) -> ModelRouterConfig:
+    def from_env(
+        cls,
+        enabled_raw: str | None,
+        routes_raw: str | None,
+        log_only_raw: str | None = None,
+    ) -> ModelRouterConfig:
         """Build config from env-style strings, failing open to disabled.
 
         ``routes_raw`` is a JSON array of rule objects, e.g.::
@@ -85,15 +126,20 @@ class ModelRouterConfig:
             [{"name": "small->mini", "max_input_tokens": 4000,
               "require_no_tools": true, "to_model": "gpt-5.4-mini"}]
 
+        ``log_only_raw`` (``HEADROOM_MODEL_ROUTER_LOG_ONLY``) turns on shadow
+        mode: rules are evaluated and the intended route is logged, but the
+        model is left unchanged.
+
         A malformed value logs a warning and disables routing rather than
         raising, so a bad config can never take the proxy down.
         """
         enabled = _truthy(enabled_raw)
+        log_only = _truthy(log_only_raw)
         routes = _parse_routes(routes_raw)
         if enabled and not routes:
             logger.warning("model router enabled but no valid routes configured; disabling")
-            return cls(enabled=False, routes=())
-        return cls(enabled=enabled and bool(routes), routes=routes)
+            return cls(enabled=False, routes=(), log_only=log_only)
+        return cls(enabled=enabled and bool(routes), routes=routes, log_only=log_only)
 
 
 @dataclass(frozen=True)
@@ -122,7 +168,19 @@ class ModelRouter:
     def enabled(self) -> bool:
         return self._config.enabled and bool(self._config.routes)
 
-    def select(self, *, model: str, input_tokens: int, has_tools: bool) -> ModelDecision:
+    @property
+    def log_only(self) -> bool:
+        """True when routing runs in shadow mode (decisions logged, not applied)."""
+        return self._config.log_only
+
+    def select(
+        self,
+        *,
+        model: str,
+        input_tokens: int,
+        has_tools: bool,
+        max_tokens: int | None = None,
+    ) -> ModelDecision:
         """Return the routing decision for a request.
 
         Never raises: on a disabled router or no matching rule, returns a
@@ -134,11 +192,32 @@ class ModelRouter:
             return ModelDecision(model, model, matched=False, reason="no source model")
 
         for route in self._config.routes:
-            if route.matches(model=model, input_tokens=input_tokens, has_tools=has_tools):
+            if route.matches(
+                model=model, input_tokens=input_tokens, has_tools=has_tools, max_tokens=max_tokens
+            ):
+                if self._config.log_only:
+                    # Shadow mode: record what routing WOULD do, but keep
+                    # ``routed_model == model`` so ``changed`` is False and the
+                    # handlers leave the outgoing model untouched. The reason is
+                    # what the handlers log, so the intended route is observable.
+                    reason = (
+                        f"[shadow] would route {model} -> {route.to_model} via rule "
+                        f"{route.name or route.to_model!r} "
+                        f"(input_tokens={input_tokens}, has_tools={has_tools}); "
+                        f"log_only, model unchanged"
+                    )
+                    return ModelDecision(
+                        original_model=model,
+                        routed_model=model,
+                        matched=True,
+                        reason=reason,
+                        rule_name=route.name,
+                    )
                 reason = (
                     f"matched rule {route.name or route.to_model!r}: "
                     f"{model} -> {route.to_model} "
-                    f"(input_tokens={input_tokens}, has_tools={has_tools})"
+                    f"(input_tokens={input_tokens}, has_tools={has_tools}, "
+                    f"max_tokens={max_tokens})"
                 )
                 return ModelDecision(
                     original_model=model,
@@ -177,6 +256,18 @@ def estimate_input_tokens(messages: object, tools: object = None, system: object
         return 0
 
 
+def request_max_tokens(body: object) -> int | None:
+    """Return the request's ``max_tokens``, or ``None`` if absent or not an integer.
+
+    Booleans and non-integers are treated as absent so a malformed client value
+    can never satisfy a ``max_output_tokens`` bound. It never raises.
+    """
+    value = body.get("max_tokens") if isinstance(body, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
 
@@ -205,7 +296,16 @@ _INVALID = object()
 """Sentinel: a route field was present but malformed (fail open, skip the route)."""
 
 _ALLOWED_ROUTE_KEYS = frozenset(
-    {"to_model", "max_input_tokens", "min_input_tokens", "require_no_tools", "from_models", "name"}
+    {
+        "to_model",
+        "max_input_tokens",
+        "min_input_tokens",
+        "max_output_tokens",
+        "require_no_tools",
+        "require_tools",
+        "from_models",
+        "name",
+    }
 )
 
 
@@ -234,7 +334,8 @@ def _route_from_entry(entry: object, index: int) -> ModelRoute | None:
 
     max_tokens = _strict_opt_int(entry, "max_input_tokens", index)
     min_tokens = _strict_opt_int(entry, "min_input_tokens", index)
-    if max_tokens is _INVALID or min_tokens is _INVALID:
+    max_output = _strict_opt_int(entry, "max_output_tokens", index)
+    if max_tokens is _INVALID or min_tokens is _INVALID or max_output is _INVALID:
         return None
 
     require_no_tools = entry.get("require_no_tools", False)
@@ -242,6 +343,11 @@ def _route_from_entry(entry: object, index: int) -> ModelRoute | None:
         logger.warning(
             "model route #%d 'require_no_tools' must be a boolean; skipping route", index
         )
+        return None
+
+    require_tools = entry.get("require_tools", False)
+    if not isinstance(require_tools, bool):
+        logger.warning("model route #%d 'require_tools' must be a boolean; skipping route", index)
         return None
 
     from_models_raw = entry.get("from_models", [])
@@ -257,7 +363,9 @@ def _route_from_entry(entry: object, index: int) -> ModelRoute | None:
         to_model=to_model,
         max_input_tokens=max_tokens,  # type: ignore[arg-type]
         min_input_tokens=min_tokens,  # type: ignore[arg-type]
+        max_output_tokens=max_output,  # type: ignore[arg-type]
         require_no_tools=require_no_tools,
+        require_tools=require_tools,
         from_models=tuple(from_models_raw),
         name=str(entry.get("name", "")),
     )

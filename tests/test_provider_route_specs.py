@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections import Counter
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+
+from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.route_specs import (
     ANTHROPIC_BATCH_ROUTES,
-    ANTHROPIC_HANDLER_ROUTES,
     ANTHROPIC_PASSTHROUGH_ROUTES,
     CLOUDCODE_HANDLER_ROUTES,
     GEMINI_BATCH_ROUTES,
@@ -30,6 +35,21 @@ def test_provider_handler_route_specs_are_unique() -> None:
     assert len(route_keys) == len(PROVIDER_HANDLER_ROUTES)
 
 
+def test_registered_provider_routes_are_unique() -> None:
+    """A second route for the same method and path is shadowed by the first and never runs."""
+    app = FastAPI()
+    proxy = SimpleNamespace(config=SimpleNamespace(bedrock_api_url="https://bedrock.example.test"))
+    register_provider_routes(app, proxy)
+
+    seen: Counter[tuple[str, str]] = Counter()
+    for route in app.router.routes:
+        for method in getattr(route, "methods", None) or {"WEBSOCKET"}:
+            seen[(method, route.path)] += 1
+
+    assert seen[("POST", "/v1/messages")] == 1
+    assert [key for key, count in seen.items() if count > 1] == []
+
+
 def test_openai_passthrough_routes_model_endpoint_intent() -> None:
     assert OPENAI_PASSTHROUGH_ROUTES == (
         ProviderPassthroughRoute("POST", "/v1/embeddings", "openai", "embeddings"),
@@ -52,6 +72,8 @@ def test_anthropic_passthrough_routes_model_endpoint_intent() -> None:
             "anthropic",
             "count_tokens",
         ),
+        ProviderPassthroughRoute("GET", "/api/hello", "anthropic", "api/hello"),
+        ProviderPassthroughRoute("HEAD", "/api/hello", "anthropic", "api/hello"),
     )
 
 
@@ -77,12 +99,12 @@ def test_gemini_passthrough_routes_model_endpoint_intent() -> None:
 
 
 def test_direct_handler_routes_model_endpoint_intent() -> None:
-    assert ANTHROPIC_HANDLER_ROUTES == (
-        ProviderHandlerRoute("POST", "/v1/messages", "handle_anthropic_messages"),
-    )
     assert OPENAI_HANDLER_ROUTES == (
         ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
         ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
+        # Wrap-registry targets append their declared nonstandard chat paths
+        # (IBM Bob posts under its /inference/v1 gateway prefix).
+        ProviderHandlerRoute("POST", "/inference/v1/chat/completions", "handle_openai_chat"),
     )
     assert GEMINI_HANDLER_ROUTES == (
         ProviderHandlerRoute(
@@ -90,18 +112,21 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
             "/v1beta/models/{model}:generateContent",
             "handle_gemini_generate_content",
             "model",
+            True,
         ),
         ProviderHandlerRoute(
             "POST",
             "/v1beta/models/{model}:streamGenerateContent",
             "handle_gemini_stream_generate_content",
             "model",
+            True,
         ),
         ProviderHandlerRoute(
             "POST",
             "/v1beta/models/{model}:countTokens",
             "handle_gemini_count_tokens",
             "model",
+            True,
         ),
     )
     assert CLOUDCODE_HANDLER_ROUTES == (
@@ -116,6 +141,31 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
             "handle_google_cloudcode_stream",
         ),
     )
+
+
+def test_gemini_model_routes_all_follow_the_tagged_upstream() -> None:
+    """All three Gemini model endpoints must agree on which upstream they reach.
+
+    Counting tokens against one host and generating against another gives the
+    client counts for a model the serving host may not have, and sends the
+    tagged gateway's credential to Google.
+    """
+    assert {
+        (spec.path, spec.handler_name)
+        for spec in GEMINI_HANDLER_ROUTES
+        if spec.supports_custom_base_url
+    } == {
+        ("/v1beta/models/{model}:generateContent", "handle_gemini_generate_content"),
+        ("/v1beta/models/{model}:streamGenerateContent", "handle_gemini_stream_generate_content"),
+        ("/v1beta/models/{model}:countTokens", "handle_gemini_count_tokens"),
+    }
+
+
+def test_non_gemini_handler_routes_do_not_opt_into_the_custom_base() -> None:
+    for spec in PROVIDER_HANDLER_ROUTES:
+        if spec in GEMINI_HANDLER_ROUTES:
+            continue
+        assert not spec.supports_custom_base_url, spec.path
 
 
 def test_batch_handler_routes_model_endpoint_intent() -> None:

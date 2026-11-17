@@ -12,7 +12,7 @@ Compress everything your AI agent reads. Same answers, fraction of the tokens.
 
 [![PyPI](https://img.shields.io/pypi/v/headroom-ai.svg)](https://pypi.org/project/headroom-ai/)
 [![Python](https://img.shields.io/pypi/pyversions/headroom-ai.svg)](https://pypi.org/project/headroom-ai/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/chopratejas/headroom/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/headroomlabs-ai/headroom/blob/main/LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/yRmaUNpsPJ)
 
 </div>
@@ -224,7 +224,7 @@ ContextEngine plugin for OpenClaw agents. Auto-compresses context in `assemble()
 headroom wrap openclaw
 ```
 
-[OpenClaw Plugin &rarr;](https://github.com/chopratejas/headroom/tree/main/plugins/openclaw)
+[OpenClaw Plugin &rarr;](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/openclaw)
 
 </div>
 
@@ -418,4 +418,4 @@ your default `python3` is newer than the current wheel set.
 
 ---
 
-Apache 2.0 — Free for commercial use. [GitHub](https://github.com/chopratejas/headroom) | [PyPI](https://pypi.org/project/headroom-ai/) | [Discord](https://discord.gg/yRmaUNpsPJ)
+Apache 2.0 — Free for commercial use. [GitHub](https://github.com/headroomlabs-ai/headroom) | [PyPI](https://pypi.org/project/headroom-ai/) | [Discord](https://discord.gg/yRmaUNpsPJ)

@@ -4,17 +4,19 @@ import json
 import logging
 from importlib import import_module
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
 
 from headroom.agent_savings import (
     AGENT_90_PROFILE,
+    DEFAULT_PROFILE,
     apply_agent_savings_env_defaults,
     apply_agent_savings_profile,
     get_agent_savings_profile,
     proxy_pipeline_kwargs,
-    with_target_savings,
+    seed_proxy_env_defaults,
 )
 from headroom.cli import wrap as wrap_module
 from headroom.cli.main import main
@@ -84,7 +86,6 @@ def test_coding_persona_compresses_recent_delta_and_stays_visible() -> None:
     assert env["HEADROOM_LOSSLESS_THEN_LOSSY"] == "1"
     assert env["HEADROOM_PROTECT_READS"] == "1"
     assert env["HEADROOM_CODE_AWARE_ENABLED"] == "1"
-    assert env["HEADROOM_EFFORT_ROUTER"] == "0"
     assert env["HEADROOM_LOSSLESS"] == "0"  # lossy enabled (CCR keeps it recoverable)
     assert env["HEADROOM_MIN_CHARS_FOR_BLOCK"] == "25"
 
@@ -170,24 +171,42 @@ def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
 
 
-def test_unknown_agent_savings_profile_falls_back_to_balanced(
+def test_seed_proxy_env_defaults_reports_only_generated_keys() -> None:
+    env = {"HEADROOM_MODE": "token", "HEADROOM_LOSSLESS": "1"}
+
+    seeded = seed_proxy_env_defaults(env)
+
+    assert "HEADROOM_MODE" not in seeded
+    assert "HEADROOM_LOSSLESS" not in seeded
+    assert "HEADROOM_SAVINGS_PROFILE" in seeded
+    assert env["HEADROOM_MODE"] == "token"
+    assert env["HEADROOM_LOSSLESS"] == "1"
+
+
+def test_unknown_agent_savings_profile_falls_back_to_default(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # An unknown profile must NOT raise: it's resolved during proxy startup, so
     # raising takes the whole proxy down before it opens its port (desktop asked
-    # for a profile a fallback runtime predates). Degrade to "balanced" instead.
+    # for a profile a fallback runtime predates).
+    #
+    # It must degrade to the DEFAULT profile, not to "balanced". The two are not
+    # interchangeable: balanced flips cache->token mode, turns cross-turn dedup
+    # and tool-search off, stops compressing user messages, and raises the
+    # message floor 25x (250 vs 10) and the block floor 20x (500 vs 25). A typo
+    # in HEADROOM_SAVINGS_PROFILE used to silently reconfigure the entire proxy
+    # into that posture, which is strictly worse than behaving as if the
+    # variable were unset.
     with caplog.at_level(logging.WARNING):
         profile = get_agent_savings_profile("missing")
-    assert profile is get_agent_savings_profile("balanced")
+    assert profile is get_agent_savings_profile(None)
+    assert profile.name == DEFAULT_PROFILE
+    assert profile is not get_agent_savings_profile("balanced")
     assert "unknown savings profile" in caplog.text
     assert "missing" in caplog.text
-
-
-def test_with_target_savings_recomputes_target_ratio() -> None:
-    profile = with_target_savings(get_agent_savings_profile("balanced"), 0.85)
-
-    assert profile.target_savings == 0.85
-    assert profile.target_ratio == 0.15
+    # The warning has to name the resolved profile, so an operator reading it
+    # knows what they actually got rather than only what they asked for.
+    assert DEFAULT_PROFILE in caplog.text
 
 
 def test_agent_savings_cli_renders_shell_exports() -> None:
@@ -275,6 +294,35 @@ def test_compress_savings_profile_does_not_mutate_supplied_config(monkeypatch) -
     assert config.min_tokens_to_compress == 999
 
 
+def test_force_kompress_falls_back_to_structural_compression_when_cold(monkeypatch):
+    """A cold forced-ML profile must not hide safe content routing."""
+    import headroom.transforms.content_router as router_mod
+
+    router = ContentRouter(ContentRouterConfig())
+    compressor = SimpleNamespace(is_ready=lambda: False, ensure_background_load=MagicMock())
+    log_compressor = SimpleNamespace(
+        compress=lambda content, bias=1.0: SimpleNamespace(compressed="ERROR: compacted")
+    )
+    router._get_kompress = lambda: compressor
+    router._get_log_compressor = lambda: log_compressor
+    router._runtime_force_kompress = True
+    router._runtime_skip_kompress = False
+    router._runtime_target_ratio = None
+    router.config.enable_log_compressor = True
+    monkeypatch.setattr(
+        router_mod,
+        "_detect_content",
+        lambda content: router_mod.DetectionResult(router_mod.ContentType.BUILD_OUTPUT, 1.0, {}),
+    )
+    monkeypatch.setattr(router_mod, "is_mixed_content", lambda content: False)
+
+    result = router.compress("ERROR: repeated output\\n" * 40)
+
+    assert result.compressed == "ERROR: compacted"
+    assert result.strategy_used == CompressionStrategy.LOG
+    compressor.ensure_background_load.assert_called_once()
+
+
 def test_wrap_agent_savings_profile_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
 
@@ -283,12 +331,6 @@ def test_wrap_agent_savings_profile_is_opt_in(monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
 
     assert wrap_module._wrap_agent_savings_profile("codex") == AGENT_90_PROFILE
-
-
-def test_agent_savings_config_mismatches_requires_explicit_profile(monkeypatch) -> None:
-    monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
-
-    assert wrap_module._agent_savings_config_mismatches({}, "claude") == []
 
 
 def test_start_proxy_does_not_inject_agent_savings_by_default(monkeypatch, tmp_path) -> None:
@@ -308,7 +350,7 @@ def test_start_proxy_does_not_inject_agent_savings_by_default(monkeypatch, tmp_p
     monkeypatch.setattr(wrap_module.subprocess, "Popen", popen)
     monkeypatch.setattr(wrap_module.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(wrap_module, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_module, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_module, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
 
     wrap_module._start_proxy(8787, agent_type="codex")
 
@@ -333,83 +375,12 @@ def test_start_proxy_injects_explicit_agent_savings_profile(monkeypatch, tmp_pat
     monkeypatch.setattr(wrap_module.subprocess, "Popen", popen)
     monkeypatch.setattr(wrap_module.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(wrap_module, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_module, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_module, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
 
     wrap_module._start_proxy(8787, agent_type="codex")
 
     assert captured_env["HEADROOM_SAVINGS_PROFILE"] == AGENT_90_PROFILE
     assert captured_env["HEADROOM_TARGET_RATIO"] == "0.10"
-
-
-def test_agent_savings_config_mismatches_returns_specific_labels(monkeypatch) -> None:
-    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
-    profile = get_agent_savings_profile(AGENT_90_PROFILE)
-    running_config = {
-        "savings_profile": profile.name,
-        "target_ratio": 0.20,
-        "compress_user_messages": profile.compress_user_messages,
-        "compress_system_messages": profile.compress_system_messages,
-        "protect_recent": profile.protect_recent,
-        "protect_analysis_context": profile.protect_analysis_context,
-        "min_tokens_to_crush": profile.min_tokens_to_compress,
-        "max_items_after_crush": profile.max_items_after_crush,
-        "smart_crusher_with_compaction": profile.smart_crusher_with_compaction,
-        "accuracy_guard": profile.accuracy_guard,
-    }
-
-    assert wrap_module._agent_savings_config_mismatches(running_config, "codex") == ["target-ratio"]
-
-
-def test_agent_savings_config_mismatches_ignores_non_target_agents() -> None:
-    assert wrap_module._agent_savings_config_mismatches({}, "openhands") == []
-
-
-def test_agent_savings_config_mismatches_accepts_matching_runtime_config(monkeypatch) -> None:
-    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
-    profile = get_agent_savings_profile(AGENT_90_PROFILE)
-    running_config = {
-        "savings_profile": profile.name,
-        "target_ratio": "0.10",
-        "compress_user_messages": True,
-        "compress_system_messages": True,
-        "protect_recent": "2",
-        "protect_analysis_context": True,
-        "min_tokens_to_crush": "120",
-        "max_items_after_crush": "8",
-        "smart_crusher_with_compaction": False,
-        "accuracy_guard": "strict",
-    }
-
-    assert wrap_module._agent_savings_config_mismatches(running_config, "cursor") == []
-
-
-def test_agent_savings_config_mismatches_reports_unparseable_values(monkeypatch) -> None:
-    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
-    running_config = {
-        "savings_profile": None,
-        "target_ratio": "not-a-float",
-        "compress_user_messages": None,
-        "compress_system_messages": None,
-        "protect_recent": "not-an-int",
-        "protect_analysis_context": None,
-        "min_tokens_to_crush": object(),
-        "max_items_after_crush": object(),
-        "smart_crusher_with_compaction": None,
-        "accuracy_guard": None,
-    }
-
-    assert wrap_module._agent_savings_config_mismatches(running_config, "claude") == [
-        "savings-profile",
-        "target-ratio",
-        "compress-user-messages",
-        "compress-system-messages",
-        "protect-recent",
-        "protect-analysis-context",
-        "min-tokens",
-        "max-items",
-        "smart-crusher-compaction",
-        "accuracy-guard",
-    ]
 
 
 def test_agent_90_profile_applies_to_proxy_config_runtime_kwargs() -> None:
@@ -442,6 +413,17 @@ def test_proxy_explicit_config_overrides_agent_90_profile() -> None:
     assert kwargs["target_ratio"] == 0.25
     assert kwargs["protect_recent"] == 5
     assert kwargs["min_tokens_to_compress"] == 300
+
+
+def test_proxy_explicit_compress_user_messages_off_overrides_coding_profile() -> None:
+    # coding turns user-message compression on; an explicit off
+    # (HEADROOM_COMPRESS_USER_MESSAGES=0) must win like every other override,
+    # and leaving it unset must keep the profile default.
+    explicit_off = ProxyConfig(savings_profile="coding", compress_user_messages=False)
+    unset = ProxyConfig(savings_profile="coding")
+
+    assert proxy_pipeline_kwargs(explicit_off)["compress_user_messages"] is False
+    assert proxy_pipeline_kwargs(unset)["compress_user_messages"] is True
 
 
 def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:
@@ -784,3 +766,45 @@ def test_agent_savings_smoke_fixture_passes_real_gate(tmp_path) -> None:
     assert "codex: 91.0% savings meets 90.0%" in gate_result.output
     assert "cursor: 93.0% savings meets 90.0%" in gate_result.output
     assert "100.0% accuracy meets 90.0%" in gate_result.output
+
+
+def test_coding_profile_min_chars_block_reaches_router_without_env_seeding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The block-char floor must travel on the config object, not env only.
+
+    Every other router pipeline kwarg this function builds travels on the config
+    object; ``min_chars_for_block`` alone was populated only from
+    ``HEADROOM_MIN_CHARS_FOR_BLOCK`` (emitted by ``proxy_env()``). A proxy whose
+    config carried ``savings_profile="coding"`` but whose process env was never
+    seeded applied every sibling coding knob while this floor silently stayed at
+    ``ContentRouterConfig.min_chars_for_block_compression`` (500) instead of the
+    profile's 25 — a 20x gap on the gate that governs tool_result blocks.
+
+    Note this does not make the profile fully config-deliverable: fields whose
+    consumers read ``os.environ`` directly (``cross_turn_dedup`` via
+    ContentRouter, ``tool_search`` via the Anthropic handler) never pass through
+    this function and remain seed-dependent.
+    """
+    monkeypatch.delenv("HEADROOM_MIN_CHARS_FOR_BLOCK", raising=False)
+
+    class _Config:
+        savings_profile = "coding"
+        min_tokens_to_crush = 500
+
+    kwargs = proxy_pipeline_kwargs(_Config())
+    assert kwargs["min_chars_for_block_compression"] == 25
+    assert kwargs["min_tokens_to_compress"] == 10
+
+
+def test_explicit_min_chars_block_env_overrides_the_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit operator override still wins over the profile value."""
+    monkeypatch.setenv("HEADROOM_MIN_CHARS_FOR_BLOCK", "120")
+
+    class _Config:
+        savings_profile = "coding"
+        min_tokens_to_crush = 500
+
+    assert proxy_pipeline_kwargs(_Config())["min_chars_for_block_compression"] == 120

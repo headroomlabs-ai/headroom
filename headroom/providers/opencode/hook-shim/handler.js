@@ -8,7 +8,14 @@ var childProcess = nodeRequire("node:child_process");
 var fs = nodeRequire("node:fs");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+var PROJECT_HEADER = "x-headroom-project";
+var SESSION_TOKEN_HEADER = "x-headroom-session-token";
+function projectHeaderValue(project) {
+  return encodeURIComponent(project);
+}
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
+var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
+var WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 function getState() {
   return globalThis[STATE_KEY];
@@ -30,17 +37,48 @@ function withNodeImportOption(existing, shim) {
   }
   return parts.join(" ");
 }
-function withShimEnv(env, proxyUrl2) {
+function withExcludeHostsEnv(env, excludeHosts) {
+  if (excludeHosts.length > 0) {
+    env[EXCLUDE_HOSTS_ENV] = excludeHosts.join(",");
+  } else {
+    delete env[EXCLUDE_HOSTS_ENV];
+  }
+}
+function withWireRootsEnv(env, wireRoots) {
+  if (wireRoots.length > 0) {
+    env[WIRE_ROOTS_ENV] = wireRoots.map((root) => `${root.origin}${root.path}`).join(",");
+  } else {
+    delete env[WIRE_ROOTS_ENV];
+  }
+}
+function withShimEnv(env, proxyUrl2, excludeHosts, wireRoots) {
   const nextEnv = { ...env ?? process.env };
   nextEnv[PROXY_ENV] = proxyUrl2;
+  withExcludeHostsEnv(nextEnv, excludeHosts);
+  withWireRootsEnv(nextEnv, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
   }
   return nextEnv;
 }
-function installProcessEnv(proxyUrl2) {
+var PROCESS_ENV_KEYS = [PROXY_ENV, EXCLUDE_HOSTS_ENV, WIRE_ROOTS_ENV, "NODE_OPTIONS"];
+function snapshotProcessEnv() {
+  return Object.fromEntries(PROCESS_ENV_KEYS.map((key) => [key, process.env[key]]));
+}
+function restoreProcessEnv(saved) {
+  for (const key of PROCESS_ENV_KEYS) {
+    if (saved[key] === void 0) {
+      delete process.env[key];
+    } else {
+      process.env[key] = saved[key];
+    }
+  }
+}
+function installProcessEnv(proxyUrl2, excludeHosts, wireRoots) {
   process.env[PROXY_ENV] = proxyUrl2;
+  withExcludeHostsEnv(process.env, excludeHosts);
+  withWireRootsEnv(process.env, wireRoots);
   const shim = shimImportSpecifier();
   if (shim) {
     process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
@@ -49,12 +87,20 @@ function installProcessEnv(proxyUrl2) {
 function isOptions(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
 }
-function injectOptionsEnv(args, optionIndex, proxyUrl2) {
+function injectOptionsEnv(args, optionIndex, state) {
   const nextArgs = [...args];
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
-  existing.env = withShimEnv(existing.env, proxyUrl2);
-  if (isOptions(nextArgs[optionIndex])) {
+  existing.env = withShimEnv(
+    existing.env,
+    state.proxyUrl,
+    state.excludeHosts,
+    state.wireRoots
+  );
+  if (process.platform === "win32" && existing.windowsHide === void 0) {
+    existing.windowsHide = true;
+  }
+  if (isOptions(nextArgs[optionIndex]) || nextArgs[optionIndex] == null && optionIndex < nextArgs.length) {
     nextArgs[optionIndex] = existing;
   } else {
     nextArgs.splice(optionIndex, 0, existing);
@@ -64,14 +110,18 @@ function injectOptionsEnv(args, optionIndex, proxyUrl2) {
   }
   return nextArgs;
 }
+function optionsIndexAfterArgs(args) {
+  const params = typeof args.at(-1) === "function" ? args.slice(0, -1) : args;
+  return Array.isArray(params[1]) || params.length > 2 && params[1] == null ? 2 : 1;
+}
 function wrapSpawn(originalSpawn) {
   return function headroomSpawn(...args) {
     const state = getState();
     if (!state) {
       return Reflect.apply(originalSpawn, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    const optionIndex = optionsIndexAfterArgs(args);
+    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function wrapExec(originalExec) {
@@ -80,7 +130,7 @@ function wrapExec(originalExec) {
     if (!state) {
       return Reflect.apply(originalExec, this, args);
     }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state.proxyUrl));
+    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state));
   };
 }
 function wrapExecFile(originalExecFile) {
@@ -89,8 +139,8 @@ function wrapExecFile(originalExecFile) {
     if (!state) {
       return Reflect.apply(originalExecFile, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    const optionIndex = optionsIndexAfterArgs(args);
+    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function wrapFork(originalFork) {
@@ -99,18 +149,119 @@ function wrapFork(originalFork) {
     if (!state) {
       return Reflect.apply(originalFork, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    const optionIndex = optionsIndexAfterArgs(args);
+    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function normalizeProxyUrl(proxyUrl2) {
   return new URL(proxyUrl2);
 }
-function isLoopback(hostname) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+var reportedProxyUrls = /* @__PURE__ */ new Set();
+function usableProxyUrl(proxyUrl2) {
+  try {
+    const proxy = normalizeProxyUrl(proxyUrl2);
+    if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new TypeError("unsupported scheme");
+    return proxy;
+  } catch {
+    if (!reportedProxyUrls.has(proxyUrl2)) {
+      reportedProxyUrls.add(proxyUrl2);
+      console.warn(`headroom: the configured proxy URL is ${proxyUrl2 === "" ? "empty" : "not a valid http(s) URL"}; requests are not routed`);
+    }
+    return void 0;
+  }
 }
-function shouldRoute(url, proxy) {
+function canonicalHostname(hostname) {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
+function isLoopback(hostname) {
+  const normalized = canonicalHostname(hostname);
+  if (normalized === "localhost" || normalized === "::1" || normalized === "0.0.0.0") {
+    return true;
+  }
+  if (isLoopbackIpv4(normalized)) {
+    return true;
+  }
+  const mapped = /^::ffff:(.+)$/.exec(normalized)?.[1];
+  if (!mapped) {
+    return false;
+  }
+  if (isLoopbackIpv4(mapped)) {
+    return true;
+  }
+  const groups = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(mapped);
+  if (!groups) {
+    return false;
+  }
+  const address = parseInt(groups[1], 16) << 16 | parseInt(groups[2], 16);
+  return address >>> 24 === 127;
+}
+function isLoopbackIpv4(host) {
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+function normalizeExcludeHosts(entries) {
+  const hosts = /* @__PURE__ */ new Set();
+  for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
+    const host = canonicalHostname(String(entry).trim()).replace(/^(?:\*\.|\.)/, "");
+    if (host) {
+      hosts.add(host);
+    }
+  }
+  return [...hosts];
+}
+function isExcludedHost(hostname, excludeHosts) {
+  const normalized = canonicalHostname(hostname);
+  return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
+}
+function normalizeWireRoots(entries) {
+  const roots = /* @__PURE__ */ new Map();
+  for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
+    const raw = String(entry).trim();
+    if (!raw) {
+      continue;
+    }
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        continue;
+      }
+      const path = url.pathname.replace(/\/+$/, "");
+      roots.set(`${url.origin}${path}`, { origin: url.origin, path });
+    } catch {
+    }
+  }
+  return [...roots.values()];
+}
+function isConfiguredWireRoot(origin, pathname, wireRoots) {
+  return wireRoots.some(
+    (root) => root.origin === origin && (root.path === "" ? pathname.startsWith("/") : pathname === root.path || pathname.startsWith(`${root.path}/`))
+  );
+}
+var NAMED_WIRE_ROOTS = /* @__PURE__ */ new Set(["backend-api", "codex", "openai", "anthropic", "zen"]);
+var IMMEDIATE_WIRE_ROOTS = /* @__PURE__ */ new Set(["api"]);
+function isVersionSegment(segment) {
+  return /^v\d+[a-z0-9]*$/i.test(segment);
+}
+function hasWireRootBefore(body) {
+  const segments = body.split("/").filter(Boolean);
+  const last = segments.at(-1);
+  return last !== void 0 && (isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s)));
+}
+function isLlmEndpointPath(pathname, origin = "", wireRoots = []) {
+  if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
+    return true;
+  }
+  for (const suffix of ["/chat/completions", "/responses", "/messages"]) {
+    if (!pathname.endsWith(suffix)) {
+      continue;
+    }
+    if (isConfiguredWireRoot(origin, pathname, wireRoots)) {
+      return true;
+    }
+    return hasWireRootBefore(pathname.slice(0, -suffix.length));
+  }
+  return false;
+}
+function isRoutableUpstream(url, proxy, excludeHosts) {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
   }
@@ -120,7 +271,19 @@ function shouldRoute(url, proxy) {
   if (url.origin === proxy.origin) {
     return false;
   }
+  if (isExcludedHost(url.hostname, excludeHosts)) {
+    return false;
+  }
   return true;
+}
+function isLlmMethod(method) {
+  return typeof method === "string" && method.toUpperCase() === "POST";
+}
+function shouldRoute(url, proxy, excludeHosts, method, wireRoots = []) {
+  if (!isLlmMethod(method) || !isRoutableUpstream(url, proxy, excludeHosts)) {
+    return false;
+  }
+  return isLlmEndpointPath(url.pathname, url.origin, wireRoots);
 }
 function routedUrl(upstream, proxy) {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
@@ -156,7 +319,7 @@ function requestUrl(input) {
   }
   return new URL(String(input));
 }
-function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
+function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project = void 0, sessionToken = void 0) {
   const headers = new Headers(input instanceof Request ? input.headers : void 0);
   if (init?.headers) {
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
@@ -168,24 +331,31 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
+  if (project) {
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
+  }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
+  }
   return headers;
 }
-function withRoutedFetchInput(input, init, proxy) {
+function withRoutedFetchInput(input, init, proxy, project, excludeHosts, sessionToken, wireRoots = []) {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy)) {
+  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+  if (!shouldRoute(upstream, proxy, excludeHosts, method, wireRoots)) {
     return [input, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath)
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project, sessionToken)
   };
   if (input instanceof Request) {
     return [new Request(nextUrl, input), nextInit];
   }
   return [nextUrl, nextInit];
 }
-function splitNodeArgs(args) {
+function splitNodeArgs(args, defaultProtocol) {
   const callback = typeof args.at(-1) === "function" ? args.at(-1) : void 0;
   const withoutCallback = callback ? args.slice(0, -1) : args;
   const [first, second] = withoutCallback;
@@ -202,12 +372,12 @@ function splitNodeArgs(args) {
   }
   if (typeof first === "object" && first !== null) {
     const requestOptions = { ...first, ...options };
-    return { url: urlFromRequestOptions(requestOptions), options: requestOptions, callback };
+    return { url: urlFromRequestOptions(requestOptions, defaultProtocol), options: requestOptions, callback };
   }
   return { options, callback };
 }
-function urlFromRequestOptions(options) {
-  const protocol = String(options.protocol ?? "http:");
+function urlFromRequestOptions(options, defaultProtocol) {
+  const protocol = String(options.protocol ?? defaultProtocol);
   if (protocol !== "http:" && protocol !== "https:") {
     return void 0;
   }
@@ -224,11 +394,17 @@ function urlFromRequestOptions(options) {
     return void 0;
   }
 }
-function headersForNodeRequest(options, upstream, originalPath) {
+function headersForNodeRequest(options, upstream, originalPath, project, sessionToken) {
   const headers = new Headers(options.headers);
   headers.set(BASE_URL_HEADER, upstream.origin);
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  if (project) {
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
+  }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
   }
   headers.delete("host");
   const result = {};
@@ -237,8 +413,8 @@ function headersForNodeRequest(options, upstream, originalPath) {
   });
   return result;
 }
-function routedNodeOptions(parts, proxy) {
-  if (!parts.url || !shouldRoute(parts.url, proxy)) {
+function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken, wireRoots = []) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts, parts.options.method ?? "GET", wireRoots)) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -268,7 +444,7 @@ function routedNodeOptions(parts, proxy) {
     hostname: nextUrl.hostname,
     port: nextUrl.port || void 0,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath)
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project, sessionToken)
   };
 }
 function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest) {
@@ -277,9 +453,19 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     if (!state) {
       return Reflect.apply(originalRequest, this, args);
     }
-    const proxy = normalizeProxyUrl(state.proxyUrl);
-    const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy);
+    const proxy = usableProxyUrl(state.proxyUrl);
+    if (!proxy) {
+      return Reflect.apply(originalRequest, this, args);
+    }
+    const parts = splitNodeArgs(args, originalRequest === originalHttpsRequest ? "https:" : "http:");
+    const nextOptions = routedNodeOptions(
+      parts,
+      proxy,
+      state.project,
+      state.excludeHosts,
+      state.sessionToken,
+      state.wireRoots
+    );
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -296,33 +482,33 @@ function wrapGet(request) {
   };
 }
 function wrapHttp2Connect(originalConnect) {
-  return function headroomHttp2Connect(authority, ...args) {
-    const state = getState();
-    if (state) {
-      const proxy = normalizeProxyUrl(state.proxyUrl);
-      const upstream = authority instanceof URL ? authority : new URL(String(authority));
-      if (shouldRoute(upstream, proxy)) {
-        throw new Error(
-          `Headroom OpenCode wrap blocked direct HTTP/2 connection to ${upstream.origin}. Use fetch, http, or https so traffic can be routed through Headroom.`
-        );
-      }
-    }
-    return Reflect.apply(originalConnect, this, [authority, ...args]);
+  return function headroomHttp2Connect(...args) {
+    return Reflect.apply(originalConnect, this, args);
   };
 }
 function installHeadroomTransport(options) {
+  const excludeHosts = normalizeExcludeHosts(options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+  const wireRoots = normalizeWireRoots(options.wireRoots ?? process.env[WIRE_ROOTS_ENV] ?? "");
   const existing = getState();
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
+    existing.project = options.project;
+    existing.excludeHosts = excludeHosts;
+    existing.wireRoots = wireRoots;
     existing.debug = Boolean(options.debug);
-    installProcessEnv(options.proxyUrl);
+    existing.sessionToken = options.sessionToken;
+    installProcessEnv(options.proxyUrl, excludeHosts, wireRoots);
     return () => uninstallHeadroomTransport();
   }
   const state = {
     refs: 1,
     proxyUrl: options.proxyUrl,
+    project: options.project,
+    excludeHosts,
+    wireRoots,
     debug: Boolean(options.debug),
+    sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,
@@ -332,17 +518,29 @@ function installHeadroomTransport(options) {
     originalChildSpawn: childProcess.spawn,
     originalChildExec: childProcess.exec,
     originalChildExecFile: childProcess.execFile,
-    originalChildFork: childProcess.fork
+    originalChildFork: childProcess.fork,
+    originalEnv: snapshotProcessEnv()
   };
   setState(state);
-  installProcessEnv(options.proxyUrl);
+  installProcessEnv(options.proxyUrl, excludeHosts, wireRoots);
   globalThis.fetch = async (...args) => {
     const current = getState();
     if (!current) {
       return state.originalFetch(...args);
     }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
+    const proxy = usableProxyUrl(current.proxyUrl);
+    if (!proxy) {
+      return state.originalFetch(...args);
+    }
+    const [nextInput, nextInit] = withRoutedFetchInput(
+      args[0],
+      args[1],
+      proxy,
+      current.project,
+      current.excludeHosts,
+      current.sessionToken,
+      current.wireRoots
+    );
     return state.originalFetch(nextInput, nextInit);
   };
   http.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpRequest);
@@ -376,6 +574,7 @@ function uninstallHeadroomTransport() {
   childProcess.exec = state.originalChildExec;
   childProcess.execFile = state.originalChildExecFile;
   childProcess.fork = state.originalChildFork;
+  restoreProcessEnv(state.originalEnv);
   syncBuiltinESMExports();
   setState(void 0);
 }

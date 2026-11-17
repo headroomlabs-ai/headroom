@@ -1,12 +1,10 @@
 import { createRequire } from "node:module";
 import { compress } from "../compress.js";
 import type { CompressOptions, CompressResult } from "../types.js";
-import { vercelToOpenAI, openAIToVercel } from "../utils/format.js";
 
 /**
  * Minimal structural type for Vercel AI SDK language models.
- * Compatible with both LanguageModelV1 (@ai-sdk/provider <=1.x)
- * and LanguageModelV3 (@ai-sdk/provider >=2.x).
+ * Compatible with LanguageModelV1, LanguageModelV3, and LanguageModelV4.
  */
 interface LanguageModel {
   readonly specificationVersion: string;
@@ -21,7 +19,7 @@ interface LanguageModel {
 type VercelMessage = any;
 
 /**
- * Vercel AI SDK LanguageModelV3Middleware that compresses messages
+ * Vercel AI SDK language model middleware that compresses messages
  * before they reach the LLM.
  *
  * @example
@@ -50,22 +48,20 @@ export function headroomMiddleware(options: CompressOptions = {}) {
 
       const model = options.model ?? params.modelId ?? "gpt-4o";
 
-      // Convert Vercel format → OpenAI format
-      const openaiMessages = vercelToOpenAI(prompt);
-
-      // Compress via Headroom
-      const result = await compress(openaiMessages, {
+      // compress() converts the prompt to OpenAI shape for the proxy and back. The format is
+      // declared rather than detected: a text-only prompt is indistinguishable from OpenAI
+      // messages, and the converted messages carry AI SDK parts (reasoning, providerOptions)
+      // that detection would otherwise read as Vercel input again.
+      const result = await compress(prompt, {
         stack: "adapter_ts_vercel_ai",
         ...options,
         model,
+        format: "vercel",
       });
 
       if (!result.compressed) return params;
 
-      // Convert back to Vercel format
-      const compressedPrompt = openAIToVercel(result.messages);
-
-      return { ...params, prompt: compressedPrompt };
+      return { ...params, prompt: result.messages };
     },
   };
 }
@@ -78,16 +74,15 @@ export async function compressVercelMessages(
   messages: VercelMessage[],
   options: CompressOptions = {},
 ): Promise<CompressResult & { messages: VercelMessage[] }> {
-  const openaiMessages = vercelToOpenAI(messages);
-  const result = await compress(openaiMessages, {
+  const result = await compress(messages, {
     stack: "adapter_ts_vercel_ai",
     ...options,
+    format: "vercel",
   });
-  const vercelMessages = openAIToVercel(result.messages);
 
   return {
     ...result,
-    messages: vercelMessages,
+    messages: result.messages,
   };
 }
 

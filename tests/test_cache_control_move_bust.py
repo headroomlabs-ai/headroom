@@ -61,14 +61,11 @@ def test_marker_move_would_fail_a_raw_dict_guard():
     assert _strip_cache_control(CUR_ORIG[:2]) == _strip_cache_control(PREV_ORIG)
 
 
-def test_overlay_replays_despite_moved_marker():
+def test_overlay_skips_inflating_moved_marker_replay():
     out = overlay_cached_prefix(OPTIMIZED, CUR_ORIG, PREV_ORIG, PREV_FWD)
-    # The content-only guard lets the replay happen: the forwarded prefix is now
-    # byte-identical to what the provider cached (compressed), NOT the freeze's
-    # original bytes → cache hits instead of busting.
-    assert out[:2] == PREV_FWD
-    assert out[:2] != OPTIMIZED[:2]
-    assert out[2] == OPTIMIZED[2]  # compressed tail preserved
+    # Moving cache_control must not exempt a larger replay candidate from the
+    # no-inflation bound, even when content-only history alignment succeeds.
+    assert out == OPTIMIZED
 
 
 # ── Cross-turn: client moves the marker every turn, provider keys on full bytes ─

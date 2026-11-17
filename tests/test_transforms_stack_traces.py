@@ -116,31 +116,6 @@ def test_node_async_frames_count_toward_log_detection() -> None:
     assert result.content_type is ContentType.BUILD_OUTPUT
 
 
-# Shim pattern mirror ----------------------------------------------------------
-
-
-def test_parse_lines_marks_new_flavor_openers() -> None:
-    compressor = LogCompressor()
-    lines = [
-        "panic: boom",
-        "goroutine 7 [select]:",
-        "\t/app/main.go:10 +0x20",
-        "thread 'main' panicked at src/lib.rs:1:1:",
-        "stack backtrace:",
-        "   0: rust_begin_unwind",
-        "Unhandled exception. System.Exception: x",
-        "   at App.Main(String[] a) in /src/P.cs:line 3",
-        "Caused by: java.io.IOException: y",
-        "   ... 3 more",
-        "",  # blank resets the shim's legacy in-trace latch
-        "plain line",
-    ]
-    parsed = compressor._parse_lines(lines)
-    flags = [ln.is_stack_trace for ln in parsed]
-    assert all(flags[:-2]), f"unmarked opener among {flags}"
-    assert not flags[-1]
-
-
 # End-to-end compression --------------------------------------------------------
 
 

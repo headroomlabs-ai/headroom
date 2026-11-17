@@ -83,7 +83,7 @@
 "grpclib","0.4.9","BSD License","https://github.com/vmagamedov/grpclib"
 "h11","0.16.0","MIT License","https://github.com/python-hyper/h11"
 "h2","4.3.0","MIT License","https://github.com/python-hyper/h2/"
-"headroom-ai","0.27.0","Apache-2.0","https://headroom-docs.vercel.app"
+"headroom-ai","0.27.0","Apache-2.0","https://docs.headroomlabs.ai"
 "headroom-security","0.1.0","Proprietary","UNKNOWN"
 "hf-xet","1.2.0","Apache-2.0","https://github.com/huggingface/xet-core"
 "hnswlib","0.8.0","UNKNOWN","https://github.com/yurymalkov/hnsw"

@@ -4,6 +4,8 @@
 //! port; this binary forwards every HTTP/SSE/WebSocket request verbatim to
 //! `--upstream`. See RUST_DEV.md for the operator runbook.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -54,24 +56,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
+    // The ~261 MB Kompress ONNX session must never build on the request
+    // path: dispatch answers NoOp until the model is ready. Warm it in
+    // the background at startup so steady-state traffic meets a settled
+    // slot; a byte-pipe proxy (--compression off) never loads a model.
+    if config.compression {
+        if let Err(e) = std::thread::Builder::new()
+            .name("live-zone-warmup".into())
+            .spawn(|| {
+                let ready = headroom_core::transforms::live_zone::warm_live_zone_compressors();
+                tracing::info!(event = "live_zone_warmup_complete", kompress_ready = ready);
+            })
+        {
+            // Non-fatal: the dispatcher's lazy path still initializes
+            // off-request; only the eager warmup is lost.
+            tracing::warn!(event = "live_zone_warmup_spawn_failed", error = %e);
+        }
+    }
+
     let mut state = AppState::new(config.clone())?;
 
     // PR-D1: resolve AWS credentials at startup via the `aws-config`
-    // default chain. Loaded once so per-request signing is cheap.
+    // default chain. The provider is kept and asked again before the
+    // cached credentials expire (`bedrock::credentials`).
     // Failure is NOT fatal — the proxy may run in front of a non-AWS
     // upstream — but the Bedrock invoke handler refuses to forward
     // unsigned requests when `bedrock_credentials` is `None`
     // (see `bedrock::invoke::handle_invoke`).
+    // A first resolution that fails keeps the provider too: a failed
+    // fetch is not cached, so each Bedrock request asks it again and
+    // the proxy recovers once credentials appear, without a restart.
     if config.enable_bedrock_native {
         match load_bedrock_credentials(&config).await {
-            Ok(creds) => {
-                state = state.with_bedrock_credentials(creds);
-                tracing::info!(
-                    event = "bedrock_credentials_loaded",
-                    region = %config.bedrock_region,
-                    profile = ?config.aws_profile,
-                    "AWS credentials resolved for Bedrock SigV4 signing"
-                );
+            Ok(source) => {
+                let first = source.get().await;
+                state = state.with_bedrock_credentials_source(source);
+                match first {
+                    Ok(_) => tracing::info!(
+                        event = "bedrock_credentials_loaded",
+                        region = %config.bedrock_region,
+                        profile = ?config.aws_profile,
+                        "AWS credentials resolved for Bedrock SigV4 signing"
+                    ),
+                    Err(e) => tracing::warn!(
+                        event = "bedrock_credentials_unavailable",
+                        region = %config.bedrock_region,
+                        profile = ?config.aws_profile,
+                        error = %e,
+                        "AWS credentials not available at startup; each Bedrock request asks the provider again until it succeeds"
+                    ),
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -83,6 +117,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
         }
+    }
+
+    // Savings observability: with the master compression switch on
+    // but the mode off, the dispatcher passes every body through and
+    // tokens_saved reads 0 on the dashboard with no hint why. Say so
+    // once at startup instead of letting the zero look like a bug.
+    if config.compression
+        && matches!(
+            config.compression_mode,
+            headroom_proxy::config::CompressionMode::Off
+        )
+    {
+        tracing::warn!(
+            event = "compression_mode_off",
+            "--compression is on but --compression-mode is `off`: bodies \
+             pass through unmodified and the dashboard's compression \
+             savings will read 0. Set --compression-mode live_zone to \
+             engage the dispatcher."
+        );
+    }
+
+    // Savings ledger: background persistence while serving, plus a
+    // best-effort final flush after the server drains (capture tasks
+    // are detached, so a request finishing in the same instant as
+    // shutdown may still miss it — see observability::capture docs).
+    let stats_ledger = state.stats.clone();
+    if config.stats {
+        // Pay the vendored price-table parse now, not on the first
+        // recorded request.
+        headroom_proxy::observability::pricing::warm();
+        tracing::info!(
+            event = "stats_enabled",
+            path = ?stats_ledger.path().map(|p| p.display().to_string()),
+            "native savings stats active (/stats, /dashboard)"
+        );
+        headroom_proxy::observability::ledger::spawn_flusher(stats_ledger.clone());
     }
 
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -101,6 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokio::time::sleep(grace).await;
         })
         .await?;
+
+    stats_ledger.flush().await;
 
     Ok(())
 }
@@ -122,12 +194,14 @@ fn init_tracing(level: &str) {
 /// Uses the `aws-config` default chain (env vars → shared profile
 /// file → IMDS / ECS task role). Honours `Config::aws_profile` when
 /// set; otherwise the chain picks up `AWS_PROFILE` from the
-/// environment automatically.
+/// environment automatically. Only fails when the chain has no
+/// provider at all; the caller resolves once so a missing credential
+/// is reported at startup, and the returned source keeps the provider
+/// for later attempts and refreshes.
 async fn load_bedrock_credentials(
     config: &Config,
-) -> Result<aws_credential_types::Credentials, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<headroom_proxy::bedrock::BedrockCredentials, Box<dyn std::error::Error + Send + Sync>> {
     use aws_config::BehaviorVersion;
-    use aws_credential_types::provider::ProvideCredentials;
 
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new(config.bedrock_region.clone()));
@@ -138,8 +212,9 @@ async fn load_bedrock_credentials(
     let creds_provider = aws_config
         .credentials_provider()
         .ok_or("no credentials provider configured")?;
-    let creds = creds_provider.provide_credentials().await?;
-    Ok(creds)
+    Ok(headroom_proxy::bedrock::BedrockCredentials::new(
+        creds_provider,
+    ))
 }
 
 async fn shutdown_signal() {

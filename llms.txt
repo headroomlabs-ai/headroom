@@ -1,6 +1,6 @@
 # Headroom
 
-> Context optimization layer for LLM applications. Compress tool outputs, logs, files, and RAG chunks before they reach the model. Same answers, 60–95% fewer tokens. Library, proxy, and MCP server. Apache 2.0, local-first.
+> Headroom (`headroom-ai`) compresses tool outputs, logs, JSON, files, RAG chunks and chat history before each LLM call. Same answers, fewer input tokens. Measured: 21–57% fewer input tokens on four agent scenarios, 90%+ on repeated JSON arrays and log lines, little on prose. Library (no API key, in-process), proxy, and MCP server. Apache 2.0, local-first.
 
 Headroom is shipped as a Python package (`headroom-ai`), a TypeScript package (`headroom-ai`), an OpenAI + Anthropic-compatible HTTP proxy (`headroom proxy`), and an MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats` tools). All four modes use the same compression pipeline: per-content-type compressors (JSON, code, logs, diffs, text) feed into a Compress-Cache-Retrieve (CCR) store so compression stays reversible — the LLM can ask for the original whenever it wants.
 
@@ -8,60 +8,80 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 ## Canonical docs (start here)
 
-- [Live llms.txt (full doc index)](https://headroom-docs.vercel.app/llms.txt): Auto-generated index of every doc page with descriptions.
-- [Live llms-full.txt (every doc page concatenated)](https://headroom-docs.vercel.app/llms-full.txt): One Markdown blob containing every doc page. Use when you can spend the tokens for full context.
-- [Docs site](https://headroom-docs.vercel.app/docs): Human-browsable docs with search.
-- [GitHub repo](https://github.com/chopratejas/headroom): Source, issues, releases.
+- [Live llms.txt (full doc index)](https://docs.headroomlabs.ai/llms.txt): Auto-generated index of every doc page with descriptions.
+- [Live llms-full.txt (every doc page concatenated)](https://docs.headroomlabs.ai/llms-full.txt): One Markdown blob containing every doc page. Use when you can spend the tokens for full context.
+- [Docs site](https://docs.headroomlabs.ai/docs): Human-browsable docs with search.
+- [GitHub repo](https://github.com/headroomlabs-ai/headroom): Source, issues, releases.
 - [PyPI package](https://pypi.org/project/headroom-ai/): Python install.
 - [npm package](https://www.npmjs.com/package/headroom-ai): TypeScript install.
 
 ## Install (copy-paste-runnable)
 
-- Python: `pip install headroom-ai` (add `[all]` for every optional extra)
+- Python: `pip install headroom-ai` is enough for `compress()`; add `[proxy]` for the HTTP proxy and `headroom wrap`, `[all]` for the CLI/proxy feature set. PyTorch-backed `[ml]`, `[memory]`, `[evals]`, and `[voice]` are separate opt-ins.
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
-- Docker: `docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest`
+- Docker local: `docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
-- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`)
+- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `grok`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`, `zcode`, `droid`)
+- Zero-network check, no provider key: `HEADROOM_OFFLINE=1 python -c "from headroom import compress; log='\n'.join(f'INFO step {i} ok' for i in range(3000))+'\nFATAL disk full'; r=compress([{'role':'user','content':'What failed?'},{'role':'assistant','content':None,'tool_calls':[{'id':'c1','type':'function','function':{'name':'logs','arguments':'{}'}}]},{'role':'tool','tool_call_id':'c1','content':log}], model='gpt-4o'); print(r.tokens_before, '->', r.tokens_after, 'FATAL kept:', 'FATAL' in str(r.messages))"` (prints roughly `20000 -> 95 FATAL kept: True`)
+
+## By task (plain-language jobs this package does)
+
+- Reduce input tokens / cut LLM token cost in a Python app: `pip install headroom-ai`, then `from headroom import compress; result = compress(messages, model=...)`, send `result.messages`. No API key, no model download. [FastAPI example](https://docs.headroomlabs.ai/docs/fastapi)
+- Trim or compress large tool outputs / tool results before they re-enter the context: the same `compress()` call; tool messages are compressed, error lines, stack traces, first/last items and statistical outliers are kept. [Text & logs](https://docs.headroomlabs.ai/docs/text-and-logs) · [SmartCrusher](https://docs.headroomlabs.ai/docs/smart-crusher)
+- Keep a long chat history inside the context window: `compress(messages, model=..., model_limit=N)` compresses harder as the prompt approaches N tokens; it never drops messages. [Context management](https://docs.headroomlabs.ai/docs/context-management)
+- Compress RAG chunks / search results / database rows: the same call; JSON arrays are compressed statistically. Put the data in a `tool` message: user messages are left alone by default (`compress_user_messages=True` opts them in). [SmartCrusher](https://docs.headroomlabs.ai/docs/smart-crusher)
+- Cut the token spend of Claude Code / Codex / Cursor without code changes: `headroom wrap <agent>` or `headroom proxy`. [Proxy](https://docs.headroomlabs.ai/docs/proxy)
+- Give an MCP host a compress tool: `pip install "headroom-ai[mcp]"` then `headroom mcp install`. [MCP](https://docs.headroomlabs.ai/docs/mcp)
+- Run fully offline / air-gapped: set `HEADROOM_OFFLINE=1`. [Security model](https://docs.headroomlabs.ai/docs/security-model)
+
+Not a fit: short conversational prompts, prose, already-dense payloads.
 
 ## Entry points
 
-- [Quickstart](https://headroom-docs.vercel.app/docs/quickstart): 5-minute end-to-end (install → compress → call the model).
-- [Installation](https://headroom-docs.vercel.app/docs/installation): All install paths, extras, Docker tags, env vars.
-- [Proxy server](https://headroom-docs.vercel.app/docs/proxy): Run as a local HTTP proxy in front of OpenAI / Anthropic / Gemini.
-- [MCP server](https://headroom-docs.vercel.app/docs/mcp): `headroom_compress`, `headroom_retrieve`, `headroom_stats` for Claude Code / Cursor / any MCP host.
-- [API reference](https://headroom-docs.vercel.app/docs/api-reference): Python + TypeScript `compress()` API.
+- [Quickstart](https://docs.headroomlabs.ai/docs/quickstart): 5-minute end-to-end (install → compress → call the model).
+- [Installation](https://docs.headroomlabs.ai/docs/installation): All install paths, extras, Docker tags, env vars.
+- [Proxy server](https://docs.headroomlabs.ai/docs/proxy): Run as a local HTTP proxy in front of OpenAI / Anthropic / Gemini.
+- [MCP server](https://docs.headroomlabs.ai/docs/mcp): `headroom_compress`, `headroom_retrieve`, `headroom_stats` for Claude Code / Cursor / any MCP host.
+- [API reference](https://docs.headroomlabs.ai/docs/api-reference): Python + TypeScript `compress()` API.
 
 ## How it works
 
-- [How compression works](https://headroom-docs.vercel.app/docs/how-compression-works): Three-stage pipeline + automatic content routing.
-- [SmartCrusher](https://headroom-docs.vercel.app/docs/smart-crusher): Statistical JSON / array compression (70–90% on tool outputs).
-- [Code compression](https://headroom-docs.vercel.app/docs/code-compression): AST-aware via tree-sitter (preserves imports, signatures, types).
-- [Text & log compression](https://headroom-docs.vercel.app/docs/text-and-logs): Search results, build logs, diffs.
-- [CCR (reversible)](https://headroom-docs.vercel.app/docs/ccr): Compress-Cache-Retrieve — originals never deleted; LLM retrieves on demand.
+- [How compression works](https://docs.headroomlabs.ai/docs/how-compression-works): Three-stage pipeline + automatic content routing.
+- [SmartCrusher](https://docs.headroomlabs.ai/docs/smart-crusher): Statistical JSON / array compression (90%+ on repeated arrays; keeps errors, outliers and boundaries).
+- [Code compression](https://docs.headroomlabs.ai/docs/code-compression): AST-aware via tree-sitter (preserves imports, signatures, types).
+- [Text & log compression](https://docs.headroomlabs.ai/docs/text-and-logs): Search results, build logs, diffs.
+- [CCR (reversible)](https://docs.headroomlabs.ai/docs/ccr): Compress-Cache-Retrieve — originals never deleted; LLM retrieves on demand.
 
 ## SDK / framework integrations
 
-- [Anthropic SDK](https://headroom-docs.vercel.app/docs/anthropic-sdk): `withHeadroom(anthropic)` wrapper.
-- [OpenAI SDK](https://headroom-docs.vercel.app/docs/openai-sdk): `withHeadroom(openai)` wrapper.
-- [Vercel AI SDK](https://headroom-docs.vercel.app/docs/vercel-ai-sdk): Middleware + `withHeadroom()`.
-- [LangChain](https://headroom-docs.vercel.app/docs/langchain): Chat models, memory, retrievers, agents.
-- [Agno](https://headroom-docs.vercel.app/docs/agno): Model wrapping + observability hooks.
-- [Strands](https://headroom-docs.vercel.app/docs/strands): Model wrapping + hook-based tool output compression.
-- [LiteLLM](https://headroom-docs.vercel.app/docs/litellm): Single callback; works with all 100+ LiteLLM providers.
+- [Anthropic SDK](https://docs.headroomlabs.ai/docs/anthropic-sdk): `withHeadroom(anthropic)` wrapper.
+- [OpenAI SDK](https://docs.headroomlabs.ai/docs/openai-sdk): `withHeadroom(openai)` wrapper.
+- [Vercel AI SDK](https://docs.headroomlabs.ai/docs/vercel-ai-sdk): Middleware + `withHeadroom()`.
+- [LangChain](https://docs.headroomlabs.ai/docs/langchain): Chat models, memory, retrievers, agents.
+- [Agno](https://docs.headroomlabs.ai/docs/agno): Model wrapping + observability hooks.
+- [Strands](https://docs.headroomlabs.ai/docs/strands): Model wrapping + hook-based tool output compression.
+- [LiteLLM](https://docs.headroomlabs.ai/docs/litellm): Single callback; works with all 100+ LiteLLM providers.
 
 ## Memory & cross-agent state
 
-- [Persistent memory](https://headroom-docs.vercel.app/docs/memory): Per-project SQLite + HNSW vector store. No cross-project bleed (GH #462).
-- [SharedContext](https://headroom-docs.vercel.app/docs/shared-context): Compressed inter-agent context handoffs.
-- [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning): Offline analysis writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` (shared) / `AGENTS.md` / `GEMINI.md`.
+- [Persistent memory](https://docs.headroomlabs.ai/docs/memory): Per-project SQLite + HNSW vector store. No cross-project bleed (GH #462).
+- [SharedContext](https://docs.headroomlabs.ai/docs/shared-context): Compressed inter-agent context handoffs.
+- [Failure learning](https://docs.headroomlabs.ai/docs/failure-learning): Offline analysis writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` (shared) / `AGENTS.md` / `GEMINI.md`.
 
 ## Operations
 
-- [Configuration](https://headroom-docs.vercel.app/docs/configuration): Env vars, config file, per-call overrides.
-- [Benchmarks](https://headroom-docs.vercel.app/docs/benchmarks): Token-savings numbers across content types.
-- [Troubleshooting](https://headroom-docs.vercel.app/docs/troubleshooting): Common failure modes and fixes.
-- [Limitations](https://headroom-docs.vercel.app/docs/limitations): What Headroom won't do well today.
+- [Configuration](https://docs.headroomlabs.ai/docs/configuration): Env vars, config file, per-call overrides.
+- [Benchmarks](https://docs.headroomlabs.ai/docs/benchmarks): Token-savings numbers across content types.
+- [Troubleshooting](https://docs.headroomlabs.ai/docs/troubleshooting): Common failure modes and fixes.
+- [Limitations](https://docs.headroomlabs.ai/docs/limitations): What Headroom won't do well today.
+
+## Headroom for Teams
+
+Headroom OSS is a framework built to show what's possible on one developer's laptop, so it saves less than Headroom Enterprise. Enterprise adds more cost savings, tokens secured, on premise deployment, deep attribution and many more features. Teams and enterprises: contact hello@headroomlabs.ai or visit https://headroomlabs.ai.
+
+- [Headroom for Teams](https://docs.headroomlabs.ai/docs/teams): Open source vs Enterprise, and how to reach us.
+- [headroomlabs.ai](https://headroomlabs.ai): Company site. Email hello@headroomlabs.ai.
 
 ## Licensing
 
-Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. Anonymous telemetry is **off by default** (opt-in); enable with `HEADROOM_TELEMETRY=on` or `headroom proxy --telemetry`.
+Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. An anonymous usage beacon is **on by default**: it reports compression ratios, counters, provider and model IDs, OS and architecture, and never prompts, completions, code or file paths. Turn it off with `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or `HEADROOM_OFFLINE=1`. See [Telemetry](https://github.com/headroomlabs-ai/headroom#telemetry).
