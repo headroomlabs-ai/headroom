@@ -400,6 +400,7 @@ def test_unresolved_project_native_memory_tool_fails_closed(tmp_path: Path) -> N
             "alice",
             "anthropic",
             request_context=ctx,
+            tool_names=frozenset({"memory", "memory_save"}),
         )
     )
 
