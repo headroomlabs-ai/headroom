@@ -179,11 +179,13 @@ _PATTERN_DEFAULTS = {
     "o3": {"context": 200000, "encoding": "o200k_base", "pricing": (2.00, 8.00)},
 }
 
-# Default for completely unknown OpenAI models
+# Default for completely unknown OpenAI models: the shared unknown-model
+# fallback ($3.00/$10 per 1M), matching the savings basis and
+# ``CostTracker._UNKNOWN_MODEL_DEFAULT_PRICING_PER_1M`` (#3825 review item 2).
 _UNKNOWN_OPENAI_DEFAULT = {
     "context": 128000,
     "encoding": "o200k_base",
-    "pricing": (2.50, 10.00),  # GPT-4o tier as reasonable default
+    "pricing": (3.00, 10.00),
 }
 
 
@@ -742,8 +744,8 @@ class OpenAIProvider(Provider):
         """Resolve pricing and report whether it is the unknown-model default.
 
         Returns ``(pricing, is_estimated)`` where ``is_estimated`` is True only
-        when the price fell all the way through to the GPT-4o-tier default
-        guess. The flag is derived from *this lookup* — explicit overrides and
+        when the price fell all the way through to the shared unknown-model
+        fallback guess. The flag is derived from *this lookup* — explicit overrides and
         the built-in table/family patterns are decisions or catalog data, not
         guesses — so a model that later resolves (explicit config added,
         LiteLLM catalog updated) stops being flagged without any cache to
@@ -780,7 +782,7 @@ class OpenAIProvider(Provider):
         if family and family in _PATTERN_DEFAULTS:
             return cast(tuple[float, float], _PATTERN_DEFAULTS[family]["pricing"]), False
 
-        # Completely unknown: the GPT-4o-tier default. A number is genuinely
+        # Completely unknown: the shared unknown-model fallback. A number is genuinely
         # required here (callers must never get None for a model nobody knows),
         # but it is a guess, not a lookup -- record it and say so loudly
         # (issue #3732). Anything downstream that treats this price as measured
@@ -845,7 +847,7 @@ class OpenAIProvider(Provider):
         in_price, out_price = cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
         logger.warning(
             "No pricing found for model '%s' in explicit config, LiteLLM, or the "
-            "built-in table -- using the GPT-4o-tier default ($%.2f/$%.2f per 1M "
+            "built-in table -- using the shared unknown-model fallback ($%.2f/$%.2f per 1M "
             "tokens). This cost is a GUESS. To price it explicitly, set the "
             "HEADROOM_MODEL_LIMITS env var or add it to ~/.headroom/models.json.",
             model,

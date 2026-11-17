@@ -201,15 +201,15 @@ class TestOpenAICostEstimation:
         assert cost == pytest.approx(1.875, rel=0.01)
 
     def test_estimate_cost_unknown_model(self, openai_provider):
-        # Unknown models now get fallback pricing (gpt-4o tier)
+        # Unknown models now get fallback pricing (shared $3.00/$10 default)
         cost = openai_provider.estimate_cost(
             input_tokens=1000,
             output_tokens=1000,
             model="unknown-model",
         )
-        # Fallback uses gpt-4o pricing: $2.50/M input + $10/M output
-        # = (1000/1M * 2.50) + (1000/1M * 10.00) = 0.0025 + 0.01 = 0.0125
-        assert cost == pytest.approx(0.0125, rel=0.01)
+        # Fallback uses the shared unknown-model default: $3.00/M input + $10/M output
+        # = (1000/1M * 3.00) + (1000/1M * 10.00) = 0.003 + 0.01 = 0.013
+        assert cost == pytest.approx(0.013, rel=0.01)
 
 
 class TestEncodingSelection:

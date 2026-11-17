@@ -9,7 +9,7 @@ records, $0 total, and allowed under count, ignore, AND block.
 
 These tests run the real ``emit_request_outcome -> CostTracker`` path with a
 model LiteLLM can't price and assert the request now books a
-PRICE_BASIS_ESTIMATED entry ($2.50/$10 per 1M provider fallback) and the
+PRICE_BASIS_ESTIMATED entry ($3.00/$10 per 1M shared unknown-model fallback) and the
 selected budget policy applies to it. ``estimated_pct`` is untouched: the
 usage was provider-reported, so it stays 0.0 -- price provenance is the
 independent second dimension, not a repurposed usage flag.
@@ -33,8 +33,8 @@ from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
 
 MODEL = "zz-made-up-model-3825"  # unknown to every price source
 
-# 200k input + 1k output at the $2.50/$10 per 1M fallback.
-EXPECTED_USD = 200_000 / 1_000_000 * 2.50 + 1_000 / 1_000_000 * 10.00
+# 200k input + 1k output at the $3.00/$10 per 1M shared unknown-model fallback.
+EXPECTED_USD = 200_000 / 1_000_000 * 3.00 + 1_000 / 1_000_000 * 10.00
 
 
 class _Metrics:
@@ -206,8 +206,14 @@ def test_runtime_reset_clears_selected_prices_and_spend():
 def no_litellm(monkeypatch: pytest.MonkeyPatch):
     """Simulate LiteLLM being unable to price: estimate_cost returns None."""
     import headroom.proxy.cost as cost_mod
+    from headroom.log_safety import WarnOnce
 
-    cost_mod._warned_pricing_models.clear()
+    # Fresh warn-once state per test: the pricing-warning set this used to
+    # clear (``_warned_pricing_models``) was replaced by the shared
+    # ``WarnOnce`` guard in #4088, so reset that instead -- plus the
+    # estimated-basis warning set the ledger path also consults.
+    monkeypatch.setattr(cost_mod, "_pricing_warnings", WarnOnce(1024, "unpriceable models"))
+    cost_mod._warned_estimated_basis_models.clear()
     monkeypatch.setattr(cost_mod, "_get_litellm_module", lambda: None)
 
 
@@ -256,7 +262,7 @@ def test_unknown_model_books_estimated_entry_and_denies_under_count(no_litellm):
     assert basis["price_estimated_usd"] == pytest.approx(EXPECTED_USD)
     assert basis["total_usd"] == pytest.approx(EXPECTED_USD)
     assert ct.stats()["total_cost_usd"] == pytest.approx(EXPECTED_USD)
-    assert ct.totals()[1] == pytest.approx(0.50)
+    assert ct.totals()[1] == pytest.approx(0.60)
     # Usage was provider-reported: estimated_pct keeps its "input count was
     # estimated" meaning and is untouched by the price guess.
     assert basis["estimated_pct"] == 0.0
@@ -321,7 +327,7 @@ def test_provider_resolved_price_and_provenance_propagate(no_litellm):
     basis = _budget_basis(ct)
     assert basis["price_estimated_records"] == 0
     assert basis["price_estimated_usd"] == 0.0
-    # 200k in + 1k out at the provider's $1.00/$2.00, not the $2.50/$10 default.
+    # 200k in + 1k out at the provider's $1.00/$2.00, not the $3.00/$10 default.
     assert basis["total_usd"] == pytest.approx(
         200_000 / 1_000_000 * 1.00 + 1_000 / 1_000_000 * 2.00
     )
@@ -331,7 +337,7 @@ def test_provider_estimated_flag_propagates(no_litellm):
     """A provider-flagged guess keeps its estimated provenance end to end."""
     ct = _tracker(budget_limit_usd=100.0)
     handler = _Handler(ct)
-    handler.openai_provider = _StubProvider((2.50, 10.00), PRICE_BASIS_ESTIMATED)
+    handler.openai_provider = _StubProvider((3.00, 10.00), PRICE_BASIS_ESTIMATED)
     _emit(handler)
 
     basis = _budget_basis(ct)
@@ -343,7 +349,7 @@ def test_real_openai_provider_resolves_unknown_default_estimated(
     no_litellm, monkeypatch: pytest.MonkeyPatch
 ):
     """The real provider object on the funnel path: unknown model -> the
-    GPT-4o-tier default with estimated provenance (the reviewer's scenario)."""
+    shared $3.00 unknown-model fallback with estimated provenance (the reviewer's scenario)."""
     import headroom.pricing.litellm_pricing as lp
     import headroom.providers.openai as openai_mod
 
@@ -378,3 +384,57 @@ def test_broken_provider_degrades_to_generic_fallback(no_litellm):
     basis = _budget_basis(ct)
     assert basis["price_estimated_records"] == 1
     assert basis["price_estimated_usd"] == pytest.approx(EXPECTED_USD)
+
+
+# ── Shared fallback / cache-read agreement (#3825 review item 2) ──────
+
+
+def test_unknown_model_cache_heavy_displayed_read_cannot_exceed_input_spend(
+    no_litellm,
+):
+    """Cache-heavy unknown model: the displayed cache-read component cannot
+    exceed the total input spend.
+
+    The ledger and the display must share one effective cache-read
+    convention, not just the nominal $3.00 input constant: the ledger books
+    cache reads at 50% of the shared fallback (``_fallback_cost_usd``), and
+    the display prices them from ``_get_cache_prices``, which derives the
+    read rate as 50% of the same captured fallback. If either side used a
+    different basis, a cache-heavy request's displayed read component would
+    exceed its total input spend — e.g. a $3.00 read rate against a $2.50
+    ledger would price 190k reads at $0.285 against $0.25 of input.
+    """
+    ct = _tracker(budget_limit_usd=100.0)
+    handler = _Handler(ct)
+    asyncio.run(
+        emit_request_outcome(
+            handler,
+            RequestOutcome(
+                request_id="req-3825-cache-heavy",
+                provider="openai",
+                model=MODEL,
+                original_tokens=200_000,
+                optimized_tokens=200_000,
+                output_tokens=1_000,
+                tokens_saved=0,
+                attempted_input_tokens=200_000,
+                # Provider-reported usage: the usage basis is measured; only the
+                # PRICE is a guess.
+                provider_input_tokens=200_000,
+                uncached_input_tokens=10_000,
+                cache_read_tokens=190_000,
+                cache_write_tokens=0,
+            ),
+        )
+    )
+
+    # Ledger and display agree on the same $3.00 basis: 10k uncached at list
+    # plus 190k reads at the 50% convention.
+    assert ct.totals()[1] == pytest.approx((10_000 + 0.5 * 190_000) / 1_000_000 * 3.00)
+    assert ct.stats()["total_input_cost_usd"] == pytest.approx(0.315)
+
+    read_price, _, _, _ = ct._get_cache_prices(MODEL)
+    assert read_price is not None
+    cache_read_component = 190_000 * read_price
+    total_input_spend = ct.stats()["total_input_cost_usd"]
+    assert cache_read_component <= total_input_spend + 1e-9

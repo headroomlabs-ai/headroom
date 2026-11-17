@@ -1,7 +1,7 @@
 """Price provenance is a ledger dimension independent of usage provenance.
 
 #3732: when no price source knows a model, ``OpenAIProvider`` falls back to the
-GPT-4o-tier default -- a guess, not a lookup. Per the maintainer's direction on
+shared $3.00/$10 unknown-model default -- a guess, not a lookup. Per the maintainer's direction on
 #3825, that guess must NOT reuse ``COST_BASIS_ESTIMATED``: a record can carry
 provider-reported usage priced at a guessed default, and consumers need the two
 dimensions separable. ``estimated_pct`` keeps meaning "the input count was

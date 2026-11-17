@@ -44,13 +44,13 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
     ("model", "want_in", "want_out"),
     [
         # Gateway-routed names. litellm.model_cost keys the UNWRAPPED form, so
-        # these all returned None (-> $2.50/$10.00 unknown default) before.
+        # these all returned None (-> $3.00/$10.00 unknown default) before.
         ("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("vertex_ai/claude-sonnet-4-5", 3.00, 15.00),
         # Any gateway-prefixed name here must be one litellm still prices:
         # when it prunes a model the unwrap finds nothing and _get_pricing
-        # silently returns the $2.50/$10.00 GPT-4o default, which is what
+        # silently returns the $3.00/$10.00 unknown default, which is what
         # this test exists to catch. litellm dropped
         # groq/llama-3.3-70b-versatile on 2026-09-23 (since restored) and
         # groq/llama-guard-3-8b (2026-10-07); see issue #3732.
@@ -142,7 +142,7 @@ def test_unknown_model_warns_once_and_is_flagged_estimated(
     """The unknown-model default must be loud and distinguishable (issue #3732).
 
     Fails before the fix: no warning was emitted at all (only a debug log via
-    the generic fallback path) and callers had no way to tell the $2.50/$10.00
+    the generic fallback path) and callers had no way to tell the $3.00/$10.00
     tuple apart from a real price lookup.
     """
     import logging
@@ -160,7 +160,7 @@ def test_unknown_model_warns_once_and_is_flagged_estimated(
         provider._get_pricing("no-such-model-warns-once")
 
     # Still a usable number -- a number is genuinely required here.
-    assert got == (2.50, 10.00)
+    assert got == (3.00, 10.00)
 
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1
