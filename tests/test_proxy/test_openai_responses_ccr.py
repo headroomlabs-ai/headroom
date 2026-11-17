@@ -609,9 +609,7 @@ async def test_buffered_responses_ccr_post_commit_error_is_a_valid_response_erro
         await response(scope, receive, send)
 
     start = next(event for event in events if event["type"] == "http.response.start")
-    bodies = b"".join(
-        event["body"] for event in events if event["type"] == "http.response.body"
-    )
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
     assert start["status"] == 200, "the grace window already committed the status"
     assert bodies.startswith(b": ping\n\n"), "the heartbeat must open the stream"
 
@@ -633,6 +631,7 @@ async def test_buffered_responses_ccr_post_commit_error_is_a_valid_response_erro
     assert event.code == "rate_limit_exceeded"
     assert event.message == "slow down"
     assert event.sequence_number == 0
+
 
 @pytest.mark.asyncio
 async def test_buffered_responses_ccr_residual_retrieve_call_fails_closed():
@@ -697,11 +696,8 @@ async def test_buffered_responses_ccr_residual_retrieve_call_fails_closed():
     start = next(event for event in events if event["type"] == "http.response.start")
     assert start["status"] == 502
     assert dict(start["headers"])[b"content-type"] == b"application/json"
-    bodies = b"".join(
-        event["body"] for event in events if event["type"] == "http.response.body"
-    )
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
     payload = json.loads(bodies)
     assert payload["error"]["type"] == "server_error"
     assert payload["error"]["code"] == "proxy_error"
     assert payload["error"]["message"] == "Unable to safely complete streamed CCR retrieval."
-
