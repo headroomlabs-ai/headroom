@@ -3,6 +3,7 @@ import base64
 import json
 import sys
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,7 @@ import httpx
 import pytest
 from fastapi import Request
 
+from headroom.memory.storage_router import RequestContext
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _is_allowed_websocket_origin,
@@ -279,7 +281,7 @@ class _MemoryToolsOnlyHandler:
         self.config = SimpleNamespace(
             inject_context=False,
             inject_tools=True,
-            project_root_override="",
+            project_root_override=str(Path(__file__).resolve().parent),
         )
         self.compute_calls = 0
 
@@ -311,7 +313,11 @@ class _MemoryContinuationHandler(_MemoryToolsOnlyHandler):
         args: dict,
         user_id: str,
         provider: str,
+        *,
+        request_context: RequestContext | None = None,
     ) -> str:
+        assert request_context is not None
+        assert request_context.base_user_id == user_id
         assert (name, args, user_id, provider) == (
             "memory_search",
             {},
@@ -401,7 +407,7 @@ class _ZdrResponsesHandler(_DummyOpenAIHandler):
         )
 
 
-def _build_request(body: dict, headers: dict[str, str]) -> Request:
+def _build_request(body: dict, headers: dict[str, str], path: str = "/v1/responses") -> Request:
     payload = json.dumps(body).encode("utf-8")
 
     async def receive():
@@ -413,8 +419,8 @@ def _build_request(body: dict, headers: dict[str, str]) -> Request:
         "http_version": "1.1",
         "method": "POST",
         "scheme": "https",
-        "path": "/v1/responses",
-        "raw_path": b"/v1/responses",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
         "query_string": b"",
         "headers": [
             (key.lower().encode("utf-8"), value.encode("utf-8")) for key, value in headers.items()
@@ -553,7 +559,11 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
 def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_tools(monkeypatch):
     request = _build_request(
         {"model": "gpt-4o-mini", "input": "hello", "store": False},
-        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
     )
     handler = _DummyOpenAIHandler()
     memory_handler = _MemoryToolsOnlyHandler()
@@ -574,6 +584,30 @@ def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_t
     assert [tool["name"] for tool in body["tools"]] == ["memory_search"]
     assert body["include"] == ["reasoning.encrypted_content"]
     assert memory_handler.compute_calls == 1
+
+
+def test_handle_openai_responses_stream_skips_memory_tools(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello", "store": False, "stream": True},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryToolsOnlyHandler()
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-tools-stream",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    anyio.run(handler.handle_openai_responses, request)
+
+    assert handler.captured_stream_request is not None
+    assert "memory_search" not in json.dumps(handler.captured_stream_request[2].get("tools", []))
+    assert handler.memory_handler.compute_calls == 0
 
 
 @pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True, False])
@@ -618,7 +652,11 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
         body["store"] = store
     request = _build_request(
         body,
-        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
     )
     handler = _ZdrResponsesHandler()
 
@@ -1056,3 +1094,69 @@ def test_responses_savings_accept_a_session_header_as_identity(monkeypatch):
     _post_responses(handler, body, {"session_id": "sess-1"})
     _post_responses(handler, body, {"session_id": "sess-2"})
     assert _booked(handler) == [100, 0, 100]
+
+
+def test_handle_openai_responses_memory_lookup_exception_fails_open_and_forwards_original_request(
+    monkeypatch,
+):
+    import sqlite3
+
+    class _FailingContextMemoryHandler:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                inject_context=True,
+                inject_tools=False,
+                project_root_override=str(Path(".").resolve()),
+            )
+            self.call_count = 0
+
+        async def search_and_format_context(self, user_id, messages, **kwargs):
+            self.call_count += 1
+            raise sqlite3.OperationalError("unable to open database file")
+
+        def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+            return []
+
+        def has_memory_tool_calls(self, response, provider: str) -> bool:
+            return False
+
+    handler = _DummyOpenAIHandler()
+    memory_handler = _FailingContextMemoryHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-fallback",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    req1 = _build_request(
+        {"model": "gpt-4o-mini", "input": "turn 1 original", "store": False},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    req2 = _build_request(
+        {"model": "gpt-4o-mini", "input": "turn 2 original", "store": False},
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+
+    # First request: lookup fails, original body forwarded without memory, response succeeds
+    res1 = anyio.run(handler.handle_openai_responses, req1)
+    assert res1.status_code == 200
+    assert handler.captured_request is not None
+    _, _, _, body1 = handler.captured_request
+    assert body1["input"] == "turn 1 original"
+
+    # Subsequent request: handler continues serving traffic normally
+    res2 = anyio.run(handler.handle_openai_responses, req2)
+    assert res2.status_code == 200
+    assert handler.captured_request is not None
+    _, _, _, body2 = handler.captured_request
+    assert body2["input"] == "turn 2 original"
+    assert memory_handler.call_count == 2

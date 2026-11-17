@@ -1,13 +1,9 @@
-//! Three universal crushers for non-dict-array JSON shapes.
+//! Two universal crushers for non-dict-array JSON shapes.
 //!
 //! Direct ports from `headroom/transforms/smart_crusher.py`:
 //!
 //! - `crush_string_array`  ← `_crush_string_array`  (line 2727)
 //! - `crush_number_array`  ← `_crush_number_array`  (line 2810) — has BUG #1
-//! - `crush_object`        ← `_crush_object`        (line 3015)
-//!   Object fields are independent properties, not sampled records.
-//!   `crush_object` preserves every key; nested arrays are compacted
-//!   by the recursive `process_value` pass before this function runs.
 //!
 //! Each takes a `&SmartCrusherConfig`, a `bias` multiplier, and returns
 //! `(crushed_items, strategy_string)`. Schema-preserving: the output
@@ -33,7 +29,7 @@
 //! the bug-doc test below flips to pin the corrected behavior and the
 //! fixtures are regenerated.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
 use super::config::SmartCrusherConfig;
@@ -382,27 +378,6 @@ pub fn crush_number_array(
     (kept_values, strategy)
 }
 
-/// Preserve every property of a JSON object.
-///
-/// Object fields are independent named properties, not interchangeable
-/// sampled records. The previous key-selection algorithm dropped keys
-/// (no CCR marker, no recovery hash) which silently deleted structured
-/// fields such as `tags` and `subtasks` from MCP task objects. Nested
-/// arrays are still compacted by the recursive `process_value` pass
-/// *before* this function runs, so legitimate large-array compaction
-/// and CCR-backed row offload remain available without deleting their
-/// enclosing keys.
-///
-/// `config` and `bias` are retained so the production call site in
-/// `SmartCrusher::process_value_with_hook` stays unchanged.
-pub fn crush_object(
-    obj: &Map<String, Value>,
-    _config: &SmartCrusherConfig,
-    _bias: f64,
-) -> (Map<String, Value>, String) {
-    (obj.clone(), "object:passthrough".to_string())
-}
-
 // ---------- helpers ----------
 
 /// Linear-interpolation percentile (numpy "linear" method).
@@ -634,165 +609,6 @@ mod tests {
         assert!(strat.contains("p75="));
     }
 
-    // ---------- crush_object ----------
-
-    /// Wide object above the historical n>8 / token-floor gate: arbitrary
-    /// names, long strings, a nested dict, nulls, booleans, empty arrays.
-    /// `expensive_index` places the nested dict at begin / middle / end.
-    fn wide_object(expensive_index: usize) -> Map<String, Value> {
-        let n = 15;
-        let expensive_index = expensive_index.min(n - 1);
-        let mut obj = Map::new();
-        for i in 0..n {
-            if i == expensive_index {
-                obj.insert(
-                    format!("expensive_{i}"),
-                    json!({
-                        "nested": {
-                            "label": format!("nested-{i}"),
-                            "note": "x".repeat(120)
-                        },
-                        "items": [],
-                        "ok": true,
-                        "missing": null
-                    }),
-                );
-            } else {
-                obj.insert(
-                    format!("field_{i:02}"),
-                    json!(format!(
-                        "this is a relatively long value string for entry number {i} with content"
-                    )),
-                );
-            }
-        }
-        obj.insert("flag".to_string(), json!(false));
-        obj.insert("empty".to_string(), json!([]));
-        obj.insert("nada".to_string(), json!(null));
-        obj
-    }
-
-    fn assert_object_fully_preserved(obj: &Map<String, Value>, config: &SmartCrusherConfig) {
-        let (out, strat) = crush_object(obj, config, 1.0);
-        assert_eq!(out, *obj, "crush_object must keep every property");
-        assert_eq!(out.len(), obj.len());
-        for key in obj.keys() {
-            assert!(out.contains_key(key), "dropped key {key}");
-            assert_eq!(out.get(key), obj.get(key));
-        }
-        assert_eq!(strat, "object:passthrough");
-        assert!(
-            !strat.contains("adaptive"),
-            "must not report a key-drop strategy: {strat}"
-        );
-        assert!(
-            !strat.contains("ccr"),
-            "must not invent a CCR hash: {strat}"
-        );
-    }
-
-    #[test]
-    fn object_passthrough_when_few_keys() {
-        let mut obj = Map::new();
-        for i in 0..5 {
-            obj.insert(format!("k{}", i), json!(i));
-        }
-        let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(out.len(), 5);
-        assert_eq!(out, obj);
-        assert_eq!(strat, "object:passthrough");
-    }
-
-    #[test]
-    fn object_passthrough_when_total_tokens_below_min() {
-        // Many tiny keys/values: historically total_tokens stayed below
-        // min_tokens_to_crush=200 and skipped selection. Preservation is
-        // now unconditional, so every key still survives.
-        let mut obj = Map::new();
-        for i in 0..30 {
-            obj.insert(format!("k{}", i), json!(i));
-        }
-        let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(out, obj);
-        assert_eq!(strat, "object:passthrough");
-    }
-
-    #[test]
-    fn object_preserves_every_key_when_token_budget_exceeded() {
-        // 30 keys, each with a long string value → historically above
-        // the token floor and subject to key-selection. Every property
-        // must survive; no adaptive key-drop strategy.
-        let mut obj = Map::new();
-        for i in 0..30 {
-            obj.insert(
-                format!("k{:02}", i),
-                json!(format!(
-                    "this is a relatively long value string for entry number {} with content",
-                    i
-                )),
-            );
-        }
-        assert_object_fully_preserved(&obj, &cfg());
-    }
-
-    #[test]
-    fn object_preserves_wide_object_with_mixed_value_types() {
-        assert_object_fully_preserved(&wide_object(7), &cfg());
-    }
-
-    #[test]
-    fn object_preserves_expensive_fields_in_any_position() {
-        // Reorder the expensive nested field into beginning, middle, and
-        // end. Boundary/stride selection used to drop the middle one.
-        for expensive_index in [0, 7, 14] {
-            assert_object_fully_preserved(&wide_object(expensive_index), &cfg());
-            assert_object_fully_preserved(&wide_object(expensive_index), &lossless_only_cfg());
-        }
-    }
-
-    #[test]
-    fn object_keeps_small_values() {
-        // Mix of small + large values; every key survives, including tiny.
-        let mut obj = Map::new();
-        obj.insert("tiny".to_string(), json!(1));
-        for i in 0..30 {
-            obj.insert(
-                format!("big{:02}", i),
-                json!(format!(
-                    "this is a long string with content for entry number {} that exceeds the small threshold",
-                    i
-                )),
-            );
-        }
-        let (out, _) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(out, obj);
-        assert!(
-            out.contains_key("tiny"),
-            "tiny key (small value) must survive"
-        );
-    }
-
-    #[test]
-    fn object_keeps_error_keywords() {
-        let mut obj = Map::new();
-        obj.insert(
-            "msg1".to_string(),
-            json!(format!("FATAL: {}", "x".repeat(200))),
-        );
-        for i in 0..30 {
-            obj.insert(
-                format!("k{:02}", i),
-                json!(format!("padding content for entry {} with text", i)),
-            );
-        }
-        let (out, _) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(out, obj);
-        assert!(
-            out.contains_key("msg1"),
-            "key with error-keyword value must survive"
-        );
-    }
-
     // ---------- lossless_only (#3625) ----------
     //
     // These crushers drop items with no CCR marker at all, so strict
@@ -830,24 +646,6 @@ mod tests {
         let (out, strat) = crush_number_array(&items, &lossless_only_cfg(), 1.0);
         assert_eq!(out, items, "lossless_only must keep every number");
         assert_eq!(strat, "number:lossless_only");
-    }
-
-    #[test]
-    fn object_lossless_only_keeps_every_key() {
-        let mut obj = Map::new();
-        for i in 0..40 {
-            obj.insert(
-                format!("k{i:02}"),
-                json!(format!(
-                    "long description for entry {i}, above the small-value floor"
-                )),
-            );
-        }
-
-        // Default mode used to drop keys with no CCR marker. Preservation
-        // is now unconditional, so both configs keep every property.
-        assert_object_fully_preserved(&obj, &cfg());
-        assert_object_fully_preserved(&obj, &lossless_only_cfg());
     }
 
     // ---------- BUG #1 documentation test ----------

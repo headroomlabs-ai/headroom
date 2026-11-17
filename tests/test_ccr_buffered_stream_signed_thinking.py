@@ -27,6 +27,7 @@ httpx = pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.models import CacheEntry  # noqa: E402
+from headroom.proxy.semantic_cache_key_policy import compute_cache_partition  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 RETRIEVE_TOOL = {
@@ -89,11 +90,13 @@ def ccr_marker() -> str:
 
 
 def _body(*, with_thinking: bool, marker: str | None = None) -> dict:
-    first = "hi" if marker is None else f"hi — earlier output is at <<ccr:{marker}>>"
-    messages: list[dict] = [{"role": "user", "content": first}]
+    # The marker rides in the latest user turn: only content new this turn
+    # gates buffering (#3587).
+    latest = "hi" if marker is None else f"hi — earlier output is at <<ccr:{marker}>>"
+    messages: list[dict] = [{"role": "user", "content": "hi" if with_thinking else latest}]
     if with_thinking:
         messages.append(SIGNED_THINKING_TURN)
-        messages.append({"role": "user", "content": "continue"})
+        messages.append({"role": "user", "content": latest})
     return {
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 64,
@@ -174,7 +177,8 @@ def test_signed_thinking_history_skips_the_buffered_ccr_path(
         assert calls["stream_body"]["stream"] is True
     else:
         assert "buffered_body" in calls, "expected the buffered CCR path"
-        assert calls["buffered_body"]["stream"] is False
+        # The buffered request itself streams; the proxy folds the reply.
+        assert calls["buffered_body"]["stream"] is True
 
 
 @pytest.mark.parametrize("upstream_delay", [0.0, 1.2], ids=["prompt", "past-keepalive"])
@@ -277,11 +281,122 @@ def test_buffering_is_gated_on_a_redeemable_marker(
     assert resp.status_code == 200, resp.text
     if expect_buffered:
         assert "buffered_body" in calls, "a redeemable marker must still buffer"
-        assert calls["buffered_body"]["stream"] is False
+        # The buffered request itself streams; the proxy folds the reply.
+        assert calls["buffered_body"]["stream"] is True
     else:
         assert "stream_body" in calls, "nothing to retrieve — the client must keep streaming"
         assert "buffered_body" not in calls
         assert calls["stream_body"]["stream"] is True
+
+
+def _owned_marker(content: str) -> str:
+    """Store one more original in the (fixture-reset) store; return its hash."""
+    from headroom.cache.compression_store import get_compression_store
+
+    return get_compression_store().store(
+        content,
+        "<<ccr:placeholder>>",
+        original_tokens=100,
+        compressed_tokens=5,
+        tool_name="Read",
+    )
+
+
+def _tool_turn(tool_use_id: str, output: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_use_id, "name": "Read", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": output}],
+        },
+    ]
+
+
+def _agent_body(messages: list[dict]) -> dict:
+    return {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [RETRIEVE_TOOL],
+        "messages": messages,
+    }
+
+
+def _replay_session(turns: list[list[dict]]) -> list[str]:
+    """Send each message list as one turn of the same session; report the path taken."""
+    paths: list[str] = []
+
+    async def fake_stream_response(url, headers, body, *args, **kwargs):  # noqa: ANN001
+        paths.append("streamed")
+        return fastapi.responses.StreamingResponse(iter([SSE_BODY]), media_type="text/event-stream")
+
+    async def fake_retry(method, url, headers, req_body, *args, **kwargs):  # noqa: ANN001
+        paths.append("buffered")
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-20250514",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+    app = create_app(_config())
+    with TestClient(app) as client:
+        client.app.state.proxy._stream_response = fake_stream_response
+        client.app.state.proxy._retry_request = fake_retry
+        for messages in turns:
+            resp = client.post("/v1/messages", json=_agent_body(messages), headers=_headers())
+            assert resp.status_code == 200, resp.text
+    return paths
+
+
+def test_a_marker_already_forwarded_does_not_buffer_later_turns(ccr_marker: str) -> None:
+    """A marker carried forward in history does not make every later turn buffer.
+
+    The marker was in front of the model on the turn that introduced it, and
+    that turn buffered. Buffering every later turn for it is #3587: the
+    buffered share climbed toward 90% of turns with zero retrievals.
+    """
+    first = [
+        {"role": "user", "content": "read the logs"},
+        *_tool_turn("tu_1", f"earlier output at <<ccr:{ccr_marker}>>"),
+    ]
+    second = [*first, *_tool_turn("tu_2", "short")]
+
+    assert _replay_session([first, second]) == ["buffered", "streamed"]
+
+
+def test_a_marker_first_shown_in_an_earlier_message_still_buffers(ccr_marker: str) -> None:
+    """New to the model is what counts, not where the marker sits.
+
+    Token mode can compress an earlier tool result on a later request, so the
+    model first sees that marker in the middle of the history. Retrieval has
+    to be handled server-side there too, or the call reaches the client.
+    """
+    newly_compressed = _owned_marker("a different, uncompressed tool output")
+    first = [
+        {"role": "user", "content": "read the logs"},
+        *_tool_turn("tu_1", f"earlier output at <<ccr:{ccr_marker}>>"),
+    ]
+    second = [
+        {"role": "user", "content": "read the logs"},
+        *_tool_turn(
+            "tu_1",
+            f"earlier output at <<ccr:{ccr_marker}>> and <<ccr:{newly_compressed}>>",
+        ),
+        *_tool_turn("tu_2", "short"),
+    ]
+
+    assert _replay_session([first, second]) == ["buffered", "buffered"]
 
 
 def test_cache_hit_never_replays_a_foreign_content_type() -> None:
@@ -314,6 +429,9 @@ def test_cache_hit_never_replays_a_foreign_content_type() -> None:
         key = proxy.cache._compute_key(
             body["messages"],
             body["model"],
+            # Same partition the handler derives for this caller (01-F15).
+            partition=compute_cache_partition(_headers()),
+            upstream_base_url=None,
             system=None,
             tools=None,
             tool_choice=None,

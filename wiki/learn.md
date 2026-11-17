@@ -169,12 +169,22 @@ Options:
 
 `headroom learn --verbosity` analyzes past sessions to infer the ideal output verbosity level for your project and writes a `verbosity.json` profile.
 
-**Important**: the output shaper is **off by default** and requires the `beta`
-runtime rollout channel. Running `--verbosity --apply` will either:
+**Important**: the output shaper is **off by default** (`HEADROOM_OUTPUT_SHAPER=1`
+turns it on; it is available on every rollout channel). Running `--verbosity --apply` will either:
 - Hot-enable the output shaper on an eligible running proxy (`POST /admin/runtime-env`), OR
-- Print instructions to set `HEADROOM_ROLLOUT_CHANNEL=beta` and `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
+- Print instructions to set `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
 
-To keep the shaper on across proxy restarts, export both variables before starting the proxy.
+A proxy in cache mode (the default) does not read `verbosity.json`: a level that
+changes mid-conversation would bust the prompt cache, so it steers at its startup
+level. On a cache-mode proxy `--apply` therefore also pins
+`HEADROOM_VERBOSITY_LEVEL` to the learned level, and records the pin (port,
+proxy pid, level) in `verbosity_pin.json`. A `HEADROOM_VERBOSITY_LEVEL` that is
+already set is left alone, and `--apply` says so. The one exception is a pin that
+record proves an earlier `--apply` set: the same proxy process still holding the
+same raw value. That pin is replaced. A changed raw pin remains operator-owned
+even if it clamps to the same effective level as the previous CLI pin.
+
+To keep the shaper on across proxy restarts, export `HEADROOM_OUTPUT_SHAPER=1` before starting the proxy, plus `HEADROOM_VERBOSITY_LEVEL=<level>` in cache mode.
 
 **Flag interactions**:
 - `--all` and `--project` are mutually exclusive
@@ -218,7 +228,17 @@ export HEADROOM_LEARN_CLI=codex
 headroom learn
 ```
 
-Valid values for `HEADROOM_LEARN_CLI`: `claude`, `gemini`, `codex`.
+Valid values for `HEADROOM_LEARN_CLI`: `claude`, `gemini`, `codex`, `agy`.
+
+`agy` (Antigravity CLI) is never auto-detected. It has no mode that starts a session without tools, so instructions embedded in analyzed session text could make it write files or run shell commands with your permissions. To use it anyway, opt in explicitly:
+
+```bash
+export HEADROOM_LEARN_CLI=agy
+export HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1
+headroom learn
+```
+
+Without `HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1`, selecting `agy` (via `HEADROOM_LEARN_CLI` or `--model agy-cli`) fails before any analysis runs.
 
 ## Real-World Results
 

@@ -23,6 +23,7 @@ from headroom.proxy.helpers import (
     merge_extra_headers,
     sanitize_forwarded_response_headers,
 )
+from headroom.proxy.ssl_context import build_websocket_ssl
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 
 logger = logging.getLogger("headroom.providers.codex.live")
@@ -226,7 +227,7 @@ async def handle_codex_live_websocket(
                 additional_headers=forwarded_headers,
                 # websockets types wire protocol tokens as a nominal wrapper.
                 subprotocols=cast(Any, subprotocols or None),
-                ssl=True if upstream_url.startswith("wss://") else None,
+                ssl=build_websocket_ssl() if upstream_url.startswith("wss://") else None,
                 open_timeout=max(30, getattr(config, "connect_timeout_seconds", 10) * 3),
                 close_timeout=10,
                 ping_interval=20,

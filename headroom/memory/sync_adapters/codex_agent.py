@@ -121,7 +121,7 @@ class CodexAdapter(AgentMemoryAdapter):
             self._path.parent.mkdir(parents=True, exist_ok=True)
             content = section + "\n"
 
-        self._path.write_text(content, encoding="utf-8")
+        self._path.write_text(content, encoding="utf-8", newline="\n")
         return added
 
     def fingerprint(self) -> str:

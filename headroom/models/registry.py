@@ -422,16 +422,17 @@ def _register_builtin_models() -> None:
         notes="DeepSeek Coder - Specialized for code",
     )
 
-    _MODELS["deepseek-v4-flash"] = ModelInfo(
-        name="deepseek-v4-flash",
+    _MODELS["deepseek-flash"] = ModelInfo(
+        name="deepseek-flash",
         provider="deepseek",
         context_window=1_000_000,
         max_output_tokens=384_000,
         supports_tools=True,
-        supports_vision=False,
+        supports_vision=True,
         supports_streaming=True,
         tokenizer_backend="huggingface",
-        notes="DeepSeek V4 Flash - 13B active params; non-thinking + thinking modes",
+        aliases=("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"),
+        notes="DeepSeek V4.1-Flash - vision; non-thinking + thinking modes",
     )
 
     _MODELS["deepseek-v4-pro"] = ModelInfo(

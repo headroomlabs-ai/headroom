@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import ssl
 import sys
 import tarfile
 import zipfile
@@ -101,7 +103,7 @@ def fake_urlopen(monkeypatch):
     """Install a fake urllib.request.urlopen that serves registered URLs."""
     served: dict[str, bytes] = {}
 
-    def fake(req, timeout=None):  # noqa: ARG001
+    def fake(req, timeout=None, context=None):  # noqa: ARG001
         url = req.full_url if hasattr(req, "full_url") else req
         if url not in served:
             raise AssertionError(f"unexpected fetch for {url}")
@@ -195,6 +197,110 @@ def test_resolve_honors_path(monkeypatch, tmp_path):
     assert binaries.resolve("scc") == fake_bin
 
 
+def _plant_in_cwd(monkeypatch, tmp_path, name: str) -> None:
+    """Put an executable `name` in a fresh cwd and make PATH resolve it there."""
+    project = tmp_path / "project"
+    project.mkdir()
+    planted = project / name
+    planted.write_text("#!/bin/sh\n")
+    planted.chmod(0o755)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", ".")
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+
+
+def test_which_ignores_a_tool_in_the_current_directory(monkeypatch, tmp_path):
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    assert binaries.which("difft") is None
+
+
+def test_resolve_ignores_a_tool_in_the_current_directory(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    monkeypatch.setenv("HEADROOM_BINARIES_OFFLINE", "1")
+    with pytest.raises(binaries.OfflineError):
+        binaries.resolve("difft")
+
+
+def test_status_does_not_report_a_cwd_tool_as_on_path(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert row["state"] == "missing"
+    assert row["path"] is None
+
+
+def test_which_skips_a_cwd_hit_and_finds_the_next_path_entry(monkeypatch, tmp_path):
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tool = bin_dir / "difft"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(bin_dir)]))
+    assert binaries.which("difft") == tool
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("on-path", str(tool))
+
+
+def test_which_skips_a_cwd_hit_with_windows_lookup_rules(monkeypatch, tmp_path):
+    """On Windows shutil.which() checks the cwd before every PATH it is given."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "difft.exe").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    installed = bin_dir / "difft.exe"
+    installed.write_text("")
+    installed.chmod(0o755)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(binaries.sys, "platform", "win32")
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("PATHEXT", ".exe")
+    monkeypatch.setattr(
+        binaries.shutil, "which", lambda name, path=None: os.path.join(".", f"{name}.exe")
+    )
+    assert binaries._which_outside_cwd("difft") == installed
+
+
+def test_status_reports_a_tool_in_the_interpreter_scripts_dir(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    monkeypatch.setenv("PATH", "/no-such-bin")
+    scripts = tmp_path / "venv" / "bin"
+    scripts.mkdir(parents=True)
+    (scripts / "difft").write_text("#!/bin/sh\n")
+    (scripts / "difft").chmod(0o755)
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("on-path", str(scripts / "difft"))
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX execute bit")
+def test_status_ignores_a_non_executable_file_in_the_scripts_dir(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    monkeypatch.setenv("PATH", "/no-such-bin")
+    scripts = tmp_path / "venv" / "bin"
+    scripts.mkdir(parents=True)
+    (scripts / "difft").write_text("not a program\n")
+    (scripts / "difft").chmod(0o644)
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    assert binaries.which("difft") is None
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("missing", None)
+
+
+def test_which_keeps_a_tool_on_path_outside_the_current_directory(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tool = bin_dir / "difft"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    assert binaries.which("difft") == tool
+
+
 # -------- Offline / mirror / fetch behavior ------------------------------ #
 
 
@@ -216,6 +322,20 @@ def test_mirror_substitution(monkeypatch):
     )
     # Non-matching URLs are left alone.
     assert binaries._mirror_url("https://example.com/x") == "https://example.com/x"
+
+
+def test_download_wraps_tls_context_error_and_preserves_cause(monkeypatch, tmp_path):
+    error = ssl.SSLError("invalid configured certificate bundle")
+    monkeypatch.setattr(
+        binaries,
+        "_ssl_context",
+        lambda: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(binaries.BinaryFetchError, match="failed to configure TLS trust") as exc:
+        binaries._download("https://example.invalid/tool.tar.gz", tmp_path / "tool.tar.gz")
+
+    assert exc.value.__cause__ is error
 
 
 def test_mirror_url_with_query_params_strips_them_from_download_filename(
@@ -284,7 +404,7 @@ def test_download_retries_transient_network_failure(monkeypatch, tmp_path):
     attempts = 0
     sleeps: list[float] = []
 
-    def flaky_urlopen(req, timeout=None):  # noqa: ARG001
+    def flaky_urlopen(req, timeout=None, context=None):  # noqa: ARG001
         nonlocal attempts
         attempts += 1
         if attempts < 3:
@@ -465,7 +585,7 @@ def test_ensure_tools_partial_failure_proxy_still_starts(monkeypatch, allow_unve
     scc_asset = binaries._registry()["tools"]["scc"]["assets"]["darwin-aarch64"]
     scc_tar = _make_tar_gz({"scc": b"ok"})
 
-    def selective_urlopen(req, timeout=None):  # noqa: ARG001
+    def selective_urlopen(req, timeout=None, context=None):  # noqa: ARG001
         url = req.full_url if hasattr(req, "full_url") else req
         if url == scc_asset["url"]:
             return _FakeResponse(scc_tar)
@@ -490,6 +610,50 @@ def test_status_reports_every_registered_tool(monkeypatch):
     assert {"difft", "scc", "ast-grep"} <= names
     for r in rows:
         assert r["state"] in ("on-path", "cached", "missing", "unsupported-platform")
+
+
+# -------- HEADROOM_BINARIES_ALLOW_UNVERIFIED (security: fail closed) ------- #
+
+
+def _write(tmp_path, data: bytes):
+    p = tmp_path / "asset.bin"
+    p.write_bytes(data)
+    return p
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "  "])
+def test_allow_unverified_non_affirmative_still_verifies(monkeypatch, tmp_path, value):
+    # A security bypass must fail CLOSED: only an explicit affirmative disables
+    # verification. Setting the var to "0"/"false" (the natural way to say "keep
+    # verifying") previously passed a bare presence check and silently skipped
+    # sha256 verification of the downloaded binary.
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", value)
+    path = _write(tmp_path, b"payload")
+    with pytest.raises(binaries.Sha256Mismatch):
+        binaries._verify_sha256(path, "deadbeef" * 8)  # wrong pin
+
+
+def test_allow_unverified_unset_still_verifies(monkeypatch, tmp_path):
+    monkeypatch.delenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", raising=False)
+    path = _write(tmp_path, b"payload")
+    with pytest.raises(binaries.Sha256Mismatch):
+        binaries._verify_sha256(path, "deadbeef" * 8)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_allow_unverified_affirmative_skips_verification(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", value)
+    path = _write(tmp_path, b"payload")
+    # Wrong pin, but an explicit affirmative bypass returns without raising.
+    binaries._verify_sha256(path, "deadbeef" * 8)
+
+
+def test_verify_download_bytes_zero_still_verifies(monkeypatch):
+    # Same fail-closed contract on the in-memory installer path.
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", "0")
+    monkeypatch.setattr(binaries, "sha256_for_url", lambda _url: "deadbeef" * 8)
+    with pytest.raises(binaries.Sha256Mismatch):
+        binaries.verify_download_bytes(b"payload", url="https://x/y", name="y")
 
 
 # -------- Registry key hygiene ------------------------------------------- #

@@ -330,7 +330,7 @@ async def main():
     print("=" * 60)
     print("Google Gemini Multimodal E2E Tests")
     print("=" * 60)
-    print(f"Using API key: {api_key[:10]}...")
+    print("Using API key from environment")
 
     results = []
 

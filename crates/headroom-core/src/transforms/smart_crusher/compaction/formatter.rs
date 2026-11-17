@@ -282,17 +282,31 @@ fn write_table(
     }
     out.push('\n');
 
+    // Cells of a `json` column are decoded with `json.loads`, so a string
+    // that looks like a JSON literal needs its own quoting there.
+    let json_cols: Vec<bool> = schema.fields.iter().map(|f| f.type_tag == "json").collect();
+
     // Rows.
     for row in rows {
-        let cells: Vec<String> = row.0.iter().map(format_cell).collect();
+        let cells: Vec<String> = row
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format_cell(c, json_cols.get(i).copied().unwrap_or(false)))
+            .collect();
         out.push_str(&cells.join(","));
         out.push('\n');
     }
 }
 
-fn format_cell(c: &CellValue) -> String {
+fn format_cell(c: &CellValue, json_col: bool) -> String {
     match c {
         CellValue::Missing => String::new(),
+        CellValue::Scalar(Value::String(s)) if json_col && is_ambiguous_json_text(s) => {
+            // Render as a JSON string literal (then CSV-quoted) so the
+            // decoder gets this string back, not the value it spells.
+            csv_quote(&serde_json::to_string(s).unwrap_or_default())
+        }
         CellValue::Scalar(v) => json_scalar_to_csv(v),
         CellValue::Nested(sub) => {
             // Render nested as compact JSON; CSV-quote because it
@@ -337,11 +351,14 @@ fn humanize_bytes(n: usize) -> String {
 
 fn json_scalar_to_csv(v: &Value) -> String {
     match v {
-        Value::Null => String::new(),
+        // Keep null distinct from CellValue::Missing (empty field) and
+        // Value::String("") (quoted empty field). Literal string "null"
+        // is quoted below so these cases remain byte-distinguishable.
+        Value::Null => "null".to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => {
-            if needs_csv_quote(s) {
+            if s.is_empty() || s == "null" || needs_csv_quote(s) {
                 csv_quote(s)
             } else {
                 s.clone()
@@ -351,6 +368,17 @@ fn json_scalar_to_csv(v: &Value) -> String {
         // already promoted to Nested by the compactor).
         _ => csv_quote(&serde_json::to_string(v).unwrap_or_default()),
     }
+}
+
+/// True when `json.loads` could parse `s` into something other than the
+/// string itself. A conservative superset: after trimming JSON white
+/// space, `s` starts with `[`, `{`, `"`, `-` or a digit, or is one of the
+/// bare literals Python accepts (`true`, `false`, `null`, `NaN`,
+/// `Infinity`).
+fn is_ambiguous_json_text(s: &str) -> bool {
+    let t = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    matches!(t.chars().next(), Some('[' | '{' | '"' | '-' | '0'..='9'))
+        || matches!(t, "true" | "false" | "null" | "NaN" | "Infinity")
 }
 
 fn needs_csv_quote(s: &str) -> bool {
@@ -724,6 +752,155 @@ mod tests {
         assert!(with_summary.contains("__dropped:3"));
         let without = CsvSchemaFormatter::new().format(&c);
         assert!(!without.contains("__dropped"));
+    }
+
+    #[test]
+    fn csv_formatter_distinguishes_missing_null_empty_and_literal_null() {
+        let c = Compaction::Table {
+            schema: Schema {
+                fields: vec![super::super::ir::FieldSpec {
+                    name: "label".into(),
+                    type_tag: "string".into(),
+                    nullable: true,
+                }],
+            },
+            rows: vec![
+                Row::new(vec![CellValue::Missing]),
+                Row::new(vec![CellValue::Scalar(Value::Null)]),
+                Row::new(vec![CellValue::Scalar(Value::String(String::new()))]),
+                Row::new(vec![CellValue::Scalar(Value::String("null".into()))]),
+            ],
+            original_count: 4,
+        };
+        let out = CsvSchemaFormatter::new().format(&c);
+        assert_eq!(out, "[4]{label:string?}\n\nnull\n\"\"\n\"null\"\n");
+    }
+
+    #[test]
+    fn csv_formatter_nullable_swap_is_not_identical() {
+        let a = vec![
+            json!({"id": 1, "label": ""}),
+            json!({"id": 2, "label": null}),
+        ];
+        let b = vec![
+            json!({"id": 1, "label": null}),
+            json!({"id": 2, "label": ""}),
+        ];
+        let fa = CsvSchemaFormatter::new().format(&compact(&a, &cfg()));
+        let fb = CsvSchemaFormatter::new().format(&compact(&b, &cfg()));
+        assert_ne!(fa, fb);
+    }
+
+    /// Wire text of the single data row of a one-column table.
+    fn one_cell_wire(type_tag: &str, cell: Value) -> String {
+        let c = Compaction::Table {
+            schema: Schema {
+                fields: vec![super::super::ir::FieldSpec {
+                    name: "v".into(),
+                    type_tag: type_tag.into(),
+                    nullable: false,
+                }],
+            },
+            rows: vec![Row::new(vec![CellValue::Scalar(cell)])],
+            original_count: 1,
+        };
+        let out = CsvSchemaFormatter::new().format(&c);
+        out.lines().nth(1).unwrap().to_string()
+    }
+
+    #[test]
+    fn csv_formatter_json_column_quotes_strings_that_parse_as_json() {
+        // The cells are built by hand to pin the formatter's contract. Through
+        // `compact`, a string that parses as a JSON array or object (`[1]`,
+        // `{"a":1}`) never reaches the formatter as a string: the classifier
+        // un-escapes it first (`CellClass::StringifiedJson`).
+        // (string value, the JSON string literal it is rendered as)
+        let cases = [
+            ("null", r#""null""#),
+            ("true", r#""true""#),
+            ("false", r#""false""#),
+            ("1", r#""1""#),
+            ("-1", r#""-1""#),
+            ("1.5", r#""1.5""#),
+            ("NaN", r#""NaN""#),
+            ("Infinity", r#""Infinity""#),
+            ("-Infinity", r#""-Infinity""#),
+            (" 2 ", r#"" 2 ""#),
+            ("[1]", r#""[1]""#),
+            (r#"{"a":1}"#, r#""{\"a\":1}""#),
+            (r#""q""#, r#""\"q\"""#),
+        ];
+        for (s, literal) in cases {
+            let wire = one_cell_wire("json", Value::String(s.into()));
+            assert_eq!(wire, csv_quote(literal), "json column, string {s:?}");
+            // The control: other column types keep the old rendering.
+            let control = one_cell_wire("string", Value::String(s.into()));
+            assert_eq!(
+                control,
+                json_scalar_to_csv(&Value::String(s.into())),
+                "string column, string {s:?}"
+            );
+        }
+        assert_eq!(
+            one_cell_wire("json", Value::String("null".into())),
+            r#""""null""""#
+        );
+        assert_eq!(
+            one_cell_wire("string", Value::String("null".into())),
+            r#""null""#
+        );
+        assert_eq!(
+            one_cell_wire("string", Value::String("true".into())),
+            "true"
+        );
+    }
+
+    #[test]
+    fn csv_formatter_json_column_leaves_other_strings_alone() {
+        let cases = [
+            ("hello", "hello"),
+            ("a,b", r#""a,b""#),
+            (r#"q"uote"#, r#""q""uote""#),
+            (" ", " "),
+            ("x-y", "x-y"),
+            ("", r#""""#),
+        ];
+        for (s, wire) in cases {
+            assert_eq!(
+                one_cell_wire("json", Value::String(s.into())),
+                wire,
+                "json column, string {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_formatter_json_column_tells_strings_from_values() {
+        let items = vec![
+            json!({"id": 1, "v": "null"}),
+            json!({"id": 2, "v": null}),
+            json!({"id": 3, "v": "true"}),
+            json!({"id": 4, "v": true}),
+            json!({"id": 5, "v": "1"}),
+            json!({"id": 6, "v": 1}),
+            json!({"id": 7, "v": "hello"}),
+        ];
+        let c = compact(&items, &cfg());
+        let out = CsvSchemaFormatter::new().format(&c);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "[7]{id:int,v:json?}", "got: {out}");
+        assert_eq!(lines[1], r#"1,"""null""""#);
+        assert_eq!(lines[2], "2,null");
+        assert_eq!(lines[3], r#"3,"""true""""#);
+        assert_eq!(lines[4], "4,true");
+        assert_eq!(lines[5], r#"5,"""1""""#);
+        assert_eq!(lines[6], "6,1");
+        assert_eq!(lines[7], "7,hello");
+        // The string "true" and the bool true no longer share a wire form.
+        assert_ne!(
+            lines[3].split_once(',').unwrap().1,
+            lines[4].split_once(',').unwrap().1
+        );
     }
 
     #[test]

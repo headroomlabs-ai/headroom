@@ -12,7 +12,8 @@ Locks the following invariants:
 3. When a compression call exceeds its timeout, the awaiter unblocks with
    ``TimeoutError`` — but the worker thread keeps running (Python cannot
    preempt running CPython bytecode or in-flight Rust calls), and when the
-   work eventually completes, ``compression_leaked_threads`` increments.
+   work eventually completes, ``_compression_timed_out_workers_total``
+   increments.
 4. Jobs that time out while still queued do not leak the running gauge.
 5. ``/stats runtime.compression_executor`` surfaces the gauges + counters so
    operators can see leaked-thread rate and queue pressure.
@@ -23,7 +24,7 @@ Locks the following invariants:
 These tests also serve as documentation: anyone reading them sees that
 "timeout fired" does not mean "compression was cancelled" — it means "we
 stopped waiting; the worker is still going". A bounded pool plus the
-leaked-thread counter is how we make that visible.
+timed-out-worker counter is how we make that visible.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ pytest.importorskip("fastapi")
 
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS  # noqa: F401
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.tenant_key import get_current_tenant_key, set_request_tenant_key
 
 
 def _make_proxy(compression_max_workers: int | None = None):
@@ -81,6 +83,23 @@ def test_compression_executor_minimum_one_worker() -> None:
     """A non-positive override clamps to 1 (zero workers would deadlock)."""
     proxy = _make_proxy(compression_max_workers=0)
     assert proxy.compression_max_workers == 1
+
+
+def test_compression_executor_preserves_request_contextvars() -> None:
+    """Tenant context survives the thread-pool hop used by compression."""
+    proxy = _make_proxy(compression_max_workers=1)
+
+    async def _drive() -> str:
+        set_request_tenant_key("tenant_executor")
+        try:
+            return await proxy._run_compression_in_executor(
+                get_current_tenant_key,
+                timeout=10.0,
+            )
+        finally:
+            set_request_tenant_key(None)
+
+    assert asyncio.run(_drive()) == "tenant_executor"
 
 
 def test_in_flight_gauge_tracks_running_compressions() -> None:
@@ -127,6 +146,62 @@ def test_in_flight_gauge_tracks_running_compressions() -> None:
         assert proxy._compression_in_flight == 0
 
 
+def test_contextvars_set_before_submission_are_visible_inside_the_worker() -> None:
+    """`run_in_executor` doesn't copy contextvars into the worker thread by
+    default (unlike `asyncio.to_thread`) -- without the fix, code reading
+    `get_registered_cwd()` there would silently see the default, not what
+    request middleware bound. Locks the fix with a generic ContextVar and
+    the real one astgrep.py's disk-verify depends on."""
+    import contextvars
+
+    from headroom.proxy.project_context import get_registered_cwd, set_registered_cwd
+
+    proxy = _make_proxy(compression_max_workers=2)
+    probe: contextvars.ContextVar[str | None] = contextvars.ContextVar("test_probe", default=None)
+    observed: dict[str, object] = {}
+
+    def _read_contextvars_on_worker_thread():
+        observed["probe"] = probe.get()
+        observed["registered_cwd"] = get_registered_cwd()
+        return "done"
+
+    async def _drive():
+        probe.set("set-on-calling-coroutine")
+        set_registered_cwd("/some/registered/project")
+        return await proxy._run_compression_in_executor(
+            _read_contextvars_on_worker_thread, timeout=5.0
+        )
+
+    result = asyncio.run(_drive())
+    assert result == "done"
+    assert observed["probe"] == "set-on-calling-coroutine"
+    assert observed["registered_cwd"] == "/some/registered/project"
+
+
+def test_contextvars_propagate_through_background_executor_too() -> None:
+    """Same fix, same bug class, but the *other* submission point --
+    `_run_compression_background` (no timeout, no leaked-thread accounting)
+    -- has its own `contextvars.copy_context()` call, not shared code with
+    `_run_compression_in_executor`. Covered separately since a fix at one
+    call site doesn't imply the other was fixed too."""
+    from headroom.proxy.project_context import get_registered_cwd, set_registered_cwd
+
+    proxy = _make_proxy(compression_max_workers=1)
+    observed: dict[str, object] = {}
+
+    def _read_registered_cwd_on_worker_thread():
+        observed["registered_cwd"] = get_registered_cwd()
+        return "done"
+
+    async def _drive():
+        set_registered_cwd("/some/other/registered/project")
+        return await proxy._run_compression_background(_read_registered_cwd_on_worker_thread)
+
+    result = asyncio.run(_drive())
+    assert result == "done"
+    assert observed["registered_cwd"] == "/some/other/registered/project"
+
+
 def test_high_water_mark_persists_after_completion() -> None:
     """``_compression_in_flight_max`` is monotonic — never decreases."""
     proxy = _make_proxy(compression_max_workers=8)
@@ -171,7 +246,7 @@ def test_high_water_mark_persists_after_completion() -> None:
 def test_timeout_fires_and_leaked_thread_is_counted() -> None:
     """When the compression exceeds ``timeout``, the awaiter sees
     ``TimeoutError`` immediately. The worker keeps running; when it finishes,
-    ``_compression_leaked_threads`` increments by 1.
+    ``_compression_timed_out_workers_total`` increments by 1.
     """
     proxy = _make_proxy(compression_max_workers=2)
     finished_event = threading.Event()
@@ -195,13 +270,13 @@ def test_timeout_fires_and_leaked_thread_is_counted() -> None:
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
         with proxy._compression_metrics_lock:
-            if proxy._compression_leaked_threads >= 1:
+            if proxy._compression_timed_out_workers_total >= 1:
                 break
         time.sleep(0.01)
 
     with proxy._compression_metrics_lock:
-        assert proxy._compression_leaked_threads >= 1, (
-            f"leaked_threads should be ≥ 1; got {proxy._compression_leaked_threads}. "
+        assert proxy._compression_timed_out_workers_total >= 1, (
+            f"timed-out-worker count should be ≥ 1; got {proxy._compression_timed_out_workers_total}. "
             f"The worker either didn't finish past the deadline, or the wrapper "
             f"didn't increment the counter."
         )
@@ -262,7 +337,7 @@ def test_timeout_quarantines_new_work_until_timed_out_worker_finishes() -> None:
 
         with proxy._compression_metrics_lock:
             assert proxy._compression_timed_out_in_flight == 0
-            assert proxy._compression_leaked_threads == 1
+            assert proxy._compression_timed_out_workers_total == 1
 
         # Quarantine is self-clearing: normal compression resumes after the
         # timed-out worker has genuinely left the executor.
@@ -274,6 +349,93 @@ def test_timeout_quarantines_new_work_until_timed_out_worker_finishes() -> None:
     prometheus_text = asyncio.run(_drive())
     assert 'headroom_compression_quarantine_total{event="activated"} 1' in prometheus_text
     assert 'headroom_compression_quarantine_total{event="skipped"} 1' in prometheus_text
+
+
+def test_quarantine_waits_for_half_the_pool_to_be_stuck() -> None:
+    """One straggler must not refuse compression while most workers are idle.
+
+    The quarantine exists so timed-out work cannot saturate the executor. On
+    an 8-worker pool, one or three stuck workers leave the pool mostly idle,
+    so compression keeps running; at four (half the pool) the quarantine
+    engages, is counted once, and ``/health`` reports it. A timeout after the
+    time cap released it counts as a fresh activation.
+    """
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import CompressionQuarantinedError
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        compression_max_workers=8,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    release = threading.Event()
+
+    async def _strand(count: int) -> None:
+        for _ in range(count):
+            with pytest.raises(asyncio.TimeoutError):
+                await proxy._run_compression_in_executor(release.wait, timeout=0.05)
+
+    def _executor_health() -> dict:
+        with TestClient(app) as client:
+            return client.get("/health").json()["runtime"]["compression_executor"]
+
+    try:
+        asyncio.run(_strand(1))
+        assert asyncio.run(proxy._run_compression_in_executor(lambda: "ran", timeout=1.0)) == "ran"
+        health = _executor_health()
+        assert health["timed_out_workers"] == 1
+        assert health["quarantine_active"] is False
+
+        asyncio.run(_strand(2))
+        assert asyncio.run(proxy._run_compression_in_executor(lambda: "ran", timeout=1.0)) == "ran"
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_quarantine_activations == 0
+            assert proxy._compression_quarantine_skips == 0
+            assert proxy._compression_quarantine_releases == 0
+
+        asyncio.run(_strand(1))
+        with pytest.raises(CompressionQuarantinedError):
+            asyncio.run(proxy._run_compression_in_executor(lambda: "unused", timeout=1.0))
+        health = _executor_health()
+        assert health["timed_out_workers"] == 4
+        assert health["quarantine_active"] is True
+        assert health["quarantine_activations_total"] == 1
+        assert health["quarantine_skips_total"] == 1
+
+        proxy._compression_quarantine_deadline = time.monotonic() - 1.0
+        assert asyncio.run(proxy._run_compression_in_executor(lambda: "ran", timeout=1.0)) == "ran"
+        assert proxy._compression_quarantine_releases == 1
+        asyncio.run(_strand(1))
+        with pytest.raises(CompressionQuarantinedError):
+            asyncio.run(proxy._run_compression_in_executor(lambda: "unused", timeout=1.0))
+        assert proxy._compression_quarantine_activations == 2
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    ("workers", "env", "expected"),
+    [(8, None, 4), (3, None, 1), (1, None, 1), (8, "1", 1), (8, "0", 4)],
+)
+def test_quarantine_threshold_is_half_the_pool_unless_overridden(
+    monkeypatch, workers: int, env: str | None, expected: int
+) -> None:
+    if env is None:
+        monkeypatch.delenv("HEADROOM_COMPRESSION_QUARANTINE_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("HEADROOM_COMPRESSION_QUARANTINE_THRESHOLD", env)
+    proxy = _make_proxy(compression_max_workers=workers)
+    assert proxy._compression_quarantine_threshold == expected
 
 
 def test_timeout_before_worker_start_does_not_leak_in_flight() -> None:
@@ -325,7 +487,7 @@ def test_timeout_before_worker_start_does_not_leak_in_flight() -> None:
     with proxy._compression_metrics_lock:
         assert proxy._compression_queued == 0
         assert proxy._compression_in_flight == 0
-        assert proxy._compression_leaked_threads == 0
+        assert proxy._compression_timed_out_workers_total == 0
         assert proxy._compression_timed_out_in_flight == 0
         assert proxy._compression_quarantine_activations == 0
         assert proxy._compression_quarantine_skips == 0
@@ -426,6 +588,9 @@ def test_compression_executor_metrics_appear_in_runtime_payload() -> None:
         assert ce["queue_wait_seconds_total"] == 0.0
         assert ce["run_seconds_total"] == 0.0
         assert ce["leaked_threads_total"] == 0
+        # Deprecated alias must track the canonical counter (#3653).
+        assert ce["timed_out_workers_total"] == 0
+        assert ce["timed_out_workers_total"] == ce["leaked_threads_total"]
         assert ce["quarantine_active"] is False
         assert ce["timed_out_workers"] == 0
         assert ce["timed_out_workers_max"] == 0

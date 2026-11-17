@@ -41,8 +41,8 @@ jobs:
     outputs:
       rust: ${{ steps.decide.outputs.rust }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         if: github.event_name == 'pull_request' || github.event_name == 'push'
         with:
@@ -65,26 +65,38 @@ jobs:
           esac
 
   test:
-    name: test (ubuntu)
+    # `test (ubuntu)` keeps its exact check name, which branch protection may
+    # require. macOS runs only `cargo test`: the magika/ORT tests there take a
+    # different path (Core ML EP, `ps -M` thread counts, #4191) that Linux
+    # never exercises; fmt/clippy stay on Ubuntu.
+    name: test (${{ matrix.name }})
     needs: rust-changes
     if: needs.rust-changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu
+            os: ubuntu-latest
+          - name: macos
+            os: macos-26
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable toolchain
         # Pin action code to @stable (latest fixes), toolchain version
         # via input. The @1.95.0 ref shipped action code that errors on
         # ubuntu-latest with `detected conflict: 'bin/cargo-clippy'`
         # because the pre-installed runner Rust collides with the
         # clippy-preview component install.
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v7
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
       - name: Provide ONNX Runtime dylib
@@ -139,11 +151,19 @@ jobs:
           print(f"onnxruntime {version} -> {libs[0]}", file=sys.stderr)
           PY
       - name: cargo fmt --check
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
       - name: cargo clippy
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      - name: cargo test (magika idle threads)
+        # Cargo stops at the first failing test binary, so a failure elsewhere
+        # in the suite would skip this macOS-specific check (#4191). Run it on
+        # its own even then; --nocapture keeps its thread counts in the log.
+        if: ${{ !cancelled() && matrix.os == 'macos-26' }}
+        run: cargo test -p headroom-core --test magika_idle_threads -- --nocapture
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
@@ -156,13 +176,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.95.0
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: cargo test simulator-backed proxy e2e
         run: cargo test -p headroom-proxy --test e2e_simulators
 
@@ -179,7 +199,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             maturin-target: x86_64
-          - os: macos-14
+          - os: macos-26
             target: aarch64-apple-darwin
             maturin-target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -188,12 +208,12 @@ jobs:
         # Intel macOS uses `ort-load-dynamic` (no prebuilt ORT from ort-sys);
         # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
       - name: "Build wheel (single-wheel architecture builds headroom-ai)"
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         # Maturin reads `[tool.maturin]` from the root `pyproject.toml`
         # which points at `crates/headroom-py/Cargo.toml` for the cdylib.
         # Output is `headroom_ai-<ver>-<py>-<py>-<platform>.whl` containing
@@ -203,37 +223,15 @@ jobs:
           args: --release --out dist
           target: ${{ matrix.maturin-target }}
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
 
-  audit:
-    name: audit
-    needs: rust-changes
-    if: needs.rust-changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit + cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit,cargo-deny
-      # Blocking. Soft-failing this made it useless: RUSTSEC-2026-0258 (h2,
-      # unbounded empty DATA frames -> unbounded memory or a panic) was
-      # reported by this job for as long as it existed and never turned a run
-      # red, so nobody acted on it. Accepted advisories go in audit.toml with
-      # a written reason rather than being swallowed wholesale here.
-      - name: cargo audit
-        run: cargo audit
-      - name: cargo deny check licenses
-        continue-on-error: true
-        run: cargo deny check licenses
+  # The Rust dependency advisory scan (`cargo audit`) moved to security.yml,
+  # where it runs on every PR and push regardless of which paths changed. Here
+  # it sat behind the `rust-changes` filter and this workflow's schedule, and
+  # that combination let three weeks pass with no scan at all.
 
   # Blocking on every PR that touches Rust. Safe to harden now because the
   # harness fails only on a Diff — `parity-run` sets `any_diffs` inside the
@@ -251,11 +249,11 @@ jobs:
     if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # No Python toolchain: headroom-parity links headroom-core directly and
       # never crosses into the interpreter, so the venv + maturin + `pip
       # install -e .` setup this job used to do was pure overhead.

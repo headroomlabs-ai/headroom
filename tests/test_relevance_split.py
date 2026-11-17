@@ -42,13 +42,70 @@ def test_segment_windows_dense_stream_losslessly():
 
 
 def test_segment_keeps_indented_continuation_attached():
-    # window=1 forces splitting, but indented continuation lines must stay
-    # with their head line (stack-trace / pretty-JSON safety).
+    # window=1 forces splitting, but a SHORT (sub-budget) indented continuation
+    # stays with its head line (stack-trace / pretty-JSON safety). This holds
+    # only while the run fits in max_chars; a longer run is bounded and its later
+    # segments start headless, pinned by the test two below.
     text = "ERROR boom\n  File a.py line 1\n  File b.py line 2\nnext record\n"
     segs = segment(text, window=1)
     assert "".join(segs) == text
     for s in segs:
-        assert not s.startswith((" ", "\t"))  # every segment starts at a head line
+        assert not s.startswith((" ", "\t"))  # sub-budget run: each segment has its head
+
+
+def test_segment_bounds_indented_continuation_by_max_chars():
+    # A long indented run (deep stack trace / indented log payload) must NOT
+    # collapse into one mega-segment: it is bounded by max_chars, not just by
+    # indentation, so the blob splits into multiple scorable records instead of
+    # being scored all-or-nothing as a single record.
+    text = "HEADER (not indented)\n" + "".join(f"    frame line {i:03d}\n" for i in range(300))
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text  # partition stays lossless
+    assert len(segs) > 2  # split into records, not one mega-segment
+    assert all(len(s) <= 1200 for s in segs)  # every segment held to max_chars
+
+
+def test_segment_long_indented_run_yields_headless_segments():
+    # The cost of bounding a long run: once the budget is spent mid-run the next
+    # segment necessarily begins on an indented continuation line, so it is
+    # scored without its head line. Pinned so the trade-off is deliberate rather
+    # than an accident, and so it is not mistaken for the head-line property the
+    # sub-budget test above asserts.
+    text = "ERROR boom\n" + "".join(f"    frame {i:03d} in handler\n" for i in range(200))
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text
+    assert len(segs) > 2
+    assert any(s.startswith((" ", "\t")) for s in segs)
+
+
+def test_segment_bounds_block_of_long_lines():
+    # The budget covers the whole segment, not only the continuation, so a block
+    # of plain (non-indented) long lines is windowed by chars rather than by line
+    # count alone. Without that, `window` lines of long text sail past max_chars.
+    text = "".join("L" * 500 + "\n" for _ in range(8))
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text
+    assert all(len(s) <= 1200 for s in segs)
+
+
+def test_segment_keeps_over_long_single_line_atomic():
+    # A single line longer than max_chars cannot be split without breaking the
+    # lossless partition, so it is emitted whole and the bound yields to it.
+    text = "X" * 5000 + "\n" + "short tail\n"
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text
+    assert len(segs[0]) == 5001
+
+
+def test_segment_bounds_continuation_across_blank_delimited_blocks():
+    # Blank lines split blocks (Pass 1); a long indented run inside one block is
+    # still windowed under max_chars (Pass 2). The whole partition stays lossless
+    # across both passes with short surrounding paragraphs intact.
+    block = "head\n" + "".join(f"\tdetail {i:03d}\n" for i in range(200))
+    text = "intro paragraph\n\n" + block + "\ntail note\n"
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text
+    assert all(len(s) <= 1200 for s in segs)
 
 
 def test_split_keeps_relevant_drops_irrelevant():
@@ -66,6 +123,31 @@ def test_split_keeps_relevant_drops_irrelevant():
     assert "widgets" in dropped
     # partition stays lossless regardless of keep/drop labels
     assert "".join(t for _, t in runs) == content
+
+
+def test_split_uses_all_user_text_blocks():
+    from headroom.relevance.bm25 import BM25Scorer
+    from headroom.utils import extract_user_query
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Review production incidents"},
+                {"type": "text", "text": "Focus on Kafka replication"},
+            ],
+        }
+    ]
+    content = (
+        "Production incident: payment gateway high latency\n\n"
+        "Kafka replication lag on broker 17 exceeded 30 minutes\n\n"
+        "Disk full on backup server\n\n"
+        "Production incident: expired TLS certificate\n"
+    )
+    runs = plan_relevance_split(content, extract_user_query(messages), BM25Scorer(), threshold=0.25)
+    kept = "".join(text for keep, text in runs if keep)
+    assert "Kafka replication lag" in kept
+    assert "Disk full on backup server" not in kept
 
 
 def test_empty_query_yields_no_split():
@@ -158,7 +240,9 @@ def test_router_lossless_mode_folds_only_no_drop():
     # irrelevant "widget" records must be PRESERVED, not silently dropped, and the
     # Kompress tail stub must never run.
     r = _router(split_on=True)  # lossless mode
-    out, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    out, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert chain == ["lossless_search"]
     assert "oauth token" in out  # relevant records kept
     assert "widget" in out  # irrelevant tail ALSO kept — no silent drop in lossless mode
@@ -171,7 +255,9 @@ def test_router_relevance_split_fires_in_ccr_mode():
     # #1721); the _try_ml_compressor stub stands in for it here. Proves the
     # split is mode-agnostic, not lossless-only.
     r = _router(split_on=True, lossless=False)
-    out, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    out, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert chain == ["search", "relevance_split"]
     assert "oauth token" in out
     assert "[TAIL]" in out
@@ -180,14 +266,18 @@ def test_router_relevance_split_fires_in_ccr_mode():
 def test_router_diff_stays_pure_lossless():
     r = _router(split_on=True)
     diff = "diff --git a/x b/x\nindex 111..222 100644\n@@ -1 +1 @@\n-old widget\n+new oauth token\n"
-    _, _, chain = r._apply_strategy_to_content(diff, CompressionStrategy.DIFF, "oauth token")
+    _, _, chain, _reversible = r._apply_strategy_to_content(
+        diff, CompressionStrategy.DIFF, "oauth token"
+    )
     assert "relevance_split" not in chain  # Kompressing hunks would break apply
     assert chain == ["lossless_diff"]
 
 
 def test_router_split_can_be_disabled():
     r = _router(split_on=False)
-    _, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
+    _, _, chain, _reversible = r._apply_strategy_to_content(
+        _SEARCH, CompressionStrategy.SEARCH, "oauth token"
+    )
     assert "relevance_split" not in chain
 
 

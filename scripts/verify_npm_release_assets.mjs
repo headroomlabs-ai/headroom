@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -65,15 +65,43 @@ function assertNoFileDependencies(pkg) {
   }
 }
 
-function runNpm(args, cwd) {
-  if (process.platform === "win32") {
-    return spawnSync("cmd.exe", ["/d", "/s", "/c", "npm.cmd", ...args], {
-      cwd,
-      encoding: "utf8",
-    });
+// npm on Windows is a .cmd shim, which only runs through cmd.exe, and cmd.exe
+// reinterprets characters such as & and | inside arguments (paths included).
+// Run npm's own CLI script under this Node binary instead, so no shell is
+// involved on any platform.
+function npmCommand(args) {
+  if (process.platform !== "win32") {
+    return ["npm", args];
   }
+  return [process.execPath, [findNpmCli(), ...args]];
+}
 
-  return spawnSync("npm", args, {
+// Node and npm can live in different directories (a node shim, or npm
+// upgraded into the global prefix), so look where npm itself says it is, then
+// next to node, then next to every npm.cmd on PATH. Every npm.cmd install
+// keeps its CLI at node_modules/npm/bin/npm-cli.js beside the shim.
+function findNpmCli() {
+  const cliPath = path.join("node_modules", "npm", "bin", "npm-cli.js");
+  const candidates = [];
+  if (process.env.npm_execpath?.endsWith("npm-cli.js")) {
+    candidates.push(process.env.npm_execpath);
+  }
+  candidates.push(path.join(path.dirname(process.execPath), cliPath));
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (dir && existsSync(path.join(dir, "npm.cmd"))) {
+      candidates.push(path.join(dir, cliPath));
+    }
+  }
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (!found) {
+    throw new Error(`npm CLI (npm-cli.js) not found. Looked in: ${candidates.join(", ")}`);
+  }
+  return found;
+}
+
+function runNpm(args, cwd) {
+  const [command, commandArgs] = npmCommand(args);
+  return spawnSync(command, commandArgs, {
     cwd,
     encoding: "utf8",
   });

@@ -76,12 +76,71 @@ def _extract_tool_result_content(msg: dict) -> str | None:
     return None
 
 
+def _can_swap_tool_result_content(msg: dict) -> bool:
+    """Whether replacing extracted text preserves the tool-result content shape.
+
+    A joined replacement cannot be mapped back to multiple blocks without
+    losing boundaries, metadata or media. All rewrite callers must check this
+    before extraction, transformation or savings accounting. Textless Anthropic
+    results remain stable without any rewrite.
+    """
+    content = msg.get("content")
+    if msg.get("role") != "tool":
+        if not isinstance(content, list):
+            return True
+        result = next(
+            (b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"),
+            None,
+        )
+        if result is None:
+            return True
+        content = result.get("content")
+        if content is None or (
+            isinstance(content, list)
+            and not any(isinstance(b, dict) and b.get("type") == "text" for b in content)
+        ):
+            return True
+    if isinstance(content, str):
+        return True
+    return (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+    )
+
+
+def _carries_tool_result_text(msg: dict) -> bool:
+    """Whether any tool result in ``msg`` holds text (both formats)."""
+    if msg.get("role") == "tool":
+        results = [msg.get("content")]
+    else:
+        results = [
+            b.get("content")
+            for b in msg.get("content") or []
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+    return any(
+        isinstance(c, str) or (isinstance(c, list) and _extract_text_from_blocks(c) is not None)
+        for c in results
+    )
+
+
 def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
-    """Deep copy msg and replace tool result content with new_content."""
+    """Deep copy and rewrite supported content; preserve unsupported layouts."""
     new_msg = copy.deepcopy(msg)
+    if not _can_swap_tool_result_content(msg):
+        return new_msg
     # OpenAI format
     if new_msg.get("role") == "tool":
-        new_msg["content"] = new_content
+        content = new_msg.get("content")
+        if isinstance(content, list):
+            # The shared guard permits only an unambiguous single text block.
+            # Keep its shape and metadata, including gateway cache breakpoints.
+            content[0]["text"] = new_content
+        else:
+            new_msg["content"] = new_content
         return new_msg
     # Anthropic format
     content = new_msg.get("content")
@@ -89,14 +148,14 @@ def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 inner = block.get("content")
-                if isinstance(inner, list):
-                    # Collapse list-of-blocks to a single text block.
-                    # The compressed content is a single string; preserving
-                    # multiple text blocks would produce a different joined
-                    # output on re-extraction (first text block replaced,
-                    # remaining text blocks still joined).
-                    block["content"] = [{"type": "text", "text": new_content}]
-                else:
+                if (
+                    isinstance(inner, list)
+                    and len(inner) == 1
+                    and isinstance(inner[0], dict)
+                    and inner[0].get("type") == "text"
+                ):
+                    inner[0]["text"] = new_content
+                elif isinstance(inner, str):
                     block["content"] = new_content
                 break
     return new_msg
@@ -294,9 +353,10 @@ class CompressionCache:
         """Count consecutive stable messages from the start.
 
         A message is stable if it is a plain user/assistant/system message,
-        an assistant message with tool_use blocks, or a tool_result whose
-        content hash is already in the cache. The first unstable tool_result
-        (cache miss) stops the count.
+        an assistant message with tool_use blocks, an Anthropic tool_result with no text
+        (nothing to replay), or a tool_result whose cached text and shape can
+        be replayed. A cache miss or unsupported text shape stops the count.
+        A joined text hash alone does not prove shape-safe replay.
 
         The trailing message is *always* excluded from the frozen prefix
         (cap of ``len(messages) - 1``). The trailing message represents
@@ -314,14 +374,25 @@ class CompressionCache:
             count = 0
             for msg in messages:
                 if _is_tool_result_message(msg):
+                    # A joined-text cache/stable hash cannot prove replay for
+                    # shapes that apply_cached deliberately leaves untouched.
+                    # Anthropic textless results retain their no-rewrite path.
+                    if not _can_swap_tool_result_content(msg):
+                        break
                     content = _extract_tool_result_content(msg)
                     if content is not None:
                         h = self.content_hash(content)
                         if h not in self._cache and h not in self._stable_hashes:
                             break
-                    else:
-                        # tool_result with non-string content; treat as unstable
+                    elif _carries_tool_result_text(msg):
+                        # Text after a textless first tool_result: the cache
+                        # keys a message by its first one, so this text was
+                        # never stored and cannot be byte-replayed.
                         break
+                    # A tool_result with no text at all (a ToolSearch
+                    # tool_reference list, an image) gives the cache nothing
+                    # to replay, so it is stable. As a miss it stopped the
+                    # count for the rest of the session.
                 # Regular user/assistant/system messages and assistant+tool_use
                 # are always stable — fall through.
                 count += 1
@@ -341,6 +412,9 @@ class CompressionCache:
         with self._lock:
             result: list[dict] = []
             for msg in messages:
+                if not _can_swap_tool_result_content(msg):
+                    result.append(msg)
+                    continue
                 if _is_tool_result_message(msg):
                     content = _extract_tool_result_content(msg)
                     if content is not None:

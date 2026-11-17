@@ -41,6 +41,7 @@ blending two meanings.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 
 # Reuse the proxy tracker's pricing + normalization so MCP and proxy events
 # bucket models identically and price them through one implementation.
@@ -67,6 +69,26 @@ try:
     _HAS_FCNTL = True
 except ImportError:
     _HAS_FCNTL = False
+
+logger = logging.getLogger(__name__)
+
+# The first failed append to each ledger path is a WARNING so an unwritable
+# ledger is visible; repeats drop to DEBUG so a persistent failure cannot flood
+# logs. A successful append re-arms the path.
+_append_warnings = WarnOnce(64, "unwritable savings ledgers")
+
+
+def _warn_append_failure(target: Path, exc: BaseException) -> None:
+    if _append_warnings.first(str(target), logger):
+        logger.warning(
+            "savings ledger: append to %s failed: %s; savings will not be recorded. "
+            "Make the directory writable or set HEADROOM_SAVINGS_EVENTS_PATH.",
+            target,
+            describe_exception(exc),
+        )
+    else:
+        logger.debug("savings ledger: append to %s failed: %s", target, describe_exception(exc))
+
 
 SCHEMA_VERSION = 2
 UNKNOWN = "unknown"
@@ -201,7 +223,8 @@ def _price_event(
     """
     try:
         from headroom.pricing.counterfactual import CacheMix, Region, price_savings
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("savings ledger: pricing module failed to import: %s", describe_exception(exc))
         return None
 
     cache = event.get("cache") or {}
@@ -244,7 +267,12 @@ def _price_event(
             total += priced.usd
             total_list += priced.usd_list
             bases.append(priced.basis)
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "savings ledger: pricing failed for model=%s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
         return None
 
     if not bases:
@@ -277,6 +305,8 @@ def record_savings_event(
     uncached_input_tokens: Any = 0,
     cache_inferred: Any = False,
     provider: Any = None,
+    new_input_tokens: int | None = None,
+    deferred_tokens: int = 0,
 ) -> bool:
     """Append one savings event to the durable ledger. Never raises.
 
@@ -287,7 +317,25 @@ def record_savings_event(
     proxy path does; the MCP path does not), both are recorded and the event
     also carries a cache-aware ``cost_effective_usd``. ``cost_usd`` keeps its
     original list-priced meaning either way, so existing readers are unaffected.
+    ``new_input_tokens`` is the provider-billed input that newly entered
+    context this request (uncached + cache-write), the denominator /stats
+    reports as ``new_input_savings_percent``. ``deferred_tokens`` is the part
+    of ``saved`` that is tool-schema deferral, which rides the cached prefix
+    and is never part of new input; it is subtracted from the numerator so the
+    ledger pairs compression-only savings with new input exactly as /stats
+    does. Both are optional so MCP-tool events and older callers keep writing
+    the same line they always did.
+
+    A request that saved nothing but carries ``new_input_tokens`` is still
+    written, as a denominator-only observation: the new-input basis must see
+    every request that newly billed input, not only the ones compression
+    touched, or a 100-saved/100-new turn followed by a 0-saved/10,000-new turn
+    reads as 50 percent instead of under 1. Without ``new_input_tokens`` a
+    zero-saving request is skipped exactly as before.
     """
+
+    if _paths.process_is_stateless():
+        return False
 
     try:
         before = max(int(tokens_before), 0)
@@ -296,7 +344,7 @@ def record_savings_event(
         return False
 
     saved = max(before - after, 0)
-    if saved <= 0:
+    if saved <= 0 and new_input_tokens is None:
         return False
 
     model_label = _normalize_model(model)
@@ -320,6 +368,13 @@ def record_savings_event(
         "source": str(source or UNKNOWN),
         "pid": os.getpid(),
     }
+    if new_input_tokens is not None:
+        try:
+            event["new_input"] = max(int(new_input_tokens), 0)
+            event["deferred"] = min(max(int(deferred_tokens), 0), saved)
+        except (TypeError, ValueError):
+            event.pop("new_input", None)
+            event.pop("deferred", None)
 
     # The savings split. Recorded only when the caller actually knows it —
     # absent means "one undifferentiated figure", which is what every v1 event
@@ -371,6 +426,8 @@ def record_savings_event(
             if cost_usd is None:
                 event["cost_usd"] = round(list_usd, 6)
 
+    if not _paths.persistence_allowed("savings ledger"):
+        return False
     target = _resolve_path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -383,9 +440,11 @@ def record_savings_event(
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        _warn_append_failure(target, exc)
         return False
 
+    _append_warnings.forget(str(target))
     _maybe_compact(target)
     return True
 
@@ -425,7 +484,13 @@ def _read_events(
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "savings ledger: could not read %s: %s. Check that it is a readable file, "
+            "or set HEADROOM_SAVINGS_EVENTS_PATH.",
+            target,
+            describe_exception(exc),
+        )
         return []
     return events
 
@@ -443,6 +508,10 @@ class _Bucket:
     #: Weakest pricing basis among the events in this bucket, so a total cannot
     #: read as better-grounded than its worst contributing event.
     basis: str | None = None
+    # Only events that recorded new input contribute to BOTH of these, so the
+    # ratio never pairs one event's savings with another event's denominator.
+    new_input_tokens: int = 0
+    new_input_saved: int = 0
 
     def add(
         self,
@@ -452,7 +521,15 @@ class _Bucket:
         cost: float,
         cost_effective: float | None = None,
         basis: str | None = None,
+        new_input: int | None = None,
+        deferred: int = 0,
     ) -> None:
+        if saved <= 0 and new_input is not None:
+            # Denominator-only observation (see record_savings_event): it
+            # belongs in the new-input basis and nowhere else, so calls,
+            # before/saved and cost keep their saved-event semantics.
+            self.new_input_tokens += new_input
+            return
         self.tokens_saved += saved
         self.tokens_before += before
         self.cost_usd += cost
@@ -464,12 +541,29 @@ class _Bucket:
         self.cost_effective_usd += cost if cost_effective is None else cost_effective
         self.calls += 1
         self.basis = _weakest(self.basis, basis)
+        if new_input is not None:
+            self.new_input_tokens += new_input
+            self.new_input_saved += max(saved - deferred, 0)
 
     @property
     def savings_percent(self) -> float:
         if self.tokens_before <= 0:
             return 0.0
         return round(self.tokens_saved / self.tokens_before * 100, 1)
+
+    @property
+    def new_input_savings_percent(self) -> float:
+        """Compression-only savings as a share of what newly entered context.
+
+        The whole-wire ratio above recounts a session's cached history every
+        turn, so long sessions read as ~0% no matter how well compression does
+        on new content. Same definition as /stats ``new_input_savings_percent``:
+        saved / (new input + saved), since removed tokens never reached the
+        provider and are added back to form the baseline.
+        """
+        if self.new_input_tokens <= 0:
+            return 0.0
+        return round(self.new_input_saved / (self.new_input_tokens + self.new_input_saved) * 100, 1)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -480,6 +574,8 @@ class _Bucket:
             "basis": self.basis or BASIS_LIST,
             "calls": self.calls,
             "savings_percent": self.savings_percent,
+            "new_input_tokens": self.new_input_tokens,
+            "new_input_savings_percent": self.new_input_savings_percent,
         }
 
 
@@ -493,7 +589,8 @@ def _weakest(existing: str | None, incoming: str | None) -> str | None:
         from headroom.pricing.counterfactual import weakest_basis
 
         return weakest_basis(existing, incoming)
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("savings ledger: could not compare pricing bases: %s", describe_exception(exc))
         return existing
 
 
@@ -590,6 +687,15 @@ def aggregate_savings(
         # built from them widens to a union that no longer type-checks against
         # `add`'s signature. Listed out per bucket rather than via a local
         # helper, which would close over these loop variables.
+        new_input: int | None = None
+        deferred = 0
+        if event.get("new_input") is not None:
+            try:
+                new_input = max(int(event.get("new_input") or 0), 0)
+                deferred = max(int(event.get("deferred", 0) or 0), 0)
+            except (TypeError, ValueError):
+                new_input = None
+
         targets = [windowed]
         if ts >= today_cutoff:
             targets.append(today)
@@ -605,6 +711,8 @@ def aggregate_savings(
                 cost=cost,
                 cost_effective=effective,
                 basis=basis,
+                new_input=new_input,
+                deferred=deferred,
             )
 
     model_rows = _ranked(by_model, "model")
@@ -687,7 +795,8 @@ def _maybe_compact(target: Path) -> None:
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        logger.debug("savings ledger: compaction of %s failed: %s", target, describe_exception(exc))
         return
 
 
