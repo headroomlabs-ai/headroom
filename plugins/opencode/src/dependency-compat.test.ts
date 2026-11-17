@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import { Effect, FileSystem, Path } from "effect";
-import { Primitive } from "effect/unstable/cli";
+import { Primitive } from "effect/cli";
 import { describe, expect, it } from "vitest";
 
 function parseConfig(content: string): Promise<unknown> {
@@ -10,7 +10,7 @@ function parseConfig(content: string): Promise<unknown> {
     readFileString: () => Effect.succeed(content),
   });
   return Effect.runPromise(
-    Primitive.fileParse({ format: "toml" }).parse("/headroom/config.toml").pipe(
+    Primitive.FileParse({ format: "toml" }).parse("/headroom/config.toml").pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
       Effect.provide(Path.layer),
     ) as Effect.Effect<unknown, string>,
