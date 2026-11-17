@@ -1,9 +1,8 @@
 //! `JsonMinifier` — a [`ReformatTransform`] that strips insignificant
-//! whitespace from JSON via `serde_json` round-trip.
+//! whitespace from validated JSON without reserializing its values.
 //!
-//! Lossless by construction: parse to `serde_json::Value`, re-emit
-//! compactly, return whichever is shorter. No CCR involvement —
-//! reformat transforms never need it.
+//! Strings, escapes, number literals, key order and duplicate keys remain
+//! byte-identical. No CCR involvement — reformat transforms never need it.
 //!
 //! [`ReformatTransform`]: crate::transforms::pipeline::traits::ReformatTransform
 
@@ -16,6 +15,43 @@ const NAME: &str = "json_minifier";
 /// since `JsonObject` and `JsonArray` are both registered content types.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JsonMinifier;
+
+impl JsonMinifier {
+    /// Return a smaller data-equivalent JSON representation, or no rewrite.
+    pub fn minify(&self, content: &str) -> Result<Option<String>, TransformError> {
+        if content.trim().is_empty() {
+            return Err(TransformError::skipped(NAME, "empty input"));
+        }
+        let _: &serde_json::value::RawValue = serde_json::from_str(content)
+            .map_err(|e| TransformError::invalid_input(NAME, e.to_string()))?;
+        let mut output: Option<String> = None;
+        let mut segment_start = 0;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (index, byte) in content.bytes().enumerate() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else if byte == b'"' {
+                quoted = true;
+            } else if matches!(byte, b' ' | b'\n' | b'\r' | b'\t') {
+                output
+                    .get_or_insert_with(|| String::with_capacity(content.len() - 1))
+                    .push_str(&content[segment_start..index]);
+                segment_start = index + 1;
+            }
+        }
+        if let Some(output) = &mut output {
+            output.push_str(&content[segment_start..]);
+        }
+        Ok(output)
+    }
+}
 
 impl ReformatTransform for JsonMinifier {
     fn name(&self) -> &'static str {
@@ -30,40 +66,25 @@ impl ReformatTransform for JsonMinifier {
     }
 
     fn apply(&self, content: &str) -> Result<ReformatOutput, TransformError> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return Err(TransformError::skipped(NAME, "empty input"));
-        }
-
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| TransformError::invalid_input(NAME, e.to_string()))?;
-
-        let minified = serde_json::to_string(&value)
-            .map_err(|e| TransformError::internal(NAME, e.to_string()))?;
-
-        // Defensive: if minification grew the byte count (e.g. caller
-        // already passed compact JSON, or escaping rules added bytes),
-        // hand the original back so we never inflate the wire output.
-        if minified.len() >= content.len() {
-            return Ok(ReformatOutput::from_lengths(
-                content.len(),
-                content.to_string(),
-            ));
-        }
-
-        Ok(ReformatOutput::from_lengths(content.len(), minified))
+        let output = self.minify(content)?.unwrap_or_else(|| content.to_string());
+        Ok(ReformatOutput::from_lengths(content.len(), output))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn name_and_applies_to() {
-        let m = JsonMinifier;
-        assert_eq!(m.name(), "json_minifier");
-        assert_eq!(m.applies_to(), &[ContentType::JsonArray]);
+    fn minification_preserves_json_literals() {
+        let input =
+            r#" { "z": 123456789012345678901234567890, "a": 1.2300e+400, "z": "\u0061 \" b 🌍" } "#;
+        let compact =
+            r#"{"z":123456789012345678901234567890,"a":1.2300e+400,"z":"\u0061 \" b 🌍"}"#;
+        assert_eq!(
+            JsonMinifier.minify(input).unwrap().as_deref(),
+            Some(compact)
+        );
+        assert_eq!(JsonMinifier.minify(compact).unwrap(), None);
     }
 
     #[test]

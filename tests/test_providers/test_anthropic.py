@@ -3,6 +3,73 @@
 import pytest
 
 
+class TestContextLimitCache:
+    @pytest.mark.parametrize("metadata_field", ["max_input_tokens", "max_tokens"])
+    @pytest.mark.parametrize(
+        ("first", "second", "metadata", "expected"),
+        [
+            ("gpt-4", "gpt-4-turbo", {"gpt-4": 8192, "gpt-4-turbo": 128000}, (8192, 128000)),
+            ("gpt-4-turbo", "gpt-4", {"gpt-4": 8192, "gpt-4-turbo": 128000}, (128000, 8192)),
+            ("gateway", "gateway-large", {"gateway-large": 1000000}, (128000, 1000000)),
+            ("gateway", "gateway-unknown", {"gateway": 64000}, (64000, 128000)),
+            (
+                "claude-future-sonnet",
+                "claude-future-sonnet-extended",
+                {"claude-future-sonnet-extended": 1000000},
+                (200000, 1000000),
+            ),
+            ("gateway", "gateway-sonnet", {}, (128000, 200000)),
+            (
+                "claude-future",
+                "claude-future-long",
+                {"claude-future-long": 640000},
+                (200000, 640000),
+            ),
+            (
+                "gateway-20260101",
+                "gateway",
+                {"gateway-20260101": 64000, "gateway": 128000},
+                (64000, 128000),
+            ),
+        ],
+    )
+    def test_each_model_keeps_its_own_resolved_limit(
+        self, monkeypatch, first, second, metadata, expected, metadata_field
+    ):
+        import headroom.providers.anthropic as anthropic_module
+
+        lookups = []
+
+        def get_model_info(model):
+            lookups.append(model)
+            return {metadata_field: metadata[model]} if model in metadata else None
+
+        monkeypatch.setattr(
+            anthropic_module, "_get_litellm_clients", lambda: (None, get_model_info)
+        )
+        provider = anthropic_module.AnthropicProvider(warn=False)
+
+        assert (provider.get_context_limit(first), provider.get_context_limit(second)) == expected
+        assert (provider.get_context_limit(first), provider.get_context_limit(second)) == expected
+        assert lookups == [first, second]
+        assert provider.supports_model(first)
+        assert provider.supports_model(second)
+
+    def test_configured_aliases_and_1m_suffix_keep_their_limits(self, monkeypatch):
+        import headroom.providers.anthropic as anthropic_module
+
+        monkeypatch.setattr(anthropic_module, "_get_litellm_clients", lambda: (None, None))
+        provider = anthropic_module.AnthropicProvider(
+            context_limits={"gateway": 64000, "gateway-exact": 96000}, warn=False
+        )
+
+        assert provider.get_context_limit("gateway-20260101") == 64000
+        assert provider.get_context_limit("gateway-exact") == 96000
+        assert provider.get_context_limit("gateway[1m]") == 1000000
+        assert provider.get_context_limit("gateway") == 64000
+        assert provider.get_context_limit("claude-sonnet-4-5-20250929") == 200000
+
+
 class TestAnthropicModelSanitization:
     def test_sanitize_model_id_removes_ansi_escape_sequences(self):
         from headroom.providers.anthropic import sanitize_anthropic_model_id

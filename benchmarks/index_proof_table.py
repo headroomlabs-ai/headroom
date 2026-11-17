@@ -82,61 +82,51 @@ def main() -> int:
 
     tok = OpenAICompatibleTokenCounter(model=MODEL)
 
-    # Two configurations, because the default protects the tail of the
-    # conversation and these scenarios are only 3-5 messages long. Under the
-    # default, protect_recent=4 shields almost every tool result and the
-    # measurement says more about the guard than about the compressor.
+    # One configuration: the default, i.e. what a coding agent actually gets.
     #
-    #   "default"  - what a coding agent actually gets out of the box.
-    #   "full"     - protect_recent=0, every tool result eligible. This is the
-    #                honest number for "how far can this payload compress",
-    #                and it is the one a benchmark table should quote, LABELLED.
-    configs = {
-        "default (protect_recent=4)": CompressConfig(),
-        "full corpus (protect_recent=0)": CompressConfig(protect_recent=0),
-    }
+    # A second `protect_recent=0` run used to be printed here, and came out
+    # identical in every row and in the total (#4732). Not a coincidence: the
+    # router applies `protect_recent` only to content detected as SOURCE_CODE
+    # ("Don't compress recent CODE"). These scenarios are JSON tool payloads --
+    # JSON_ARRAY even under the native detector -- so the guard never fires and
+    # the second table carried no information. Printing it again would only
+    # relabel a duplicate, so it is stated here once instead.
+    cfg = CompressConfig()
 
     # Built in a fixed order: every generator draws from the same global RNG,
     # so re-ordering these lines changes every number below.
     print(f"seed={args.seed}  model={MODEL}  tokenizer={type(tok._tokenizer).__name__}")
 
-    out: dict[str, list[dict]] = {}
-    for cname, cfg in configs.items():
-        # Reseed per configuration so both see a byte-identical corpus.
-        seed_everything(args.seed)
-        rows = [
-            measure(
-                "Code search (100 results)",
-                [generate_github_code_search("JWT authentication middleware", num_results=100)],
-                tok,
-                cfg,
-            ),
-            measure("SRE incident debugging", create_sre_debugging_scenario().tools, tok, cfg),
-            measure("Codebase exploration", create_codebase_exploration_scenario().tools, tok, cfg),
-            measure("GitHub issue triage", create_issue_triage_scenario().tools, tok, cfg),
-        ]
-        out[cname] = rows
+    seed_everything(args.seed)
+    rows = [
+        measure(
+            "Code search (100 results)",
+            [generate_github_code_search("JWT authentication middleware", num_results=100)],
+            tok,
+            cfg,
+        ),
+        measure("SRE incident debugging", create_sre_debugging_scenario().tools, tok, cfg),
+        measure("Codebase exploration", create_codebase_exploration_scenario().tools, tok, cfg),
+        measure("GitHub issue triage", create_issue_triage_scenario().tools, tok, cfg),
+    ]
 
-        print(f"\n=== {cname} ===")
-        print(f"{'Scenario':<30} {'Before':>10} {'After':>10} {'Savings':>9}")
-        print("-" * 62)
-        for r in rows:
-            print(
-                f"{r['scenario']:<30} {r['before']:>10,} {r['after']:>10,} "
-                f"{r['savings_pct']:>8.0f}%"
-            )
-        tb = sum(r["before"] for r in rows)
-        ta = sum(r["after"] for r in rows)
-        print("-" * 62)
-        print(f"{'TOTAL':<30} {tb:>10,} {ta:>10,} {(tb - ta) / tb * 100:>8.0f}%")
+    print("\n=== default (protect_recent=4) ===")
+    print(f"{'Scenario':<30} {'Before':>10} {'After':>10} {'Savings':>9}")
+    print("-" * 62)
+    for r in rows:
+        print(f"{r['scenario']:<30} {r['before']:>10,} {r['after']:>10,} {r['savings_pct']:>8.0f}%")
+    tb = sum(r["before"] for r in rows)
+    ta = sum(r["after"] for r in rows)
+    print("-" * 62)
+    print(f"{'TOTAL':<30} {tb:>10,} {ta:>10,} {(tb - ta) / tb * 100:>8.0f}%")
 
     print(
         "\n\nMarkdown for docs/content/docs/index.mdx "
-        "(full-corpus config, which must be stated on the page):\n"
+        "(default config, which must be stated on the page):\n"
     )
     print("| Scenario | Before | After | Savings |")
     print("|---|---|---|---|")
-    for r in out["full corpus (protect_recent=0)"]:
+    for r in rows:
         print(
             f"| {r['scenario']} | {r['before']:,} | {r['after']:,} | **{r['savings_pct']:.0f}%** |"
         )

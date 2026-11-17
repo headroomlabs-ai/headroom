@@ -17,9 +17,12 @@ Usage:
     # Search and inject context
     context = await handler.search_and_format_context(user_id, messages)
 
-    # Handle tool calls in response
+    # Handle tool calls in response, only for the tools the proxy injected
+    names = server_memory_tool_names(request_tools, client_tools)
     if handler.has_memory_tool_calls(response, "anthropic"):
-        results = await handler.handle_memory_tool_calls(response, user_id, "anthropic")
+        results = await handler.handle_memory_tool_calls(
+            response, user_id, "anthropic", tool_names=names
+        )
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from headroom.memory.storage_router import (
     ResolvedScope,
 )
 from headroom.proxy.public_errors import tool_result_error
+from headroom.proxy.tool_name_policy import extract_tool_name
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -88,6 +92,25 @@ NATIVE_MEMORY_BETA_HEADER = "context-management-2025-06-27"
 
 # Native memory tool type
 NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
+
+
+def server_memory_tool_names(tools: Any, client_tools: Any) -> frozenset[str]:
+    """Memory tools in ``tools`` that the proxy injected and must run itself.
+
+    ``tools`` is the tool list sent upstream, ``client_tools`` the list the
+    client sent. A memory-named tool the client declared stays the client's:
+    its calls are forwarded, never withheld or executed by the proxy.
+    """
+    client_tool_names = {extract_tool_name(t) for t in client_tools or [] if isinstance(t, dict)}
+    return frozenset(
+        name
+        for t in tools or []
+        if isinstance(t, dict)
+        and isinstance(name := extract_tool_name(t), str)
+        and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
+        and name not in client_tool_names
+    )
+
 
 # Maximum time to wait for a single backend initialization (one-shot).
 # Applies to MemoryHandler._ensure_initialized. On timeout, _initialized
@@ -782,11 +805,19 @@ class MemoryHandler:
 
         if self.is_project_unresolved(request_context):
             return None
-        await self._ensure_initialized()
-        if not self._backend:
-            return None
+        try:
+            await self._ensure_initialized()
+            if not self._backend:
+                return None
 
-        backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+            backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        except Exception as e:
+            logger.warning(
+                "Memory: Failed to initialize or resolve backend for user %s: %s",
+                user_id,
+                e,
+            )
+            return None
 
         # Fail-closed when the router was unable to resolve a project in
         # PROJECT mode and `unresolved_project_fallback="empty"` (the
@@ -1066,17 +1097,35 @@ your responses, not to drive new actions."""
         if provider == "anthropic":
             content = response.get("content", [])
             if isinstance(content, list):
-                return [block for block in content if block.get("type") == "tool_use"]
+                return [
+                    block
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                ]
             return []
 
         elif provider == "openai":
-            # Chat Completions format: choices[0].message.tool_calls
-            choices = response.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                tc_list = list(message.get("tool_calls", []) or [])
-                if tc_list:
-                    return tc_list
+            # Chat Completions format: choices[0].message.tool_calls. Guard the
+            # first choice for dict-ness the way the sibling
+            # CCRResponseHandler._extract_assistant_message already does: an
+            # OpenAI-compatible gateway can send `choices: [null]` on a
+            # content-filtered / usage-only response, and this runs from
+            # has_memory_tool_calls, which is called outside the try that wraps
+            # the rest of memory handling — so an unguarded `choices[0].get` here
+            # would surface AttributeError to the request handler.
+            choices = response.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else None
+            if isinstance(first, dict):
+                message = first.get("message")
+                if isinstance(message, dict):
+                    # Filter to dict entries: a null / string element inside
+                    # tool_calls (which downstream immediately calls `.get` on)
+                    # would otherwise still crash detection.
+                    tc_list = [
+                        tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)
+                    ]
+                    if tc_list:
+                        return tc_list
 
             # Responses API format: output[] with type=function_call
             output = response.get("output", [])
@@ -1099,6 +1148,8 @@ your responses, not to drive new actions."""
         user_id: str,
         provider: str = "anthropic",
         request_context: RequestContext | None = None,
+        *,
+        tool_names: frozenset[str],
     ) -> list[dict[str, Any]]:
         """Execute memory tool calls and return results.
 
@@ -1110,6 +1161,9 @@ your responses, not to drive new actions."""
                 save/search/update/delete operations route to the per-
                 workspace DB so projects cannot read or overwrite each
                 other's memories (GH #462).
+            tool_names: The memory tools the proxy injected on this request
+                (see ``server_memory_tool_names``). Calls to any other tool,
+                memory-named or not, are the client's and are skipped.
 
         Returns:
             List of tool results in provider format.
@@ -1125,6 +1179,8 @@ your responses, not to drive new actions."""
             # the following `.get` would raise AttributeError on a malformed /
             # partial upstream tool call. Coalesce to {}.
             tool_name = tc.get("name") or (tc.get("function") or {}).get("name")
+            if tool_name not in tool_names:
+                continue
             tool_id = tc.get("id") or tc.get("call_id", "")
 
             # Parse input data
@@ -1424,7 +1480,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "updated", "memory_id": memory.id})
         else:
             # Fallback: delete old, save new
-            await backend.delete_memory(memory_id)
+            if not await backend.delete_memory(memory_id, user_id=effective_user_id):
+                return json.dumps({"status": "not_found", "memory_id": memory_id})
             memory = await backend.save_memory(
                 content=new_content,
                 user_id=effective_user_id,
@@ -1455,10 +1512,10 @@ your responses, not to drive new actions."""
         if not memory_id:
             return json.dumps({"status": "error", "error": "memory_id is required"})
 
-        backend, _scope, _effective = self._resolve_for_request(user_id, request_context)
+        backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
         if error := self._unresolved_project_error(_scope):
             return error
-        deleted = await backend.delete_memory(memory_id)
+        deleted = await backend.delete_memory(memory_id, user_id=effective_user_id)
 
         return json.dumps(
             {

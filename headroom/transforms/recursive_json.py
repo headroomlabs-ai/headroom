@@ -37,9 +37,9 @@ _OPEN = "[{"
 _CLOSE = "]}"
 _PAIR = {"}": "{", "]": "["}
 
-#: A dispatch callback: given a JSON span's text, return the compressed text
-#: (which may carry CCR markers) or ``None`` to leave it unchanged.
-Dispatch = Callable[[str], "str | None"]
+#: Return (compressed text, reversible) or None to leave the span unchanged.
+#: Reversibility must cover this span, not a marker elsewhere in the document.
+Dispatch = Callable[[str], "tuple[str, bool] | None"]
 
 
 def _match_span(text: str, start: int) -> int | None:
@@ -240,10 +240,10 @@ def route_embedded_json(
     dispatch: Dispatch,
     *,
     tok: Callable[[str], int] | None = None,
-) -> str | None:
-    """Route every embedded JSON span in ``content`` through ``dispatch`` and
-    splice the results back in place. Returns the rewritten block, or ``None``
-    when nothing safe/smaller applied.
+) -> tuple[str, bool] | None:
+    """Splice smaller dispatch results into ``content``, preserving surrounding bytes.
+
+    Return (rewritten block, all adopted spans reversible), or None if no win.
 
     ``content`` that is itself a single JSON value is intentionally skipped — the
     caller already routes pure-JSON blocks; this exists for the *embedded* case.
@@ -257,17 +257,22 @@ def route_embedded_json(
         return None
 
     repls: list[tuple[int, int, str]] = []
+    reversible = True
     for a, b in spans:
         chunk = content[a:b]
         if "<<ccr:" in chunk:  # R1: already compressed — never re-route
             continue
         if not carries_record_array(chunk):
             continue
-        out = dispatch(chunk)
-        if out is None or out == chunk:
+        result = dispatch(chunk)
+        if result is None:
+            continue
+        out, span_reversible = result
+        if out == chunk:
             continue
         if tok(out) < tok(chunk):  # benefit gate (outcome, not a threshold)
             repls.append((a, b, out))
+            reversible = reversible and span_reversible
 
     if not repls:
         return None
@@ -279,4 +284,4 @@ def route_embedded_json(
         last = b
     parts.append(content[last:])
     new = "".join(parts)
-    return new if tok(new) < tok(content) else None
+    return (new, reversible) if tok(new) < tok(content) else None
