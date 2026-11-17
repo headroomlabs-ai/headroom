@@ -29,15 +29,20 @@ The router auto-detects content type by analyzing structure and patterns. No man
 | Content Type | Detection Signal | Compressor | Typical Savings |
 |---|---|---|---|
 | JSON arrays | Valid JSON with array elements | SmartCrusher | Varies with redundancy -- measured 26-54% on realistic (non-duplicate) tool-output arrays of 100-10,000 items; highly repetitive arrays compress far more. See `benchmarks/compression_benchmark.py`. |
-| Source code | Syntax patterns, indentation, keywords | Kompress via the library `compress()`/`HeadroomClient` path (`enable_code_aware` defaults to `False` there); CodeAwareCompressor via `headroom proxy` (`HEADROOM_CODE_AWARE_ENABLED` defaults to on) | workload-dependent |
+| Source code | Syntax patterns, indentation, keywords | Left unchanged (passthrough) via the library `compress()`/`HeadroomClient` path (`enable_code_aware` defaults to `False` there); CodeAwareCompressor via `headroom proxy` (`HEADROOM_CODE_AWARE_ENABLED` defaults to on). Source code is never sent to Kompress. | workload-dependent |
 | Search results | `file:line:content` format | SearchCompressor | 80-95% (measured ~91% on a synthetic 40-file ripgrep-style corpus) |
 | Build/test logs | Timestamps, log levels, pytest/npm markers | LogCompressor | 85-95% (measured ~93% on a synthetic 1,000-line log with clustered errors) |
 | Diffs | Unified diff format | DiffCompressor | 60-80% (measured ~70% on a multi-file diff with default `max_context_lines`/`max_hunks_per_file` limits) |
 | HTML | Tag structure | HTMLExtractor | 70-90% (module docstring; measured ~81% on a synthetic nav/ads/script-heavy page) |
 | Tabular (CSV/TSV/markdown tables) | Delimited rows / table syntax | TabularCompressor | Varies with redundancy -- TabularCompressor bridges to SmartCrusher, so it inherits the same range (measured 26-28% on non-duplicate rows) |
+| Human-readable Git status | Branch/detached-HEAD header plus status sections and entries | Lossless passthrough (Python and Rust) | None: staged, unstaged, and untracked paths must remain intact |
 | Structured config (YAML/TOML/INI) | Config syntax | ConfigCompressor | 40-70% (measured ~50% on a commented/blank-line-heavy YAML file) |
 | Plain text | Text with no stronger signal | Kompress | workload-dependent |
 | Anything else | Fallback chain, then passthrough if no safe saving is found | Kompress / passthrough | varies |
+
+Human-readable Git status is structured output, not prose: it is preserved byte-for-byte, including section labels and paths containing spaces. The router checks its structure before model classification and before selected external or lossy compressors, so CSV and wildcard plugins cannot trim status entries. This protection does not exclude all `Bash` results; ordinary prose and build logs still follow their normal routes. The recognizer covers the standard English status format (`LC_ALL=C`); localized formats are not covered.
+
+This protection also takes precedence over mixed-content splitting when a recognized status is followed by fenced code or JSON. The combined tool result is preserved rather than splitting status entries into prose sections.
 
 ## Quick Start
 

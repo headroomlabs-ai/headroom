@@ -121,6 +121,46 @@ def test_inject_memories_handles_empty_and_inserts_context() -> None:
     }
 
 
+def test_inject_memories_keeps_multimodal_content_parts() -> None:
+    """List (multimodal) user content keeps its parts; the context is a new text part.
+
+    See https://github.com/headroomlabs-ai/headroom/issues/4362 (item 10).
+    """
+    client, _response = make_client()
+    fake_memory = FakeMemory()
+    wrapper = MemoryWrapper(client, user_id="alice", _memory=fake_memory)
+    fake_memory.search_results = [
+        SimpleNamespace(memory=SimpleNamespace(content="Prefers Python")),
+    ]
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    parts = [{"type": "text", "text": "What is in this chart?"}, image]
+    original = [{"role": "user", "content": parts}]
+
+    injected = wrapper._inject_memories(original)
+
+    assert original[0]["content"] == parts
+    assert injected[0]["content"] == [
+        {"type": "text", "text": "<context>\n- Prefers Python\n</context>"},
+        {"type": "text", "text": "What is in this chart?"},
+        image,
+    ]
+    assert fake_memory.last_search["query"] == "What is in this chart?"
+
+
+def test_inject_memories_skips_search_for_content_without_text() -> None:
+    client, _response = make_client()
+    fake_memory = FakeMemory()
+    wrapper = MemoryWrapper(client, user_id="alice", _memory=fake_memory)
+    fake_memory.search_results = [
+        SimpleNamespace(memory=SimpleNamespace(content="Prefers Python")),
+    ]
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    messages = [{"role": "user", "content": [image]}]
+
+    assert wrapper._inject_memories(messages) == messages
+    assert not hasattr(fake_memory, "last_search")
+
+
 def test_store_memories_persists_only_nonempty_content() -> None:
     client, _response = make_client()
     fake_memory = FakeMemory()
@@ -224,3 +264,17 @@ def test_parse_response_with_memory_tolerates_non_object_memory_block() -> None:
     )
     assert parsed.memories == [{"content": "User likes Python"}]
     assert parsed.content == "text"
+
+
+def test_parse_response_with_memory_tolerates_none_content() -> None:
+    from headroom.memory.inline_extractor import parse_response_with_memory
+
+    # `chat.completions` returns `message.content == None` whenever the model
+    # answers with tool/function calls instead of text. The callers forward that
+    # `None` straight in, where `re.search(pattern, None)` used to raise
+    # `TypeError` and crash the whole request. It must degrade gracefully and
+    # preserve `None` (not coerce a tool-call turn to text).
+    parsed = parse_response_with_memory(None)
+    assert parsed.content is None
+    assert parsed.memories == []
+    assert parsed.raw is None

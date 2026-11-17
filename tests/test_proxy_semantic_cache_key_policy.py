@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from headroom.proxy.semantic_cache_key import (
+import pytest
+
+from headroom.proxy.semantic_cache_key_policy import (
     compute_semantic_cache_key,
     strip_cache_control,
 )
@@ -12,11 +14,11 @@ MODEL = "claude-haiku-4-5"
 
 
 def test_semantic_cache_key_distinguishes_response_shaping_fields() -> None:
-    assert compute_semantic_cache_key(MESSAGES, MODEL, system="French") != (
-        compute_semantic_cache_key(MESSAGES, MODEL, system="English")
+    assert compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", system="French") != (
+        compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", system="English")
     )
-    assert compute_semantic_cache_key(MESSAGES, MODEL, temperature=0.0) != (
-        compute_semantic_cache_key(MESSAGES, MODEL, temperature=1.0)
+    assert compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", temperature=0.0) != (
+        compute_semantic_cache_key(MESSAGES, MODEL, partition="p_test", temperature=1.0)
     )
 
 
@@ -24,8 +26,12 @@ def test_semantic_cache_key_ignores_moved_cache_control() -> None:
     with_cache_control = [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]
     without_cache_control = [{"type": "text", "text": "sys"}]
 
-    assert compute_semantic_cache_key(MESSAGES, MODEL, system=with_cache_control) == (
-        compute_semantic_cache_key(MESSAGES, MODEL, system=without_cache_control)
+    assert compute_semantic_cache_key(
+        MESSAGES, MODEL, partition="p_test", system=with_cache_control
+    ) == (
+        compute_semantic_cache_key(
+            MESSAGES, MODEL, partition="p_test", system=without_cache_control
+        )
     )
 
 
@@ -38,8 +44,8 @@ def test_semantic_cache_key_ignores_moved_message_cache_control() -> None:
         }
     ]
     messages_without_cc = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
-    assert compute_semantic_cache_key(messages_with_cc, MODEL) == (
-        compute_semantic_cache_key(messages_without_cc, MODEL)
+    assert compute_semantic_cache_key(messages_with_cc, MODEL, partition="p_test") == (
+        compute_semantic_cache_key(messages_without_cc, MODEL, partition="p_test")
     )
 
 
@@ -55,3 +61,24 @@ def test_strip_cache_control_recurses_through_dicts_and_lists() -> None:
         "system": [{"type": "text", "text": "sys"}],
         "tools": [{"name": "read"}],
     }
+
+
+def test_strip_cache_control_preserves_user_defined_schema_property() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "cache_control": {
+                "type": "boolean",
+                "description": "Flush the application cache",
+            }
+        },
+    }
+
+    assert strip_cache_control(schema) == schema
+
+
+def test_semantic_cache_key_requires_a_partition() -> None:
+    """The partition is mandatory, not defaulted: a shared proxy must never
+    answer one caller from another caller's cached response."""
+    with pytest.raises(ValueError, match="requires a caller partition"):
+        compute_semantic_cache_key(MESSAGES, MODEL, partition="")

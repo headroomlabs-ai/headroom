@@ -84,6 +84,7 @@ require_cmd() {
 
 ensure_host_dirs() {
   mkdir -p \
+    "${HEADROOM_HOST_HOME}/.config/opencode" \
     "${HEADROOM_HOST_HOME}/.headroom" \
     "${HEADROOM_HOST_HOME}/.claude" \
     "${HEADROOM_HOST_HOME}/.codex" \
@@ -103,12 +104,30 @@ append_passthrough_envs() {
   done
 }
 
+# Publish the proxy on host loopback only. The container itself must bind
+# 0.0.0.0 for Docker port forwarding to reach it, and the proxy refuses a
+# token-less non-loopback bind unless the operator states that the runtime
+# already confines the port. This helper is the only place that statement is
+# made, and it is made together with the 127.0.0.1 publication it relies on,
+# so the acknowledgement can never be added without the loopback restriction.
+append_loopback_publish_args() {
+  local -n _target="$1"
+  local port="$2"
+  _target+=(-p "127.0.0.1:${port}:${port}" --env "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1")
+}
+
 append_common_container_args() {
   local -n ref=$1
 
   ensure_host_dirs
   ref+=(-w /workspace)
   ref+=(--env "HOME=${HEADROOM_CONTAINER_HOME}")
+  # Docker creates ${HEADROOM_CONTAINER_HOME} as root:root when the image has
+  # no such directory, so $HOME is not writable by the --user <host-uid>
+  # process (issue #4207). Keep the HuggingFace/XDG caches on the
+  # bind-mounted workspace, which the host user owns.
+  ref+=(--env "HF_HOME=${HEADROOM_CONTAINER_HOME}/.headroom/cache/huggingface")
+  ref+=(--env "XDG_CACHE_HOME=${HEADROOM_CONTAINER_HOME}/.headroom/cache")
   ref+=(--env "PYTHONUNBUFFERED=1")
   # Canonical Headroom filesystem contract (issue #175) — forward into the
   # container so the proxy resolves state/config to the bind-mounted path.
@@ -119,6 +138,7 @@ append_common_container_args() {
   ref+=(-v "${HEADROOM_HOST_HOME}/.claude:${HEADROOM_CONTAINER_HOME}/.claude")
   ref+=(-v "${HEADROOM_HOST_HOME}/.codex:${HEADROOM_CONTAINER_HOME}/.codex")
   ref+=(-v "${HEADROOM_HOST_HOME}/.gemini:${HEADROOM_CONTAINER_HOME}/.gemini")
+  ref+=(-v "${HEADROOM_HOST_HOME}/.config/opencode:${HEADROOM_CONTAINER_HOME}/.config/opencode")
 
   if command -v id >/dev/null 2>&1; then
     ref+=(--user "$(id -u):$(id -g)")
@@ -184,7 +204,8 @@ start_proxy_container() {
 
   local container_name="headroom-proxy-${port}-$$"
   local args=()
-  args=(docker run -d --rm --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --rm --name "${container_name}")
+  append_loopback_publish_args args "${port}"
   append_common_container_args args
   args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")
   "${args[@]}" >/dev/null
@@ -489,7 +510,8 @@ start_persistent_docker_install() {
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
-  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "127.0.0.1:${port}:${port}")
+  args=(docker run -d --restart unless-stopped --name "${container_name}")
+  append_loopback_publish_args args "${port}"
   append_persistent_container_args args
   append_dashboard_gateway_env args
   args+=(
@@ -616,6 +638,7 @@ Supported commands:
   aider
   cursor
   openclaw
+  opencode
 
 Notes:
   - GitHub Copilot CLI wrapping is not supported by the Docker-native wrapper.
@@ -1471,11 +1494,13 @@ main() {
         proxy_args+=(--region "${region}")
       fi
 
-      local container_name=""
+      # Keep this in the wrapper's global scope so the EXIT trap can still
+      # stop the proxy after main returns.
+      container_name=""
       if [[ "${no_proxy}" -eq 0 ]]; then
         container_name="$(start_proxy_container "${port}" "${proxy_args[@]}")"
       fi
-      trap 'stop_proxy_container "${container_name}"' EXIT INT TERM
+      trap 'stop_proxy_container "${container_name:-}"' EXIT INT TERM
 
       local prep_args=("${known_args[@]}")
       if [[ "${no_proxy}" -eq 0 ]]; then
@@ -1507,6 +1532,15 @@ EOF
           while true; do
             sleep 1
           done
+          ;;
+        opencode)
+          local opencode_config_file="${HEADROOM_HOST_HOME}/.config/opencode/opencode.json"
+          if [[ -f "${opencode_config_file}" ]]; then
+            OPENCODE_CONFIG_CONTENT="$(<"${opencode_config_file}")" \
+              run_host_tool opencode "${host_args[@]}"
+          else
+            run_host_tool opencode "${host_args[@]}"
+          fi
           ;;
       esac
       ;;
@@ -1557,8 +1591,8 @@ EOF
       run_args=(docker run --rm)
       append_tty_args run_args
       append_common_container_args run_args
-      run_args+=(-p "${port}:${port}")
-      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" "${args[@]}")
+      append_loopback_publish_args run_args "${port}"
+      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" proxy --host 0.0.0.0 --port "${port}" "${args[@]:1}")
       "${run_args[@]}"
       ;;
     *)

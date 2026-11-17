@@ -176,3 +176,130 @@ async def test_gate_counter_is_thread_safe_under_concurrent_export() -> None:
     assert not errors, f"export() raced the writer: {errors[:3]}"
     totals = dict(metrics.kompress_size_gate_by_outcome)
     assert sum(totals.values()) == n_threads * per_thread
+
+
+# ---------------------------------------------------------------------------
+# headroom_requests_rate_limited_total{source} / headroom_requests_failed_total{provider}
+#
+# Issue #3696: #3615 routed upstream 429s and 4xx into these two counters, which
+# silently changed what they mean. The labels make the new meaning queryable —
+# "my limiter throttled me" vs "the provider throttled me" are acted on
+# differently, and a failure with no provider attached names no culprit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_export_splits_headroom_from_upstream() -> None:
+    metrics = PrometheusMetrics(stateless=True)
+
+    # What the four handler sites do when Headroom's OWN limiter rejects.
+    await metrics.record_rate_limited(provider="anthropic", source="headroom")
+    # What the outcome funnel does with a provider 429.
+    await metrics.record_rate_limited(provider="anthropic", source="upstream")
+    await metrics.record_rate_limited(provider="openai", source="upstream")
+
+    text = await metrics.export()
+
+    assert "# TYPE headroom_requests_rate_limited_total counter" in text
+    assert 'headroom_requests_rate_limited_total{source="headroom"} 1' in text
+    assert 'headroom_requests_rate_limited_total{source="upstream"} 2' in text
+    # `sum without (source)` must reproduce the pre-label value.
+    assert metrics.requests_rate_limited == 3
+    # No unlabelled sample alongside the labelled ones — that would double-count.
+    assert "\nheadroom_requests_rate_limited_total 3" not in text
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_source_series_exist_before_any_429() -> None:
+    """Both series export from startup, so a rate() never appears mid-incident."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    text = await metrics.export()
+
+    assert 'headroom_requests_rate_limited_total{source="headroom"} 0' in text
+    assert 'headroom_requests_rate_limited_total{source="upstream"} 0' in text
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_source_defaults_to_headroom_and_clamps_unknown() -> None:
+    metrics = PrometheusMetrics(stateless=True)
+
+    await metrics.record_rate_limited(provider="anthropic")
+    await metrics.record_rate_limited(provider="anthropic", source="bogus")
+
+    text = await metrics.export()
+
+    assert 'headroom_requests_rate_limited_total{source="headroom"} 2' in text
+    assert 'headroom_requests_rate_limited_total{source="upstream"} 0' in text
+    assert "bogus" not in text
+
+
+@pytest.mark.asyncio
+async def test_failed_export_is_attributed_to_the_provider_that_failed() -> None:
+    metrics = PrometheusMetrics(stateless=True)
+
+    await metrics.record_failed(provider="anthropic")
+    await metrics.record_failed(provider="openai")
+    await metrics.record_failed(provider="openai")
+
+    text = await metrics.export()
+
+    assert "# TYPE headroom_requests_failed_total counter" in text
+    assert 'headroom_requests_failed_total{provider="anthropic"} 1' in text
+    assert 'headroom_requests_failed_total{provider="openai"} 2' in text
+    # `sum without (provider)` must reproduce the pre-label value.
+    assert metrics.requests_failed == 3
+    assert "\nheadroom_requests_failed_total 3" not in text
+
+
+@pytest.mark.asyncio
+async def test_failed_without_a_provider_lands_in_unknown() -> None:
+    metrics = PrometheusMetrics(stateless=True)
+
+    await metrics.record_failed()
+
+    text = await metrics.export()
+
+    assert 'headroom_requests_failed_total{provider="unknown"} 1' in text
+
+
+@pytest.mark.asyncio
+async def test_reset_runtime_clears_rate_limit_and_failure_splits() -> None:
+    metrics = PrometheusMetrics(stateless=True)
+
+    await metrics.record_rate_limited(provider="anthropic", source="upstream")
+    await metrics.record_failed(provider="anthropic")
+
+    await metrics.reset_runtime()
+
+    assert metrics.requests_rate_limited == 0
+    assert metrics.requests_failed == 0
+    assert metrics.requests_rate_limited_by_source == {"headroom": 0, "upstream": 0}
+    # Re-seeded, not emptied: the metric must keep exporting a sample after a
+    # reset, same as the rate-limit source series above.
+    assert dict(metrics.requests_failed_by_provider) == {"unknown": 0}
+
+
+@pytest.mark.asyncio
+async def test_failed_total_exports_a_sample_before_any_failure() -> None:
+    """A healthy proxy must still export ``headroom_requests_failed_total``.
+
+    Before the provider label this counter was always present as a bare
+    ``headroom_requests_failed_total 0``. A labelled map that starts empty
+    emits no sample at all, which makes the documented failure-rate query
+    return an empty vector (an empty numerator empties the whole expression),
+    so the panel reads "No data" instead of 0% while everything is fine --
+    and `absent()` alerts fire on healthy proxies.
+    """
+    metrics = PrometheusMetrics(stateless=True)
+
+    text = await metrics.export()
+
+    assert 'headroom_requests_failed_total{provider="unknown"} 0' in text
+
+    # The seed must not survive as a duplicate once a real provider fails.
+    await metrics.record_failed(provider="anthropic")
+    text = await metrics.export()
+    assert 'headroom_requests_failed_total{provider="anthropic"} 1' in text
+    assert 'headroom_requests_failed_total{provider="unknown"} 0' in text
+    assert metrics.requests_failed == 1

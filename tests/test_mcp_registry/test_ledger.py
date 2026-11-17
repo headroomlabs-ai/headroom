@@ -55,6 +55,28 @@ def test_mutation_preflight_rejects_unsafe_shapes(tmp_path, value):
         validate_ledger_for_mutation(ledger)
 
 
+@pytest.mark.parametrize("contents", ["{}", '{"agents": {}}'])
+def test_mutation_preflight_accepts_empty_ledger(tmp_path, contents):
+    """An empty ledger must not be rejected as malformed.
+
+    ``clear_install`` pops the ``agents`` section once its last entry is removed,
+    so a fully-unwrapped ledger is exactly ``{}``. Rejecting it made the next
+    mutation (``headroom mcp adopt``) fail with a bogus "malformed" error.
+    """
+    ledger = tmp_path / "mcp_installs.json"
+    ledger.write_text(contents)
+    validate_ledger_for_mutation(ledger)  # must not raise
+
+
+def test_mutation_preflight_accepts_ledger_after_clearing_last_install(tmp_path):
+    ledger = tmp_path / "mcp_installs.json"
+    spec = _spec()
+    record_install("claude", spec, path=ledger)
+    clear_install("claude", "serena", path=ledger)
+    assert ledger.read_text().strip() == "{}"
+    validate_ledger_for_mutation(ledger)  # must not raise
+
+
 def test_mutation_preflight_rejects_unreadable_ledger(monkeypatch, tmp_path):
     ledger = tmp_path / "mcp_installs.json"
     ledger.write_text('{"agents": {}}')
@@ -95,3 +117,20 @@ def test_record_install_recovers_from_unsafe_ledger_shape(tmp_path, contents):
     record_install("claude", _spec(), path=ledger)
 
     assert headroom_installed_matching("claude", _spec(), path=ledger)
+
+
+def test_failed_ledger_write_keeps_the_previous_ledger(monkeypatch, tmp_path):
+    """ENOSPC mid-write must not truncate the ledger or leave a temp file."""
+    ledger = tmp_path / "mcp_installs.json"
+    record_install("claude", _spec(), path=ledger)
+    before = ledger.read_bytes()
+
+    def no_space(fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("headroom.fsutil.os.fsync", no_space)
+    with pytest.raises(OSError, match="No space left"):
+        clear_install("claude", "serena", path=ledger)
+
+    assert ledger.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["mcp_installs.json"]

@@ -363,8 +363,10 @@ headroom perf --raw
 | `--hours` | `168.0` | Time window in hours |
 | `--raw` | off | Print raw PERF records instead of the summarized report |
 
-The command reads `${HEADROOM_WORKSPACE_DIR}/logs/proxy.log` (defaults
-to `~/.headroom/logs/proxy.log` — see the
+The command reads each per-port runtime log
+`${HEADROOM_WORKSPACE_DIR}/logs/proxy-<port>.log` (defaults to
+`~/.headroom/logs/`) plus PID-qualified files from multi-worker deployments,
+aggregating them while still reading a legacy `proxy.log` when present — see the
 [Filesystem Contract](filesystem-contract.md)).
 
 ## `headroom inspect`
@@ -382,7 +384,7 @@ headroom inspect --format json   # raw feed for piping into another tool
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--port` / `-p` | `8787` | Proxy port to query (env: `HEADROOM_PORT`) |
+| `--port` / `-p` | auto-detected, else `8787` | Proxy port to query. Defaults to the most recently started live wrap session (env: `HEADROOM_PORT`) |
 | `--last` | `1` | Number of most-recent requests to show |
 | `--format` | `text` | `text` renders a highlighted diff; `json` emits the raw feed |
 | `--full` | off | Include messages the compressor left unchanged |
