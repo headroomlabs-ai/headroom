@@ -16,6 +16,8 @@ import click
 
 from headroom import paths as _paths
 from headroom.providers.registry import (
+    BackendUnavailableError,
+    preflight_backend,
     resolve_api_overrides,
     resolve_api_targets,
     resolve_extra_headers,
@@ -482,6 +484,15 @@ def dashboard(port: int | None, no_open: bool) -> None:
         "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
     ),
 )
+@click.option(
+    "--tray/--no-tray",
+    "tray",
+    default=False,
+    help=(
+        "Show a system tray icon with savings, dashboard link and update alerts "
+        "(opt-in, Windows; needs headroom-ai[tray])"
+    ),
+)
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
@@ -556,6 +567,16 @@ def dashboard(port: int | None, no_open: bool) -> None:
         "carries a redeemable marker runs as stream:false upstream and is "
         "re-emitted as chat.completion.chunk frames, so that turn's text arrives "
         "all at once. Off by default. Env: HEADROOM_CCR_BUFFERED_CHAT_STREAMING."
+    ),
+)
+@click.option(
+    "--ccr-inject-system-instructions",
+    is_flag=True,
+    envvar="HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS",
+    help=(
+        "Append the Compressed Context Available instruction block to the system "
+        "message, listing active retrieval hashes. Off by default. "
+        "Env: HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS."
     ),
 )
 @click.option(
@@ -1122,6 +1143,14 @@ def dashboard(port: int | None, no_open: bool) -> None:
     help=("Custom Vertex AI regional API URL for publisher endpoints (env: VERTEX_TARGET_API_URL)"),
 )
 @click.option(
+    "--omlx-api-url",
+    default=None,
+    help=(
+        "Custom local oMLX API URL for hybrid local/cloud routing "
+        "(env: HEADROOM_OMLX_BASE_URL or OMLX_TARGET_API_URL)"
+    ),
+)
+@click.option(
     "--region",
     default="us-west-2",
     envvar="HEADROOM_REGION",
@@ -1145,6 +1174,15 @@ def dashboard(port: int | None, no_open: bool) -> None:
         "passthrough routes. Point at a re-signing gateway (LiteLLM, "
         "LocalStack), NOT raw AWS — rewriting the body breaks SigV4. "
         "(env: BEDROCK_TARGET_API_URL)"
+    ),
+)
+@click.option(
+    "--factory-api-url",
+    default=None,
+    help=(
+        "Factory Droid upstream for /api/* (used by `headroom wrap droid`). "
+        "/api/llm/a/v1/messages is compressed; other /api/* paths pass "
+        "through verbatim. (env: FACTORY_TARGET_API_URL)"
     ),
 )
 @click.option(
@@ -1211,6 +1249,7 @@ def proxy(
     http2: bool,
     http_proxy: str | None,
     intercept_tool_results: bool,
+    tray: bool,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
@@ -1221,6 +1260,7 @@ def proxy(
     lossless: bool,
     ccr_inline_resolve: bool,
     ccr_buffered_chat_streaming: bool,
+    ccr_inject_system_instructions: bool,
     no_ccr_proactive_expansion: bool,
     no_ccr_response_handling: bool,
     proxy_extension: tuple[str, ...],
@@ -1281,10 +1321,12 @@ def proxy(
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None,
+    omlx_api_url: str | None,
     region: str,
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    factory_api_url: str | None,
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
@@ -1506,6 +1548,8 @@ def proxy(
     if memory_qdrant_api_key is not None:
         qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
 
+    from headroom.config import resolve_omlx_target_api_url
+
     config = ProxyConfig(
         host=host,
         port=port,
@@ -1519,6 +1563,7 @@ def proxy(
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
+        omlx_target_api_url=resolve_omlx_target_api_url(omlx_api_url, os.environ),
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,
@@ -1563,6 +1608,9 @@ def proxy(
         ccr_handle_responses=not (no_ccr or no_ccr_response_handling),
         ccr_resolve_markers_inline=ccr_inline_resolve,
         ccr_buffered_chat_streaming=ccr_buffered_chat_streaming,
+        ccr_inject_system_instructions=(
+            False if (no_ccr or lossless) else ccr_inject_system_instructions
+        ),
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -1663,6 +1711,7 @@ def proxy(
         # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
         # the sibling *_TARGET_API_URL passthrough overrides.
         bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        factory_api_url=factory_api_url or os.environ.get("FACTORY_TARGET_API_URL"),
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
@@ -1708,6 +1757,12 @@ def proxy(
     openai_url = provider_api_targets.openai
     cloudcode_url = provider_api_targets.cloudcode
     vertex_url = provider_api_targets.vertex
+    factory_route_line = (
+        f"\n  /api/*                          → {config.factory_api_url}  "
+        "(Factory Droid; /api/llm/a/v1/messages compressed)"
+        if config.factory_api_url
+        else ""
+    )
     backend_section = ""
 
     if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
@@ -1913,7 +1968,7 @@ Routing:
   /v1/chat/completions            → {openai_url}
   /v1/responses                   → {openai_url}  (HTTP + WebSocket)
   /v1internal:streamGenerateContent → {cloudcode_url}
-  /v1/projects/.../publishers/... → {vertex_url}
+  /v1/projects/.../publishers/... → {vertex_url}{factory_route_line}
 
 Usage:
 {usage_section}
@@ -1944,6 +1999,13 @@ Press Ctrl+C to stop.
     # Option E: start embedding server sidecar if requested
     # -----------------------------------------------------------------------
     _embed_watchdog = None
+    try:
+        # Here, not only in create_app: with --workers >1 each worker builds its
+        # own app and uvicorn would keep restarting them instead of exiting.
+        preflight_backend(backend)
+    except BackendUnavailableError as exc:
+        click.echo(f"\nCannot start proxy: {exc}", err=True)
+        raise SystemExit(2) from None
     if embedding_server:
         _embed_socket = embedding_server_socket or f"/tmp/headroom-embed-{config.port}.sock"
         # Pass socket path to all worker processes via environment variable
@@ -1992,10 +2054,19 @@ Press Ctrl+C to stop.
         # a richer one above. Direct `python -m headroom.proxy.server` keeps
         # the legacy banner via run_server's default.
         run_kwargs["print_banner"] = False
+        if tray:
+            from headroom.tray.launcher import start_tray_for_proxy
+
+            start_tray_for_proxy(host, port)
         run_server(config, **run_kwargs)
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
         raise SystemExit(130) from None
+    except BackendUnavailableError as exc:
+        # Operator misconfiguration, not a crash to debug: show the remedy, not
+        # a traceback through our startup internals.
+        click.echo(f"\nCannot start proxy: {exc}", err=True)
+        raise SystemExit(2) from None
     finally:
         if _embed_watchdog is not None:
             import asyncio as _asyncio2
