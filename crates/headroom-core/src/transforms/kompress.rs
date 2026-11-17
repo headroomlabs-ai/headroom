@@ -608,9 +608,64 @@ fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
     Ok(tokenizer)
 }
 
+/// Decision behind [`ort_session_preconditions`]: an ONNX Runtime session may
+/// only be built when the CPU can run the precompiled binary (else `SIGILL`,
+/// #1723) and the dynamic loader is pinned (else `ort` deadlocks, #1715).
+/// The CPU check comes first and `loader` is only invoked when it passes:
+/// the loader initializes the native runtime, which itself can `SIGILL` on
+/// a CPU without AVX2 (same order as the magika guard). `Err` carries a
+/// stable `reason` tag plus detail for logging.
+pub(crate) fn ort_session_gate(
+    cpu_ok: bool,
+    loader: impl FnOnce() -> Result<(), String>,
+) -> Result<(), (&'static str, String)> {
+    if !cpu_ok {
+        return Err((
+            "cpu_unsupported",
+            "ONNX Runtime backend requires AVX2 on this x86 CPU".to_string(),
+        ));
+    }
+    loader().map_err(|e| ("ort_loader_unavailable", e))
+}
+
+/// Run the two guards the crate requires before any `ort` session is built
+/// (same pair, same order, as magika and the embedding scorer).
+pub(crate) fn ort_session_preconditions() -> Result<(), (&'static str, String)> {
+    ort_session_gate(
+        crate::onnx_cpu::onnx_runtime_supported_by_cpu(),
+        crate::transforms::magika_detector::dynamic_ort_loader_ready,
+    )
+}
+
 fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
+    // Every Kompress constructor (from_files / from_pretrained / from_cache)
+    // funnels through here, so guarding here covers all of them.
+    ort_session_preconditions().map_err(|(reason, e)| format!("{reason}: {e}"))?;
     let session = Session::builder()?.commit_from_file(path)?;
     Ok(session)
+}
+
+/// Whether this process can build Kompress sessions: the same CPU-then-loader
+/// preconditions every `Kompress` constructor checks, in the same order. The
+/// CPU must run the precompiled ONNX Runtime (AVX2 on x86), and only then is
+/// the library resolved (`ORT_DYLIB_PATH`, or the pip `onnxruntime` under
+/// `VIRTUAL_ENV`, `CONDA_PREFIX` or `./.venv`) and committed, once per
+/// process. `Err` is `"<reason>: <detail>"`. For harnesses that should skip,
+/// not fail, on a machine that can't run Kompress.
+pub fn onnx_runtime_ready() -> Result<(), String> {
+    onnx_runtime_ready_with(
+        crate::onnx_cpu::onnx_runtime_supported_by_cpu(),
+        crate::transforms::magika_detector::dynamic_ort_loader_ready,
+    )
+}
+
+/// [`onnx_runtime_ready`] with the CPU verdict and loader passed in, so tests
+/// can check the loader never runs on an unsupported CPU.
+fn onnx_runtime_ready_with(
+    cpu_ok: bool,
+    loader: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    ort_session_gate(cpu_ok, loader).map_err(|(reason, e)| format!("{reason}: {e}"))
 }
 
 /// The tokenizer and the ONNX artifact `onnx` (e.g.
@@ -827,6 +882,56 @@ mod tests {
         );
         std::env::set_var("HF_HUB_CACHE", t.path().join("empty"));
         assert_eq!(lookup(), None);
+    }
+
+    #[test]
+    fn ort_session_gate_rejects_unsupported_cpu_and_loader_failure() {
+        assert_eq!(ort_session_gate(true, || Ok(())), Ok(()));
+        let (reason, _) = ort_session_gate(false, || Ok(())).unwrap_err();
+        assert_eq!(reason, "cpu_unsupported");
+        let (reason, e) = ort_session_gate(true, || Err("no dylib".into())).unwrap_err();
+        assert_eq!((reason, e.as_str()), ("ort_loader_unavailable", "no dylib"));
+    }
+
+    #[test]
+    fn ort_session_gate_never_invokes_the_loader_on_an_unsupported_cpu() {
+        // The loader initializes the native runtime, which can SIGILL on a CPU
+        // without AVX2, so it must not run once the CPU check has failed.
+        let called = std::cell::Cell::new(false);
+        let out = ort_session_gate(false, || {
+            called.set(true);
+            Ok(())
+        });
+        assert_eq!(out.unwrap_err().0, "cpu_unsupported");
+        assert!(!called.get(), "loader ran although the CPU check failed");
+        // ...and it is invoked exactly when the CPU is fine.
+        let called = std::cell::Cell::new(false);
+        let _ = ort_session_gate(true, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(called.get());
+    }
+
+    #[test]
+    fn onnx_runtime_ready_checks_the_cpu_before_the_loader() {
+        // The public readiness check (used by harnesses to skip) must keep
+        // the constructors' order: on an unsupported CPU it reports the CPU
+        // reason without initializing the native runtime.
+        let called = std::cell::Cell::new(false);
+        let out = onnx_runtime_ready_with(false, || {
+            called.set(true);
+            Ok(())
+        });
+        let message = out.unwrap_err();
+        assert!(message.starts_with("cpu_unsupported: "), "{message}");
+        assert!(!called.get(), "loader ran although the CPU check failed");
+
+        assert_eq!(
+            onnx_runtime_ready_with(true, || Err("no dylib".into())),
+            Err("ort_loader_unavailable: no dylib".to_string())
+        );
+        assert_eq!(onnx_runtime_ready_with(true, || Ok(())), Ok(()));
     }
 
     /// `from_pretrained` must refuse before `Api::new()` when the operator

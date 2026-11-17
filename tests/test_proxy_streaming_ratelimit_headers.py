@@ -493,7 +493,7 @@ class TestStreamingRatelimitHeaderForwarding:
         assert result.body == b'{"error":{"message":"capacity exhausted"}}'
         assert result.headers.get("content-encoding") is None
         fake_logger.warning.assert_any_call(
-            "[%s] Forwarding upstream streaming error status=%s url=%s",
+            "[%s] Upstream provider returned an error; forwarding it to the client status=%s url=%s",
             "test-http-error",
             503,
             "https://api.anthropic.com/v1/messages",
