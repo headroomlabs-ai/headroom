@@ -2,6 +2,7 @@
 
 from .vscode import (
     configure_vscode_proxy_settings,
+    copilot_harness_settings_enabled,
     remove_vscode_proxy_settings,
     unrouted_vscode_profiles,
     vscode_proxy_url,
@@ -37,6 +38,7 @@ __all__ = [
     "strip_auto_model_args",
     "validate_configuration",
     "configure_vscode_proxy_settings",
+    "copilot_harness_settings_enabled",
     "remove_vscode_proxy_settings",
     "unrouted_vscode_profiles",
     "vscode_proxy_url",
