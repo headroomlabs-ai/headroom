@@ -1589,23 +1589,25 @@ class TestSmartCrusherFallback:
             f"{strategy_chain}"
         )
 
-    def test_code_aware_fallback_also_uses_unified_block(self, router, monkeypatch):
-        """CodeAware strategy also uses the unified fallback block.
-        Verify it doesn't double-invoke Kompress either."""
+    def test_code_aware_declining_never_falls_back_to_kompress(self, router, monkeypatch):
+        """Code-aware declining a block leaves it unchanged; prose ML never runs (#4214).
+
+        Replaces the old "no double Kompress" check: with the CODE_AWARE ->
+        Kompress fallbacks removed, Kompress must not run even once.
+        """
         import headroom.transforms.content_router as crm
 
-        monkeypatch.setattr(
-            crm.ContentRouter,
-            "_try_ml_compressor",
-            lambda self, content, context="", question=None: (
-                content,
-                len(content.split()),
-            ),
-        )
+        ml_calls: list[str] = []
+
+        def spy(self, content, context="", question=None):
+            ml_calls.append(content)
+            return content, len(content.split())
+
+        monkeypatch.setattr(crm.ContentRouter, "_try_ml_compressor", spy)
 
         plain = "This is just plain text. " * 200
 
-        compressed, compressed_tokens, strategy_chain, _reversible = (
+        compressed, _compressed_tokens, strategy_chain, _reversible = (
             router._apply_strategy_to_content(
                 plain,
                 CompressionStrategy.CODE_AWARE,
@@ -1613,15 +1615,10 @@ class TestSmartCrusherFallback:
             )
         )
 
-        # CodeAware should be in the chain
         assert "code_aware" in strategy_chain
-
-        # No duplicate fallback entries
-        kompress_count = strategy_chain.count("kompress")
-        assert kompress_count <= 1, (
-            f"Kompress appeared {kompress_count} times; "
-            f"duplicate fallback in CodeAware path: {strategy_chain}"
-        )
+        assert "kompress" not in strategy_chain
+        assert ml_calls == []
+        assert compressed == plain
 
 
 # =============================================================================
