@@ -9,6 +9,9 @@ SavingsRecorder.estimate_request_savings supplies that per-request number.
 
 from __future__ import annotations
 
+import pytest
+
+from headroom.proxy import output_savings
 from headroom.proxy.output_savings import (
     SavingsRecorder,
     stratum_key,
@@ -86,3 +89,140 @@ def test_estimate_request_savings_zero_for_control_and_unknown(tmp_path):
     assert rec.estimate_request_savings(["something-else"], 600) == 0
     # Treatment but output exceeded the baseline -> clamped to 0, never negative.
     assert rec.estimate_request_savings([stratum_label("treatment", key)], 5000) == 0
+
+
+@pytest.fixture
+def l4_factors(monkeypatch):
+    """Benchmark factors as an enterprise extension would register them."""
+    monkeypatch.setattr(output_savings, "MODELLED_REDUCTION", {4: (0.2, 0.5)})
+
+
+def test_shaped_request_without_a_baseline_is_priced_from_its_level_factors(tmp_path, l4_factors):
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    labels = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+    rec.record_from_labels(labels, 800)  # the funnel records before it estimates
+
+    # Observed output is already shaped: saved = 800 * r / (1 - r).
+    assert rec.request_savings_range(labels, 800) == (200, 800)
+
+
+def test_a_holdout_too_small_to_report_keeps_the_factor_tier(tmp_path, l4_factors):
+    """Same tier as the dashboard: one control observation does not make the
+    holdout the headline, so the request stays on the modelled band."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    key = _key()
+    shaped = [stratum_label("treatment", key), "output_shaper:verbosity:L4"]
+    rec.record_from_labels(shaped, 800)
+    rec.record_from_labels([stratum_label("control", key)], 1000)
+
+    assert rec._ledger.best_estimate(4).kind == "modelled"
+    assert rec.request_savings_range(shaped, 800) == (200, 800)
+
+
+def test_measured_tier_credits_only_strata_inside_the_measurement(tmp_path, l4_factors):
+    """Devin's case: stratum A carries the holdout, stratum B has no control.
+    A request in A books A's own control mean minus its output; a request in
+    B books nothing, exactly as the measured headline leaves B out."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    a, b = "opus|a|s|tools", "opus|b|s|tools"
+    for i in range(5):
+        rec._ledger.record("control", a, 1000, f"c{i}")
+        rec._ledger.record("treatment", a, 800, f"t{i}")
+    rec._ledger.record("treatment", b, 1000, "tb")
+    assert rec._ledger.best_estimate(4).kind == "measured"
+
+    shaped = "output_shaper:verbosity:L4"
+    assert rec.request_savings_range([stratum_label("treatment", a), shaped], 800) == (200, 200)
+    assert rec.request_savings_range([stratum_label("treatment", b), shaped], 1000) == (0, 0)
+
+
+def test_baseline_and_holdout_outrank_the_factors(tmp_path, l4_factors):
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    key = _key()
+    for _ in range(5):
+        rec._ledger.baseline.observe(key, 1000)
+
+    shaped = "output_shaper:verbosity:L4"
+    assert rec.request_savings_range([stratum_label("treatment", key), shaped], 600) == (400, 400)
+    assert rec.request_savings_range([stratum_label("control", key)], 600) == (0, 0)
+
+
+def test_no_registered_factors_means_no_modelled_saving(tmp_path):
+    """Plain OSS ships an empty factor table: nothing is booked."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    labels = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+    assert rec.request_savings_range(labels, 800) == (0, 0)
+
+
+def test_lifetime_carries_the_output_savings_range_across_a_restart(tmp_path):
+    path = str(tmp_path / "s.json")
+    tracker = SavingsTracker(path=path)
+    tracker.record_request(
+        model="claude-opus-4-8",
+        input_tokens=1000,
+        tokens_saved=0,
+        output_tokens_saved=200,
+        output_tokens_saved_high=800,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+    tracker.record_request(  # a point estimate: high end equals low end
+        model="claude-opus-4-8",
+        input_tokens=1000,
+        tokens_saved=0,
+        output_tokens_saved=100,
+        timestamp="2026-03-27T09:30:00Z",
+    )
+
+    lifetime = SavingsTracker(path=path).snapshot()["lifetime"]
+    assert lifetime["output_tokens_saved"] == 300
+    assert lifetime["output_tokens_saved_high"] == 900
+    low_usd, high_usd = lifetime["output_savings_usd"], lifetime["output_savings_usd_high"]
+    assert low_usd > 0
+    assert high_usd == pytest.approx(low_usd * 3, rel=1e-3)
+
+
+def test_treatment_request_that_was_not_shaped_saves_nothing(tmp_path, l4_factors):
+    """The stratum label is attached before shaping is attempted; only the
+    verbosity label proves the request was shaped."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    key = _key()
+    for _ in range(5):
+        rec._ledger.baseline.observe(key, 1000)
+
+    assert rec.request_savings_range([stratum_label("treatment", key)], 600) == (0, 0)
+
+
+def test_factors_are_not_booked_once_the_deployment_has_a_baseline(tmp_path, l4_factors):
+    """A baseline learned for other traffic must not leave this request on
+    benchmark factors while /stats reports the estimated tier."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    other = stratum_key(
+        turn_kind="chat", input_tokens=500, model="claude-opus-4-8", has_tools=False
+    )
+    for _ in range(5):
+        rec._ledger.baseline.observe(other, 1000)
+
+    labels = [stratum_label("treatment", _key()), "output_shaper:verbosity:L4"]
+    rec.record_from_labels(labels, 800)
+    low, high = rec.request_savings_range(labels, 800)
+    assert low == high  # a baseline point estimate, never the factor band
+
+
+def test_fresh_tracker_lifetime_carries_the_range_keys(tmp_path):
+    lifetime = SavingsTracker(path=str(tmp_path / "s.json")).snapshot()["lifetime"]
+    assert lifetime["output_tokens_saved_high"] == 0
+    assert lifetime["output_savings_usd_high"] == 0.0
+
+
+def test_a_response_without_output_usage_books_nothing(tmp_path, l4_factors):
+    """A missing completion count arrives as 0; no tier may read that as
+    the whole baseline saved."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    a = "opus|a|s|tools"
+    for i in range(5):
+        rec._ledger.record("control", a, 1000, f"c{i}")
+        rec._ledger.record("treatment", a, 800, f"t{i}")
+        rec._ledger.baseline.observe(a, 1000)
+    shaped = [stratum_label("treatment", a), "output_shaper:verbosity:L4"]
+
+    assert rec.request_savings_range(shaped, 0) == (0, 0)
