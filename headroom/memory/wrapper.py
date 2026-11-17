@@ -27,6 +27,19 @@ from headroom.memory.models import Memory
 logger = logging.getLogger(__name__)
 
 
+def _text_of(content: Any) -> str:
+    """Return the text of a message's content: a string, or the text parts of a list."""
+    if isinstance(content, list):
+        return "\n".join(
+            part["text"]
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    return str(content)
+
+
 class MemoryWrapper:
     """Wraps an LLM client to add automatic memory with zero extra latency.
 
@@ -140,12 +153,18 @@ class MemoryWrapper:
         if not user_content:
             return messages
 
+        # Multimodal content is a list of parts; search on its text parts only,
+        # never on the list's repr.
+        query = _text_of(user_content)
+        if not query:
+            return messages
+
         # Search for relevant memories (async -> sync)
         loop = asyncio.new_event_loop()
         try:
             memories = loop.run_until_complete(
                 self._memory.search(
-                    query=str(user_content),
+                    query=query,
                     user_id=self._user_id,
                     session_id=self._session_id,
                     top_k=self._top_k,
@@ -169,7 +188,12 @@ class MemoryWrapper:
         for msg in new_messages:
             if msg.get("role") == "user":
                 original = msg.get("content", "")
-                msg["content"] = f"{context_block}\n\n{original}"
+                if isinstance(original, list):
+                    # Keep the parts (images, files) as they are; add the
+                    # context as a leading text part.
+                    msg["content"] = [{"type": "text", "text": context_block}, *original]
+                else:
+                    msg["content"] = f"{context_block}\n\n{original}"
                 break
 
         return new_messages

@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from collections.abc import Mapping
 from typing import Any
+
+from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
+from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
 
 logger = logging.getLogger("headroom.providers.hermes")
 
@@ -20,12 +25,64 @@ _CLAUDE_TEXT_PART_TYPES = frozenset({"text"})
 _RESPONSES_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _CODEX_RESPONSES_SUFFIX = "/v1/responses"
 _CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
+# Hermes Studio's scoped proxy prefixes. They live under `/api/`, so a
+# Factory-mode proxy must keep every path below them on the normal catch-all.
+CODEX_PROXY_PREFIX = "/api/codex-proxy/"
+CLAUDE_CODE_PROXY_PREFIX = "/api/claude-code-proxy/"
+SCOPED_PATH_PREFIXES = (CODEX_PROXY_PREFIX, CLAUDE_CODE_PROXY_PREFIX)
+
+
+def build_launch_env(
+    port: int, environ: Mapping[str, str] | None = None
+) -> tuple[dict[str, str], list[str]]:
+    """Build the environment used to route the Hermes CLI through Headroom."""
+    env = dict(environ if environ is not None else os.environ)
+    openai_base_url = codex_proxy_base_url(port)
+    anthropic_base_url = claude_proxy_base_url(port)
+    env["OPENAI_BASE_URL"] = openai_base_url
+    env["ANTHROPIC_BASE_URL"] = anthropic_base_url
+    return env, [
+        f"OPENAI_BASE_URL={openai_base_url}",
+        f"ANTHROPIC_BASE_URL={anthropic_base_url}",
+    ]
+
+
+# Hermes honors OPENAI_BASE_URL / ANTHROPIC_BASE_URL only for these providers.
+# Its default (openrouter) and others such as nous call their own endpoints.
+_ROUTED_PROVIDERS = frozenset({"anthropic", "openai"})
+
+
+def unsupported_provider_error(hermes_args: tuple[str, ...] | list[str]) -> str | None:
+    """Return an error unless ``--provider`` names a provider Headroom can route.
+
+    ponytail: the flag is required on purpose. Hermes also resolves a provider
+    from config.yaml and HERMES_INFERENCE_PROVIDER; mirroring that order here
+    would drift. Parse them only if requiring the flag proves too strict.
+    """
+    args = list(hermes_args)
+    provider = ""
+    for index, arg in enumerate(args):
+        if arg == "--provider" and index + 1 < len(args):
+            provider = args[index + 1]
+        elif arg.startswith("--provider="):
+            provider = arg.split("=", 1)[1]
+    if provider.strip().lower() in _ROUTED_PROVIDERS:
+        return None
+    selected = f"'{provider}'" if provider else "no --provider flag"
+    return (
+        f"Error: Headroom cannot route this Hermes launch ({selected}).\n"
+        "Only the anthropic and openai providers go through Headroom. Hermes's "
+        "default provider (openrouter) and others such as nous call their own "
+        "endpoints.\n"
+        "Run: headroom wrap hermes -- --provider anthropic\n"
+        "To use another provider, run `hermes` directly, without Headroom."
+    )
 
 
 def is_scoped_coding_agent_path(path: str) -> bool:
     """Return whether *path* is a Hermes scoped coding-agent endpoint."""
-    return (path.startswith("/api/codex-proxy/") and path.endswith(_CODEX_RESPONSES_SUFFIX)) or (
-        path.startswith("/api/claude-code-proxy/") and path.endswith(_CLAUDE_MESSAGES_SUFFIX)
+    return (path.startswith(CODEX_PROXY_PREFIX) and path.endswith(_CODEX_RESPONSES_SUFFIX)) or (
+        path.startswith(CLAUDE_CODE_PROXY_PREFIX) and path.endswith(_CLAUDE_MESSAGES_SUFFIX)
     )
 
 
@@ -53,7 +110,7 @@ def compress_scoped_passthrough_body(
         if not model:
             return body
 
-        if path.startswith("/api/claude-code-proxy/"):
+        if path.startswith(CLAUDE_CODE_PROXY_PREFIX):
             field_name = "messages"
             route_name = "claude-code"
         else:
