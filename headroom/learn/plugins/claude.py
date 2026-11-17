@@ -527,9 +527,18 @@ def _main_worktree_root(path: Path) -> Path | None:
         pointer = (checkout / ".git").read_text(encoding="utf-8").strip()
         if not pointer.startswith("gitdir:"):
             return None
-        gitdir = checkout / pointer[len("gitdir:") :].strip()
+        gitdir = (checkout / pointer[len("gitdir:") :].strip()).resolve()
         # Only a linked worktree's gitdir has `commondir` (a submodule's does not).
         common = (gitdir / (gitdir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+        # The pointers come from the checkout itself, so accept only git's own
+        # layout: the admin dir is <common>/worktrees/<name> and its `gitdir`
+        # file points back at this checkout's .git. Anything else could name
+        # an unrelated directory as the "main checkout" that learn writes to.
+        if gitdir.parent.name != "worktrees" or gitdir.parent.parent != common:
+            return None
+        back = (gitdir / (gitdir / "gitdir").read_text(encoding="utf-8").strip()).resolve()
+        if back != (checkout / ".git").resolve():
+            return None
     except (OSError, UnicodeDecodeError):
         return None
     # A bare repo has no checkout to merge into.
