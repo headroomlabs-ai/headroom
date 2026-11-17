@@ -135,7 +135,7 @@ class TestCacheReplayShapes(unittest.TestCase):
                 )
                 self.assertEqual(prep.frozen_message_count, min(confirmed, 1))
 
-    def test_cached_text_after_textless_anthropic_result_remains_mutable(self) -> None:
+    def test_cached_text_after_textless_anthropic_result_is_replayed(self) -> None:
         messages = [
             {
                 "role": "user",
@@ -148,10 +148,12 @@ class TestCacheReplayShapes(unittest.TestCase):
         ]
         before = copy.deepcopy(messages)
         prep = prepare_turn(self.cache, messages, policy=FREEZE_POLICY_REPLAYABLE)
-        self.assertEqual(prep.frozen_message_count, 0)
-        self.assertEqual(prep.pipeline_input, before)
+        self.assertEqual(prep.frozen_message_count, 1)
+        expected = copy.deepcopy(before)
+        expected[0]["content"][1]["content"] = "short"
+        self.assertEqual(prep.pipeline_input, expected)
         self.assertEqual(messages, before)
-        self.assertEqual(self.cache.get_stats()["hits"], 0)
+        self.assertEqual(self.cache.get_stats()["hits"], 1)
 
     def test_supported_stable_hash_and_trailing_live_zone_are_unchanged(self) -> None:
         cache = CompressionCache()
