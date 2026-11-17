@@ -19795,6 +19795,9 @@ var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 var PROJECT_HEADER = "x-headroom-project";
 var SESSION_TOKEN_HEADER = "x-headroom-session-token";
+function projectHeaderValue(project) {
+  return encodeURIComponent(project);
+}
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 var WIRE_ROOTS_ENV = "HEADROOM_OPENCODE_WIRE_ROOTS";
@@ -19882,7 +19885,7 @@ function injectOptionsEnv(args, optionIndex, state) {
   if (process.platform === "win32" && existing.windowsHide === void 0) {
     existing.windowsHide = true;
   }
-  if (isOptions(nextArgs[optionIndex])) {
+  if (isOptions(nextArgs[optionIndex]) || nextArgs[optionIndex] == null && optionIndex < nextArgs.length) {
     nextArgs[optionIndex] = existing;
   } else {
     nextArgs.splice(optionIndex, 0, existing);
@@ -19892,13 +19895,17 @@ function injectOptionsEnv(args, optionIndex, state) {
   }
   return nextArgs;
 }
+function optionsIndexAfterArgs(args) {
+  const params = typeof args.at(-1) === "function" ? args.slice(0, -1) : args;
+  return Array.isArray(params[1]) || params.length > 2 && params[1] == null ? 2 : 1;
+}
 function wrapSpawn(originalSpawn) {
   return function headroomSpawn(...args) {
     const state = getState();
     if (!state) {
       return Reflect.apply(originalSpawn, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
@@ -19917,7 +19924,7 @@ function wrapExecFile(originalExecFile) {
     if (!state) {
       return Reflect.apply(originalExecFile, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
@@ -19927,7 +19934,7 @@ function wrapFork(originalFork) {
     if (!state) {
       return Reflect.apply(originalFork, this, args);
     }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
+    const optionIndex = optionsIndexAfterArgs(args);
     return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
@@ -20022,7 +20029,7 @@ function isVersionSegment(segment) {
 function hasWireRootBefore(body) {
   const segments = body.split("/").filter(Boolean);
   const last = segments.at(-1);
-  return last === void 0 || isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s));
+  return last !== void 0 && (isVersionSegment(last) || IMMEDIATE_WIRE_ROOTS.has(last) || segments.some((s) => NAMED_WIRE_ROOTS.has(s)));
 }
 function isLlmEndpointPath(pathname, origin = "", wireRoots = []) {
   if (pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent")) {
@@ -20117,7 +20124,7 @@ function mergeFetchHeaders(input2, init, upstream, originalPath = void 0, projec
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
@@ -20186,7 +20193,7 @@ function headersForNodeRequest(options, upstream, originalPath, project, session
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   if (project) {
-    headers.set(PROJECT_HEADER, project);
+    headers.set(PROJECT_HEADER, projectHeaderValue(project));
   }
   if (sessionToken) {
     headers.set(SESSION_TOKEN_HEADER, sessionToken);
@@ -20479,7 +20486,7 @@ function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessio
         ...draft.headers,
         [BASE_URL_HEADER]: upstream.origin,
         [ORIGINAL_PATH_HEADER]: `${trimTrailingSlashes(upstream.pathname)}${suffix}`,
-        [PROJECT_HEADER]: project,
+        [PROJECT_HEADER]: projectHeaderValue(project),
         ...sessionToken ? { [SESSION_TOKEN_HEADER]: sessionToken } : {}
       };
     });

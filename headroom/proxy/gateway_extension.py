@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from typing import Any
 
 from starlette.requests import Request
@@ -28,6 +29,7 @@ from headroom.proxy.compress_turn import (
     register_compress_turn_extension,
     registered_compress_turn_extensions,
 )
+from headroom.proxy.gateway_native import view_shape
 from headroom.proxy.gateway_responses import carries_view
 from headroom.proxy.gateway_turn import (
     OBLIGATION_RELAY_USAGE,
@@ -86,6 +88,9 @@ class GatewayTurn:
         # it is fixed for the life of the turn: the response half has to write
         # a re-drive in the same shape the request half read.
         self.responses_shape = carries_view(body)
+        # Gemini and Converse bodies: messages are compressed through a view;
+        # their tools, steering and re-drive stay out (none speak these shapes).
+        self.native_shape = view_shape(body)
         self.model_name = str(body.get("model") or "")
         self.tags: dict[str, Any] = {}
         self._transformer: RequestTransformer | None = None
@@ -100,7 +105,7 @@ class GatewayTurn:
     # -- fail-open ---------------------------------------------------------
     def fail_open_fields(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         # Originals, no obligations: the gateway forwards the body as sent.
-        return gateway_response_fields(
+        fields = gateway_response_fields(
             request=self.request,
             body=self.body,
             caps=self.caps,
@@ -109,6 +114,10 @@ class GatewayTurn:
             obligations=[],
             turn_id=new_turn_id(),
         )
+        if self.native_shape and "messages" in fields["body"]:
+            # I-BODY, as in `finish`: a Converse answer's `messages` is its own list.
+            fields["messages"] = fields["body"]["messages"]
+        return fields
 
     # -- before the executor ----------------------------------------------
     def prepare(self, *, model_name: str, tags: dict[str, Any], config: Any) -> None:
@@ -123,10 +132,11 @@ class GatewayTurn:
         self._transformer = RequestTransformer(
             provider=self.provider,
             model_name=model_name,
-            tools=self.body.get("tools"),
+            tools=None if self.native_shape else self.body.get("tools"),
             config=config,
             tags=tags,
-            caps=self.caps,
+            # No re-drive for native shapes, so only stream-safe hooks run.
+            caps=replace(self.caps, can_redrive=False) if self.native_shape else self.caps,
             conversation=self.conversation,
         )
 
@@ -180,8 +190,9 @@ class GatewayTurn:
             return FinishedTurn(fields={}, transforms=list(transforms_applied), messages=None)
         # mode="ccr" markers are only useful if the model can resolve them:
         # inject headroom_retrieve and let the response half answer it (a
-        # re-drive), or leave it to the caller otherwise.
-        self._ccr_armed = arm_ccr_redrive(
+        # re-drive), or leave it to the caller otherwise. `handle_compress`
+        # rejects mode="ccr" for native shapes, which have no retrieval tool.
+        self._ccr_armed = not self.native_shape and arm_ccr_redrive(
             result,
             provider=self.provider,
             caps=self.caps,
@@ -195,7 +206,8 @@ class GatewayTurn:
         # outcome's transforms for the response half's relayed output_tokens
         # to become output savings.
         self._obligations = compute_obligations(
-            self.caps, redrive_armed=result.redrive_armed or self._ccr_armed
+            self.caps,
+            redrive_armed=not self.native_shape and (result.redrive_armed or self._ccr_armed),
         )
         self._turn_id = new_turn_id()
         self._fields = gateway_response_fields(
@@ -208,15 +220,16 @@ class GatewayTurn:
             turn_id=self._turn_id,
             headers=result.headers,
         )
-        shape_gateway_body(
-            self._fields["body"],
-            provider=self.provider,
-            model_name=self.model_name,
-            config=self.proxy.config,
-            input_tokens=tokens_before,
-            transforms=transforms,
-        )
-        if not self.responses_shape and "anthropic" in (
+        if not self.native_shape:
+            shape_gateway_body(
+                self._fields["body"],
+                provider=self.provider,
+                model_name=self.model_name,
+                config=self.proxy.config,
+                input_tokens=tokens_before,
+                transforms=transforms,
+            )
+        if not (self.responses_shape or self.native_shape) and "anthropic" in (
             self.provider,
             provider_for_model(self.model_name),
         ):
