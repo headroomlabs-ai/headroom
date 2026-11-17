@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 
@@ -46,7 +47,7 @@ from headroom.providers.claude import (
 )
 
 from .main import get_version, main
-from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez
+from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez, loopback_port
 from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
@@ -56,9 +57,60 @@ SKIP = "skip"
 
 DEFAULT_PROXY_PORT = 8787
 
-_LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
+# The loopback host forms a proxy URL can take: IPv4, the ``localhost`` alias,
+# and the IPv6 literal ``::1`` (``urlsplit`` strips the ``[...]`` brackets and
+# lowercases the host, so ``HTTP://Localhost`` and ``http://[::1]`` normalize
+# into this set).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Codex TOML routes via a quoted ``base_url``. Capture the quoted value only and
+# classify it with the shared URL parser below — a prefix/regex match on the URL
+# would accept userinfo and hostname-suffix lookalikes such as
+# ``http://localhost:8787@evil.example`` as loopback. Anchored to a line start so
+# an indented key is matched consistently, and paired with the active
+# ``model_provider`` so only the routed provider's block is inspected.
 _CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
 _CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
+_CODEX_OPENAI_BASE_URL_RE = re.compile(r'(?m)^[ \t]*openai_base_url\s*=\s*"([^"\r\n]+)"')
+
+
+def _loopback_route_port(url: str) -> int | None:
+    """Return the port if ``url`` is a well-formed loopback proxy route.
+
+    Classifies by parsing the URL rather than prefix-matching it: the scheme
+    must be http(s), there must be no userinfo, the host must be *exactly* a
+    loopback literal, and the port must be present and valid. This is what makes
+    ``doctor`` a URL classifier rather than a string matcher, so lookalikes that
+    a prefix match accepts are correctly rejected:
+
+    * userinfo — ``http://localhost:8787@evil.example/v1`` parses to host
+      ``evil.example`` (the ``localhost:8787`` is credentials), and any URL
+      carrying userinfo is refused outright;
+    * hostname suffix — ``http://localhost.evil.example:8787`` and
+      ``http://127.0.0.1.evil.example:8787`` are not exact loopback hosts.
+
+    A correctly-routed loopback URL (including ``[::1]`` and an upper-cased
+    scheme/host) still classifies, preserving the #3205 / #3213 fix.
+    """
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https"):
+        return None
+    # Reject any credentials in the authority: a real Headroom route never
+    # carries userinfo, and userinfo is the vector that masks the true host.
+    if parts.username is not None or parts.password is not None:
+        return None
+    try:
+        host = parts.hostname  # lowercased, brackets stripped
+        port = parts.port  # raises ValueError on an out-of-range port
+    except ValueError:
+        return None
+    if host is None or host not in _LOOPBACK_HOSTS or port is None:
+        return None
+    return port
+
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -573,7 +625,19 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
 
 def codex_active_base_url(text: str) -> tuple[str, str | None]:
     """Return ``(provider_id, base_url)`` for the active Codex provider in ``text``."""
-    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
+    first_table = re.search(r"(?m)^[ \t]*\[", text)
+    root = text[: first_table.start()] if first_table is not None else text
+    # Only a root `model_provider` picks the default session's provider; one
+    # under `[profiles.*]` applies only when that profile is selected.
+    active_match = _CODEX_MODEL_PROVIDER_RE.search(root)
+    if active_match is None or active_match.group(1) == "openai":
+        # A root `openai_base_url` re-points Codex's built-in `openai` provider
+        # (the default when `model_provider` is unset), so it beats an inactive
+        # `[model_providers.headroom]` table. Headroom Desktop routes this way
+        # because the ChatGPT app hides features for any other provider.
+        root_url = _CODEX_OPENAI_BASE_URL_RE.search(root)
+        if root_url is not None:
+            return "openai", root_url.group(1)
     provider_id = active_match.group(1) if active_match else "headroom"
     return provider_id, _codex_provider_base_url(text, provider_id)
 
@@ -629,7 +693,13 @@ def check_codex_routing(
             summary="not routed (no active provider base_url in config.toml)",
             hint="wrap it: headroom wrap codex",
         )
+
     config_path, text, provider_id, base_url = found
+
+    # base_url is the active provider's, already extracted and None-checked
+    # above. Classify it through the shared URL parser so a lookalike or remote
+    # base_url (userinfo, hostname suffix, non-loopback) is a WARN, not a PASS.
+
     routing = _classify_routing_url(name, base_url, port, source=str(config_path))
     if routing.status != PASS:
         return routing
@@ -659,6 +729,24 @@ def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
         section = section[: next_section.start()]
     base_url_match = _CODEX_BASE_URL_RE.search(section)
     return base_url_match.group(1) if base_url_match else None
+
+
+def _configured_client_ports(
+    claude_paths: Sequence[Path], codex_paths: Sequence[Path]
+) -> list[int]:
+    """Loopback ports the Claude Code and Codex configs (project and user) send traffic to.
+
+    Headroom Desktop (port 6767) and ``wrap --port N`` leave no deployment
+    manifest, so without these a bare ``doctor`` only ever finds 8787.
+    """
+    urls = [_claude_base_url_in(path)[0] for path in claude_paths]
+    for path in codex_paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        urls.append(codex_active_base_url(text)[1] or "")
+    return [port for port in map(loopback_port, urls) if port is not None]
 
 
 def _codex_block_missing_openai_auth(
@@ -881,14 +969,13 @@ def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
 
 
 def _classify_routing_url(name: str, url: str, port: int, *, source: str) -> CheckResult:
-    match = _LOOPBACK_URL_RE.match(url.strip())
-    if match is None:
+    found_port = _loopback_route_port(url)
+    if found_port is None:
         return CheckResult(
             name=name,
             status=WARN,
             summary=f"points at {url}, not the local Headroom proxy ({source})",
         )
-    found_port = int(match.group(1))
     if found_port != port:
         if found_port == _OLLAMA_DEFAULT_PORT:
             # Not a mis-probed Headroom port — this is Ollama's endpoint, so
@@ -1211,20 +1298,25 @@ def doctor(
     health = probe_json(f"{base_url}/health", timeout=5.0) if livez else None
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
+    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
+    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     live_elsewhere = None
     if livez is None:
         # Cheap, bounded: only ports Headroom recorded (HEADROOM_PORT, 8787,
-        # deployment manifests, the project's wrap marker), probed in parallel.
+        # deployment manifests, project wrap markers, live client markers, and
+        # ports agents are configured for), probed in parallel.
         live_elsewhere = find_live_proxy_elsewhere(
             port,
             manifests=manifests,
+            extra=_configured_client_ports(
+                [project_local_claude_settings, project_claude_settings, claude_settings_path()],
+                [codex_project_config_path(), codex_config_path()],
+            ),
             probe=lambda p: is_headroom_livez(
                 probe_json(f"http://127.0.0.1:{p}/livez", timeout=0.5)
             ),
         )
 
-    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
-    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     checks = [
         note_live_proxy_elsewhere(check_proxy_liveness(livez, base_url), live_elsewhere),
         check_proxy_readiness(livez, readyz, base_url),

@@ -57,7 +57,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.log_safety import describe_exception, safe_id
 from headroom.memory import qdrant_env
+from headroom.memory.backends.mem0 import disable_mem0_telemetry_by_default
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
 from headroom.offline import guard_egress
@@ -68,6 +70,60 @@ logger = logging.getLogger(__name__)
 def _utcnow() -> datetime:
     """Return current UTC time as timezone-aware datetime."""
     return datetime.now(timezone.utc)
+
+
+def _mem0_search_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    """Return extra payload fields from a Mem0 2.x search hit.
+
+    ``MemoryItem.metadata`` defaults to ``None``. When a hit has no extra
+    payload keys, ``MemoryItem.model_dump()`` therefore emits
+    ``metadata: None``. ``dict.get("metadata", {})`` still returns ``None``
+    in that case (the key is present), so callers must not treat the default
+    as a guaranteed mapping.
+    """
+    metadata = result.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _mem0_search_content(result: dict[str, Any], metadata: dict[str, Any]) -> str:
+    """Resolve memory text from a Mem0 2.x search hit.
+
+    Mem0 maps the Qdrant payload's ``data`` field onto the result's
+    ``memory`` key. Direct-adapter writes also keep a ``memory`` alias for
+    older payload readers, which can surface under ``metadata`` when Mem0
+    treats it as extra payload.
+    """
+    content = result.get("memory") or result.get("data")
+    if not content:
+        content = metadata.get("memory") or metadata.get("data") or result.get("content")
+    return content or ""
+
+
+def _direct_qdrant_payload(
+    fact: str,
+    user_id: str,
+    importance: float,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a Qdrant payload that Mem0 2.x search can round-trip.
+
+    Mem0's ``_search_vector_store`` skips hits whose payload has no ``data``
+    field. Headroom historically stored the fact under ``memory`` only, so
+    saved records were invisible to ``Memory.search``. New writes store the
+    text under both ``data`` (required) and ``memory`` (legacy alias).
+    """
+    return {
+        "user_id": user_id,
+        "importance": importance,
+        "created_at": _utcnow().isoformat(),
+        "hash": hashlib.md5(fact.encode()).hexdigest(),  # nosec B324
+        **(metadata or {}),
+        # ``data`` must win over caller metadata: Mem0 2.x search skips
+        # payloads that lack it. ``memory`` is a compatibility alias for
+        # records and readers that predate the mem0 2.x payload contract.
+        "data": fact,
+        "memory": fact,
+    }
 
 
 @dataclass
@@ -218,6 +274,7 @@ class DirectMem0Adapter:
                 self._neo4j_driver = None
 
         # Initialize Mem0 client for fallback path
+        disable_mem0_telemetry_by_default()
         try:
             from mem0 import Memory as Mem0Memory
 
@@ -278,7 +335,7 @@ class DirectMem0Adapter:
         return list(response.data[0].embedding)
 
     def _generate_id(self, content: str, user_id: str) -> str:
-        """Generate a deterministic ID for a memory."""
+        """Generate a unique (time-salted) ID for a memory."""
         hash_input = f"{user_id}:{content}:{_utcnow().isoformat()}"
         return hashlib.sha256(hash_input.encode()).hexdigest()[:32]
 
@@ -288,39 +345,44 @@ class DirectMem0Adapter:
         user_id: str,
         importance: float,
         metadata: dict[str, Any] | None = None,
+        memory_ids: list[str] | None = None,
     ) -> list[str]:
         """Write pre-extracted facts directly to Qdrant.
+
+        Each point's payload stores the fact under ``data`` (required by
+        mem0ai 2.x ``Memory.search``) and ``memory`` (legacy alias). Records
+        written before this contract only have ``memory`` and will not be
+        returned by search until they are migrated; see wiki/memory.md.
 
         Args:
             facts: List of fact strings to store.
             user_id: User identifier.
             importance: Importance score.
             metadata: Optional additional metadata.
+            memory_ids: Optional IDs to store the facts under, one per fact.
 
         Returns:
             List of memory IDs for the stored facts.
         """
         from qdrant_client.models import PointStruct
 
+        if memory_ids is None:
+            memory_ids = [self._generate_id(fact, user_id) for fact in facts]
+        elif len(memory_ids) != len(facts):
+            raise ValueError(f"Got {len(memory_ids)} memory IDs for {len(facts)} facts")
+
         points = []
-        memory_ids = []
 
-        for fact in facts:
-            memory_id = self._generate_id(fact, user_id)
-            memory_ids.append(memory_id)
-
+        for fact, memory_id in zip(facts, memory_ids):
             # Generate embedding
             embedding = await asyncio.to_thread(self._embed, fact)
 
-            # Build metadata payload
-            payload = {
-                "memory": fact,
-                "user_id": user_id,
-                "importance": importance,
-                "created_at": _utcnow().isoformat(),
-                "hash": hashlib.md5(fact.encode()).hexdigest(),  # nosec B324
-                **(metadata or {}),
-            }
+            payload = _direct_qdrant_payload(
+                fact=fact,
+                user_id=user_id,
+                importance=importance,
+                metadata=metadata,
+            )
 
             points.append(
                 PointStruct(
@@ -597,6 +659,14 @@ class DirectMem0Adapter:
             task_id = self._generate_task_id()
             now = _utcnow()
 
+            # Snapshot facts so a caller mutating its list can't desync the IDs.
+            facts = list(facts) if facts is not None else None
+
+            # Pick the IDs now so the returned ID is the one actually stored.
+            fact_ids: list[str] | None = None
+            if facts or extracted_entities or extracted_relationships:
+                fact_ids = [self._generate_id(fact, user_id) for fact in (facts or [content])]
+
             # Create the background task
             task = asyncio.create_task(
                 self._save_memory_internal(
@@ -610,12 +680,20 @@ class DirectMem0Adapter:
                     facts=facts,
                     extracted_entities=extracted_entities,
                     extracted_relationships=extracted_relationships,
+                    fact_ids=fact_ids,
                 )
             )
             self._background_tasks[task_id] = task
 
             # Return immediately with task info
-            primary_id = self._generate_id(facts[0] if facts else content, user_id)
+            pending_metadata: dict[str, Any]
+            if fact_ids is not None:
+                primary_id = fact_ids[0]
+                pending_metadata = {"_all_memory_ids": list(fact_ids)}
+            else:
+                # Mem0 assigns the ID later; see get_task_status(task_id).
+                primary_id = task_id
+                pending_metadata = {"_id_pending": True}
             return Memory(
                 id=primary_id,
                 content=facts[0] if facts else content,
@@ -625,6 +703,7 @@ class DirectMem0Adapter:
                 entity_refs=entities or [],
                 metadata={
                     **(metadata or {}),
+                    **pending_metadata,
                     "_async": True,
                     "_task_id": task_id,
                     "_status": "processing",
@@ -659,6 +738,7 @@ class DirectMem0Adapter:
         facts: list[str] | None = None,
         extracted_entities: list[dict[str, str]] | None = None,
         extracted_relationships: list[dict[str, str]] | None = None,
+        fact_ids: list[str] | None = None,
     ) -> Memory:
         """Internal save implementation (can run in background)."""
         now = _utcnow()
@@ -671,31 +751,18 @@ class DirectMem0Adapter:
             memory_ids = []
 
             # Write facts to Qdrant (vector store)
-            if facts:
-                fact_ids = await self._write_facts_to_qdrant(
-                    facts=facts,
-                    user_id=user_id,
-                    importance=importance,
-                    metadata={
-                        "session_id": session_id,
-                        "entity_refs": entities or [],
-                        **(metadata or {}),
-                    },
-                )
-                memory_ids.extend(fact_ids)
-            else:
-                # If no facts, write content as single fact
-                fact_ids = await self._write_facts_to_qdrant(
-                    facts=[content],
-                    user_id=user_id,
-                    importance=importance,
-                    metadata={
-                        "session_id": session_id,
-                        "entity_refs": entities or [],
-                        **(metadata or {}),
-                    },
-                )
-                memory_ids.extend(fact_ids)
+            stored_ids = await self._write_facts_to_qdrant(
+                facts=facts or [content],
+                user_id=user_id,
+                importance=importance,
+                metadata={
+                    "session_id": session_id,
+                    "entity_refs": entities or [],
+                    **(metadata or {}),
+                },
+                memory_ids=fact_ids,
+            )
+            memory_ids.extend(stored_ids)
 
             # Write entities and relationships to Neo4j (graph store)
             if (extracted_entities or extracted_relationships) and self._config.enable_graph:
@@ -806,29 +873,33 @@ class DirectMem0Adapter:
         """
         await self._ensure_initialized()
 
-        # Use Mem0's search (no LLM calls, just embeddings)
+        # Use Mem0's search (no LLM calls, just embeddings). mem0ai 2.x is
+        # keyword-only and rejects top-level entity params via
+        # ``_reject_top_level_entity_params`` (raising for ``user_id``) while
+        # silently swallowing ``limit`` from ``**kwargs``. Scope with
+        # ``filters`` and bound the result count with ``top_k``.
         results = await asyncio.to_thread(
             self._mem0_client.search,
             query=query,
-            user_id=user_id,
-            limit=top_k,
+            filters={"user_id": user_id},
+            top_k=top_k,
         )
 
         search_results: list[MemorySearchResult] = []
         result_list = results if isinstance(results, list) else results.get("results", [])
 
         for result in result_list:
-            # Mem0 returns memory in metadata.memory when using direct Qdrant writes
-            result_metadata = result.get("metadata", {})
-            memory_content = result.get("memory") or result_metadata.get(
-                "memory", result.get("content", "")
-            )
+            # Mem0 2.x may omit extra payload keys and then dump
+            # ``metadata: None`` (not a missing key). Entity/session filters
+            # and user_id construction all call ``.get`` on this mapping.
+            result_metadata = _mem0_search_metadata(result)
+            memory_content = _mem0_search_content(result, result_metadata)
             memory_id = result.get("id", str(uuid.uuid4()))
             similarity = result.get("score", result.get("similarity", 0.0))
+            memory_entities = result_metadata.get("entity_refs") or []
 
             # Filter by entities if provided
             if entities:
-                memory_entities = result_metadata.get("entity_refs", [])
                 content_lower = memory_content.lower()
                 if not any(e in memory_entities for e in entities):
                     if not any(e.lower() in content_lower for e in entities):
@@ -841,10 +912,10 @@ class DirectMem0Adapter:
             memory = Memory(
                 id=memory_id,
                 content=memory_content,
-                user_id=result_metadata.get("user_id", user_id),
+                user_id=result.get("user_id") or result_metadata.get("user_id") or user_id,
                 session_id=result_metadata.get("session_id"),
                 importance=result_metadata.get("importance", 0.5),
-                entity_refs=result_metadata.get("entity_refs", []),
+                entity_refs=memory_entities,
                 metadata=result_metadata,
                 created_at=_utcnow(),
                 valid_from=_utcnow(),
@@ -854,7 +925,7 @@ class DirectMem0Adapter:
                 MemorySearchResult(
                     memory=memory,
                     score=float(similarity),
-                    related_entities=result_metadata.get("entity_refs", []),
+                    related_entities=memory_entities,
                     related_memories=[],
                 )
             )
@@ -874,12 +945,19 @@ class DirectMem0Adapter:
             memory_id: ID of the memory to update.
             new_content: New content to replace existing.
             reason: Reason for the update.
-            user_id: User ID for validation.
+            user_id: When given, only a memory owned by this user is updated;
+                any other id is treated as not found.
 
         Returns:
             Updated Memory object.
+
+        Raises:
+            ValueError: If the memory is not found or the update fails.
         """
         await self._ensure_initialized()
+
+        if user_id is not None and not await self._is_owned_by(memory_id, user_id):
+            raise ValueError(f"Memory {memory_id} not found")
 
         try:
             await asyncio.to_thread(
@@ -911,18 +989,49 @@ class DirectMem0Adapter:
         Args:
             memory_id: ID of the memory to delete.
             reason: Reason for deletion.
-            user_id: User ID for validation.
+            user_id: When given, only a memory owned by this user is deleted;
+                any other id is treated as not found.
 
         Returns:
             True if deleted, False if not found.
         """
         await self._ensure_initialized()
 
+        if user_id is not None and not await self._is_owned_by(memory_id, user_id):
+            return False
+
         try:
             await asyncio.to_thread(self._mem0_client.delete, memory_id=memory_id)
             return True
-        except Exception:
+        except Exception as e:
+            # mem0 (Memory.delete, mem0ai 2.x) raises exactly
+            # ValueError(f"Memory with id {memory_id} not found") for an unknown id.
+            # The delete is model-driven, so a stale or invented id is expected. Any
+            # other ValueError (e.g. a missing collection) is a real failure.
+            if isinstance(e, ValueError) and str(e).startswith(
+                f"Memory with id {memory_id} not found"
+            ):
+                logger.debug("DirectMem0: delete_memory(%s): memory not found", safe_id(memory_id))
+                return False
+            # Backend exception text can carry stored memory or connection details,
+            # so no level logs its message; DEBUG gets describe_exception.
+            logger.warning(
+                "DirectMem0: delete_memory(%s) failed (%s)",
+                safe_id(memory_id),
+                safe_id(e),
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DirectMem0: delete_memory(%s) failure: %s",
+                    safe_id(memory_id),
+                    describe_exception(e),
+                )
             return False
+
+    async def _is_owned_by(self, memory_id: str, user_id: str) -> bool:
+        """Whether ``memory_id`` exists and belongs to ``user_id`` (a failed lookup is not)."""
+        memory = await self.get_memory(memory_id)
+        return memory is not None and memory.user_id == user_id
 
     async def get_memory(self, memory_id: str) -> Memory | None:
         """Retrieve a specific memory by ID.
@@ -949,7 +1058,14 @@ class DirectMem0Adapter:
                 valid_from=_utcnow(),
                 metadata=result.get("metadata") or {},
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("DirectMem0: get_memory(%s) failed (%s)", safe_id(memory_id), safe_id(e))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DirectMem0: get_memory(%s) failure: %s",
+                    safe_id(memory_id),
+                    describe_exception(e),
+                )
             return None
 
     @property

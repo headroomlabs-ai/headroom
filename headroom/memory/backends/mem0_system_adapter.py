@@ -2,18 +2,33 @@
 
 This adapter bridges the Mem0Backend interface to the MemoryBackend protocol
 required by MemorySystem, enabling Mem0 to be used with the memory tools system.
+
+.. deprecated::
+    Nothing in Headroom uses this adapter. For local mode (Qdrant + Neo4j), use
+    ``DirectMem0Adapter`` (``headroom.memory.backends.direct_mem0``), which also
+    satisfies the MemoryBackend protocol. ``save_memory`` skips Mem0's LLM
+    extraction only when the caller passes non-empty pre-extracted ``facts``,
+    ``extracted_entities`` or ``extracted_relationships``. Passing only ``content``
+    with ``entities``/``relationships`` still runs Mem0's extraction. Cloud mode
+    (``Mem0Config(mode="cloud")``) has no replacement in Headroom; use the ``mem0``
+    client directly.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.log_safety import safe_id
 from headroom.memory.backends.mem0 import Mem0Backend, Mem0Config
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -23,6 +38,10 @@ def _utcnow() -> datetime:
 
 class Mem0SystemAdapter:
     """Adapter that makes Mem0Backend conform to MemorySystem's MemoryBackend protocol.
+
+    .. deprecated::
+        Use ``DirectMem0Adapter`` for local mode. Cloud mode has no replacement in
+        Headroom; use the ``mem0`` client directly.
 
     This adapter wraps Mem0Backend and provides the interface expected by
     MemorySystem, enabling LLM-driven memory tools (memory_save, memory_search,
@@ -53,6 +72,15 @@ class Mem0SystemAdapter:
         Args:
             config: Configuration for Mem0. If None, uses default local config.
         """
+        warnings.warn(
+            "Mem0SystemAdapter is deprecated and will be removed in a future release; "
+            "for local mode use DirectMem0Adapter (headroom.memory.backends.direct_mem0), "
+            "which skips Mem0's LLM extraction only when given pre-extracted facts, "
+            "extracted_entities or extracted_relationships; "
+            "cloud mode has no Headroom replacement, so use the mem0 client directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._backend = Mem0Backend(config)
         self._config = config or Mem0Config()
 
@@ -316,21 +344,27 @@ class Mem0SystemAdapter:
         Args:
             memory_id: ID of the memory to delete.
             reason: Reason for deletion (for audit trail).
-            user_id: User ID for validation (optional).
+            user_id: When given, only a memory confirmed to belong to this user
+                is deleted; any other id, or one whose owner cannot be read, is
+                treated as not found.
 
         Returns:
             True if deleted, False if not found.
         """
         client = await self._backend._ensure_client()
 
-        # Validate user if needed
         if user_id:
             try:
                 existing = await asyncio.to_thread(client.get, memory_id=memory_id)
-                if existing and existing.get("user_id") and existing["user_id"] != user_id:
-                    return False
-            except Exception:
-                pass
+            except (ValueError, OSError) as e:
+                logger.warning(
+                    "Mem0SystemAdapter: delete_memory(%s) not run: owner lookup failed (%s)",
+                    safe_id(memory_id),
+                    type(e).__name__,
+                )
+                return False
+            if not existing or existing.get("user_id") != user_id:
+                return False
 
         try:
             await asyncio.to_thread(client.delete, memory_id=memory_id)

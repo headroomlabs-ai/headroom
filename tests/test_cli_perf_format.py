@@ -230,6 +230,39 @@ def test_perf_json_format(runner, monkeypatch):
     assert data["overhead"]["optimization_ms"]["p95_ms"] == 11.8
 
 
+def test_perf_json_survives_litellm_provider_banner(tmp_path):
+    """Pricing an unknown model makes litellm print() its "Provider List"
+    banner to stdout unless suppressed. The perf CLI imports no module that
+    suppresses it, so the pricing module has to.
+
+    Runs in a fresh interpreter: the flag is set at import time, and
+    reloading the module in-process would leave stale class references
+    behind for later tests.
+    """
+    import subprocess
+    import sys
+
+    pytest.importorskip("litellm")
+    script = (
+        "import json, litellm\n"
+        "assert not litellm.suppress_debug_info\n"
+        "from headroom.perf.analyzer import build_perf_summary, PerfReport, PerfRecord\n"
+        "rec = PerfRecord(timestamp='2026-06-05 10:00:00,000', request_id='hr_1',\n"
+        "    model='no-such-model-banner-probe', num_messages=1, tokens_before=10,\n"
+        "    tokens_after=5, tokens_saved=5, cache_read=0, cache_write=0,\n"
+        "    cache_hit_pct=0, optimization_ms=1.0, transforms=[])\n"
+        "print(json.dumps(build_perf_summary(PerfReport(perf_records=[rec]))))\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "LITELLM_SUPPRESS_DEBUG_INFO"}
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Provider List" not in result.stdout
+    assert json.loads(result.stdout)["total_requests"] == 1
+
+
 def test_perf_json_raw_is_array(runner, monkeypatch):
     _patch_report(monkeypatch, _sample_report())
     result = runner.invoke(main, ["perf", "--format", "json", "--raw"])
@@ -545,3 +578,23 @@ def test_token_source_and_dollar_source_coexist(tmp_path, monkeypatch):
 def test_no_section_when_nothing_attributed(tmp_path, monkeypatch):
     out = _report_for([_savings_perf_line("none")], tmp_path, monkeypatch)
     assert "Savings by Source" not in out
+
+
+def test_coalesced_savings_rows_count_every_event_in_text_and_summary():
+    """A PERF row summed from 3 recordings is 3 events; a row without the field is 1."""
+    report = PerfReport(
+        perf_records=[
+            PerfRecord(
+                timestamp="2026-06-05 10:00:00,000",
+                request_id="hr_1",
+                savings_breakdown=[
+                    {"source": "tool_search", "tokens": 300, "events": 3},
+                    {"source": "router", "tokens": 5},
+                ],
+            )
+        ]
+    )
+
+    by_source = {row["source"]: row["events"] for row in build_perf_summary(report)["by_source"]}
+    assert by_source == {"tool_search": 3, "router": 1}
+    assert "tool_search: 3 events" in analyzer.format_report(report)

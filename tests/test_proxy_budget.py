@@ -718,7 +718,7 @@ def test_websocket_http_fallback_blocked_when_budget_exhausted() -> None:
 
     async def _run() -> None:
         proxy = _ws_budget_proxy(retry_max_attempts=1)
-        proxy._ws_http_fallback = AsyncMock(return_value=(0, 0, 0, 0, 0))
+        proxy._ws_http_fallback = AsyncMock(return_value=(0, 0, 0, 0, 0, True))
 
         async def _fake_connect(*args, **kwargs):
             _spend_past_budget(proxy)

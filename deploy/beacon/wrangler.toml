@@ -61,10 +61,35 @@ enabled = true
 [observability.logs]
 invocation_logs = false
 
-# Rate limiting is configured in the Cloudflare dashboard, not here — this
-# endpoint is unauthenticated by design (anonymity is the product), so it is
-# the only thing between the Worker and a bored stranger:
-#   Security > WAF > Rate limiting rules
-#   otlp.headroomlabs.ai/v1/logs -> 60 requests / minute / IP
-# A real client sends ~2 requests/hour, so that is ~1000x headroom while still
-# capping a single abusive source hard.
+# Abuse bound for this unauthenticated endpoint, enforced in fetch(). One
+# shared key, not per-IP: the Worker never reads the sender's address, and a
+# per-IP key would mean reading it. Counters are per Cloudflare location, so
+# this caps each location, not the planet. Normal load is ~300 req/min in
+# total (~2 req/hour per client), so 3000/min per location is ~10x headroom
+# while still bounding what a flood can cost in Worker time and R2 writes.
+# Only 10 or 60 is accepted for `period`.
+[[ratelimits]]
+name = "RATE_LIMIT"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 3000
+  period = 60
+
+# Dev/test deployment: `npx wrangler deploy --env dev`. Its own Worker
+# (headroom-beacon-dev) and its own bucket, so test traffic can never land in
+# the production corpus. Bindings are not inherited by environments, so each
+# one is restated here.
+[env.dev]
+name = "headroom-beacon-dev"
+workers_dev = true
+
+[[env.dev.r2_buckets]]
+binding = "CORPUS"
+bucket_name = "headroom-telemetry-dev"
+
+[[env.dev.ratelimits]]
+name = "RATE_LIMIT"
+namespace_id = "1002"
+  [env.dev.ratelimits.simple]
+  limit = 600
+  period = 60

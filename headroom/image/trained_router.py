@@ -359,13 +359,3 @@ class TrainedRouter:
             query_prediction=technique.value,
             query_confidence=query_confidence,
         )
-
-
-def get_trained_router(model_path: str | None = None) -> TrainedRouter:
-    """Get a trained router instance.
-
-    Args:
-        model_path: Optional path to model (local or HF hub).
-                   If None, uses local model if available, else HF hub.
-    """
-    return TrainedRouter(model_path=model_path)

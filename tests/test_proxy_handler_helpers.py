@@ -17,11 +17,15 @@ from headroom.proxy.handlers.openai import (
     _decode_openai_bearer_payload,
     _passthrough_usage_from_json,
     _prefers_http1_passthrough,
+    prefers_http1_passthrough,
 )
+from headroom.proxy.handlers.streaming import StreamingMixin
 from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
+    is_third_party_model,
     relocate_system_messages_to_top_level,
 )
+from headroom.proxy.outcome import emit_request_outcome
 from headroom.proxy.server import HeadroomProxy
 
 
@@ -333,7 +337,17 @@ def test_relocate_system_messages_noop_without_system_entry() -> None:
     assert system == "A"
 
 
-def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5",
+        # Claude Haiku 5.5 supports mid-conversation system messages too; it was
+        # missing here, so Claude Code's Haiku subagent traffic had every valid
+        # section hoisted into the top-level system prompt.
+        "claude-haiku-5-5",
+    ],
+)
+def test_relocate_system_messages_preserves_valid_mid_conversation_section(model: str) -> None:
     messages = [
         {"role": "user", "content": "Run the tests."},
         {
@@ -343,9 +357,7 @@ def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> 
         {"role": "assistant", "content": "I will do both."},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, "base", "claude-opus-5"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "base", model)
 
     assert changed is False
     assert clean is messages
@@ -392,19 +404,83 @@ def test_relocate_system_messages_still_moves_invalid_mid_conversation_placement
     assert system == [{"type": "text", "text": messages[1]["content"]}]
 
 
-def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> None:
+@pytest.mark.parametrize("model", ["claude-sonnet-4-6", "claude-haiku-4-5"])
+def test_relocate_system_messages_moves_valid_shape_for_unsupported_model(model: str) -> None:
     messages = [
         {"role": "user", "content": "question"},
         {"role": "system", "content": "mid-turn instruction"},
     ]
 
-    clean, system, changed = relocate_system_messages_to_top_level(
-        messages, None, "claude-sonnet-4-6"
-    )
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, model)
 
     assert changed is True
     assert clean == [{"role": "user", "content": "question"}]
     assert system == [{"type": "text", "text": "mid-turn instruction"}]
+
+
+@pytest.mark.parametrize(
+    ("model", "third_party_upstream", "expected"),
+    [
+        ("qwen3.8-flash-next", True, True),
+        ("glm-5.3", True, True),
+        # Claude-named models behind a gateway keep the conservative hoist.
+        ("claude-opus-5", True, False),
+        ("anthropic/claude-sonnet-4-6", True, False),
+        ("global.anthropic.claude-sonnet-5-v1:0", True, False),
+        # Anthropic itself (or Vertex / a backend) keeps the model allow-list.
+        ("qwen3.8-flash-next", False, False),
+    ],
+)
+def test_is_third_party_model(model: str, third_party_upstream: bool, expected: bool) -> None:
+    assert is_third_party_model(model, third_party_upstream=third_party_upstream) is expected
+
+
+def test_relocate_system_messages_keeps_valid_sections_for_third_party_model() -> None:
+    # #3552 kept non-text blocks in place for third-party upstreams, but text
+    # sections were still hoisted for every model there. A client that appends a
+    # section most turns changed the top-level system prompt on each request, and
+    # the upstream's prefix cache missed the whole conversation every turn.
+    messages = [
+        {"role": "user", "content": "Run the tests."},
+        {"role": "system", "content": "The user added: update the changelog too."},
+        {"role": "assistant", "content": "I will do both."},
+        {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+        {"role": "system", "content": "<system-reminder>todo list changed</system-reminder>"},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, "base", "qwen3.8-flash-next", third_party_model=True
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system == "base"
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        # The #765 case: a system block left at messages[0] is invalid anywhere.
+        [
+            {"role": "system", "content": "You are a harness."},
+            {"role": "user", "content": "hi"},
+        ],
+        [
+            {"role": "assistant", "content": "answer"},
+            {"role": "system", "content": "You are a harness."},
+        ],
+    ],
+)
+def test_relocate_system_messages_still_moves_invalid_placement_for_third_party_model(
+    messages: list[dict],
+) -> None:
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "qwen3.8-flash-next", third_party_model=True
+    )
+
+    assert changed is True
+    assert all(message.get("role") != "system" for message in clean)
+    assert system == [{"type": "text", "text": "You are a harness."}]
 
 
 def test_relocate_system_messages_keeps_image_blocks_out_of_top_level_system() -> None:
@@ -490,6 +566,123 @@ def test_relocate_system_messages_image_only_sections_pass_through_unchanged() -
     assert changed is False
     assert clean == messages
     assert new_system == system
+
+
+def test_relocate_system_messages_drops_non_text_from_leading_section(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    cached_text = {
+        "type": "text",
+        "text": "leading instruction",
+        "cache_control": {"type": "ephemeral"},
+    }
+    messages: list[dict] = [
+        {"role": "system", "content": [cached_text, image_block]},
+        {"role": "user", "content": "hi"},
+    ]
+
+    caplog.set_level("WARNING", logger="headroom.proxy")
+    clean, new_system, changed = relocate_system_messages_to_top_level(
+        messages, [{"type": "text", "text": "base"}], "claude-opus-5"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert new_system == [
+        {"type": "text", "text": "base"},
+        cached_text,
+    ]
+    assert "event=system_relocation_block_dropped" in caplog.text
+    assert "block_type=image" in caplog.text
+
+
+def test_relocate_system_messages_drops_all_non_text_leading_section() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages: list[dict] = [
+        {"role": "system", "content": [image_block]},
+        {"role": "user", "content": "hi"},
+    ]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(
+        messages, [{"type": "text", "text": "base"}], "claude-opus-5"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert new_system == [{"type": "text", "text": "base"}]
+
+
+@pytest.mark.parametrize("block_type", ["text", "image", "tool_use", "tool_result", None])
+def test_leading_system_text_uses_only_anthropic_text_block_fields(block_type) -> None:
+    from copy import deepcopy
+
+    cache_control = {"type": "ephemeral", "ttl": "1h"}
+    citations = [
+        {
+            "type": "char_location",
+            "cited_text": "instruction",
+            "document_index": 0,
+            "document_title": "source",
+            "start_char_index": 0,
+            "end_char_index": 11,
+        }
+    ]
+    block = {
+        "type": block_type,
+        "text": "instruction",
+        "cache_control": cache_control,
+        "citations": citations,
+        "source": {"type": "url", "url": "https://example.invalid/image.png"},
+        "id": "tool1",
+        "name": "read",
+        "input": {"path": "file.txt"},
+        "tool_use_id": "tool1",
+        "is_error": False,
+    }
+    messages = [
+        {"role": "system", "content": [block]},
+        {"role": "user", "content": "hi"},
+    ]
+    original = deepcopy(messages)
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, None)
+    assert changed
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert system == [
+        {
+            "type": "text",
+            "text": "instruction",
+            "cache_control": cache_control,
+            "citations": citations,
+        }
+    ]
+    assert messages == original
+
+
+def test_all_contiguous_leading_system_sections_are_normalized() -> None:
+    image = {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a"}}
+    clean, system, changed = relocate_system_messages_to_top_level(
+        [
+            {"role": "system", "content": "first instruction"},
+            {"role": "system", "content": [image]},
+            {"role": "system", "content": [{"type": "text", "text": "second instruction"}]},
+            {"role": "user", "content": "hi"},
+        ],
+        None,
+        None,
+    )
+    assert changed
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert system == [
+        {"type": "text", "text": "first instruction"},
+        {"type": "text", "text": "second instruction"},
+    ]
 
 
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
@@ -585,6 +778,78 @@ def test_chatgpt_passthrough_falls_back_when_h1_client_missing() -> None:
     assert response.status_code == 200
     assert json.loads(response.body)["client"] == "h2"
     assert handler.http_client.calls == 1
+
+
+def test_streaming_client_selection() -> None:
+    assert prefers_http1_passthrough("https://chatgpt.com/backend-api/codex/responses") is True
+    assert prefers_http1_passthrough("https://api.openai.com/v1/chat/completions") is False
+
+    mixin = object.__new__(StreamingMixin)
+    mixin.http_client = "h2"
+    mixin.http_client_h1 = "h1"
+
+    assert mixin._select_streaming_client("https://chatgpt.com/backend-api/codex/responses") == "h1"
+    assert mixin._select_streaming_client("https://api.openai.com/v1/chat/completions") == "h2"
+
+    mixin.http_client_h1 = None
+    assert mixin._select_streaming_client("https://chatgpt.com/backend-api/codex/responses") == "h2"
+
+
+@pytest.mark.asyncio
+async def test_retry_request_selects_http1_for_chatgpt(monkeypatch) -> None:
+    calls = []
+
+    class DummyClient:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def post(self, url, **kwargs):
+            calls.append((self.name, url))
+            return httpx.Response(200, json={"ok": True})
+
+    proxy = object.__new__(HeadroomProxy)
+    proxy.config = type("Config", (), {"retry_max_attempts": 1, "retry_enabled": False})()
+    proxy.http_client = DummyClient("h2")
+    proxy.http_client_h1 = DummyClient("h1")
+
+    await proxy._retry_request("POST", "https://chatgpt.com/backend-api/codex/responses", {}, {})
+    assert calls == [("h1", "https://chatgpt.com/backend-api/codex/responses")]
+
+    calls.clear()
+    await proxy._retry_request("POST", "https://api.openai.com/v1/chat/completions", {}, {})
+    assert calls == [("h2", "https://api.openai.com/v1/chat/completions")]
+
+
+@pytest.mark.asyncio
+async def test_proxy_routes_openai_responses_subpath_selects_http1(monkeypatch) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from headroom.providers.openai_responses import OpenAIResponsesSubpathRoute
+    from headroom.providers.proxy_routes import _register_openai_responses_subpath_route
+
+    received_clients = []
+
+    async def fake_subpath(http_client, request, sub_path):
+        received_clients.append(http_client)
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        "headroom.providers.proxy_routes.handle_chatgpt_codex_responses_subpath",
+        fake_subpath,
+    )
+
+    app = FastAPI()
+    proxy = type("Proxy", (), {"http_client": "h2", "http_client_h1": "h1"})()
+    spec = OpenAIResponsesSubpathRoute(
+        path="/v1/responses/{sub_path:path}",
+        methods=("GET", "POST"),
+    )
+    _register_openai_responses_subpath_route(app, proxy, spec)
+
+    client = TestClient(app)
+    client.get("/v1/responses/items/resp_1")
+    assert received_clients == ["h1"]
 
 
 def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
@@ -723,6 +988,78 @@ def test_vertex_stream_passthrough_preserves_chunks_and_records_usage() -> None:
     assert outcome.optimized_tokens == 13
     assert outcome.output_tokens == 5
     assert outcome.cache_read_tokens == 2
+
+
+def test_vertex_stream_passthrough_records_outcome_when_stream_ends_mid_character() -> None:
+    closed: list[bool] = []
+
+    class _CountingChunks(_AsyncChunks):
+        async def aclose(self) -> None:
+            closed.append(True)
+
+    class _TruncatedClient(_VertexStreamClient):
+        async def send(self, request, stream=False):  # noqa: ANN001, ANN201
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                stream=_CountingChunks(
+                    [
+                        b'data: {"usageMetadata":{"promptTokenCount":13,'
+                        b'"candidatesTokenCount":5}}\n\n',
+                        b'data: {"t":"\xe2\x82',  # first 2 bytes of a 3-byte character
+                    ]
+                ),
+            )
+
+    handler = object.__new__(HeadroomProxy)
+    handler.http_client = _TruncatedClient()
+    outcomes = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex_truncated"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _VertexStreamPassthroughRequest(),
+            "https://vertex.test",
+            "streamGenerateContent",
+            "vertex:google",
+        )
+    )
+
+    async def collect():  # noqa: ANN202
+        return [chunk async for chunk in response.body_iterator]
+
+    assert len(asyncio.run(collect())) == 2
+    assert len(outcomes) == 1
+    assert closed == [True]
+    # Usage already received is kept, but a stream cut mid-character did not
+    # complete: it takes the same failure status as other post-start stream
+    # failures, so the outcome funnel books it as failed, not as a success.
+    assert outcomes[0].optimized_tokens == 13
+    assert outcomes[0].output_tokens == 5
+    assert outcomes[0].status_code == 502
+
+    failed: list[str] = []
+    requested: list[dict] = []
+
+    class _Metrics:
+        async def record_failed(self, provider):  # noqa: ANN001, ANN202
+            failed.append(provider)
+
+        async def record_request(self, **kwargs):  # noqa: ANN003, ANN202
+            requested.append(kwargs)
+
+    asyncio.run(emit_request_outcome(SimpleNamespace(metrics=_Metrics()), outcomes[0]))
+    assert failed == [outcomes[0].provider]
+    assert requested == []
 
 
 def test_stream_finalizer_records_vertex_provider_for_dashboard() -> None:
@@ -1066,6 +1403,89 @@ def test_append_context_skips_trailing_system_message() -> None:
     assert inject(messages, "memory", frozen_message_count=0) is messages
     messages = [trailing_system]
     assert inject(messages, "memory", frozen_message_count=0) is messages
+
+
+def test_proactive_expansion_appends_after_cached_prefix_without_mutating_it() -> None:
+    """CCR expansion must not rewrite a message the provider has already cached (#4287)."""
+    from headroom.ccr.context_tracker import (
+        PROACTIVE_EXPANSION_CLOSE_TAG,
+        PROACTIVE_EXPANSION_OPEN_TAG,
+    )
+
+    env_block = {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}
+    trailing_system = {"role": "system", "content": [env_block]}
+    first_user = {
+        "role": "user",
+        "content": [{"type": "text", "text": "hello from turn 0"}],
+    }
+    messages = [first_user, trailing_system]
+    expansion = f"{PROACTIVE_EXPANSION_OPEN_TAG}\nexpanded\n{PROACTIVE_EXPANSION_CLOSE_TAG}"
+
+    forwarded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
+        messages, expansion
+    )
+
+    assert forwarded[0] == first_user
+    assert forwarded[1]["role"] == "system"
+    assert forwarded[1]["content"][0] == env_block
+    assert forwarded[1]["content"][1] == {"type": "text", "text": expansion}
+    assert "cache_control" not in forwarded[1]["content"][1]
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(forwarded) == messages
+    assert messages[0]["content"][0]["text"] == "hello from turn 0"
+    assert messages[1]["content"] == [env_block]
+
+
+def test_proactive_expansion_without_cache_control_stays_on_the_live_user_turn() -> None:
+    from headroom.ccr.context_tracker import (
+        PROACTIVE_EXPANSION_CLOSE_TAG,
+        PROACTIVE_EXPANSION_OPEN_TAG,
+    )
+
+    messages = [{"role": "user", "content": "hello"}]
+    expansion = f"{PROACTIVE_EXPANSION_OPEN_TAG}\nexpanded\n{PROACTIVE_EXPANSION_CLOSE_TAG}"
+    forwarded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
+        messages, expansion
+    )
+    assert forwarded[0]["content"][0] == {"type": "text", "text": "hello"}
+    assert forwarded[0]["content"][1] == {"type": "text", "text": expansion}
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(forwarded) == [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+    ]
+    assert messages[0]["content"] == "hello"
+
+
+def test_proactive_expansion_keeps_tool_results_together_and_client_text() -> None:
+    from headroom.ccr.context_tracker import (
+        PROACTIVE_EXPANSION_CLOSE_TAG,
+        PROACTIVE_EXPANSION_OPEN_TAG,
+    )
+
+    expansion = f"{PROACTIVE_EXPANSION_OPEN_TAG}\nexample\n{PROACTIVE_EXPANSION_CLOSE_TAG}"
+    tool_a = {
+        "type": "tool_result",
+        "tool_use_id": "A",
+        "content": "a",
+        "cache_control": {"type": "ephemeral"},
+    }
+    tool_b = {"type": "tool_result", "tool_use_id": "B", "content": "b"}
+    messages = [{"role": "user", "content": [tool_a, tool_b]}]
+    forwarded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
+        messages, expansion
+    )
+    content = forwarded[0]["content"]
+    assert [block.get("type") for block in content] == ["tool_result", "tool_result", "text"]
+    assert content[0] is tool_a and content[1] is tool_b and "cache_control" not in content[2]
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(forwarded) == messages
+    client = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Explain this:"},
+                {"type": "text", "text": expansion},
+            ],
+        }
+    ]
+    assert AnthropicHandlerMixin._without_proactive_expansion_messages(client) == client
 
 
 def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn() -> None:

@@ -862,7 +862,7 @@ class _FakeMemory:
         return resp.get("id") == "msg_mem_first"
 
     async def handle_memory_tool_calls(
-        self, resp, user_id, provider="anthropic", request_context=None
+        self, resp, user_id, provider="anthropic", request_context=None, *, tool_names=None
     ):  # noqa: ANN001, ANN201
         return [{"type": "tool_result", "tool_use_id": "toolu_m", "content": "ok"}]
 

@@ -14,6 +14,7 @@ from headroom.config import DEFAULT_EXCLUDE_TOOLS, is_tool_excluded
         "mcp__headroom__headroom_retrieve",
         "mcp_headroom_headroom_retrieve",
         "headroom_headroom_retrieve",
+        "headroom__headroom_retrieve",
     ],
 )
 def test_retrieve_tool_aliases_are_excluded(name: str) -> None:

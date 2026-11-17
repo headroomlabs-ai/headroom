@@ -399,3 +399,29 @@ def test_content_protection_no_op_when_pattern_count_preserved() -> None:
     assert out_text == crushed_with_marker
     assert was_modified is True
     assert info == "lossless:table"
+
+
+@pytest.mark.parametrize("pattern", ["Kraków", "错误", "Zürich"])
+def test_protected_patterns_match_non_ascii_text(pattern: str) -> None:
+    """Patterns are matched against the characters, not `\\uXXXX` escapes.
+    Tool output keeps UTF-8, so a non-ASCII pattern must find its row, and
+    the row must survive a real lossy crush that samples it out otherwise."""
+    from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
+
+    cities = ["Berlin", "Paris", "Madrid", "Rome", "Vienna", "Oslo", "Lisbon", "Prague"]
+    items = [{"id": i, "city": cities[i % 8], "ms": (i * 37) % 999} for i in range(600)]
+    items[437]["city"] = pattern
+    content = json.dumps(items, ensure_ascii=False)
+
+    crusher = SmartCrusher(
+        SmartCrusherConfig(audit_safe=True, protected_patterns=[pattern]),
+        with_compaction=False,
+    )
+    assert crusher._scan_protected_rows(content) == [items[437]]
+
+    crushed, was_modified, _info = crusher._smart_crush_content(content)
+
+    assert was_modified
+    kept = json.loads(crushed)
+    assert items[437] in kept
+    assert len(kept) < len(items)

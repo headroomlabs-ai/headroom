@@ -14,6 +14,7 @@ from opentelemetry.metrics import CallbackOptions, Observation
 
 from headroom._version import get_version
 from headroom.offline import guard_egress
+from headroom.proxy.savings_attribution import event_count
 
 logger = logging.getLogger(__name__)
 
@@ -558,7 +559,7 @@ class HeadroomOtelMetrics:
                 realized=bool(item.get("realized", True)),
                 estimated=bool(item.get("estimated", False)),
             )
-            self._savings_attribution_events.add(1, attrs)
+            self._savings_attribution_events.add(event_count(item), attrs)
             saved = max(0, int(item.get("tokens", 0) or 0))
             if saved:
                 self._savings_attributed_tokens.add(saved, attrs)

@@ -28,6 +28,8 @@ class ProviderHandlerRoute:
 
 ANTHROPIC_PASSTHROUGH_ROUTES: tuple[ProviderPassthroughRoute, ...] = (
     ProviderPassthroughRoute("POST", "/v1/messages/count_tokens", "anthropic", "count_tokens"),
+    ProviderPassthroughRoute("GET", "/api/hello", "anthropic", "api/hello"),
+    ProviderPassthroughRoute("HEAD", "/api/hello", "anthropic", "api/hello"),
 )
 
 
@@ -72,11 +74,6 @@ PROVIDER_PASSTHROUGH_ROUTES: tuple[ProviderPassthroughRoute, ...] = (
     *ANTHROPIC_PASSTHROUGH_ROUTES,
     *OPENAI_PASSTHROUGH_ROUTES,
     *GEMINI_PASSTHROUGH_ROUTES,
-)
-
-
-ANTHROPIC_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
-    ProviderHandlerRoute("POST", "/v1/messages", "handle_anthropic_messages"),
 )
 
 
@@ -204,7 +201,6 @@ CLOUDCODE_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
 
 
 PROVIDER_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
-    *ANTHROPIC_HANDLER_ROUTES,
     *ANTHROPIC_BATCH_ROUTES,
     *OPENAI_HANDLER_ROUTES,
     *OPENAI_BATCH_ROUTES,
