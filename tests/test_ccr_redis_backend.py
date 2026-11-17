@@ -318,13 +318,18 @@ def test_rust_log_compression_keeps_the_log_while_redis_fails(flaky_store, outag
     assert store.retrieve(resumed.cache_key).original_content == log
 
 
-def test_mcp_read_returns_the_file_and_caches_no_hash_while_redis_is_down(flaky_store, tmp_path):
+def test_mcp_read_returns_the_file_and_caches_no_hash_while_redis_is_down(
+    flaky_store, tmp_path, monkeypatch
+):
     import asyncio
 
     from tests._mcp_stub import import_module_with_mcp_stub
 
     mcp_server = import_module_with_mcp_stub("headroom.ccr.mcp_server")
     store, client = flaky_store
+    monkeypatch.setenv(
+        "HEADROOM_MCP_READ_ROOTS", str(tmp_path)
+    )  # reads are confined to the workspace
     path = tmp_path / "a.py"
     source = "x = 1\n" * 50
     path.write_bytes(source.encode())  # exact bytes: write_text would emit CRLF on Windows

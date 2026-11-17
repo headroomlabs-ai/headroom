@@ -21,6 +21,7 @@ from headroom._subprocess import run
 from headroom.install.models import ConfigScope, DeploymentManifest, ManagedMutation, ToolTarget
 from headroom.install.paths import codex_config_path
 
+from .config_toml import loads_codex_config, root_assignment_lines, split_toml_lines
 from .runtime import proxy_base_url
 from .threads import retag_to_headroom, retag_to_native
 
@@ -65,7 +66,7 @@ print(key, end="")
 
 def _codex_credential_store(config_dir: Path) -> str | None:
     try:
-        config = tomllib.loads((config_dir / "config.toml").read_text(encoding="utf-8"))
+        config = loads_codex_config((config_dir / "config.toml").read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return None
     store = config.get("cli_auth_credentials_store")
@@ -261,7 +262,7 @@ def codex_auth_helper_is_referenced(content: str, helper_path: str) -> bool | No
     the helper instead of risking deletion of a pre-existing user file.
     """
     try:
-        document = tomllib.loads(content)
+        document = loads_codex_config(content)
     except (tomllib.TOMLDecodeError, TypeError):
         return None
 
@@ -358,7 +359,7 @@ def _insert_block_at_root(content: str, block: str) -> str:
     root instead.
     """
     block = block.strip()
-    lines = content.splitlines()
+    lines = split_toml_lines(content)
     for index, line in enumerate(lines):
         if _TOML_TABLE_HEADER_RE.search(line):
             head = "\n".join(lines[:index]).rstrip()
@@ -369,19 +370,18 @@ def _insert_block_at_root(content: str, block: str) -> str:
 
 
 def _strip_root_provider_assignments(content: str) -> str:
-    """Remove root provider assignments without touching table-scoped settings."""
-    lines = content.splitlines(keepends=True)
-    kept: list[str] = []
-    in_root = True
-    for line in lines:
-        if in_root and _TOML_TABLE_HEADER_RE.search(line):
-            in_root = False
-        if in_root and (
-            _ROOT_MODEL_PROVIDER_RE.match(line) or _ROOT_OPENAI_BASE_URL_RE.match(line)
-        ):
-            continue
-        kept.append(line)
-    return "".join(kept)
+    """Remove root provider assignments without touching table-scoped settings.
+
+    Keys nested in a multi-line inline table (e.g. a ``profiles = {`` override)
+    are not root assignments and are kept.
+    """
+    root_lines = root_assignment_lines(content)
+    return "".join(
+        line
+        for index, line in enumerate(split_toml_lines(content, keepends=True))
+        if index not in root_lines
+        or not (_ROOT_MODEL_PROVIDER_RE.match(line) or _ROOT_OPENAI_BASE_URL_RE.match(line))
+    )
 
 
 def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None:
@@ -411,7 +411,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     existing = _CODEX_PATTERN.sub("", existing)
     existing = _strip_root_provider_assignments(existing)
     merged = _insert_block_at_root(existing, section)
-    tomllib.loads(merged)
+    loads_codex_config(merged)
     path.write_text(merged, encoding="utf-8")
     # Pull existing native threads into the headroom-provider menu so Codex's
     # history list stays whole once it routes through Headroom. Best-effort.

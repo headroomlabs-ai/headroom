@@ -248,7 +248,9 @@ class SQLiteGraphStore:
     async def add_entity(self, entity: Entity) -> None:
         """Add an entity to the graph store.
 
-        If an entity with the same ID already exists, it will be replaced.
+        If an entity with the same ID and owner already exists, its fields are
+        updated without deleting its relationships. Reassigning the owner
+        replaces the entity and deletes its old relationships.
 
         Args:
             entity: The entity to add.
@@ -257,6 +259,14 @@ class SQLiteGraphStore:
 
         with self._lock:
             with self._get_conn() as conn:
+                # Keep owner reassignment's replacement/cascade semantics. Both
+                # statements share a transaction, so a failed save restores the old graph.
+                conn.execute(
+                    "DELETE FROM entities WHERE id = :id AND user_id != :user_id",
+                    row,
+                )
+                # The ID upsert overrides REPLACE's delete. Keep REPLACE's existing
+                # NOT NULL/default handling for the incoming row.
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO entities (
@@ -266,6 +276,16 @@ class SQLiteGraphStore:
                         :id, :user_id, :name, :name_lower, :entity_type, :description,
                         :properties, :created_at, :updated_at, :metadata
                     )
+                    ON CONFLICT(id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        name = excluded.name,
+                        name_lower = excluded.name_lower,
+                        entity_type = excluded.entity_type,
+                        description = excluded.description,
+                        properties = excluded.properties,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at,
+                        metadata = excluded.metadata
                     """,
                     row,
                 )

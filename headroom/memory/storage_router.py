@@ -8,8 +8,8 @@ a request.
 Three storage modes:
 
 * ``PROJECT`` (default): one DB per resolved project. The project is
-  identified from request headers (explicit) or by parsing a Claude
-  Code / Codex ``<env>`` block for the working directory.
+  identified from explicit request signals or client working-directory
+  context, including Claude Code / Codex ``<env>`` and pi ``<cwd>`` blocks.
 * ``USER``: one DB per ``x-headroom-user-id`` (no project axis).
 * ``GLOBAL``: a single DB shared across everything. Matches the pre-fix
   behaviour and is preserved so users can still reach memories written
@@ -91,7 +91,7 @@ class ResolvedScope:
     """
 
     mode: MemoryStorageMode
-    db_path: Path
+    db_path: Path | None
     display_name: str  # human-readable label, e.g. project basename
     project_key: str | None  # stable hash, None for USER/GLOBAL
 
@@ -183,7 +183,7 @@ class ProjectResolver:
             if ident is not None:
                 return ident
 
-        # Tier 4: parse the system prompt for a ``<env>`` cwd line.
+        # Tier 4: parse client working-directory context from the system prompt.
         sys_cwd = self._extract_cwd_from_system_prompt(ctx.system_prompt)
         if sys_cwd:
             ident = self._identity_from_cwd(sys_cwd)
@@ -207,7 +207,9 @@ class ProjectResolver:
         return None
 
     @classmethod
-    def _extract_cwd_from_system_prompt(cls, system_prompt: str) -> str | None:
+    def _extract_cwd_from_system_prompt(
+        cls, system_prompt: str, *, allow_cwd_block: bool = True
+    ) -> str | None:
         if not system_prompt:
             return None
         for prefix in _CWD_PREFIXES:
@@ -220,6 +222,13 @@ class ProjectResolver:
                 chunk = line[len(prefix) :].strip()
                 if chunk:
                     return chunk
+        if allow_cwd_block:
+            block_start = system_prompt.find("<cwd>")
+            if block_start >= 0:
+                block_start += len("<cwd>")
+                block_end = system_prompt.find("</cwd>", block_start)
+                if block_end >= 0:
+                    return system_prompt[block_start:block_end].strip() or None
         return None
 
     @classmethod
@@ -304,12 +313,19 @@ class BackendRouter:
         self._backends: OrderedDict[Path, LocalBackend] = OrderedDict()
         self._lock = threading.Lock()
 
-    def backend_for(self, ctx: RequestContext) -> tuple[LocalBackend, ResolvedScope]:
+    def backend_for(self, ctx: RequestContext) -> tuple[LocalBackend | None, ResolvedScope]:
         """Return the backend + scope metadata to use for this request."""
 
         scope = self._resolve_scope(ctx)
+        if scope.db_path is None:
+            return None, scope
         backend = self._get_or_create_backend(scope.db_path)
         return backend, scope
+
+    def scope_for(self, ctx: RequestContext) -> ResolvedScope:
+        """Resolve request scope without acquiring or creating a backend."""
+
+        return self._resolve_scope(ctx)
 
     def _resolve_scope(self, ctx: RequestContext) -> ResolvedScope:
         mode = self._config.mode
@@ -363,7 +379,7 @@ class BackendRouter:
                 )
                 return ResolvedScope(
                     mode=MemoryStorageMode.PROJECT,
-                    db_path=self._config.global_db_path,  # Unused — caller checks project_key.
+                    db_path=None,
                     display_name="unresolved (no memory)",
                     project_key=None,
                 )
@@ -484,16 +500,20 @@ def _first_user_text_with_cwd(messages: list[Any]) -> str:
 
     Claude Code 2.x sends its ``<env>`` block as an ``isMeta`` *user*
     message rather than inside ``system`` (#3595), and Trae puts it in a
-    user reminder (#1737). Only text that actually contains one of
-    ``_CWD_PREFIXES`` is returned, so ordinary user content never leaks
-    into the system prompt.
+    user reminder (#1737). Only usable legacy cwd lines enable this
+    fallback; pi cwd blocks are recognized in system context, not
+    ordinary user text.
     """
     for msg in messages:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         content = msg.get("content")
         user_text = content if isinstance(content, str) else _text_from_blocks(content)
-        if user_text and ProjectResolver._extract_cwd_from_system_prompt(user_text) is not None:
+        if (
+            user_text
+            and ProjectResolver._extract_cwd_from_system_prompt(user_text, allow_cwd_block=False)
+            is not None
+        ):
             return user_text
     return ""
 

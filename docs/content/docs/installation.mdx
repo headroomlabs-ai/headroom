@@ -87,7 +87,7 @@ The core package includes the `compress()` function, SmartCrusher, CacheAligner,
 
 ### Extras
 
-Install only what you need, or grab everything with `[all]`:
+Install only what you need, or use `[all]` for the default CLI/proxy feature set:
 
 ```bash
 pip install "headroom-ai[all]"
@@ -97,16 +97,16 @@ pip install "headroom-ai[all]"
 |---|---|---|
 | `proxy` | Proxy server, HTTP API, MCP runtime, local ONNX Kompress path | `pip install "headroom-ai[proxy]"` |
 | `proxy-prod` | `proxy` plus gunicorn on Unix production hosts | `pip install "headroom-ai[proxy,proxy-prod]"` |
-| `ml` | PyTorch/Hugging Face Kompress backend and model tooling | `pip install "headroom-ai[ml]"` |
+| `ml` | PyTorch/Hugging Face Kompress backend and model tooling; opt-in, not in `[all]` | `pip install "headroom-ai[ml]"` |
 | `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
-| `memory` | Persistent memory (sqlite-vec, sentence-transformers) — pure-Python default backend, no compiler | `pip install "headroom-ai[memory]"` |
+| `memory` | Persistent memory (sqlite-vec, sentence-transformers); opt-in, not in `[all]` | `pip install "headroom-ai[memory]"` |
 | `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
-| `memory-stack` | Optional Qdrant + Neo4j memory backend helpers; **not in `[all]`** | `pip install "headroom-ai[memory-stack]"` |
+| `memory-stack` | Optional Qdrant + Neo4j memory backend helpers; **not in `[all]`**. Headroom turns off Mem0's PostHog telemetry by default; set `MEM0_TELEMETRY=True` to allow it | `pip install "headroom-ai[memory-stack]"` |
 | `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
 | `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |
 | `reports` | HTML/Markdown report generation (Jinja2) | `pip install "headroom-ai[reports]"` |
 | `otel` | OpenTelemetry exporter (OTLP) | `pip install "headroom-ai[otel]"` |
-| `voice` | Voice/audio support | `pip install "headroom-ai[voice]"` |
+| `voice` | Voice/audio support; opt-in, not in `[all]` | `pip install "headroom-ai[voice]"` |
 | `voice-train` | Voice training dependencies; **not in `[all]`** | `pip install "headroom-ai[voice-train]"` |
 | `mcp` | MCP server tools (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) | `pip install "headroom-ai[mcp]"` |
 | `langchain` | LangChain `HeadroomChatModel` wrapper; **not in `[all]`** | `pip install "headroom-ai[langchain]"` |
@@ -116,15 +116,17 @@ pip install "headroom-ai[all]"
 | `autogen` | AutoGen AgentChat integration; **not in `[all]`** | `pip install "headroom-ai[autogen]"` |
 | `anyllm` | any-llm multi-provider backend (Python 3.11+); **not in `[all]`** | `pip install "headroom-ai[anyllm]"` |
 | `bedrock` | Native AWS Bedrock credentials/backend support; **not in `[all]`** | `pip install "headroom-ai[bedrock]"` |
-| `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks) | `pip install "headroom-ai[evals]"` |
+| `redis` | Redis client for state shared across replicas (`HEADROOM_CCR_BACKEND=redis`, `HEADROOM_COMPRESS_SESSION_STORE`); **not in `[all]`**, included in every Docker image | `pip install "headroom-ai[redis]"` |
+| `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks); opt-in, not in `[all]` | `pip install "headroom-ai[evals]"` |
 | `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
 | `html` | HTML main-content extraction with trafilatura | `pip install "headroom-ai[html]"` |
 | `spreadsheet` | `.xlsx` / `.xls` ingestion with openpyxl and xlrd | `pip install "headroom-ai[spreadsheet]"` |
-| `sandbox` | Torch-free proxy bundle for constrained environments | `pip install "headroom-ai[sandbox]"` |
-| `all` | Runtime bundle: `proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet` | `pip install "headroom-ai[all]"` |
+| `lean` | Torch-free proxy bundle for constrained environments (a dependency profile; it provides no isolation). `sandbox` is a deprecated alias | `pip install "headroom-ai[lean]"` |
+| `all` | CLI/proxy feature set without PyTorch-backed dependencies | `pip install "headroom-ai[all]"` |
 
-`[all]` is the full built-in runtime bundle, not every integration or optional
-backend. The rows marked “not in `[all]`” must be requested explicitly.
+`[all]` is the built-in CLI/proxy feature set, not every integration or
+PyTorch-backed feature. The rows marked “not in `[all]`” must be requested
+explicitly. PyPI's Linux PyTorch wheels can include CUDA runtime packages.
 
 You can combine extras:
 
@@ -255,15 +257,15 @@ If you want a host `headroom` CLI that keeps Headroom itself inside a container 
 
 | Tag | Extras | Base image | Description |
 |---|---|---|---|
-| `latest` | `proxy,bedrock` | Debian slim | Default image, runs as non-root |
-| `<version>` | `proxy,bedrock` | Debian slim | Pinned release, same default variant |
-| `nonroot` | `proxy,bedrock` | Debian slim | Explicit non-root variant |
-| `code` | `proxy,code,bedrock` | Debian slim | Includes tree-sitter for code compression |
-| `code-nonroot` | `proxy,code,bedrock` | Debian slim | Code compression, non-root |
-| `slim` | `proxy,bedrock` | Distroless | Minimal image, no shell |
-| `slim-nonroot` | `proxy,bedrock` | Distroless | Minimal, non-root |
-| `code-slim` | `proxy,code,bedrock` | Distroless | Code compression, minimal |
-| `code-slim-nonroot` | `proxy,code,bedrock` | Distroless | Code compression, minimal, non-root |
+| `latest` | `proxy,bedrock,redis` | Debian slim | Default image, runs as non-root |
+| `<version>` | `proxy,bedrock,redis` | Debian slim | Pinned release, same default variant |
+| `nonroot` | `proxy,bedrock,redis` | Debian slim | Explicit non-root variant |
+| `code` | `proxy,code,bedrock,redis` | Debian slim | Includes tree-sitter for code compression |
+| `code-nonroot` | `proxy,code,bedrock,redis` | Debian slim | Code compression, non-root |
+| `slim` | `proxy,bedrock,redis` | Distroless | Minimal image, no shell |
+| `slim-nonroot` | `proxy,bedrock,redis` | Distroless | Minimal, non-root |
+| `code-slim` | `proxy,code,bedrock,redis` | Distroless | Code compression, minimal |
+| `code-slim-nonroot` | `proxy,code,bedrock,redis` | Distroless | Code compression, minimal, non-root |
 
 ### Build from source
 
@@ -296,8 +298,11 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 | `VERTEXAI_PROJECT` | GCP project id for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_PROJECT`; set it explicitly to avoid silently billing your ADC default quota project) |
 | `VERTEXAI_LOCATION` | GCP region for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_LOCATION`) |
 
-The Vertex AI backend also requires `google-cloud-aiplatform>=1.38`, which is not
-included in any extra or Docker image — see
+The Vertex AI backend also requires `google-cloud-aiplatform>=1.38`, which ships
+in the `[vertex]` extra (`pip install "headroom-ai[proxy,vertex]"`) rather than
+`[proxy]`, since it adds roughly 175 MB and only that backend needs it. The
+proxy refuses to start if the backend is selected without it. Vertex's native
+passthrough routes need neither the extra nor the backend flag — see
 [Google Vertex AI](/docs/proxy#google-vertex-ai) for setup details.
 
 ### Proxy configuration
@@ -356,12 +361,24 @@ The recommended way to install rust is using `rustup`. You can find the official
 Headroom serves a live savings dashboard while the proxy is running. Open it with:
 
 ```bash
-headroom dashboard            # opens http://localhost:8787/dashboard in your browser
+headroom dashboard            # opens the running proxy's dashboard in your browser
 headroom dashboard --no-open  # just print the URL
 ```
 
-Or browse to `http://localhost:8787/dashboard` directly (use `--port` / `HEADROOM_PORT` if you
-run the proxy on a different port).
+With no `--port`, `headroom dashboard`, `headroom inspect` and the runtime probe used by
+`headroom learn` auto-detect the port of the most recently started live wrap session before
+falling back to `8787`. This matters because
+`headroom wrap ...` does not always land on `8787` — a Copilot-subscription session
+takes a dedicated port, and any wrap falls forward to the next free port when `8787`
+is busy, so a session can be serving on `8788` while `8787` is stale or empty.
+
+Pass `--port` (or set `HEADROOM_PORT`) to target a specific proxy explicitly; an
+explicit value always wins over auto-detection. `headroom doctor` keeps the requested
+port and reports a live proxy found elsewhere, including one associated with a wrap
+session marker, so you can rerun it with the suggested `--port`.
+
+If nothing is listening on the resolved port, the command prints a warning
+instead of silently opening a dead page.
 
 ## Next steps
 
