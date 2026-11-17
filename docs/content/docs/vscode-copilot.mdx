@@ -46,7 +46,9 @@ The command:
 2. starts Headroom on `127.0.0.1:8787` with the short-lived upstream token;
 3. adds a marker-owned block to VS Code user settings containing
    `github.copilot.advanced.debug.overrideProxyUrl` (inline completions) and
-   `github.copilot.advanced.debug.overrideCapiUrl` (chat);
+   `github.copilot.advanced.debug.overrideCapiUrl` (chat), plus
+   `chat.defaultToCopilotHarness` and `chat.editor.preferCopilotHarness` set to
+   `false` so new chats stay on VS Code's Local harness;
 4. keeps running until `Ctrl+C` so the local proxy is available to VS Code.
 
 Continue using Copilot's normal model picker. The request body—and therefore the
@@ -69,6 +71,14 @@ Copilot UI: user selects model M
   -> response from model M
 ```
 
+## Chat harness
+
+A chat running on VS Code's Copilot harness (Agent Host) ignores the endpoint
+overrides and bypasses Headroom, so the managed block keeps new chats on the
+Local harness. A chat keeps the engine it started with: start a new chat after
+running `headroom wrap vscode`. If you already set either harness setting
+yourself, Headroom leaves your value alone and warns when it is `true`.
+
 ## Safe settings lifecycle
 
 Headroom edits only a marked block in VS Code's `settings.json`. Existing JSONC
@@ -89,7 +99,7 @@ remote extension host, provide the exact user settings file:
 headroom wrap vscode --settings-file /path/to/User/settings.json
 ```
 
-Use `--no-configure` to print the two settings without editing a file.
+Use `--no-configure` to print the settings without editing a file.
 
 ## Model coverage
 
@@ -183,6 +193,9 @@ or `GITHUB_COPILOT_ENTERPRISE_DOMAIN` before both `copilot-auth login` and
 - If Headroom records no requests while Copilot keeps working, the window is
   probably using a VS Code profile with its own settings. `wrap vscode` warns
   about each such profile and prints the `--settings-file` path to configure it.
+- If only some chats are missing, they are running on the Copilot harness: start
+  a new chat, and set `chat.defaultToCopilotHarness` and
+  `chat.editor.preferCopilotHarness` to `false` if you had set them to `true`.
 - Use `--port 8788` when the default port is occupied; settings update safely.
 - If Headroom refuses settings, repair the reported JSONC/marker conflict or use
   `--no-configure` and apply the printed settings manually.
