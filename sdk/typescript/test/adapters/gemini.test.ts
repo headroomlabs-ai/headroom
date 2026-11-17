@@ -240,4 +240,64 @@ describe("Gemini withHeadroom", () => {
 
     expect(mockModel.generateContent).toHaveBeenCalledWith("text");
   });
+
+  // Issue #4770: Gemini 3 rejects a function-call turn whose functionCall lost its
+  // thoughtSignature. The proxy preserves extra keys, so echoing the request back is
+  // what the real service does; the adapter must still hand the model signed parts.
+  it("keeps thought signatures and call ids through a proxy round trip", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    mockFetch.mockImplementation(async (_url: string, opts: any) => ({
+      ok: true,
+      json: async () => ({
+        messages: JSON.parse(opts.body).messages,
+        tokens_before: 500,
+        tokens_after: 400,
+        tokens_saved: 100,
+        compression_ratio: 0.8,
+        transforms_applied: ["smart_crusher"],
+        ccr_hashes: [],
+      }),
+    }));
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent({
+      contents: [
+        { role: "user", parts: [{ text: "What is the weather in Paris?" }] },
+        {
+          role: "model",
+          parts: [
+            { text: "Let me look that up.", thought: true, thoughtSignature: "sig-thought-1" },
+            {
+              functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } },
+              thoughtSignature: "sig-call-1",
+            },
+          ],
+        },
+        {
+          role: "user",
+          parts: [{ functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } } }],
+        },
+      ],
+    });
+
+    expect(mockModel.generateContent).toHaveBeenCalledWith({
+      contents: [
+        { role: "user", parts: [{ text: "What is the weather in Paris?" }] },
+        {
+          role: "model",
+          parts: [
+            { text: "Let me look that up.", thought: true, thoughtSignature: "sig-thought-1" },
+            {
+              functionCall: { id: "call_abc123", name: "get_weather", args: { city: "Paris" } },
+              thoughtSignature: "sig-call-1",
+            },
+          ],
+        },
+        {
+          role: "user",
+          parts: [{ functionResponse: { id: "call_abc123", name: "get_weather", response: { tempC: 21 } } }],
+        },
+      ],
+    });
+  });
 });

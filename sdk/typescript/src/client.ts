@@ -16,7 +16,13 @@ import type {
   ProxyCompressResponse,
   ProxyErrorResponse,
 } from "./types.js";
-import { mapProxyError, HeadroomConnectionError, HeadroomAuthError, HeadroomCompressError } from "./errors.js";
+import {
+  mapProxyError,
+  HeadroomError,
+  HeadroomConnectionError,
+  HeadroomAuthError,
+  HeadroomCompressError,
+} from "./errors.js";
 import { deepCamelCase, deepSnakeCase } from "./utils/case.js";
 import { parseSSE } from "./utils/stream.js";
 import type { CompressRequestConfig, HeadroomMode } from "./types/config.js";
@@ -63,6 +69,20 @@ function makeFallbackResult(messages: OpenAIMessage[]): CompressResult {
     ccrHashes: [],
     compressed: false,
   };
+}
+
+/**
+ * True for a proxy error response below 500, whichever class `mapProxyError`
+ * picked. Typed classes carry the status in `details.statusCode`.
+ */
+function isClientError(error: unknown): boolean {
+  const status =
+    error instanceof HeadroomCompressError
+      ? error.statusCode
+      : error instanceof HeadroomError
+        ? error.details?.statusCode
+        : undefined;
+  return typeof status === "number" && status < 500;
 }
 
 // --- Headroom request params ---
@@ -255,12 +275,7 @@ export class HeadroomClient implements HeadroomClientInterface {
       } catch (error) {
         lastError = error;
         if (error instanceof HeadroomAuthError) throw error;
-        if (
-          error instanceof HeadroomCompressError &&
-          error.statusCode < 500
-        ) {
-          throw error;
-        }
+        if (isClientError(error)) throw error;
       }
     }
 
