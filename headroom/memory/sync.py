@@ -140,14 +140,29 @@ def _save_sync_state(state_path: Path, state: dict[str, Any]) -> None:
 
 
 def _db_fingerprint(memories: list[Any]) -> str:
-    """Compute a fast fingerprint of DB state."""
+    """Fingerprint the fields that affect sync for every returned memory."""
     if not memories:
         return "empty"
-    # Hash: count + most recent created_at
-    parts = [str(len(memories))]
-    for m in memories[:5]:  # Sample first 5 for speed
-        parts.append(getattr(m, "id", "")[:8])
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    # IDs and row count stay unchanged on in-place edits. Sampling also misses
+    # changes outside the newest rows. Hash the already-fetched snapshot using
+    # the content and export/lineage fields, without volatile access counters.
+    rows = []
+    for memory in memories:
+        meta = memory.metadata or {}
+        rows.append(
+            (
+                memory.id,
+                memory.content,
+                getattr(memory, "category", "") or "",
+                getattr(memory, "importance", 0.5),
+                str(memory.created_at),
+                meta.get("source_agent", "unknown"),
+                meta.get("sync_direction", ""),
+                meta.get("content_hash", ""),
+            )
+        )
+    payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
