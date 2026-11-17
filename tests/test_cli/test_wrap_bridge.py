@@ -74,6 +74,40 @@ def test_wrap_grok_build_uses_actual_proxy_port(monkeypatch, tmp_path: Path) -> 
     assert "http://127.0.0.1:8787/" not in result.output
 
 
+def test_wrap_grok_build_passes_xai_openai_api_url(monkeypatch, tmp_path: Path) -> None:
+    """Grok Build must set proxy upstream to xAI (same as wrap grok).
+
+    Without openai_api_url, the proxy defaults to api.openai.com and Grok
+    session auth returns 401 on every chat completion.
+    """
+    from headroom.providers.grok import DEFAULT_API_URL
+
+    _set_test_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    captured: dict = {}
+
+    def fake_watcher(**kwargs) -> None:
+        captured.update(kwargs)
+        kwargs["print_setup_lines"](kwargs["port"])
+
+    monkeypatch.setattr("headroom.cli.wrap._run_proxy_only_watcher", fake_watcher)
+
+    result = runner.invoke(main, ["wrap", "grok-build", "--port", "8787"])
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("openai_api_url") == DEFAULT_API_URL
+    # Equality on the constant (not substring containment) keeps CodeQL
+    # incomplete-url-substring-sanitization quiet while pinning the host.
+    assert DEFAULT_API_URL == "https://api.x.ai"
+    expected_upstream = f"  Proxy upstream (OpenAI-compatible): {DEFAULT_API_URL}"
+    upstream_lines = [
+        line
+        for line in result.output.splitlines()
+        if line.startswith("  Proxy upstream (OpenAI-compatible): ")
+    ]
+    assert upstream_lines == [expected_upstream]
+
+
 def test_wrap_rejects_retired_context_tool_flag(monkeypatch, tmp_path: Path) -> None:
     """A surviving --context-tool must fail loudly, not be silently ignored.
 

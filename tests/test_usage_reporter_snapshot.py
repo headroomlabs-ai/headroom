@@ -8,6 +8,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import anyio
+import pytest
 
 from headroom.telemetry.reporter import UsageReporter
 
@@ -70,3 +71,28 @@ def test_baseline_not_advanced_on_exception():
     anyio.run(r._report_usage)
     assert r._last_tokens_saved_by_model == {}
     assert r._last_requests_by_model == {}
+
+
+@pytest.mark.windows_newline
+def test_license_cache_is_written_with_lf(tmp_path, monkeypatch):
+    """The cache is indented JSON; pin LF so Windows does not write CRLF (#3698).
+
+    Asserted at the call: on POSIX an unpinned write is identical on disk.
+    """
+    from headroom import fileperms
+    from headroom.telemetry.reporter import LicenseInfo
+
+    calls = []
+    original = fileperms.open_owner_only
+
+    def spy(path, mode="a", **kwargs):
+        calls.append(kwargs.get("newline"))
+        return original(path, mode, **kwargs)
+
+    monkeypatch.setattr(fileperms, "open_owner_only", spy)
+    cache = tmp_path / "license.json"
+    reporter = UsageReporter("hlk_test", cache_path=cache)
+    reporter._license_info = LicenseInfo(status="active")
+    reporter._save_cache()
+    assert calls == ["\n"]
+    assert b"\r\n" not in cache.read_bytes()

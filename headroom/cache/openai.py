@@ -421,9 +421,7 @@ class OpenAICacheOptimizer(BaseCacheOptimizer):
                 leading = len(line) - len(line.lstrip())
                 # Collapse multiple spaces in content (not indentation)
                 content_part = " ".join(stripped.split())
-                normalized_lines.append(
-                    " " * leading + content_part[leading:] if leading else content_part
-                )
+                normalized_lines.append(line[:leading] + content_part)
             else:
                 normalized_lines.append("")
 
@@ -434,7 +432,9 @@ class OpenAICacheOptimizer(BaseCacheOptimizer):
             while "\n\n\n" in result:
                 result = result.replace("\n\n\n", "\n\n")
 
-        return result.strip()
+        # Lines are already right-stripped and blank lines are empty, so only
+        # surrounding newlines remain; keep the first line's indentation.
+        return result.strip("\n")
 
     def _format_dynamic_section(
         self,

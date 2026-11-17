@@ -1,5 +1,5 @@
 {
-  "_comment": "Registry of externally fetched CLI tool binaries. Bump versions and SHA256s via the weekly tools-version-check CI job (see .github/workflows/). sha256=null means HTTPS-trust-only (initial bootstrap); the CI job fills real SHAs per release.",
+  "_comment": "Registry of externally fetched CLI tool binaries. SHA-256 pins are enforced before execution (headroom/binaries.py). After bumping a version, regenerate pins with scripts/refresh_tool_hashes.py; the tools-hash-refresh CI workflow verifies they match the published assets.",
   "tools": {
     "difft": {
       "version": "0.64.0",
@@ -11,39 +11,39 @@
         "linux-x86_64-gnu": {
           "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-unknown-linux-gnu.tar.gz",
           "member": "difft",
-          "sha256": null
+          "sha256": "9ec3aa9f784a54c8099d1af71b6bc18d3ad12ce50055565ffa2979aff93c5732"
         },
         "linux-x86_64-musl": {
           "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-unknown-linux-gnu.tar.gz",
           "member": "difft",
-          "sha256": null,
+          "sha256": "9ec3aa9f784a54c8099d1af71b6bc18d3ad12ce50055565ffa2979aff93c5732",
           "_comment": "same asset as linux-x86_64-gnu; upstream has no dedicated musl build"
         },
         "linux-aarch64-gnu": {
           "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-aarch64-unknown-linux-gnu.tar.gz",
           "member": "difft",
-          "sha256": null
+          "sha256": "f657b0cc1baba3b5bcde4fdfbafbc58f2131476ed53d01e4880898d34a1cb124"
         },
         "linux-aarch64-musl": {
           "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-aarch64-unknown-linux-gnu.tar.gz",
           "member": "difft",
-          "sha256": null,
+          "sha256": "f657b0cc1baba3b5bcde4fdfbafbc58f2131476ed53d01e4880898d34a1cb124",
           "_comment": "same asset as linux-aarch64-gnu"
         },
         "darwin-x86_64": {
           "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-apple-darwin.tar.gz",
           "member": "difft",
-          "sha256": null
+          "sha256": "d6b7f1c4a66495400f1f6e224efdaf82aa66e8930fcb257bc9357d69d52dd69d"
         },
         "darwin-aarch64": {
           "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-aarch64-apple-darwin.tar.gz",
           "member": "difft",
-          "sha256": null
+          "sha256": "e1e59ff3cf6c0837c94ddd4910d43351ec14f8c169abcfa51e63136d14c9e528"
         },
         "windows-x86_64": {
           "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-pc-windows-msvc.zip",
           "member": "difft.exe",
-          "sha256": null
+          "sha256": "1ac0113adf9ade9417ee133bed38efe3085b7ccbb32ab620bdc36c4a9b365276"
         }
       }
     },
@@ -52,42 +52,42 @@
       "binary": "scc",
       "source": "boyter/scc",
       "homepage": "https://github.com/boyter/scc",
-      "_comment": "scc is a statically-linked Go binary, so the same asset is used for both libc variants. The duplicated gnu/musl entries are intentional — they document musl support for `headroom tools doctor`.",
+      "_comment": "scc is a statically-linked Go binary, so the same asset is used for both libc variants. The duplicated gnu/musl entries are intentional \u2014 they document musl support for `headroom tools doctor`.",
       "assets": {
         "linux-x86_64-gnu": {
           "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_x86_64.tar.gz",
           "member": "scc",
-          "sha256": null
+          "sha256": "6c31f4d0cf3b7a8c5ca910fa4e451949434798f6541ec5dea4b83f4973e13772"
         },
         "linux-x86_64-musl": {
           "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_x86_64.tar.gz",
           "member": "scc",
-          "sha256": null
+          "sha256": "6c31f4d0cf3b7a8c5ca910fa4e451949434798f6541ec5dea4b83f4973e13772"
         },
         "linux-aarch64-gnu": {
           "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_arm64.tar.gz",
           "member": "scc",
-          "sha256": null
+          "sha256": "64446b1ca954aa1ac34984bbb4f098f46e6c69c84d64a7d096275ea6e50461eb"
         },
         "linux-aarch64-musl": {
           "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_arm64.tar.gz",
           "member": "scc",
-          "sha256": null
+          "sha256": "64446b1ca954aa1ac34984bbb4f098f46e6c69c84d64a7d096275ea6e50461eb"
         },
         "darwin-x86_64": {
           "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Darwin_x86_64.tar.gz",
           "member": "scc",
-          "sha256": null
+          "sha256": "33fee1db983a6d22297d5f4e41bca25438c8a09d5c7c558acbfb5f9cd4deb19b"
         },
         "darwin-aarch64": {
           "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Darwin_arm64.tar.gz",
           "member": "scc",
-          "sha256": null
+          "sha256": "0e967d77ad564fa77bc5ed157d4e04bc6b56c5619edef317e5c99b15c9fca9d2"
         },
         "windows-x86_64": {
           "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Windows_x86_64.zip",
           "member": "scc.exe",
-          "sha256": null
+          "sha256": "9ce15936440f1680bd133905c9f6c99a5d258bcea6f73fc372c3f8b4b888200f"
         }
       }
     },
@@ -98,6 +98,52 @@
       "homepage": "https://ast-grep.github.io/",
       "_comment": "Installed via the ast-grep-cli PyPI wheel; we never fetch from GitHub for this tool. Listed here so `headroom tools doctor` can report it.",
       "assets": {}
+    },
+    "codebase-memory-mcp": {
+      "version": "v0.8.1",
+      "binary": "codebase-memory-mcp",
+      "source": "DeusData/codebase-memory-mcp",
+      "_comment": "Upstream names its assets arm64/amd64; the registry keys them by PlatformKey.key(), i.e. aarch64/x86_64.",
+      "assets": {
+        "linux-x86_64-gnu": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-amd64.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "dbd3b92ea870ef240b63059f26bda15015f76ef9978931bebc3a0f9d09470973"
+        },
+        "linux-x86_64-musl": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-amd64-portable.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "6ab87a6c05d049dde57700803ca0ab4199fcf25973a0606618af0fcee73f5abd",
+          "_comment": "upstream publishes a separate -portable build of this release; used for musl, where the standard (glibc-linked) linux asset is not expected to run. Not yet run on a musl host."
+        },
+        "linux-aarch64-gnu": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091"
+        },
+        "linux-aarch64-musl": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64-portable.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "13526acc2a6a0697dff3c763fb443a416589bc10ad8b12015b63d87e515dd72b",
+          "_comment": "upstream publishes a separate -portable build of this release; used for musl, where the standard (glibc-linked) linux asset is not expected to run. Not yet run on a musl host."
+        },
+        "darwin-x86_64": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-darwin-amd64.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "fb62da3016ea12b948351208759b5c083fb1446cf6e78d6db8b7cd28fe86fd54"
+        },
+        "darwin-aarch64": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-darwin-arm64.tar.gz",
+          "member": "codebase-memory-mcp",
+          "sha256": "fbd047509852021b5446a11141bcb0a3d1dcaebf6e5112460960f29f052c1c58"
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-windows-amd64.zip",
+          "member": "codebase-memory-mcp.exe",
+          "sha256": "a602ad090ed3f49d86c55472f73f27ad7055222806a82358f2e08513e027f00f",
+          "_comment": "member name follows the difft/scc convention for the windows zip; not yet extracted on a windows host."
+        }
+      }
     }
   }
 }

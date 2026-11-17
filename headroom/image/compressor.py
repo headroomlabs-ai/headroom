@@ -25,7 +25,9 @@ import base64
 import io
 import logging
 import re
+import time
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -34,9 +36,23 @@ if TYPE_CHECKING:
 # Import the enum from the dependency-free module so importing the compressor
 # does not eagerly import trained_router (and thus torch/transformers) — that
 # eager import crashed on Python 3.13+ (#2513).
-from .image_types import Technique
+from .decoder_guard import pillow_is_safe
+from .image_types import ImageMemo, Technique
 
 logger = logging.getLogger(__name__)
+
+# Retained OCR text per compressor. A dense full-screen screenshot OCRs to
+# ~10-20 KB, so even at 100 KB each this keeps a 300-screenshot history, while a
+# worker that lives across conversations cannot grow past it.
+_OCR_MEMO_BYTES = 32 * 1024 * 1024
+
+
+class OcrEngineError(RuntimeError):
+    """OCR engine failed to start or run: a fault of the engine, not the image.
+
+    Unlike a ``None`` (no confident text), it must not be remembered for the
+    image, so a recovered engine retries it.
+    """
 
 
 # OCR backend resolution — see issue #372.
@@ -147,6 +163,7 @@ class ImageCompressor:
         # Cache it on the instance and reuse it.
         self._router: TrainedRouter | None = None
         self._onnx_router: Any = None
+        self._ocr_memo: ImageMemo[str | None] = ImageMemo(max_bytes=_OCR_MEMO_BYTES)
 
         # Set on a process-wide shared instance (see the isolation worker and
         # _get_image_compressor) so a per-request close() does not unload models
@@ -317,13 +334,11 @@ class ImageCompressor:
         # Resize
         resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-        # Convert to RGB if needed (for JPEG)
-        if resized.mode in ("RGBA", "P"):
-            resized = resized.convert("RGB")
-
         # Save as JPEG for best compression
+        from .tile_optimizer import _jpeg_ready
+
         buf = io.BytesIO()
-        resized.save(buf, format="JPEG", quality=quality, optimize=True)
+        _jpeg_ready(resized).save(buf, format="JPEG", quality=quality, optimize=True)
         return buf.getvalue(), "image/jpeg"
 
     def _estimate_tokens(self, image_data: bytes, detail: str = "high") -> int:
@@ -415,7 +430,8 @@ class ImageCompressor:
           ``None`` when nothing was detected.
 
         Returns extracted text if OCR is confident, ``None`` otherwise
-        (caller falls back to image-as-image).
+        (caller falls back to image-as-image). Raises ``OcrEngineError`` when
+        the engine fails to initialize or run.
         """
         ocr_cls, api_version = _resolve_rapidocr()
         if ocr_cls is None:
@@ -434,7 +450,7 @@ class ImageCompressor:
                     api_version,
                     exc,
                 )
-                return None
+                raise OcrEngineError(str(exc)) from exc
 
         try:
             raw = self._ocr_engine(image_data)
@@ -444,7 +460,7 @@ class ImageCompressor:
                 api_version,
                 exc,
             )
-            return None
+            raise OcrEngineError(str(exc)) from exc
 
         if api_version == "v1":
             # 1.x returns (list_of_tuples, elapsed). list may be empty
@@ -525,8 +541,15 @@ class ImageCompressor:
         messages: list[dict[str, Any]],
         technique: Technique,
         provider: str,
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Apply compression technique to messages."""
+        """Apply compression technique to messages.
+
+        ``deadline`` (a ``time.time()`` value) stops new OCR once passed: an image
+        not OCR'd yet takes the no-text fallback this turn and is OCR'd on a later
+        one, so a long history of new screenshots finishes inside the caller's
+        timeout instead of being killed and redone from the start every turn.
+        """
         if technique.value == "preserve":
             return messages
 
@@ -572,7 +595,19 @@ class ImageCompressor:
 
                 # --- TRANSCODE: OCR the image and replace with text ---
                 if technique.value == "transcode" and image_bytes_for_ocr:
-                    extracted = self._ocr_extract(image_bytes_for_ocr)
+                    extracted = None
+                    if (
+                        deadline is None
+                        or time.time() < deadline
+                        or image_bytes_for_ocr in self._ocr_memo
+                    ):
+                        try:
+                            extracted = self._ocr_memo.get(
+                                image_bytes_for_ocr,
+                                partial(self._ocr_extract, image_bytes_for_ocr),
+                            )
+                        except OcrEngineError:
+                            pass  # not memoized: retried next turn
                     if extracted:
                         # Replace image with extracted text
                         new_content.append(
@@ -648,6 +683,7 @@ class ImageCompressor:
         self,
         messages: list[dict[str, Any]],
         provider: str = "openai",
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
         """Compress images in messages.
 
@@ -659,11 +695,18 @@ class ImageCompressor:
         Args:
             messages: LLM messages (OpenAI/Anthropic/Google format)
             provider: Target provider ('openai', 'anthropic', 'google')
+            deadline: ``time.time()`` after which no new OCR starts (see
+                ``_apply_compression``); None for no limit.
 
         Returns:
             Messages with compressed images
         """
-        if not self.has_images(messages):
+        # Reset first: the per-worker singleton (proxy/image_isolation.py) keeps
+        # one ImageCompressor for every request and reports last_result whenever
+        # it is not None, so a request we return early on below must not inherit
+        # the previous request's technique and token numbers.
+        self.last_result = None
+        if not self.has_images(messages) or not pillow_is_safe():
             return messages
 
         # Step 1: Tile-boundary optimization (always safe, pure math)
@@ -730,7 +773,7 @@ class ImageCompressor:
         original_tokens = self._estimate_tokens(image_data, "high") + tile_saved
 
         # Step 3: Apply compression technique
-        compressed_messages = self._apply_compression(messages, technique, provider)
+        compressed_messages = self._apply_compression(messages, technique, provider, deadline)
 
         # Count actual tokens AFTER compression by measuring the result.
         # If the image was replaced with text (OCR), count text tokens.

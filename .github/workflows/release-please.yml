@@ -42,16 +42,41 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v5
+      # Prefer a short-lived, repo-scoped GitHub App installation token. A
+      # personal PAT carries the maintainer's whole account — with a classic
+      # `repo` scope that reaches every other repository they can access — and
+      # this credential can tag past branch protection and reaches PyPI, npm and
+      # GHCR through the `release: published` publishes. An installation token is
+      # scoped to this repository and expires in an hour. Gated on the repo
+      # variable so an unconfigured app falls through instead of blocking a
+      # release. See #2955.
+      - name: Mint installation token
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          # PAT (not GITHUB_TOKEN): a release/tag created by GITHUB_TOKEN does
-          # NOT emit events that trigger other workflows, so release.yml
-          # (PyPI/npm) and docker.yml — which fire on `release: published` —
-          # never ran, and releases had to be cut by hand. A PAT is treated as a
-          # real user, so the release it creates DOES trigger those publishes; it
-          # also lets the bot tag past branch/tag protection. Falls back to
-          # GITHUB_TOKEN when the secret is unset (the release PR still opens; it
-          # just won't trigger the downstream publishes).
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      # A Windows body edit can introduce CRCRLF. release-please strips one CR,
+      # then cannot find its exact `---` delimiters and silently skips release
+      # creation. Repair only merged, pending release PR envelopes before the
+      # action reads them; do not infer versions or rewrite generated notes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Normalize pending release PR body line endings
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python scripts/normalize_release_pr_bodies.py --repo "${{ github.repository }}" --apply
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          # Neither an app token nor a PAT is GITHUB_TOKEN, and that matters: a
+          # release/tag created by GITHUB_TOKEN does NOT emit events that trigger
+          # other workflows, so release.yml (PyPI/npm) and docker.yml — which fire
+          # on `release: published` — never ran, and releases had to be cut by
+          # hand. Falls back to GITHUB_TOKEN when nothing else is set (the release
+          # PR still opens; it just won't trigger the downstream publishes).
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json

@@ -123,6 +123,7 @@ class BM25Scorer(RelevanceScorer):
         query_tokens: list[str],
         avg_doc_len: float | None = None,
         idf_map: dict[str, float] | None = None,
+        query_freq: Counter[str] | None = None,
     ) -> tuple[float, list[str]]:
         """Compute BM25 score between document and query.
 
@@ -130,6 +131,10 @@ class BM25Scorer(RelevanceScorer):
             doc_tokens: Tokenized document.
             query_tokens: Tokenized query.
             avg_doc_len: Average document length (optional).
+            query_freq: Pre-computed ``Counter(query_tokens)``. In a batch the
+                query (context) is identical for every item, so counting it once
+                and passing it in avoids rebuilding the same Counter per item.
+                When ``None`` it is computed from ``query_tokens`` as before.
             idf_map: Pre-computed corpus IDF per term. When supplied (batch
                 scoring, where a real corpus exists) each term is weighted by
                 its inverse document frequency, so a discriminative term such
@@ -148,7 +153,8 @@ class BM25Scorer(RelevanceScorer):
         avgdl = avg_doc_len or doc_len or 1
 
         doc_freq = Counter(doc_tokens)
-        query_freq = Counter(query_tokens)
+        if query_freq is None:
+            query_freq = Counter(query_tokens)
 
         score = 0.0
         matched_terms: list[str] = []
@@ -231,19 +237,28 @@ class BM25Scorer(RelevanceScorer):
         if not context_tokens:
             return [RelevanceScore(score=0.0, reason="BM25: empty context") for _ in items]
 
-        # Compute average document length for normalization
-        all_tokens = [self._tokenize(item) for item in items]
-        avg_len = sum(len(t) for t in all_tokens) / max(len(items), 1)
+        # Count the query once: it is the same context for every item, so
+        # rebuilding Counter(context_tokens) inside each _bm25_score call would
+        # redo identical work per item.
+        context_freq = Counter(context_tokens)
+
+        # Retain corpus statistics, not the tokens for the entire batch.
+        total_len = 0
+        n_docs = 0
+        doc_freq_across: Counter[str] = Counter()
+        for item in items:
+            tokens = self._tokenize(item)
+            total_len += len(tokens)
+            n_docs += 1
+            doc_freq_across.update({token for token in tokens if token in context_freq})
+            del tokens
+        avg_len = total_len / max(len(items), 1)
 
         # Compute corpus IDF per query term. Unlike single-item scoring,
         # a batch is a real corpus, so document frequency is meaningful:
         # terms that appear in many items are down-weighted while rare,
         # discriminative terms (IDs, UUIDs) are boosted. This is what makes
         # the ranking BM25 rather than plain term-frequency weighting.
-        n_docs = len(all_tokens)
-        doc_freq_across: Counter[str] = Counter()
-        for tokens in all_tokens:
-            doc_freq_across.update(set(tokens))
         idf_map = {
             term: self._compute_idf(term, n_docs, doc_freq_across[term])
             for term in set(context_tokens)
@@ -251,10 +266,17 @@ class BM25Scorer(RelevanceScorer):
         }
 
         results = []
-        for item_tokens in all_tokens:
+        reasons = {0: "BM25: no matches"}
+        for item in items:
+            item_tokens = self._tokenize(item)
             raw_score, matched = self._bm25_score(
-                item_tokens, context_tokens, avg_doc_len=avg_len, idf_map=idf_map
+                item_tokens,
+                context_tokens,
+                avg_doc_len=avg_len,
+                idf_map=idf_map,
+                query_freq=context_freq,
             )
+            del item_tokens
 
             # Normalize
             if self.normalize_score:
@@ -268,10 +290,9 @@ class BM25Scorer(RelevanceScorer):
                 normalized = min(1.0, normalized + 0.3)
 
             match_count = len(matched)
-            if match_count == 0:
-                reason = "BM25: no matches"
-            else:
-                reason = f"BM25: {match_count} terms"
+            if match_count not in reasons:
+                reasons[match_count] = f"BM25: {match_count} terms"
+            reason = reasons[match_count]
 
             results.append(
                 RelevanceScore(

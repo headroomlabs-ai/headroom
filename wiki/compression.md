@@ -79,21 +79,18 @@ from headroom.compression import UniversalCompressorConfig
 
 config = UniversalCompressorConfig(
     # Detection
-    use_magika=True,               # Use ML-based detection (requires magika)
-
+    use_magika=True,  # Use ML-based detection (requires magika)
     # Compression
     # (Note: the legacy `use_llmlingua` flag was retired with the
     # LLMLingua-2 integration. The optional ML compressor is now Kompress,
     # installed via `headroom-ai[ml]` and configured separately.)
     compression_ratio_target=0.3,  # Keep 30% of content (70% reduction)
-    min_content_length=100,        # Skip content shorter than this
-
+    min_content_length=100,  # Skip content shorter than this
     # Structure preservation
-    use_entropy_preservation=True, # Preserve high-entropy tokens
-    entropy_threshold=0.85,        # Entropy threshold for preservation
-
+    use_entropy_preservation=True,  # Preserve high-entropy tokens
+    entropy_threshold=0.85,  # Entropy threshold for preservation
     # CCR
-    ccr_enabled=True,              # Store originals for retrieval
+    ccr_enabled=True,  # Store originals for retrieval
 )
 ```
 
@@ -102,7 +99,7 @@ config = UniversalCompressorConfig(
 | Option | Default | Description |
 |--------|---------|-------------|
 | `use_magika` | `True` | Use ML-based content detection |
-| `use_llmlingua` | `True` | Use LLMLingua for compression |
+| `use_kompress` | `True` | Use Kompress for content compression (`use_llmlingua` was retired; passing it raises `TypeError`) |
 | `compression_ratio_target` | `0.3` | Target ratio (0.3 = keep 30%) |
 | `min_content_length` | `100` | Minimum chars to compress |
 | `use_entropy_preservation` | `True` | Preserve high-entropy tokens |
@@ -121,12 +118,12 @@ Preserves JSON structure while compressing values:
 from headroom.compression.handlers.json_handler import JSONStructureHandler
 
 handler = JSONStructureHandler(
-    preserve_short_values=True,     # Keep values < 20 chars
-    short_value_threshold=20,       # Threshold for "short"
-    preserve_high_entropy=True,     # Keep UUIDs, hashes
-    entropy_threshold=0.85,         # Entropy threshold
-    max_array_items_full=3,         # Keep first N array items full
-    max_number_digits=10,           # Preserve numbers up to N digits
+    preserve_short_values=True,  # Keep values < 20 chars
+    short_value_threshold=20,  # Threshold for "short"
+    preserve_high_entropy=True,  # Keep UUIDs, hashes
+    entropy_threshold=0.85,  # Entropy threshold
+    max_array_items_full=3,  # Keep first N array items full
+    max_number_digits=10,  # Preserve numbers up to N digits
 )
 ```
 
@@ -141,18 +138,10 @@ handler = JSONStructureHandler(
 
 ```python
 # Before
-{
-    "id": "usr_abc123",
-    "name": "Alice Johnson",
-    "bio": "A long description that goes on and on..."
-}
+{"id": "usr_abc123", "name": "Alice Johnson", "bio": "A long description that goes on and on..."}
 
 # After (structure preserved, long values compressed)
-{
-    "id": "usr_abc123",
-    "name": "Alice Johnson",
-    "bio": "A long...[compressed]..."
-}
+{"id": "usr_abc123", "name": "Alice Johnson", "bio": "A long...[compressed]..."}
 ```
 
 ### Code Handler
@@ -163,9 +152,9 @@ Preserves code structure using AST parsing (tree-sitter) or regex fallback:
 from headroom.compression.handlers.code_handler import CodeStructureHandler
 
 handler = CodeStructureHandler(
-    preserve_comments=False,        # Preserve comments as structural
-    use_tree_sitter=True,           # Use tree-sitter for parsing
-    default_language="python",      # Default when detection fails
+    preserve_comments=False,  # Preserve comments as structural
+    use_tree_sitter=True,  # Use tree-sitter for parsing
+    default_language="python",  # Default when detection fails
 )
 ```
 
@@ -226,24 +215,24 @@ from headroom.compression import compress
 result = compress(content)
 
 # Access result fields
-print(result.compressed)           # Compressed content
-print(result.original)             # Original content
-print(result.compression_ratio)    # e.g., 0.35 (35% of original size)
-print(result.tokens_before)        # Estimated tokens before
-print(result.tokens_after)         # Estimated tokens after
-print(result.tokens_saved)         # tokens_before - tokens_after
-print(result.savings_percentage)   # e.g., 65.0 (65% savings)
+print(result.compressed)  # Compressed content
+print(result.original)  # Original content
+print(result.compression_ratio)  # e.g., 0.35 (35% of original size)
+print(result.tokens_before)  # Estimated tokens before
+print(result.tokens_after)  # Estimated tokens after
+print(result.tokens_saved)  # tokens_before - tokens_after
+print(result.savings_percentage)  # e.g., 65.0 (65% savings)
 
 # Detection info
-print(result.content_type)         # ContentType.JSON, CODE, etc.
-print(result.detection_confidence) # 0.0-1.0
+print(result.content_type)  # ContentType.JSON, CODE, etc.
+print(result.detection_confidence)  # 0.0-1.0
 
 # Structure info
-print(result.handler_used)         # "json", "code", etc.
-print(result.preservation_ratio)   # Fraction preserved as structure
+print(result.handler_used)  # "json", "code", etc.
+print(result.preservation_ratio)  # Fraction preserved as structure
 
 # CCR info
-print(result.ccr_key)              # Key for retrieval (if CCR enabled)
+print(result.ccr_key)  # Key for retrieval (if CCR enabled)
 ```
 
 ---
@@ -259,8 +248,8 @@ compressor = UniversalCompressor()
 
 contents = [
     '{"users": [...]}',
-    'def hello(): pass',
-    'Plain text content',
+    "def hello(): pass",
+    "Plain text content",
 ]
 
 results = compressor.compress_batch(contents)
@@ -373,7 +362,7 @@ from headroom.compression import UniversalCompressor, UniversalCompressorConfig
 config = UniversalCompressorConfig(
     compression_ratio_target=0.25,  # Keep 25%
     use_magika=True,
-    use_llmlingua=True,
+    use_kompress=True,
     ccr_enabled=True,
 )
 
@@ -393,11 +382,11 @@ json_content = """
 
 result = compressor.compress(json_content)
 
-print(f"Type: {result.content_type}")          # ContentType.JSON
-print(f"Handler: {result.handler_used}")        # json
+print(f"Type: {result.content_type}")  # ContentType.JSON
+print(f"Handler: {result.handler_used}")  # json
 print(f"Saved: {result.savings_percentage:.0f}%")  # ~60%
 print(f"Structure: {result.preservation_ratio:.0%} preserved")  # ~40%
-print(f"CCR Key: {result.ccr_key}")             # For retrieval
+print(f"CCR Key: {result.ccr_key}")  # For retrieval
 ```
 
 ---

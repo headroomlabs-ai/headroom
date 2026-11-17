@@ -33,7 +33,11 @@ assert report.passed
 suite = (
     Headroom.Suite("phase-1")
     .Add(Headroom.WithOpenAI().named("openai-cache").WithCompression(mode="cache"))
-    .Add(Headroom.WithBedrock(region="us-east-1").named("bedrock-token").WithCompression(mode="token"))
+    .Add(
+        Headroom.WithBedrock(region="us-east-1")
+        .named("bedrock-token")
+        .WithCompression(mode="token")
+    )
 )
 
 suite.write_manifest_bundle("headroom-testing-bundle.json", provider="openai", port_start=19000)

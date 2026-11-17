@@ -865,10 +865,11 @@ impl CodeAwareCompressor {
 
         // Unknown language → fallback (Kompress) or passthrough.
         if detected_lang == CodeLanguage::Unknown {
-            // Kompress fallback is delegated to the live-zone dispatcher in
-            // the Rust port (the engine doesn't own the model); fixtures are
-            // recorded with fallback_to_kompress=False, so this is the
-            // passthrough branch.
+            // The Rust engine does not own the Kompress model, so this is
+            // always the passthrough branch (fixtures are recorded with
+            // fallback_to_kompress=False). The live-zone dispatcher leaves
+            // the declined block unchanged too: code is never handed to the
+            // prose model, which drops keywords (#4214).
             return CodeCompressionResult {
                 language: CodeLanguage::Unknown,
                 language_confidence: 0.0,
@@ -1897,7 +1898,7 @@ mod tests {
     fn detect_language_basic() {
         let (lang, conf) = detect_language("import os\n\ndef f(x):\n    return x + 1\n");
         assert_eq!(lang, CodeLanguage::Python);
-        assert!(conf >= 0.3 && conf <= 1.0);
+        assert!((0.3..=1.0).contains(&conf));
 
         let (lang, _) = detect_language("package main\n\nfunc main() {}\n");
         assert_eq!(lang, CodeLanguage::Go);

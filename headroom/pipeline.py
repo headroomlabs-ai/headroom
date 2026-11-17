@@ -4,13 +4,46 @@ from __future__ import annotations
 
 import importlib.metadata
 import logging
+import os
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 log = logging.getLogger(__name__)
 
+
+class FrozenLabels(dict[str, str]):
+    """A ``dict`` that refuses changes: what :attr:`OutcomeSnapshot.attribution` holds.
+
+    A subclass of ``dict`` rather than a ``MappingProxyType`` so the snapshot
+    stays what it was before it carried labels: hashable, picklable, and safe
+    for ``dataclasses.asdict``, ``copy.deepcopy`` and ``json.dumps``.
+    """
+
+    __slots__ = ()
+
+    def _read_only(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise TypeError("attribution labels are read-only")
+
+    __setitem__ = __delitem__ = __ior__ = _read_only
+    clear = pop = popitem = setdefault = update = _read_only
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return hash(frozenset(self.items()))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (dict(self),))
+
+    def __copy__(self) -> FrozenLabels:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FrozenLabels:
+        return self
+
+
 ENTRY_POINT_GROUP = "headroom.pipeline_extension"
+ENV_VAR = "HEADROOM_PIPELINE_EXTENSIONS"
 
 
 class PipelineStage(str, Enum):
@@ -27,6 +60,7 @@ class PipelineStage(str, Enum):
     PRE_SEND = "pre_send"
     POST_SEND = "post_send"
     RESPONSE_RECEIVED = "response_received"
+    OUTCOME_OBSERVED = "outcome_observed"
 
 
 CANONICAL_PIPELINE_STAGES: tuple[PipelineStage, ...] = (
@@ -41,15 +75,89 @@ CANONICAL_PIPELINE_STAGES: tuple[PipelineStage, ...] = (
     PipelineStage.PRE_SEND,
     PipelineStage.POST_SEND,
     PipelineStage.RESPONSE_RECEIVED,
+    PipelineStage.OUTCOME_OBSERVED,
 )
+
+
+@dataclass(frozen=True)
+class OutcomeSnapshot:
+    """What actually happened on one request. Read-only by construction.
+
+    Emitted at :attr:`PipelineStage.OUTCOME_OBSERVED` so an extension can learn
+    from a response — a token ceiling that was hit, an effort setting that did
+    or did not pay off — without being able to rewrite the measurement it is
+    learning from. Extensions declare what they did; the core records what
+    happened; attribution is the core's arithmetic over both.
+
+    ``thinking_tokens`` is ``None`` when the provider reported no split and none
+    could be inferred. That is NOT zero: Anthropic reports no thinking count at
+    all, so treating unknown as zero would credit visible-text levers with
+    reductions that reasoning-effort levers produced.
+    """
+
+    request_id: str = ""
+    provider: str = ""
+    model: str = ""
+    output_tokens: int = 0
+    thinking_tokens: int | None = None
+    thinking_inferred: bool = False
+    stop_reason: str | None = None
+    input_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    turn_index: int = 0
+    transforms_applied: tuple[str, ...] = ()
+    #: Input tokens Headroom removed from THIS request's payload (the wire
+    #: figure PERF logs as ``tok_saved``), message compression only.
+    tokens_saved: int = 0
+    #: The share of ``tokens_saved`` new to this conversation, which is what
+    #: running totals book (PERF ``tok_novel``). The proxy funnel always sets
+    #: both; they differ only on ``/v1/responses``, where the whole transcript
+    #: is re-sent and recompressed every turn, and ``tokens_saved -
+    #: novel_tokens_saved`` is the re-sent history removed again.
+    novel_tokens_saved: int = 0
+    #: Whose request this was: ``{dimension: label}``, for now ``project`` and
+    #: ``client`` when known. Self-reported labels, not authenticated
+    #: identity. Read-only.
+    attribution: Mapping[str, str] = field(default_factory=dict)
+    #: Stable across every turn of one conversation, when the handler knows it.
+    conversation_key: str | None = None
+    #: Pre-compression input size on the same tokenizer as ``tokens_saved``.
+    original_tokens: int = 0
+    #: Estimated output tokens avoided by output shaping on this request.
+    output_tokens_saved: int = 0
+
+    def __post_init__(self) -> None:
+        # Frozen fields can still hold a mutable dict; freeze it so an
+        # extension cannot rewrite the labels another extension will read.
+        object.__setattr__(self, "attribution", FrozenLabels(self.attribution or {}))
+
+    @property
+    def truncated(self) -> bool:
+        """Whether a token ceiling cut the response off.
+
+        The one unambiguous, provider-supplied feedback signal available to an
+        adaptive lever — which is why a ceiling can run a closed control loop
+        where verbosity steering (whose signals need transcript inference)
+        cannot.
+        """
+        return self.stop_reason in ("max_tokens", "length")
+
+    @property
+    def visible_output_tokens(self) -> int | None:
+        """Output tokens excluding thinking, or ``None`` when unknown."""
+        if self.thinking_tokens is None:
+            return None
+        return max(0, self.output_tokens - self.thinking_tokens)
 
 
 @dataclass
 class PipelineEvent:
     """Event emitted at a canonical pipeline stage.
 
-    Extensions may mutate ``messages``, ``tools``, ``headers``, or ``metadata`` in
-    place, or return a replacement ``PipelineEvent`` from ``on_pipeline_event``.
+    Extensions may mutate ``messages``, ``tools``, ``headers`` or ``metadata``
+    in place, or return a replacement ``PipelineEvent`` from
+    ``on_pipeline_event``.
     """
 
     stage: PipelineStage
@@ -61,6 +169,7 @@ class PipelineEvent:
     tools: list[dict[str, Any]] | None = None
     headers: dict[str, str] | None = None
     response: Any = None
+    outcome: OutcomeSnapshot | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -71,15 +180,69 @@ class PipelineExtension(Protocol):
         """Handle a canonical pipeline event."""
 
 
-def discover_pipeline_extensions() -> list[PipelineExtension]:
-    """Load registered pipeline extensions from Python entry points."""
+def _resolve_enabled(enabled: Iterable[str] | None) -> set[str]:
+    """Resolve the enabled entry-point names.
+
+    Precedence: the explicit argument, else ``HEADROOM_PIPELINE_EXTENSIONS``,
+    else nothing. Mirrors :mod:`headroom.proxy.extensions` so operators learn
+    one rule for both seams.
+    """
+    raw: Iterable[str]
+    if enabled is not None:
+        raw = enabled
+    else:
+        raw = (os.environ.get(ENV_VAR) or "").split(",")
+    return {n.strip() for n in raw if n and n.strip()}
+
+
+def discover_pipeline_extensions(
+    enabled: Iterable[str] | None = None,
+) -> list[PipelineExtension]:
+    """Load explicitly-enabled pipeline extensions from Python entry points.
+
+    **Opt-in.** Discovery enumerates every registered entry point, but only
+    those the operator named are loaded. Merely installing a package — as a
+    transitive dependency, say — must not silently start rewriting requests.
+
+    An unaudited package in the same environment could otherwise rewrite the
+    messages of every request on live traffic. The proxy-extension seam has
+    always worked this way; this brings the pipeline seam in line.
+
+    Extensions passed directly to :class:`PipelineExtensionManager` are
+    unaffected — constructing one and handing it over is already explicit.
+
+    Enable with ``HEADROOM_PIPELINE_EXTENSIONS=name1,name2``; the literal ``*``
+    enables everything discovered (only where every package is trusted).
+    """
 
     discovered: list[PipelineExtension] = []
     try:
-        entries = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
+        entries = list(importlib.metadata.entry_points(group=ENTRY_POINT_GROUP))
     except Exception as exc:  # noqa: BLE001 - importlib metadata varies by runtime
         log.debug("pipeline extensions: entry-point enumeration failed: %s", exc)
         return discovered
+
+    enabled_set = _resolve_enabled(enabled)
+    if not enabled_set:
+        if entries:
+            log.info(
+                "pipeline extensions discovered but disabled (opt-in): %s. "
+                "Enable with %s=<name1,name2>.",
+                ",".join(sorted(e.name for e in entries)),
+                ENV_VAR,
+            )
+        return discovered
+
+    wildcard = "*" in enabled_set
+    if not wildcard:
+        missing = enabled_set - {e.name for e in entries}
+        if missing:
+            log.warning(
+                "pipeline extensions requested but not found: %s (available: %s)",
+                ",".join(sorted(missing)),
+                ",".join(sorted(e.name for e in entries)) or "<none>",
+            )
+        entries = [e for e in entries if e.name in enabled_set]
 
     for entry in entries:
         try:
@@ -129,6 +292,17 @@ class PipelineExtensionManager:
     def enabled(self) -> bool:
         return bool(self._extensions)
 
+    def add(self, extension: Any) -> None:
+        """Attach an extension after construction.
+
+        For a proxy extension (``headroom.proxy_extension``) that also needs
+        lifecycle events: it is installed after the proxy and its manager
+        exist, so it cannot be passed to the constructor. Adding the same
+        object twice is a no-op.
+        """
+        if all(existing is not extension for existing in self._extensions):
+            self._extensions.append(extension)
+
     def emit(
         self,
         stage: PipelineStage,
@@ -141,6 +315,7 @@ class PipelineExtensionManager:
         tools: list[dict[str, Any]] | None = None,
         headers: dict[str, str] | None = None,
         response: Any = None,
+        outcome: OutcomeSnapshot | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> PipelineEvent:
         """Emit a canonical lifecycle event and return the final event state."""
@@ -155,6 +330,7 @@ class PipelineExtensionManager:
             tools=tools,
             headers=headers,
             response=response,
+            outcome=outcome,
             metadata=metadata or {},
         )
 

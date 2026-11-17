@@ -3,20 +3,56 @@
 from __future__ import annotations
 
 from headroom.proxy.memory_query_policy import (
+    ASSISTANT_DELIM,
+    TOOL_DELIM,
+    USER_DELIM,
     extract_memory_query_sources,
     render_embedding_input,
 )
 
 
-def test_render_embedding_input_orders_sources_for_embedding() -> None:
+def test_bounded_embedding_keeps_primary_question_and_context_tails() -> None:
+    user = "古い質問" * 2000 + " latest JWT question"
+    tool = "old tool output " * 1000 + " latest authentication failure"
+    assistant = "old assistant context " * 1000 + " inspect auth.py"
     rendered = render_embedding_input(
-        user_text="latest user",
-        recent_tool_outputs=("tool output",),
-        recent_assistant_turns=("assistant context",),
+        user_text=user,
+        recent_tool_outputs=(tool,),
+        recent_assistant_turns=(assistant,),
+        max_chars=4096,
     )
 
-    assert rendered.index("assistant context") < rendered.index("tool output")
-    assert rendered.index("tool output") < rendered.index("latest user")
+    assert len(rendered) <= 4096
+    assert rendered.startswith(USER_DELIM + user[-2048:])
+    assert TOOL_DELIM + tool[-512:] in rendered
+    assert ASSISTANT_DELIM + assistant[-512:] in rendered
+
+
+def test_bounded_embedding_spends_remaining_budget_on_newest_context() -> None:
+    rendered = render_embedding_input(
+        user_text="latest question",
+        recent_tool_outputs=tuple("x" * 600 + f" end-{i}" for i in range(10)),
+        recent_assistant_turns=("old background",),
+        max_chars=1200,
+    )
+
+    assert len(rendered) <= 1200
+    assert rendered.startswith(USER_DELIM + "latest question")
+    assert "end-9" in rendered and "end-8" in rendered
+    assert "end-0" not in rendered
+    assert "old background" not in rendered
+
+
+def test_zero_embedding_budget_does_not_send_context_without_the_question() -> None:
+    assert (
+        render_embedding_input(
+            user_text="question",
+            recent_tool_outputs=("tool context",),
+            recent_assistant_turns=("assistant context",),
+            max_chars=0,
+        )
+        == ""
+    )
 
 
 def test_extract_sources_uses_latest_user_and_recent_context_in_order() -> None:

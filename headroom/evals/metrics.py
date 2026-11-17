@@ -79,50 +79,6 @@ def compute_f1(response_a: str, response_b: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def compute_bleu(response_a: str, response_b: str, max_n: int = 4) -> float:
-    """Compute BLEU-like score between two responses.
-
-    Uses n-gram precision up to max_n.
-    """
-    tokens_a = tokenize(response_a)
-    tokens_b = tokenize(response_b)
-
-    if not tokens_a or not tokens_b:
-        return 0.0
-
-    precisions = []
-
-    for n in range(1, max_n + 1):
-        # Get n-grams
-        ngrams_a = [tuple(tokens_a[i : i + n]) for i in range(len(tokens_a) - n + 1)]
-        ngrams_b = [tuple(tokens_b[i : i + n]) for i in range(len(tokens_b) - n + 1)]
-
-        if not ngrams_a:
-            break
-
-        counter_a = Counter(ngrams_a)
-        counter_b = Counter(ngrams_b)
-
-        # Clipped count
-        clipped = sum((counter_a & counter_b).values())
-        total = len(ngrams_a)
-
-        if total > 0:
-            precisions.append(clipped / total)
-        else:
-            precisions.append(0.0)
-
-    if not precisions or all(p == 0 for p in precisions):
-        return 0.0
-
-    # Geometric mean of precisions
-    import math
-
-    nonzero_precisions = [p for p in precisions if p > 0]
-    log_sum = sum(math.log(p) for p in nonzero_precisions) / len(nonzero_precisions)
-    return math.exp(log_sum)
-
-
 def compute_rouge_l(response_a: str, response_b: str) -> float:
     """Compute ROUGE-L score (longest common subsequence).
 

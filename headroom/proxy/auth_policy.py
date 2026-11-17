@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass
 
 
@@ -19,7 +20,6 @@ SUBSCRIPTION_UA_PREFIXES: tuple[str, ...] = (
     "claude-code/",
     "codex-cli/",
     "cursor/",
-    "grok/",
     "claude-vscode/",
     "github-copilot/",
     "anthropic-cli/",
@@ -34,6 +34,11 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
     ("anthropic-cli/", "anthropic-cli"),
     ("codex-cli/", "codex"),
     ("cursor/", "cursor"),
+    # Current Grok Build releases send "grok-shell/<version>" (verified against
+    # grok 0.2.112); older builds sent "grok/". Deliberately NOT added to
+    # SUBSCRIPTION_UA_PREFIXES: API-key grok traffic is pay-per-token and
+    # should keep the aggressive compression policy.
+    ("grok-shell/", "grok_build"),
     ("grok/", "grok_build"),
     ("zed/", "zed"),
     ("aider/", "aider"),
@@ -46,6 +51,10 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
 
 
 CODEX_RESPONSES_PATH = "/v1/responses"
+CODEX_RESPONSES_PATHS: tuple[str, ...] = (
+    CODEX_RESPONSES_PATH,
+    "/v1/codex/responses",
+)
 
 
 @dataclass(frozen=True)
@@ -71,8 +80,17 @@ def classify_auth_signals(signals: AuthSignals) -> AuthMode:
             return AuthMode.SUBSCRIPTION
 
     auth = signals.authorization
-    if auth.startswith("Bearer "):
-        token = auth[len("Bearer ") :]
+    # The auth-scheme token ("Bearer") is case-insensitive per RFC 7235 §2.1,
+    # so a client sending `Authorization: bearer sk-...` must classify the same
+    # as `Bearer`. A case-sensitive `startswith("Bearer ")` sent such a request
+    # to the `elif auth:` (OAUTH) fallthrough, misclassifying a PAYG API key —
+    # which mis-routes compression policy and mislabels cost/TOIN auth_mode.
+    # Only the scheme is case-folded; the credential itself stays case-sensitive.
+    scheme, sep, credentials = auth.partition(" ")
+    if sep and scheme.lower() == "bearer":
+        # RFC 9110 §11.4 allows one or more spaces between the scheme and the
+        # credentials; trim them so `Bearer  sk-ant-oat...` still matches.
+        token = credentials.lstrip(" ")
         if token.startswith("sk-ant-oat"):
             return AuthMode.OAUTH
         if token.startswith("sk-ant-api") or token.startswith("sk-"):
@@ -103,9 +121,30 @@ def classify_client_signals(signals: AuthSignals, *, default: str | None = None)
     return default
 
 
+# Up to three numeric parts, and nothing numeric after them: a date stamp or a
+# four-part number is not cut down into a release that never existed.
+_UA_VERSION_RE = re.compile(r"\d{1,4}(?:\.\d{1,4}){0,2}(?![.\d])")
+
+
+def client_version_from_user_agent(user_agent: str) -> tuple[str, str] | None:
+    """``(harness, version)`` from a User-Agent such as ``claude-cli/2.1.311``.
+
+    Only the numeric release that directly follows a known harness prefix in
+    :data:`CLIENT_UA_MAP` is returned, so nothing else in the header can ride
+    along. ``None`` when the harness is unknown or carries no numeric version.
+    """
+    ua_lower = user_agent.lower()
+    for needle, name in CLIENT_UA_MAP:
+        at = ua_lower.find(needle)
+        if at >= 0:
+            match = _UA_VERSION_RE.match(ua_lower, at + len(needle))
+            return (name, match.group(0)) if match else None
+    return None
+
+
 def is_codex_responses_path(path: str) -> bool:
-    """Return True for the OpenAI Responses endpoint and its subpaths."""
-    return path == CODEX_RESPONSES_PATH or path.startswith(CODEX_RESPONSES_PATH + "/")
+    """Return True for OpenAI Responses endpoints and their subpaths."""
+    return any(root == path or path.startswith(root + "/") for root in CODEX_RESPONSES_PATHS)
 
 
 def should_stamp_codex_client_signals(path: str, signals: AuthSignals) -> bool:

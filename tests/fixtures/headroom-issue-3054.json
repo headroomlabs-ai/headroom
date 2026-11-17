@@ -1,0 +1,26 @@
+{
+  "issue": 3054,
+  "url": "https://github.com/headroomlabs-ai/headroom/issues/3054",
+  "old_serena_args": [
+    "--from",
+    "git+https://github.com/oraios/serena",
+    "serena",
+    "start-mcp-server",
+    "--project-from-cwd",
+    "--context",
+    "claude-code",
+    "--open-web-dashboard",
+    "False"
+  ],
+  "recommended_serena_args": [
+    "--from",
+    "serena-agent",
+    "serena",
+    "start-mcp-server",
+    "--project-from-cwd",
+    "--context",
+    "claude-code",
+    "--open-web-dashboard",
+    "False"
+  ]
+}

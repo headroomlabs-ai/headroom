@@ -78,7 +78,8 @@ impl Feature {
             Self::NativeBedrock => FeatureSpec {
                 name: "native_bedrock",
                 available_in: RolloutChannel::Stable,
-                default_enabled_in: Some(RolloutChannel::Stable),
+                // Signs requests with the host's AWS credentials: opt-in only.
+                default_enabled_in: None,
             },
             Self::OpenAiResponsesStreaming => FeatureSpec {
                 name: "openai_responses_streaming",
@@ -323,7 +324,12 @@ pub fn feature_names() -> BTreeSet<&'static str> {
 
 fn digest_value(value: &Value) -> String {
     let canonical = serde_json::to_vec(value).expect("rollout provenance is serializable");
-    format!("sha256:{:x}", Sha256::digest(canonical))
+    let digest = Sha256::digest(canonical);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("sha256:{hex}")
 }
 
 #[cfg(test)]
@@ -360,9 +366,17 @@ mod tests {
     #[test]
     fn default_enabled_feature_has_default_reason() {
         let rollout = RolloutSnapshot::default();
-        let decision = rollout.decision(Feature::NativeBedrock);
+        let decision = rollout.decision(Feature::OpenAiResponsesStreaming);
         assert!(decision.enabled);
         assert_eq!(decision.reason, FeatureDecisionReason::Default);
+    }
+
+    #[test]
+    fn native_bedrock_is_not_on_by_default() {
+        let rollout = RolloutSnapshot::default();
+        let decision = rollout.decision(Feature::NativeBedrock);
+        assert!(!decision.enabled);
+        assert_eq!(decision.reason, FeatureDecisionReason::NotRequested);
     }
 
     #[test]

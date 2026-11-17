@@ -45,12 +45,12 @@ plan = client.chat.completions.simulate(
     messages=messages,
 )
 
-waste = plan.waste_signals
-print(f"JSON bloat:     {waste.json_bloat_tokens} tokens")
-print(f"HTML noise:     {waste.html_noise_tokens} tokens")
-print(f"Whitespace:     {waste.whitespace_tokens} tokens")
-print(f"Dynamic dates:  {waste.dynamic_date_tokens} tokens")
-print(f"Repetition:     {waste.repetition_tokens} tokens")
+waste = plan.waste_signals  # dict[str, int]
+print(f"JSON bloat:     {waste['json_bloat']} tokens")
+print(f"HTML noise:     {waste['html_noise']} tokens")
+print(f"Whitespace:     {waste['whitespace']} tokens")
+print(f"Dynamic dates:  {waste['dynamic_date']} tokens")
+print(f"Repetition:     {waste['repetition']} tokens")
 ```
 
 Waste signals help you understand which parts of your input are contributing the most unnecessary tokens.
@@ -124,7 +124,7 @@ else:
 Test different configurations to find the best settings for your workload:
 
 ```python
-from headroom import HeadroomClient, OpenAIProvider
+from headroom import HeadroomClient, HeadroomConfig, OpenAIProvider
 from headroom.transforms import SmartCrusherConfig
 
 configs = [
@@ -133,14 +133,14 @@ configs = [
     SmartCrusherConfig(max_items_after_crush=50),
 ]
 
-for config in configs:
+for smart_crusher_config in configs:
     client = HeadroomClient(
         original_client=OpenAI(),
         provider=OpenAIProvider(),
-        smart_crusher_config=config,
+        config=HeadroomConfig(smart_crusher=smart_crusher_config),
     )
     plan = client.chat.completions.simulate(model="gpt-4o", messages=messages)
-    print(f"max_items={config.max_items_after_crush}: "
+    print(f"max_items={smart_crusher_config.max_items_after_crush}: "
           f"{plan.tokens_saved} tokens saved ({plan.tokens_saved/plan.tokens_before*100:.1f}%)")
 ```
 

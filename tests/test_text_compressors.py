@@ -128,7 +128,9 @@ class TestSearchCompressor:
 
     def test_compress_search_results(self):
         """Search results are compressed."""
-        content = "\n".join([f"src/file{i}.py:{i * 10}:def function_{i}():" for i in range(100)])
+        content = "\n".join(
+            [f"src/file{i}.py:{(i + 1) * 10}:def function_{i}():" for i in range(100)]
+        )
 
         compressor = SearchCompressor()
         result = compressor.compress(content, context="find function_50")
@@ -317,7 +319,9 @@ class TestSmartCrusherTextIntegration:
     def test_search_compressor_available_as_standalone(self):
         """SearchCompressor is available for explicit use by applications."""
         # Create search results content
-        search_results = "\n".join([f"src/file{i}.py:{i}:def function_{i}():" for i in range(100)])
+        search_results = "\n".join(
+            [f"src/file{i}.py:{i + 1}:def function_{i}():" for i in range(100)]
+        )
 
         # Application explicitly chooses to compress
         compressor = SearchCompressor()

@@ -469,3 +469,42 @@ class TestCompactToolDescriptions:
         assert modified is True
         savings_pct = (1 - after / before) * 100
         assert savings_pct >= 10, f"Expected ≥10% savings, got {savings_pct:.1f}%"
+
+
+class TestCompactedToolsAreNotShared:
+    """Results must not alias the module-level cache (callers mutate tools in place)."""
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            "tools": [
+                {
+                    "name": "alias_probe",
+                    "description": "Probe.   " + "Extra words. " * 40,
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "title": "Params",
+                        "type": "object",
+                        "properties": {"x": {"type": "integer", "title": "X"}},
+                    },
+                }
+            ]
+        }
+
+    def test_compact_tools_edit_does_not_leak_into_later_requests(self) -> None:
+        first, modified, _, _ = compact_tools(self._payload())
+        assert modified is True
+        first["tools"][-1]["cache_control"] = {"type": "ephemeral"}
+        for _ in range(2):  # second call after the edit, and a cache-hit call
+            later, _, _, _ = compact_tools(self._payload())
+            assert "cache_control" not in later["tools"][-1]
+
+    def test_compact_tool_descriptions_edit_does_not_leak(self) -> None:
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+
+        first, modified, _, _ = compact_tool_descriptions(self._payload(), max_chars=40)
+        assert modified is True
+        first["tools"][-1]["cache_control"] = {"type": "ephemeral"}
+        for _ in range(2):
+            later, _, _, _ = compact_tool_descriptions(self._payload(), max_chars=40)
+            assert "cache_control" not in later["tools"][-1]

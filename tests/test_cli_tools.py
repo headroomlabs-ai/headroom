@@ -96,6 +96,74 @@ def test_sg_command_reports_resolution_errors(
     assert expected in result.output
 
 
+@pytest.mark.parametrize(
+    ("args", "expected", "exit_code"),
+    [
+        (("diff", "--version"), "error: failed to configure TLS trust", 2),
+        (("tools", "install", "--tool", "difft"), "difft: failed to configure TLS trust", 1),
+    ],
+)
+def test_invalid_configured_ca_bundle_is_reported_without_fetching(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+    tmp_path: Path,
+    args: tuple[str, ...],
+    expected: str,
+    exit_code: int,
+) -> None:
+    invalid_bundle = tmp_path / "invalid.pem"
+    invalid_bundle.write_text("not a PEM certificate", encoding="ascii")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(invalid_bundle))
+    for variable in (
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+        "HEADROOM_CA_BUNDLE",
+        "HEADROOM_TLS_STRICT",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("HEADROOM_CERT_STORE", "bundled")
+    monkeypatch.setattr(cli_tools.binaries, "cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(cli_tools.binaries, "_path_lookup", lambda _name: None)
+    monkeypatch.setattr(
+        cli_tools.binaries,
+        "detect_platform",
+        lambda: binaries.PlatformKey("linux", "x86_64", "gnu"),
+    )
+    monkeypatch.setattr(
+        cli_tools.binaries,
+        "_registry",
+        lambda: {
+            "tools": {
+                "difft": {
+                    "version": "test",
+                    "source": "github",
+                    "assets": {
+                        "linux-x86_64-gnu": {
+                            "url": "https://example.invalid/difft.tar.gz",
+                            "member": "difft",
+                            "sha256": "0" * 64,
+                        }
+                    },
+                }
+            }
+        },
+    )
+    urlopen_calls: list[object] = []
+
+    def unexpected_urlopen(*call_args, **call_kwargs):
+        urlopen_calls.append((call_args, call_kwargs))
+        raise AssertionError("invalid configured trust must fail before urlopen")
+
+    monkeypatch.setattr(cli_tools.binaries.urllib.request, "urlopen", unexpected_urlopen)
+
+    result = runner.invoke(main, list(args))
+
+    assert result.exit_code == exit_code
+    assert expected in result.output
+    assert "NO_CERTIFICATE_OR_CRL_FOUND" in result.output
+    assert urlopen_calls == []
+
+
 def test_tools_list_renders_registry(monkeypatch: pytest.MonkeyPatch, runner: CliRunner) -> None:
     install_fake_rich(monkeypatch)
     monkeypatch.setattr(

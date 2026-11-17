@@ -170,7 +170,10 @@ def get_encoding_for_model(model: str) -> str:
     # verbatim, matched no prefix, and silently took DEFAULT_ENCODING -- so the
     # encoding a model got depended on the casing of whichever request warmed
     # the cache first, and flipped across restarts.
-    model = model.lower()
+    # Gateway-wrapped ids ("azure/gpt-4o", "openrouter/openai/gpt-5") are picked
+    # for tiktoken by the registry's unwrapping but arrive here as-is, so match on
+    # the bare id or they all take DEFAULT_ENCODING.
+    model = model.lower().rsplit("/", 1)[-1]
 
     # Direct lookup
     if model in MODEL_TO_ENCODING:
@@ -184,6 +187,8 @@ def get_encoding_for_model(model: str) -> str:
     # o200k_base instead of cl100k_base for unknown gpt-4 snapshots.
     for prefix, encoding in (
         ("gpt-4o", "o200k_base"),
+        # chatgpt-4o-latest and dated chatgpt-4o-* aliases are GPT-4o.
+        ("chatgpt-4o-", "o200k_base"),
         # gpt-4.1 / gpt-4.5 use o200k_base and MUST precede the "gpt-4" prefix,
         # which they would otherwise match and be mis-encoded as cl100k_base.
         ("gpt-4.1", "o200k_base"),
@@ -297,6 +302,9 @@ class TiktokenCounter(BaseTokenizer):
                     continue
 
                 if key == "content":
+                    if isinstance(value, dict):
+                        # Unwrapped single block: price it like the list form (#4273).
+                        value = [value]
                     if isinstance(value, str):
                         total += self.count_text(value)
                     elif isinstance(value, list):
@@ -304,7 +312,9 @@ class TiktokenCounter(BaseTokenizer):
                         for part in value:
                             if isinstance(part, dict):
                                 if part.get("type") == "text":
-                                    total += self.count_text(part.get("text", ""))
+                                    total += self.count_text(
+                                        coerce_countable_text(part.get("text", ""))
+                                    )
                                 elif part.get("type") == "image_url":
                                     # Image tokens vary by detail level
                                     detail = part.get("image_url", {}).get("detail", "auto")
@@ -324,6 +334,8 @@ class TiktokenCounter(BaseTokenizer):
                                     total += self._count_content_parts([part])
                             elif isinstance(part, str):
                                 total += self.count_text(part)
+                    else:
+                        total += self.count_text(coerce_countable_text(value))
                 elif key == "role":
                     total += self.count_text(coerce_countable_text(value))
                 elif key == "name":

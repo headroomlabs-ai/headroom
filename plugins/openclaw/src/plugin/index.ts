@@ -26,7 +26,7 @@ import { createHeadroomRetrieveTool } from "../tools/headroom-retrieve.js";
 /**
  * OpenClaw 2026.x plugin API requires a `{ register(api) }` object export.
  * The previous bare-function default export was silently skipped by the loader.
- * See: https://github.com/chopratejas/headroom/issues/XXX
+ * See: https://github.com/headroomlabs-ai/headroom/issues/XXX
  */
 export default {
   register: registerHeadroomPlugin,

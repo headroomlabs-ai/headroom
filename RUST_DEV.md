@@ -14,6 +14,7 @@ crates/
   headroom-proxy/                # binary: axum /healthz (Phase 2 grows this)
   headroom-py/                   # PyO3 cdylib exposing `headroom._core`
   headroom-parity/               # lib + `parity-run` CLI for Python parity tests
+  headroom-simulators/           # binary: deterministic local upstream stub for proxy tests
 tests/parity/
   fixtures/<transform>/*.json    # recorded Python outputs (Phase 1 ports match)
   recorder.py                    # Python-side fixture recorder
@@ -36,7 +37,7 @@ exposes the same targets:
 | `make test-parity` | Builds `headroom-py` via maturin, runs `parity-run run` |
 | `make bench` | `cargo bench --workspace` |
 | `make build-proxy` | Release-builds `headroom-proxy`, strips, prints size |
-| `make build-wheel` | `maturin build --release -m crates/headroom-py/pyproject.toml` |
+| `make build-wheel` | `maturin build --release -m crates/headroom-py/Cargo.toml` |
 | `make fmt` | `cargo fmt --all` |
 | `make lint` | `cargo fmt --check` + `cargo clippy --workspace -- -D warnings` |
 
@@ -53,9 +54,8 @@ at it; end users notice nothing.
 make build-proxy
 ./target/release/headroom-proxy --help
 
-# Run against a local upstream
+# Run against a local upstream (listens on 127.0.0.1:8787 by default)
 ./target/release/headroom-proxy \
-    --listen 0.0.0.0:8787 \
     --upstream http://127.0.0.1:8788
 
 # Health checks
@@ -69,7 +69,10 @@ curl -s http://127.0.0.1:8787/healthz/upstream   # => 200 if upstream reachable
 # 1. Move the Python proxy to a private port (e.g. 8788)
 HEADROOM_HOST=127.0.0.1 HEADROOM_PORT=8788 python -m headroom.proxy &  # or your existing launcher
 
-# 2. Run the Rust proxy on the previously-public port (8787) pointing at it
+# 2. Run the Rust proxy on the previously-public port (8787) pointing at it.
+#    The Python proxy sees every relayed request as coming from 127.0.0.1,
+#    so the Rust proxy enforces HEADROOM_PROXY_TOKEN itself (see below).
+export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
 ./target/release/headroom-proxy --listen 0.0.0.0:8787 --upstream http://127.0.0.1:8788 &
 
 # 3. End users keep hitting :8787 unchanged.
@@ -82,7 +85,9 @@ curl -si http://127.0.0.1:8787/v1/models
 
 | Flag | Env var | Default | Notes |
 | --- | --- | --- | --- |
-| `--listen` | `HEADROOM_PROXY_LISTEN` | `0.0.0.0:8787` | bind address |
+| `--listen` | `HEADROOM_PROXY_LISTEN` | `127.0.0.1:8787` | bind address; a non-loopback address refuses to start without `HEADROOM_PROXY_TOKEN` unless `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` |
+| `--proxy-token` | `HEADROOM_PROXY_TOKEN` | (unset) | inbound token required from non-loopback peers (below); prefer the env var |
+| `--metrics-require-loopback` | `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK` | `false` | when set, `/metrics` is served only to loopback peers (403 otherwise); recommended on non-loopback binds |
 | `--upstream` | `HEADROOM_PROXY_UPSTREAM` | (required) | base URL the proxy forwards to |
 | `--upstream-timeout` |  | `600s` | end-to-end request timeout (long for streams) |
 | `--upstream-connect-timeout` |  | `10s` | TCP/TLS connect timeout |
@@ -90,6 +95,112 @@ curl -si http://127.0.0.1:8787/v1/models
 | `--log-level` |  | `info` | `RUST_LOG`-style filter |
 | `--rewrite-host` / `--no-rewrite-host` | | rewrite | rewrite Host to upstream (default) |
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
+| `--stats` | `HEADROOM_PROXY_STATS` | `true` | native savings stats + `/dashboard` (below) |
+| `--stats-path` | `HEADROOM_PROXY_STATS_PATH` | `~/.headroom/native_stats.json` | ledger persistence (honours `HEADROOM_WORKSPACE_DIR`) |
+| `--enable-bedrock-native` | `HEADROOM_PROXY_ENABLE_BEDROCK_NATIVE` | (unset: off) | `true` or `--features native_bedrock` mounts `/model/{id}/invoke`, `/converse` and the streaming variants; they sign every request with this host's AWS credentials and do not authenticate the caller |
+| `--enable-vertex-native` | `HEADROOM_PROXY_ENABLE_VERTEX_NATIVE` | `false` | mount Vertex `:rawPredict` / `:streamRawPredict`; replaces the caller's `Authorization` with this host's Google ADC bearer (scope `--vertex-adc-scope`) and does not authenticate the caller |
+| `--vertex-allow-non-google-upstream` | `HEADROOM_PROXY_VERTEX_ALLOW_NON_GOOGLE_UPSTREAM` | `false` | by default the Vertex route only sends the ADC bearer when `--upstream` is `https://*.googleapis.com`, and answers 502 otherwise |
+
+### Inbound authentication
+
+The Rust proxy connects to the Python proxy from `127.0.0.1`, and the
+Python proxy trusts loopback callers (no token needed, and access to
+`/admin`, `/debug` and `/settings`). So the Rust proxy applies the same
+`HEADROOM_PROXY_TOKEN` rules itself, before anything is forwarded:
+
+- With a token set, a non-loopback peer must send it as
+  `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`,
+  or gets `401 {"error":"unauthorized"}`. Loopback peers are exempt, as
+  in the Python proxy. The token is removed from the request before it
+  is forwarded (`Authorization` only when it carries the token).
+- A caller that is not local here (a non-loopback peer, or a loopback
+  peer whose `Host` is not a loopback name) is never forwarded with a
+  `Host` that may name loopback (including scoped IPv6 such as
+  `[::1%lo]`), whatever `--rewrite-host` is and whatever the upstream
+  name resolves to: that `Host` is replaced with
+  `headroom-remote.invalid`, so the Python proxy's local-only routes
+  (`/admin`, `/debug`, `/settings`, ...) stay closed to it, with or
+  without a token.
+- `GET /healthz`, `/healthz/upstream`, `/health`, `/livez` and `/readyz`
+  stay reachable without the token, and `GET`/`HEAD /api/hello` is
+  answered locally with an empty `200`.
+- A non-loopback `--listen` with no token refuses to start. Set
+  `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` only when something else
+  already restricts who can reach the port.
+
+### Savings stats & dashboard (native)
+
+The Rust proxy records per-request savings/cost telemetry on every
+lane it forwards — Anthropic `/v1/messages`, OpenAI Chat/Responses,
+all four native Bedrock routes, and Vertex `rawPredict` /
+`streamRawPredict` when those are enabled — and serves it locally (never tunnelled
+upstream):
+
+```bash
+curl -s http://127.0.0.1:8787/stats | jq '.session'         # since-boot totals
+curl -s http://127.0.0.1:8787/stats | jq '.lifetime_by_model'
+curl -s "http://127.0.0.1:8787/stats/timeseries?bucket=day" | jq '.points[-7:]'
+curl -s "http://127.0.0.1:8787/stats/events?limit=5"         # recent-request feed
+open http://127.0.0.1:8787/dashboard                          # embedded UI, zero deps
+```
+
+Recording is deferred until the response is fully observed, so
+streaming output/cache token counts come from the real SSE /
+EventStream usage frames. USD figures come from the vendored LiteLLM
+price table (`data/model_prices_and_context_window.json`); a model
+missing from it records $0 and logs one WARN — refresh via
+`scripts/refresh_model_limits.sh`. Input and output are priced
+separately (`input_cost_usd` / `output_cost_usd`) because they bill
+at different rates — output is typically 4-5x input, so a spend
+figure that counted input alone would understate a short-prompt,
+long-answer turn by most of its cost. `total_cost_usd` is the sum
+and is what `/dashboard` shows as "Spend". Cache savings are NET: the
+cache-read discount minus the cache-write premium (writes bill
+above list price), floored at $0 per request — a warm-up turn that
+only writes is not counted as negative savings, and gross-read
+figures that overstate the benefit are never shown. Failed upstreams count as
+failures and accrue no savings — as do proxy-side rejections
+(missing AWS credentials, SigV4/ADC failures, oversized bodies), so
+an operator-side outage reads as a failure spike rather than as
+zero traffic. Aggregates (lifetime, per-model, 48 h hourly +
+~13 mo daily buckets) persist as one atomic snapshot written off
+the hot path every 10 s and on shutdown.
+
+> **What reads 0 today.** Spend, token counts, and prompt-cache
+> savings are live. `tokens_saved` / `compression_savings_usd` are
+> wired end-to-end but will report 0 on real traffic until the
+> live-zone per-type compressors are implemented — the dispatcher
+> currently returns `NoCompression` for every well-formed body
+> (`live_zone_mode_with_valid_body_returns_no_compression_pr_b2`
+> pins that invariant). Nothing needs changing here when they land;
+> the numbers start flowing on their own.
+
+> **No auth; exposure is split by tier.** These endpoints bind
+> wherever `--listen` points (default `127.0.0.1:8787`) and, for
+> loopback peers or with no `HEADROOM_PROXY_TOKEN`, carry no auth, so the payload is split the same way the Python proxy splits
+> its own `/stats`:
+>
+> - **Aggregates** — spend, tokens, per-model/provider rollups,
+>   history — are served to any caller that gets past the inbound gate
+>   (above), like the Prometheus `/metrics` endpoint next door: with
+>   `HEADROOM_PROXY_TOKEN` set, remote callers need the token for these
+>   too; without it, they are open to anyone who can reach the port.
+> - **Per-request rows** — `recent_requests`, all of `/stats/events`
+>   — plus the ledger's filesystem path are served **only to local
+>   callers**: loopback peer *and* a loopback `Host` header (the
+>   second is the DNS-rebinding defence — a rebound request reaches
+>   the proxy *from* loopback, so the peer check alone doesn't hold).
+>   Remote callers get `recent_requests: null` and a 404 from
+>   `/stats/events`; the dashboard says so rather than erroring.
+>
+> A request id + model + timestamp is a different sensitivity tier
+> from a counter, and `/metrics` never exposes it — so "same as
+> /metrics" isn't a licence to hand it to the open internet. Opening
+> the local-only tier to a trusted reverse proxy is tracked in
+> [#1959](https://github.com/headroomlabs-ai/headroom/issues/1959),
+> which is settling that policy for the Python dashboard first; this
+> surface should adopt it rather than grow a second scheme.
+> `--stats=false` removes the routes entirely.
 
 ### Picking the next port: invocation telemetry
 
@@ -282,9 +393,10 @@ doesn't rediscover them.
   `plugins/headroom-agent-hooks/**/plugin.json` on every commit. Those
   changes are harmless but each commit in Phase 0 picks them up. Phase 1
   does not need to do anything special — just let the hook run.
-- **`rust-toolchain.toml`** pins `channel = "stable"` rather than a specific
-  version so CI picks up the same toolchain the local box uses. Tighten to a
-  pinned version (e.g. `1.78`) once the port stabilizes.
+- **`rust-toolchain.toml`** now pins `channel = "1.95.0"` (previously tracked
+  `"stable"`, which let CI drift ahead of local dev boxes — see the file's own
+  comment for the 2026-04-27 incident this fixed). Resolved; kept here for
+  history.
 
 ## Multi-worker deployment — CCR fragmentation
 
@@ -331,10 +443,14 @@ in-memory.
 Each uvicorn worker is a separate Python process. The following state is
 fragmented across workers:
 
-1. **Python `CompressionStore`** — defaults to `InMemoryBackend` (per-process)
-   when `HEADROOM_CCR_BACKEND` is unset. Each worker has its own singleton; CCR
-   markers written on worker A are invisible to worker B. Set
-   `HEADROOM_CCR_BACKEND=sqlite` to use a shared cross-worker store.
+1. **Python `CompressionStore`** — defaults to `SQLiteBackend` at
+   `workspace_dir()/ccr_store.db` (restart-safe, shared across workers) when
+   `HEADROOM_CCR_BACKEND` is unset or `"sqlite"` (`_create_default_ccr_backend`
+   in `headroom/cache/compression_store.py`). Set `HEADROOM_CCR_BACKEND=memory`
+   to opt into the per-process `InMemoryBackend` instead — that is the setting
+   this section's fragmentation risk actually applies to; the log messages in
+   `headroom/proxy/server.py` (see below) still assume in-memory-by-default and
+   are stale on this point.
 2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py`)
    — per-session `CompressionCache` dict (instance var, always per-worker).
 3. **`HeadroomProxy.session_tracker_store`** — per-session prefix-tracker

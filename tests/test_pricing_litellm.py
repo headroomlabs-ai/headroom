@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from headroom.pricing import litellm_pricing
+from headroom.pricing.litellm_model_resolution import MODEL_ALIASES
 
 
 def test_litellm_helpers_when_dependency_is_unavailable(monkeypatch) -> None:
@@ -72,9 +73,14 @@ def test_litellm_model_pricing_uses_provider_prefixes(monkeypatch) -> None:
 
 
 def test_litellm_model_pricing_uses_aliases_and_zero_cost_defaults(monkeypatch) -> None:
+    # Keyed off the alias table rather than restating its target: this named
+    # "claude-sonnet-4-20250514" and broke when the alias moved, even though the
+    # behaviour under test (alias resolution + None costs reading as zero) was
+    # unchanged.
+    alias_target = MODEL_ALIASES["claude-3-5-sonnet-20241022"]
     fake_litellm = SimpleNamespace(
         model_cost={
-            "claude-sonnet-4-20250514": {
+            alias_target: {
                 "input_cost_per_token": None,
                 "output_cost_per_token": None,
             }
