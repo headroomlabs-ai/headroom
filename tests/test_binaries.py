@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import ssl
 import sys
 import tarfile
@@ -194,6 +195,110 @@ def test_resolve_honors_path(monkeypatch, tmp_path):
         binaries.shutil, "which", lambda name: str(fake_bin) if name == "scc" else None
     )
     assert binaries.resolve("scc") == fake_bin
+
+
+def _plant_in_cwd(monkeypatch, tmp_path, name: str) -> None:
+    """Put an executable `name` in a fresh cwd and make PATH resolve it there."""
+    project = tmp_path / "project"
+    project.mkdir()
+    planted = project / name
+    planted.write_text("#!/bin/sh\n")
+    planted.chmod(0o755)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", ".")
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+
+
+def test_which_ignores_a_tool_in_the_current_directory(monkeypatch, tmp_path):
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    assert binaries.which("difft") is None
+
+
+def test_resolve_ignores_a_tool_in_the_current_directory(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    monkeypatch.setenv("HEADROOM_BINARIES_OFFLINE", "1")
+    with pytest.raises(binaries.OfflineError):
+        binaries.resolve("difft")
+
+
+def test_status_does_not_report_a_cwd_tool_as_on_path(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert row["state"] == "missing"
+    assert row["path"] is None
+
+
+def test_which_skips_a_cwd_hit_and_finds_the_next_path_entry(monkeypatch, tmp_path):
+    _plant_in_cwd(monkeypatch, tmp_path, "difft")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tool = bin_dir / "difft"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(bin_dir)]))
+    assert binaries.which("difft") == tool
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("on-path", str(tool))
+
+
+def test_which_skips_a_cwd_hit_with_windows_lookup_rules(monkeypatch, tmp_path):
+    """On Windows shutil.which() checks the cwd before every PATH it is given."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "difft.exe").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    installed = bin_dir / "difft.exe"
+    installed.write_text("")
+    installed.chmod(0o755)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(binaries.sys, "platform", "win32")
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("PATHEXT", ".exe")
+    monkeypatch.setattr(
+        binaries.shutil, "which", lambda name, path=None: os.path.join(".", f"{name}.exe")
+    )
+    assert binaries._which_outside_cwd("difft") == installed
+
+
+def test_status_reports_a_tool_in_the_interpreter_scripts_dir(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    monkeypatch.setenv("PATH", "/no-such-bin")
+    scripts = tmp_path / "venv" / "bin"
+    scripts.mkdir(parents=True)
+    (scripts / "difft").write_text("#!/bin/sh\n")
+    (scripts / "difft").chmod(0o755)
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("on-path", str(scripts / "difft"))
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX execute bit")
+def test_status_ignores_a_non_executable_file_in_the_scripts_dir(monkeypatch, tmp_path):
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    monkeypatch.setenv("PATH", "/no-such-bin")
+    scripts = tmp_path / "venv" / "bin"
+    scripts.mkdir(parents=True)
+    (scripts / "difft").write_text("not a program\n")
+    (scripts / "difft").chmod(0o644)
+    monkeypatch.setattr(binaries.sys, "prefix", str(tmp_path / "venv"))
+    assert binaries.which("difft") is None
+    row = next(r for r in binaries.status() if r["tool"] == "difft")
+    assert (row["state"], row["path"]) == ("missing", None)
+
+
+def test_which_keeps_a_tool_on_path_outside_the_current_directory(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tool = bin_dir / "difft"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    assert binaries.which("difft") == tool
 
 
 # -------- Offline / mirror / fetch behavior ------------------------------ #
