@@ -112,9 +112,14 @@ def sanitize_anthropic_model_metadata(value: Any) -> Any:
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
-    # Claude Fable 5.1 / Fable 5 - 1M context
+    # Claude Fable 5.2 / 5.1 / 5 - 1M context
+    "claude-fable-5-2": 1000000,
     "claude-fable-5-1": 1000000,
     "claude-fable-5": 1000000,
+    # Claude Mythos 5.2 / 5.1 / 5 - 1M context (same specs as Fable)
+    "claude-mythos-5-2": 1000000,
+    "claude-mythos-5-1": 1000000,
+    "claude-mythos-5": 1000000,
     # Claude Opus 5.5 / Opus 5 - 1M context
     "claude-opus-5-5": 1000000,
     "claude-opus-5": 1000000,
@@ -156,16 +161,23 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 
 # Fallback pricing - LiteLLM is preferred source
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
-# Last updated: 2026-09-29 (platform.claude.com/docs/en/about-claude/pricing)
+# Last updated: 2026-11-17 (platform.claude.com/docs/en/about-claude/pricing)
 #
 # Newer ids still come before their prefixes, but order no longer decides a
 # match: `_is_release_of` refuses to read "claude-sonnet-5-5-..." as a release
 # of "claude-sonnet-5".
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
+    # Claude Fable 5.2: $8 in / $40 out, cache read $0.20 (0.025x input).
+    "claude-fable-5-2": {"input": 8.00, "output": 40.00, "cached_input": 0.20},
     # Claude Fable 5.1: $10 in / $50 out, cache read $0.25 (0.025x input).
     "claude-fable-5-1": {"input": 10.00, "output": 50.00, "cached_input": 0.25},
     # Claude Fable 5 (anthropic.com/pricing): $10 in / $50 out, cache read $1.
     "claude-fable-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
+    # Claude Mythos 5.2 / 5.1 / 5: priced the same as the Fable release of the
+    # same number.
+    "claude-mythos-5-2": {"input": 8.00, "output": 40.00, "cached_input": 0.20},
+    "claude-mythos-5-1": {"input": 10.00, "output": 50.00, "cached_input": 0.25},
+    "claude-mythos-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
     # Claude Opus 5.5: $4 in / $20 out, cache read $0.20 (0.05x input).
     "claude-opus-5-5": {"input": 4.00, "output": 20.00, "cached_input": 0.20},
     # Claude Opus 5: $5 in / $25 out, cache read $0.50.
@@ -342,6 +354,11 @@ _PATTERN_DEFAULTS = {
         "pricing": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     },
     "haiku": {"context": 200000, "pricing": {"input": 0.80, "output": 4.00, "cached_input": 0.08}},
+    # Every Fable release has a 1M window; rates follow the newest one (5.2).
+    "fable": {
+        "context": 1000000,
+        "pricing": {"input": 8.00, "output": 40.00, "cached_input": 0.20},
+    },
 }
 
 # Fallback for completely unknown Claude models
@@ -507,7 +524,7 @@ def _load_custom_model_config() -> dict[str, Any]:
 
 
 def _infer_model_tier(model: str) -> str | None:
-    """Infer the model tier (opus/sonnet/haiku) from model name.
+    """Infer the model tier (opus/sonnet/haiku/fable) from model name.
 
     Uses pattern matching to handle future model releases.
     """
@@ -520,6 +537,8 @@ def _infer_model_tier(model: str) -> str | None:
         return "sonnet"
     elif "haiku" in model_lower:
         return "haiku"
+    elif "fable" in model_lower:
+        return "fable"
 
     return None
 
@@ -844,7 +863,7 @@ class AnthropicProvider(Provider):
         3. ~/.headroom/models.json config file
         4. LiteLLM model info (if available)
         5. Built-in ANTHROPIC_CONTEXT_LIMITS
-        6. Pattern-based inference (opus/sonnet/haiku)
+        6. Pattern-based inference (opus/sonnet/haiku/fable)
         7. Default fallback (200K for any Claude model)
 
         A ``[1m]`` suffix raises the result to at least 1M: the caller asked for
