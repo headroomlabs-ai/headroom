@@ -951,10 +951,10 @@ class ToolIntelligenceNetwork:
         )
 
     def _sanitize_loaded_pattern(self, pattern: ToolPattern) -> bool:
-        """Remove legacy raw query keys from a loaded pattern."""
+        """Remove legacy query keys (raw text or unhashed field names) from a loaded pattern."""
         import re
 
-        safe_pattern = re.compile(r"(?:\w+:\*)(?:\s+\w+:\*)*")
+        safe_pattern = re.compile(r"[0-9a-f]{8}:\*(?:\s+[0-9a-f]{8}:\*)*")
         changed = False
         frequencies: dict[str, int] = {}
         for raw_key, count in pattern.query_pattern_frequency.items():
@@ -1249,8 +1249,10 @@ class ToolIntelligenceNetwork:
     def _anonymize_query_pattern(self, query: str) -> str | None:
         """Extract anonymized pattern from a query.
 
-        Keeps structural patterns, removes specific values.
-        E.g., "status:error AND user:john" -> "status:* AND user:*"
+        Keeps the shape of field/value predicates and drops the values. Field
+        names are hashed like every other TOIN field name: the text before a
+        ``:`` can itself be a credential (``<token>:x-oauth-basic``).
+        E.g., "status:error AND user:john" -> "<hash(status)>:* <hash(user)>:*"
         """
         if not query:
             return None
@@ -1267,7 +1269,7 @@ class ToolIntelligenceNetwork:
 
         # Preserve useful field shape while dropping operators, values, and
         # all unrelated text (which may contain arbitrary prompt data).
-        pattern = " ".join(f"{field}:*" for field in matches)
+        pattern = " ".join(f"{self._hash_field_name(field)}:*" for field in matches)
 
         # Remove if it's just generic
         if not pattern or len(pattern) > MAX_QUERY_PATTERN_LENGTH:
@@ -1431,9 +1433,14 @@ class ToolIntelligenceNetwork:
         Args:
             data: Exported pattern data.
         """
-        if not self._config.enabled:
-            return
+        self._import_patterns(data)
 
+    def _import_patterns(self, data: dict[str, Any]) -> bool:
+        """Body of ``import_patterns``; True when a legacy query key was dropped."""
+        if not self._config.enabled:
+            return False
+
+        sanitized = False
         patterns_data = data.get("patterns", {})
         source_instance = data.get("instance_id", "unknown")
 
@@ -1448,7 +1455,7 @@ class ToolIntelligenceNetwork:
                 try:
                     key = _deserialize_pattern_key(serialized_key)
                     imported = ToolPattern.from_dict(pattern_dict)
-                    self._sanitize_loaded_pattern(imported)
+                    sanitized = self._sanitize_loaded_pattern(imported) or sanitized
                     # Make sure dataclass fields agree with the dict key — pre-F3
                     # dumps don't carry tenant_key on the pattern, and pre-B5
                     # dumps don't carry auth_mode/model_family either; promote
@@ -1495,6 +1502,7 @@ class ToolIntelligenceNetwork:
                     "error": str(first_error),
                 },
             )
+        return sanitized
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
         """Merge imported pattern into existing."""
@@ -1721,15 +1729,12 @@ class ToolIntelligenceNetwork:
         if self._backend is None:
             return
 
+        changed = False
         try:
             data = self._backend.load()
             if data:
-                self.import_patterns(data)
+                changed = self._import_patterns(data)
                 with self._lock:
-                    changed = any(
-                        self._sanitize_loaded_pattern(pattern)
-                        for pattern in self._patterns.values()
-                    )
                     before = len(self._patterns)
                     self._prune_patterns_locked()
                     changed = changed or len(self._patterns) != before
@@ -1744,6 +1749,10 @@ class ToolIntelligenceNetwork:
                     "error": str(e),
                 },
             )
+        if changed:
+            # Rewrite at once: a dropped legacy query key can hold a credential,
+            # and waiting for the next observation would leave it on disk.
+            self.save()
 
     def _maybe_auto_save(self) -> None:
         """Auto-save if enough time has passed.
