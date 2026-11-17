@@ -1,7 +1,7 @@
 /**
- * Self-check for scheduled()'s hourly compaction.  node test-rollup.mjs [dir]
+ * Self-check for the hourly compaction.  node test-rollup.mjs [dir]
  *
- * The one thing that must never drift: rollupHour() and the QUALIFY in
+ * The one thing that must never drift: the rollup and the QUALIFY in
  * headroom-beacon-stats/beacon.sh have to agree on which heartbeat wins. If
  * they disagree the reports get quietly wrong rather than loudly broken, so
  * this asserts the JS picks exactly the max-seq row per (install, session).
@@ -13,21 +13,21 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import worker, { inflate, oldestRawDay, rollupHour } from './worker.js';
+import worker, { finalizeHour, inflate, oldestRawDay, rollupSlice } from './worker.js';
 
-// R2 returns at most 1000 keys per list page, so on a real hour (~4,000
-// objects) the cursor loop in rollupHour is load-bearing. The stub paginates at
-// a deliberately tiny size so that loop is exercised by every case below: with
-// a single-page stub, a regression that dropped the cursor would still print
-// "ok" while silently rolling up only the first page of every hour.
+// R2 returns at most 1000 keys per list page, so on a real slice the cursor
+// loop is load-bearing. The stub paginates at a deliberately tiny size so that
+// loop is exercised by every case below: with a single-page stub, a regression
+// that dropped the cursor would still print "ok" while silently rolling up only
+// the first page of every slice.
 const PAGE = 3;
+const SLICES = '0123456789abcdef';
 
-/** The slice of the R2 binding rollupHour uses, backed by a plain object. */
+/** The slice of the R2 binding the rollup uses, backed by a plain object. */
 function stubBucket(files, { failKeys = new Set() } = {}) {
-  const written = {};
   const reads = [];
   return {
-    written,
+    files,
     reads,
     list: async ({ prefix, cursor, delimiter }) => {
       const keys = Object.keys(files)
@@ -45,7 +45,7 @@ function stubBucket(files, { failKeys = new Set() } = {}) {
       const page = keys.slice(start, start + PAGE);
       const next = start + PAGE;
       return {
-        objects: page.map((key) => ({ key })),
+        objects: page.map((key) => ({ key, uploaded: files[key].uploaded ?? new Date(0) })),
         truncated: next < keys.length,
         cursor: next < keys.length ? keys[next] : undefined,
       };
@@ -54,10 +54,14 @@ function stubBucket(files, { failKeys = new Set() } = {}) {
       reads.push(key);
       if (failKeys.has(key)) throw new Error(`simulated R2 failure: ${key}`);
       if (!(key in files)) return null;
-      return { text: async () => files[key] };
+      return { text: async () => String(files[key]) };
     },
+    head: async (key) => (key in files ? { key } : null),
     put: async (key, body) => {
-      written[key] = body;
+      files[key] = body;
+    },
+    delete: async (keys) => {
+      for (const key of keys) delete files[key];
     },
   };
 }
@@ -67,30 +71,31 @@ const beacon = (install, id, seq) =>
 
 const PART = 'dt=2026-08-06/hh=14';
 
-/** Run rollupHour against a stub bucket and decode whatever it wrote. */
+/** Roll every slice of PART, merge, and decode whatever landed under rollup/. */
 async function run(files, opts = {}) {
-  const CORPUS = stubBucket(files, opts);
-  const spend = { read: 0 };
+  const CORPUS = stubBucket({ ...files }, opts);
   let threw = null;
-  let out = null;
   try {
-    out = await rollupHour({ CORPUS }, PART, spend);
+    for (const slice of SLICES) await rollupSlice({ CORPUS }, PART, slice);
+    await finalizeHour({ CORPUS }, PART);
   } catch (err) {
     threw = err;
   }
-  const body = CORPUS.written[`rollup/${PART}/data.ndjson`];
+  const body = CORPUS.files[`rollup/${PART}/data.ndjson`];
   return {
     threw,
-    spend,
-    wrote: out ? out.wrote : 0,
-    empty: `rollup/${PART}/empty` in CORPUS.written,
-    keys: Object.keys(CORPUS.written),
+    rawReads: CORPUS.reads.filter((k) => k.startsWith('sessions/')).length,
+    empty: `rollup/${PART}/empty` in CORPUS.files,
+    rolled: Object.keys(CORPUS.files).filter((k) => k.startsWith('rollup/')),
+    parts: Object.keys(CORPUS.files).filter((k) => k.startsWith('rollup-parts/')),
     rows: body ? body.split('\n').map((l) => JSON.parse(l)) : [],
   };
 }
 
-// 1. Highest seq wins, out-of-order input, one row per (install, session).
-//    More objects than PAGE, so the list cursor loop runs.
+// 1. Highest seq wins across slices, out-of-order input, one row per
+//    (install, session). The names start with different hex characters, so one
+//    session's heartbeats land in different slices and only the merge can pick
+//    the winner.
 {
   const files = {
     [`sessions/${PART}/a.json`]: [beacon('i1', 's1', 3), beacon('i1', 's2', 1)].join('\n'),
@@ -99,18 +104,21 @@ async function run(files, opts = {}) {
     // Same session id under a different install must not collapse together.
     [`sessions/${PART}/d.json`]: beacon('i2', 's1', 2),
     [`sessions/${PART}/e.json`]: beacon('i1', 's1', 5),
+    // Four in one slice, so that slice spans list pages.
+    [`sessions/${PART}/f1.json`]: beacon('i3', 's1', 1),
+    [`sessions/${PART}/f2.json`]: beacon('i3', 's1', 4),
+    [`sessions/${PART}/f3.json`]: beacon('i3', 's1', 2),
+    [`sessions/${PART}/f4.json`]: beacon('i3', 's1', 3),
   };
-  const { rows, spend, threw } = await run(files);
+  const { rows, rawReads, threw, parts } = await run(files);
   assert.equal(threw, null);
-  // 5 objects at PAGE=3 is two pages: proves the cursor loop, which is
-  // load-bearing at the real ~4,000 objects/hour.
-  assert.ok(Object.keys(files).length > PAGE, 'fixture must span pages');
-  assert.equal(spend.read, 5, 'reads every object across every page');
-  assert.equal(rows.length, 3, 'one row per (install, session)');
+  assert.equal(rawReads, 9, 'reads every object across every slice and page');
+  assert.equal(rows.length, 4, 'one row per (install, session)');
   const seq = Object.fromEntries(
     rows.map((r) => [`${r.resource['headroom.install_id']} ${r.session.id}`, r.session.seq])
   );
-  assert.deepEqual(seq, { 'i1 s1': 9, 'i1 s2': 1, 'i2 s1': 2 });
+  assert.deepEqual(seq, { 'i1 s1': 9, 'i1 s2': 1, 'i2 s1': 2, 'i3 s1': 4 });
+  assert.deepEqual(parts, [], 'parts are removed once the hour is merged');
 }
 
 // 2. An unparseable record loses only itself. Content this Worker wrote with
@@ -121,47 +129,143 @@ async function run(files, opts = {}) {
     [`sessions/${PART}/a.json`]: '{ this is not json',
     [`sessions/${PART}/b.json`]: `\n${beacon('i1', 's1', 4)}\n`,
   };
-  const { rows, threw } = await run(files);
-  assert.equal(threw, null, 'corrupt content does not abandon the hour');
-  assert.deepEqual(rows.map((r) => r.session.seq), [4], 'survives a corrupt object');
+  const quiet = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await run(files);
+  } finally {
+    console.error = quiet;
+  }
+  assert.equal(result.threw, null, 'corrupt content does not abandon the hour');
+  assert.deepEqual(result.rows.map((r) => r.session.seq), [4], 'survives a corrupt object');
 }
 
-// 3. A failed get is transient, so the hour must NOT be written — a rollup is
+// 3. A failed get is transient, so its slice must NOT be written — a rollup is
 //    built once and then trusted forever, so a short read would silently become
-//    the permanent record.
+//    the permanent record. The slices that did read keep their parts, which is
+//    the point: a retry redoes one slice, not the hour.
 {
   const files = {
     [`sessions/${PART}/a.json`]: beacon('i1', 's1', 1),
     [`sessions/${PART}/b.json`]: beacon('i1', 's2', 1),
   };
-  const { threw, keys } = await run(files, {
-    failKeys: new Set([`sessions/${PART}/b.json`]),
-  });
-  assert.ok(threw, 'a failed get throws so the hour is retried');
-  assert.deepEqual(keys, [], 'nothing written on a partial read');
+  const CORPUS = stubBucket({ ...files }, { failKeys: new Set([`sessions/${PART}/b.json`]) });
+  await rollupSlice({ CORPUS }, PART, 'a');
+  await assert.rejects(() => rollupSlice({ CORPUS }, PART, 'b'), /simulated R2 failure/);
+  assert.equal(await finalizeHour({ CORPUS }, PART), false, 'no merge while a slice is missing');
+  const keys = Object.keys(CORPUS.files);
+  assert.ok(!keys.some((k) => k.startsWith('rollup/')), 'nothing published on a partial read');
+  assert.ok(keys.includes(`rollup-parts/${PART}/a`), 'the slice that read cleanly is kept');
+  assert.ok(!keys.includes(`rollup-parts/${PART}/b`), 'the failed slice wrote nothing');
 }
 
-// 4. Spend is reported even when the hour throws. Charging a flat guess instead
-//    lets a run that failed late overshoot the subrequest ceiling.
+// 4. scheduled() enqueues one message per slice for every hour with no rollup,
+//    and leaves alone both finished hours and hours it enqueued recently —
+//    otherwise every cron run would enqueue the whole in-flight backlog again.
+//    queue() then turns those messages into the rollup.
 {
-  const files = Object.fromEntries(
-    Array.from({ length: 7 }, (_, i) => [`sessions/${PART}/o${i}.json`, beacon('i1', `s${i}`, 1)])
-  );
-  const { threw, spend } = await run(files, {
-    failKeys: new Set([`sessions/${PART}/o6.json`]),
+  const at = Date.parse('2026-08-06T15:05:00Z');
+  const CORPUS = stubBucket({
+    'sessions/dt=2026-08-06/hh=12/a.json': beacon('i1', 's1', 1),
+    'sessions/dt=2026-08-06/hh=13/a.json': beacon('i1', 's2', 1),
+    'sessions/dt=2026-08-06/hh=14/a.json': beacon('i1', 's3', 2),
+    'sessions/dt=2026-08-06/hh=14/b.json': beacon('i1', 's3', 6),
+    'rollup/dt=2026-08-06/hh=12/data.ndjson': beacon('i1', 's1', 1),
+    'rollup-parts/dt=2026-08-06/hh=13/queued': Object.assign(new String(''), {
+      uploaded: new Date(at - 3600_000),
+    }),
   });
-  assert.ok(threw);
-  assert.equal(spend.read, 7, 'caller sees real spend, not a guess');
+  const sent = [];
+  const env = { CORPUS, ROLLUP_QUEUE: { sendBatch: async (msgs) => sent.push(...msgs) } };
+  await worker.scheduled({ scheduledTime: at }, env);
+
+  const hours = (h) => sent.filter((m) => m.body.part === `dt=2026-08-06/hh=${h}`);
+  assert.deepEqual(hours('14').map((m) => m.body.slice).join(''), SLICES, 'every slice of the missing hour');
+  assert.equal(hours('12').length, 0, 'a finished hour is not enqueued');
+  assert.equal(hours('13').length, 0, 'an hour enqueued an hour ago is not enqueued again');
+  assert.equal(hours('00').length, 16, 'backfill reaches the start of the oldest raw day');
+
+  const acked = [];
+  const messages = hours('14').map((m) => ({
+    body: m.body,
+    ack: () => acked.push(m.body.slice),
+    retry: () => assert.fail(`slice ${m.body.slice} was retried`),
+  }));
+  await worker.queue({ messages }, env);
+  assert.equal(acked.length, 16);
+  const row = JSON.parse(CORPUS.files[`rollup/${PART}/data.ndjson`]);
+  assert.equal(row.session.seq, 6, 'the queue path publishes the merged hour');
+
+  // A redelivered message for a finished hour must not write a part: nothing
+  // would ever merge or remove it.
+  await worker.queue({ messages: [messages[0]] }, env);
+  assert.ok(!Object.keys(CORPUS.files).some((k) => k.startsWith(`rollup-parts/${PART}/`)));
+}
+
+// 4b. The recovery paths. An hour enqueued longer ago than the re-enqueue
+//     window is sent again; a slice that fails is handed back to the queue, not
+//     acknowledged; a second copy of a finished slice reuses its part instead
+//     of reading the slice again; and whatever a finished hour left under
+//     rollup-parts/ is swept, because nothing else would ever remove it.
+{
+  const at = Date.parse('2026-08-06T15:05:00Z');
+  const stale = (hoursAgo) =>
+    Object.assign(new String(''), { uploaded: new Date(at - hoursAgo * 3600_000) });
+  const CORPUS = stubBucket(
+    {
+      'sessions/dt=2026-08-06/hh=13/a.json': beacon('i1', 's2', 1),
+      'sessions/dt=2026-08-06/hh=14/a.json': beacon('i1', 's3', 2),
+      'sessions/dt=2026-08-06/hh=14/b.json': beacon('i1', 's3', 6),
+      'rollup/dt=2026-08-06/hh=13/data.ndjson': beacon('i1', 's2', 1),
+      'rollup-parts/dt=2026-08-06/hh=13/queued': stale(1),
+      'rollup-parts/dt=2026-08-06/hh=13/a': beacon('i1', 's2', 1),
+      'rollup-parts/dt=2026-08-06/hh=14/queued': stale(4),
+    },
+    { failKeys: new Set(['sessions/dt=2026-08-06/hh=14/b.json']) }
+  );
+  const sent = [];
+  const env = { CORPUS, ROLLUP_QUEUE: { sendBatch: async (msgs) => sent.push(...msgs) } };
+  await worker.scheduled({ scheduledTime: at }, env);
+
+  assert.equal(
+    sent.filter((m) => m.body.part === PART).length,
+    16,
+    'an hour enqueued four hours ago is enqueued again'
+  );
+  assert.ok(
+    !Object.keys(CORPUS.files).some((k) => k.startsWith('rollup-parts/dt=2026-08-06/hh=13/')),
+    'leftovers of a finished hour are swept'
+  );
+
+  const outcome = [];
+  const message = (slice) => ({
+    body: { part: PART, slice },
+    ack: () => outcome.push(`ack ${slice}`),
+    retry: (opts) => outcome.push(`retry ${slice} ${opts.delaySeconds}`),
+  });
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    await worker.queue({ messages: [message('a'), message('b')] }, env);
+  } finally {
+    console.error = quiet;
+  }
+  assert.deepEqual(outcome, ['ack a', 'retry b 60'], 'a failed slice goes back to the queue');
+
+  const before = CORPUS.reads.length;
+  await worker.queue({ messages: [message('a')] }, env);
+  assert.equal(CORPUS.reads.length, before, 'a finished slice is not read a second time');
 }
 
 // 5. An empty hour writes a marker, not a zero-byte NDJSON. Without it the hour
-//    stays "missing" and is re-listed on every run forever.
+//    stays "missing" and is enqueued again on every run forever.
 {
-  const { rows, empty, keys } = await run({});
+  const { rows, empty, rolled } = await run({});
   assert.deepEqual(rows, []);
   assert.ok(empty, 'empty hour leaves a marker');
   assert.ok(
-    keys.every((k) => !k.endsWith('.ndjson')),
+    rolled.every((k) => !k.endsWith('.ndjson')),
     'no zero-byte ndjson for readers to special-case'
   );
 }
@@ -187,7 +291,7 @@ if (dir) {
   for (const f of readdirSync(dir).filter((f) => f.endsWith('.json'))) {
     files[`sessions/${PART}/${f}`] = readFileSync(`${dir}/${f}`, 'utf8');
   }
-  const { rows, spend, threw } = await run(files);
+  const { rows, rawReads, threw } = await run(files);
   assert.equal(threw, null);
 
   const expected = new Map();
@@ -199,15 +303,14 @@ if (dir) {
       expected.set(k, Math.max(expected.get(k) ?? -1, r.session?.seq ?? 0));
     }
   }
-  assert.equal(spend.read, Object.keys(files).length);
+  assert.equal(rawReads, Object.keys(files).length);
   assert.equal(rows.length, expected.size, 'row count matches DISTINCT sessions');
   for (const r of rows) {
     const k = `${r.resource['headroom.install_id']} ${r.session.id}`;
     assert.equal(r.session.seq, expected.get(k), `max seq for ${k}`);
   }
   console.log(
-    `real corpus: ${spend.read} objects -> ${rows.length} sessions in 1 object` +
-      ` (${Math.ceil(spend.read / PAGE)} list pages)`
+    `real corpus: ${rawReads} objects -> ${rows.length} sessions in 1 object`
   );
 }
 
@@ -327,6 +430,14 @@ if (dir) {
   full.errors = { count: 1, by_status: { 429: 1 } };
   full.strata = [{ dim: 'arm', value: 'treatment', n: 2 }];
   full.config = [{ key: 'mode', value: 'token' }];
+  const usage = {
+    n: 2, original: 9, saved: 3, tool_saved: 1, output: 2, cache_read: 4, cache_write: 1,
+    cache_write_inferred: 0, cache_write_5m: 1, cache_write_1h: 0, uncached: 4,
+  };
+  full.client_usage = [{ client: 'claude_code', ...usage }, { client: 'via_compress_api', ...usage }];
+  full.model_usage = [{ model: 'claude-haiku-4-5', ...usage }];
+  full.client_versions = [{ client: 'claude_code', version: '2.1.311', n: 2 }];
+  full.install = { age_days: 12, container: false, ci: false };
   full.routing = { decisions: 3, by_model: [{ model: 'claude-haiku-4-5', n: 3 }], min_prefix: 1024 };
 
   /** One OTLP record through fetch(); returns what would be written to R2. */
@@ -368,6 +479,11 @@ if (dir) {
   injected.session.ended = { nested: 'object where a slug belongs' };
   injected.routing.note = 'free text with spaces';
   injected.trajectory.kinds = 'see attached transcript';
+  injected.client_usage[0].prompt = 'x';                         // unknown key in a usage row
+  injected.client_usage[1].client = 'Acme Corp Billing';         // not a harness slug
+  injected.client_versions[0].version = '2.1.311-host.internal'; // not a release number
+  injected.install.hostname = 'build-7';
+  injected.install.age_days = 'twelve';
   const hostile = [...resourceAttrs.filter((a) => a.key !== 'headroom.stack'),
     { key: 'headroom.stack', value: any({ cwd: '/home/me' }) }];
   const { resource: badResource, ...dropped } = await store(injected, hostile);
@@ -375,6 +491,9 @@ if (dir) {
   const expected = structuredClone(full);
   delete expected.session.ended;
   delete expected.trajectory.kinds;
+  delete expected.client_usage[1].client;
+  delete expected.client_versions[0].version;
+  delete expected.install.age_days;
   expected.config.push({ key: 'endpoint' });
   expected.strata.push({ dim: 'arm', n: 1 });
   assert.deepEqual(dropped, expected, 'a nested field outside the allowlist was stored');
