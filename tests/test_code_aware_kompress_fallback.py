@@ -58,22 +58,49 @@ def test_disabled_kompress_turns_off_code_aware_fallback() -> None:
     assert compressor.config.fallback_to_kompress is False
 
 
-def test_enabled_kompress_keeps_code_aware_fallback() -> None:
+def test_enabled_kompress_still_turns_off_code_aware_fallback() -> None:
+    # Kompress may be on for prose, but it must never compress code (#4214):
+    # the router's code compressor leaves blocks it cannot handle unchanged.
     router = ContentRouter(ContentRouterConfig(enable_code_aware=True))
 
     compressor = router._get_code_compressor()
 
     assert compressor is not None
-    assert compressor.config.fallback_to_kompress is True
+    assert compressor.config.fallback_to_kompress is False
 
 
-def test_unknown_language_code_passes_through_without_kompress(
-    kompress_spies: tuple[MagicMock, MagicMock],
-) -> None:
-    assert detect_language(UNKNOWN_CODE)[0] == CodeLanguage.UNKNOWN
-    router = ContentRouter(ContentRouterConfig(enable_code_aware=True, enable_kompress=False))
+PERL_CODE = "\n".join(
+    ["#!/usr/bin/perl", "use strict;", "use warnings;"]
+    + [
+        f'my $v{i} = $ARGV[{i % 3}] // {i}; print "$v{i}\\n" if $v{i} =~ /^\\d+$/;'
+        for i in range(60)
+    ]
+)
+
+PYTHON_CODE = "\n".join(
+    ["import json", ""]
+    + [
+        f"def handler_{i}(event):\n    if event.get('k{i}'):\n        return json.dumps(event)\n    return None\n"
+        for i in range(40)
+    ]
+)
+
+
+def _code_aware_entry(enable_kompress: bool):
+    router = ContentRouter(
+        ContentRouterConfig(enable_code_aware=True, enable_kompress=enable_kompress)
+    )
     entry = router.compressor_registry.get("code_aware")
     assert entry is not None
+    return router, entry
+
+
+@pytest.mark.parametrize("enable_kompress", [False, True])
+def test_unknown_language_code_passes_through_without_kompress(
+    kompress_spies: tuple[MagicMock, MagicMock], enable_kompress: bool
+) -> None:
+    assert detect_language(UNKNOWN_CODE)[0] == CodeLanguage.UNKNOWN
+    _, entry = _code_aware_entry(enable_kompress)
 
     out = entry.compress(CompressInput(content=UNKNOWN_CODE, content_type="text/x-code"))
 
@@ -81,3 +108,58 @@ def test_unknown_language_code_passes_through_without_kompress(
     available.assert_not_called()
     compressor.assert_not_called()
     assert out.content == UNKNOWN_CODE
+
+
+@pytest.mark.parametrize("enable_kompress", [False, True])
+def test_perl_code_passes_through_without_kompress(
+    kompress_spies: tuple[MagicMock, MagicMock], enable_kompress: bool
+) -> None:
+    # detect_language() reports Perl-dominant code as UNKNOWN on purpose, so the
+    # Perl branch is reached through an explicit language hint.
+    _, entry = _code_aware_entry(enable_kompress)
+
+    out = entry.compress(
+        CompressInput(content=PERL_CODE, content_type="text/x-code", config={"language": "perl"})
+    )
+
+    available, compressor = kompress_spies
+    available.assert_not_called()
+    compressor.assert_not_called()
+    assert out.content == PERL_CODE
+
+
+@pytest.mark.parametrize("enable_kompress", [False, True])
+def test_ast_failure_passes_through_without_kompress(
+    kompress_spies: tuple[MagicMock, MagicMock],
+    monkeypatch: pytest.MonkeyPatch,
+    enable_kompress: bool,
+) -> None:
+    router, entry = _code_aware_entry(enable_kompress)
+    code_compressor = router._get_code_compressor()
+    assert code_compressor is not None
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated AST failure")
+
+    monkeypatch.setattr(code_compressor, "_compress_with_ast", _boom)
+
+    out = entry.compress(CompressInput(content=PYTHON_CODE, content_type="text/x-code"))
+
+    available, compressor = kompress_spies
+    available.assert_not_called()
+    compressor.assert_not_called()
+    assert out.content == PYTHON_CODE
+
+
+def test_disk_cache_namespace_includes_the_routing_policy_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Output cached before #4214 (code sent to Kompress) must not be replayed
+    # after the fix by a restart with the same version and config.
+    import headroom.transforms.content_router as cr
+
+    config = ContentRouterConfig()
+    current = cr._config_namespace(config)
+    monkeypatch.setattr(cr, "_ROUTING_POLICY_REVISION", "earlier-policy")
+
+    assert cr._config_namespace(config) != current
