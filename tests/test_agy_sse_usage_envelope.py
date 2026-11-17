@@ -54,24 +54,6 @@ def test_buffer_gemini_native_top_level_still_parses():
     assert usage["output_tokens"] == 20
 
 
-# -- _parse_sse_usage (raw-chunk path) --
-
-
-def test_chunk_gemini_unwraps_cloudcode_response_envelope():
-    chunk = {"response": {"usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 7}}}
-    usage = _proxy()._parse_sse_usage(_sse(chunk), "gemini")
-    assert usage is not None
-    assert usage["output_tokens"] == 7
-    assert usage["input_tokens"] == 5
-
-
-def test_chunk_gemini_native_top_level_still_parses():
-    chunk = {"usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4}}
-    usage = _proxy()._parse_sse_usage(_sse(chunk), "gemini")
-    assert usage is not None
-    assert usage["output_tokens"] == 4
-
-
 # -- _gemini_usage_meta helper: guard malformed upstream (never crash) --
 
 

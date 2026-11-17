@@ -17,6 +17,7 @@ Uses trafilatura for robust extraction - it handles:
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -187,12 +188,22 @@ class HTMLExtractor:
     ) -> list[HTMLExtractionResult]:
         """Extract content from multiple HTML pages.
 
+        .. deprecated::
+            Unused inside Headroom; will be removed in a future release.
+            Call :meth:`extract` for each page instead.
+
         Args:
             html_contents: List of (html, url) tuples.
 
         Returns:
             List of HTMLExtractionResult in same order as input.
         """
+        warnings.warn(
+            "HTMLExtractor.extract_batch is deprecated and will be removed in a future release; "
+            "call HTMLExtractor.extract for each page instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return [self.extract(html, url) for html, url in html_contents]
 
 

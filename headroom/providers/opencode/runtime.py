@@ -8,17 +8,13 @@ import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from headroom._subprocess import run
 from headroom.mcp_registry.install import DEFAULT_PROXY_URL
+from headroom.providers.codex import proxy_base_url
 
 from .config import HEADROOM_OPENCODE_PLUGIN, headroom_provider_entry
-
-
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL used by OpenCode integrations."""
-    return f"http://127.0.0.1:{port}/v1"
-
 
 # OpenCode 2.x subcommands. Of these only the interactive ones (the root TUI,
 # ``run`` and ``mini``) get ``--standalone``; the rest are management commands.
@@ -157,6 +153,7 @@ def build_opencode_config_content(
     port: int,
     include_mcp: bool = True,
     include_plugin: bool = True,
+    extra_models: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     """Build JSON payload for ``OPENCODE_CONFIG_CONTENT``.
 
@@ -186,7 +183,7 @@ def build_opencode_config_content(
         "provider": {
             "anthropic": {"options": {"baseURL": base_url}},
             "openai": {"options": {"baseURL": base_url}},
-            "headroom": headroom_provider_entry(port),
+            "headroom": headroom_provider_entry(port, extra_models),
         }
     }
     if include_mcp:
@@ -217,6 +214,7 @@ def build_launch_env(
     *,
     include_mcp: bool = True,
     include_plugin: bool = True,
+    extra_models: dict[str, Any] | None = None,
     session_token: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Build environment variables for launching OpenCode through Headroom.
@@ -237,6 +235,7 @@ def build_launch_env(
         port=port,
         include_mcp=include_mcp,
         include_plugin=include_plugin,
+        extra_models=extra_models,
     )
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config_content, separators=(",", ":"))
 

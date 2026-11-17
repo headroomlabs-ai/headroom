@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -166,6 +167,181 @@ def test_create_storage_builtin_entrypoint_and_fallback(
     assert isinstance(plain, FakeSQLiteStorage)
     assert created_fallback == ["custom://fallback.db", "custom://missing.db", "metrics.db"]
     plain.close()
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def storage_log() -> Iterator[_ListHandler]:
+    handler = _ListHandler()
+    logger = logging.getLogger("headroom.storage")
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    yield handler
+    logger.removeHandler(handler)
+    logger.setLevel(previous)
+
+
+def _fallback_warnings(handler: _ListHandler) -> list[str]:
+    return [
+        r.getMessage()
+        for r in handler.records
+        if r.levelno == logging.WARNING and "falling back to SQLite" in r.getMessage()
+    ]
+
+
+def test_create_storage_warns_when_a_backend_plugin_fails_to_load(
+    monkeypatch: pytest.MonkeyPatch, storage_log: _ListHandler
+) -> None:
+    monkeypatch.setattr("headroom.storage.SQLiteStorage", lambda db_path: SimpleNamespace())
+
+    created = DummyStorage()
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group: [SimpleNamespace(name="custom", load=lambda: lambda url: created)],
+    )
+    assert create_storage("custom://user:secret@host/db") is created
+    assert _fallback_warnings(storage_log) == []
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    create_storage("custom://user:secret@host/db")
+    warnings = _fallback_warnings(storage_log)
+    assert len(warnings) == 1
+    assert "'custom'" in warnings[0]
+    assert "secret" not in warnings[0]
+
+    monkeypatch.setattr("importlib.metadata.entry_points", lambda group: [])
+    create_storage("other://host/db")
+    assert any("'other'" in w for w in _fallback_warnings(storage_log))
+
+    def _rejecting_factory(url: str) -> DummyStorage:
+        raise ValueError(f"cannot connect to {url} while storing CONTENT_CANARY")
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group: [SimpleNamespace(name="leaky", load=lambda: _rejecting_factory)],
+    )
+    storage_log.records.clear()
+    create_storage("leaky://user:secret@host/db")
+    warning_records = [r for r in storage_log.records if r.levelno == logging.WARNING]
+    assert len(warning_records) == 1
+    assert "ValueError" in warning_records[0].getMessage()
+    assert "secret" not in warning_records[0].getMessage()
+    assert warning_records[0].exc_info is None
+    # Every level, rendered the way a log handler would (exc_info included).
+    assert storage_log.records
+    for record in storage_log.records:
+        rendered = logging.Formatter().format(record)
+        assert "secret" not in rendered
+        assert "CONTENT_CANARY" not in rendered
+    debug = [r for r in storage_log.records if r.levelno == logging.DEBUG]
+    assert debug and "ValueError" in logging.Formatter().format(debug[0])
+
+    storage_log.records.clear()
+    create_storage("metrics.db")
+    assert _fallback_warnings(storage_log) == []
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_storage_plugin_class_name_cannot_leak_or_forge_log_lines(
+    monkeypatch: pytest.MonkeyPatch, storage_log: _ListHandler, level: int
+) -> None:
+    error_type = type("PRIVATE_CREDENTIAL_CANARY\nFORGED_LOG_ENTRY", (RuntimeError,), {})
+
+    def _rejecting_factory(url: str) -> DummyStorage:
+        raise error_type("plugin text")
+
+    fallback = SimpleNamespace()
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    monkeypatch.setattr("headroom.storage.SQLiteStorage", lambda db_path: fallback)
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group: [SimpleNamespace(name="plugin", load=lambda: _rejecting_factory)],
+    )
+    logging.getLogger("headroom.storage").setLevel(level)
+    assert create_storage("plugin://host/db") is fallback
+    assert len(_fallback_warnings(storage_log)) == 1
+    for record in storage_log.records:
+        rendered = logging.Formatter().format(record)
+        assert "PRIVATE_CREDENTIAL_CANARY" not in rendered
+        assert "FORGED_LOG_ENTRY" not in rendered
+        assert "\n" not in rendered
+
+
+def test_jsonl_storage_get_returns_latest_snapshot_for_a_repeated_request_id(
+    tmp_path: Path,
+) -> None:
+    """Saving a request ID again must be visible to get(), as in SQLite (#4254)."""
+    now = datetime(2026, 4, 23, 12, 0, 0)
+    initial = _metrics("req", now, after=80)
+    other = _metrics("other", now + timedelta(seconds=1))
+    updated = _metrics("req", now, after=40)
+
+    jsonl_storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite_storage = SQLiteStorage(str(tmp_path / "metrics.db"))
+    try:
+        for storage in (jsonl_storage, sqlite_storage):
+            storage.save(initial)
+            storage.save(other)
+            storage.save(updated)
+
+        reopened = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+        assert reopened.get("req") == updated
+        assert jsonl_storage.get("req") == sqlite_storage.get("req") == updated
+    finally:
+        sqlite_storage.close()
+
+
+def test_jsonl_storage_get_skips_malformed_metric_rows_and_returns_last_valid_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A later invalid JSON object must not hide the last valid snapshot.
+
+    ``{}`` parses but has no metric fields. ``get`` scans the whole journal,
+    so that row used to raise ``KeyError`` and drop the valid match. The file
+    stays as written, and query/iteration still yield only the valid rows.
+    """
+    now = datetime(2026, 4, 23, 12, 0, 0)
+    first = _metrics("req", now, after=80)
+    latest = _metrics("req", now + timedelta(seconds=5), after=40)
+
+    no_later = tmp_path / "no-later.jsonl"
+    no_later_storage = JSONLStorage(str(no_later))
+    no_later_storage.save(first)
+    with no_later.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+    no_later_journal = no_later.read_bytes()
+
+    assert no_later_storage.get("req") == first
+    assert list(no_later_storage.iter_all()) == [first]
+    assert no_later_storage.query() == [first]
+    assert no_later_storage.count() == 1
+    assert no_later.read_bytes() == no_later_journal
+
+    with_later = tmp_path / "with-later.jsonl"
+    with_later_storage = JSONLStorage(str(with_later))
+    with_later_storage.save(first)
+    with with_later.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+    with_later_storage.save(latest)
+    with_later_journal = with_later.read_bytes()
+
+    assert with_later_storage.get("req") == latest
+    assert [row.tokens_input_after for row in with_later_storage.iter_all()] == [80, 40]
+    assert [row.tokens_input_after for row in with_later_storage.query()] == [40, 80]
+    assert with_later_storage.count() == 2
+    assert with_later.read_bytes() == with_later_journal
 
 
 def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> None:
@@ -507,3 +683,43 @@ def test_jsonl_query_retains_at_most_requested_window(
     # whole match set.
     assert max(retained) <= window + 1
     assert max(retained) < len(matches)
+
+
+@pytest.mark.parametrize("backend", [JSONLStorage, SQLiteStorage])
+def test_cache_optimizer_fields_survive_durable_reopen(backend, tmp_path: Path) -> None:
+    """Both backends must persist every cache-optimizer field across a reopen (#4261)."""
+    suffix = "jsonl" if backend is JSONLStorage else "db"
+    path = str(tmp_path / f"metrics.{suffix}")
+    metrics = RequestMetrics(
+        request_id="cache-repro",
+        timestamp=datetime(2026, 4, 23, 12, 0, 0),
+        model="claude-3-opus",
+        stream=False,
+        mode="optimize",
+        tokens_input_before=1000,
+        tokens_input_after=800,
+        cache_optimizer_used="anthropic-cache-optimizer",
+        cache_optimizer_strategy="explicit_breakpoints",
+        cacheable_tokens=789,
+        breakpoints_inserted=2,
+        estimated_cache_hit=True,
+        estimated_savings_percent=42.5,
+        semantic_cache_hit=True,
+    )
+
+    storage = backend(path)
+    storage.save(metrics)
+    storage.close()
+
+    reopened = backend(path)
+    restored = reopened.get("cache-repro")
+    reopened.close()
+
+    assert restored is not None
+    assert restored.cache_optimizer_used == metrics.cache_optimizer_used
+    assert restored.cache_optimizer_strategy == metrics.cache_optimizer_strategy
+    assert restored.cacheable_tokens == metrics.cacheable_tokens
+    assert restored.breakpoints_inserted == metrics.breakpoints_inserted
+    assert restored.estimated_cache_hit == metrics.estimated_cache_hit
+    assert restored.estimated_savings_percent == metrics.estimated_savings_percent
+    assert restored.semantic_cache_hit == metrics.semantic_cache_hit

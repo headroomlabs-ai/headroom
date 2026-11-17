@@ -72,6 +72,7 @@ def test_readyz_excludes_kompress_from_aggregate_readiness(monkeypatch):
         "status": "degraded",
         "optional": True,
         "backend": None,
+        "detail": "model not cached",
     }
 
 
@@ -88,6 +89,7 @@ def test_readyz_promotes_deferred_kompress_after_runtime_load(monkeypatch):
         "status": "healthy",
         "optional": True,
         "backend": "onnx",
+        "detail": "loaded",
     }
     # The promotion must also clear the startup marker, otherwise the slot
     # serializes as loaded-but-deferred in /debug/warmup.
@@ -114,6 +116,7 @@ def test_readyz_promotes_kompress_from_module_cache(monkeypatch, attached):
         "status": "healthy",
         "optional": True,
         "backend": "onnx",
+        "detail": "loaded",
     }
     assert proxy.warmup.kompress.handle is model
     if compressor is not None:
@@ -147,6 +150,7 @@ def test_readyz_keeps_pending_kompress_unloaded(monkeypatch):
         "status": "degraded",
         "optional": True,
         "backend": None,
+        "detail": "not installed",
     }
     assert compressor.calls == ["is_ready"]
 
@@ -187,6 +191,7 @@ def test_readyz_disabled_kompress_skips_inspection(monkeypatch):
         "status": "disabled",
         "optional": True,
         "backend": None,
+        "detail": "not installed",
     }
     assert compressor.calls == []
 
@@ -209,6 +214,7 @@ def test_readyz_per_provider_kompress_override_reenables_health(monkeypatch):
         "status": "healthy",
         "optional": True,
         "backend": "onnx",
+        "detail": "loaded",
     }
     assert compressor.calls == ["is_ready", "ready_backend"]
 
@@ -231,6 +237,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
         "status": "degraded",
         "optional": True,
         "backend": None,
+        "detail": "not installed",
     }
 
 
@@ -247,6 +254,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
                 "status": "degraded",
                 "optional": True,
                 "backend": None,
+                "detail": "not installed",
             },
         ),
         (
@@ -259,6 +267,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
                 "status": "healthy",
                 "optional": True,
                 "backend": "onnx",
+                "detail": "loaded",
             },
         ),
         (
@@ -271,6 +280,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
                 "status": "healthy",
                 "optional": True,
                 "backend": "remote",
+                "detail": "loaded",
             },
         ),
         (
@@ -283,6 +293,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
                 "status": "healthy",
                 "optional": True,
                 "backend": "onnx",
+                "detail": "loaded",
             },
         ),
         (
@@ -295,6 +306,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
                 "status": "healthy",
                 "optional": True,
                 "backend": "existing",
+                "detail": "loaded",
             },
         ),
         (
@@ -307,6 +319,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
                 "status": "disabled",
                 "optional": True,
                 "backend": None,
+                "detail": "not installed",
             },
         ),
     ],
@@ -323,3 +336,59 @@ def test_readyz_kompress_state_matrix(monkeypatch, slot_status, compressor, disa
     payload = TestClient(app).get("/readyz").json()["checks"]["kompress"]
 
     assert payload == expected
+
+
+# /health and /readyz are auth-exempt, so nothing they serialize may carry raw
+# exception text: loader failures embed absolute paths, model ids and URLs.
+_SENTINEL_DETAIL = "/opt/secret-path/model.onnx token=SENTINEL-LEAK-9f3a"
+
+
+@pytest.mark.parametrize("endpoint", ["/health", "/readyz"])
+def test_public_health_does_not_leak_warm_failure_text(monkeypatch, endpoint):
+    app, proxy = _health_app(monkeypatch)
+    # What the background warm thread would have written pre-#2799 review.
+    proxy.warmup.kompress.info["detail"] = f"warm failed: {_SENTINEL_DETAIL}"
+
+    response = TestClient(app).get(endpoint)
+
+    assert response.json()["checks"]["kompress"]["detail"] == "unavailable"
+    assert "SENTINEL-LEAK-9f3a" not in response.text
+    assert "secret-path" not in response.text
+
+
+@pytest.mark.parametrize("endpoint", ["/health", "/readyz"])
+def test_public_health_does_not_leak_slot_error_text(monkeypatch, endpoint):
+    app, proxy = _health_app(monkeypatch)
+    proxy.warmup.kompress.mark_error(f"native load failed: {_SENTINEL_DETAIL}")
+
+    response = TestClient(app).get(endpoint)
+
+    assert response.json()["checks"]["kompress"]["detail"] == "unavailable"
+    assert "SENTINEL-LEAK-9f3a" not in response.text
+    assert "secret-path" not in response.text
+
+
+def test_remote_kompress_endpoint_skips_local_model_at_startup(monkeypatch):
+    """With HEADROOM_KOMPRESS_ENDPOINT set, startup neither fetches nor warms the
+    local model, and /readyz still names the remote backend."""
+    import threading
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_ENDPOINT", "https://kompress.example.test")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "3600")
+    prefetched: list[str] = []
+    monkeypatch.setattr(
+        kompress_compressor,
+        "ensure_background_prefetch",
+        lambda model_id: (prefetched.append(model_id), True)[1],
+    )
+    app = create_app(ProxyConfig(optimize=True, cache_enabled=False, rate_limit_enabled=False))
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = object()
+        payload = client.get("/readyz").json()
+
+    assert prefetched == []
+    assert not any(t.name == "kompress-warmup" for t in threading.enumerate())
+    assert payload["checks"]["kompress"]["backend"] == "remote"

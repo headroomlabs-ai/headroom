@@ -1,6 +1,7 @@
 """Tests for JSONL storage query paging (shared newest-first contract)."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -62,6 +63,31 @@ def _expected_page(
 
 def _ids(metrics: list[RequestMetrics]) -> list[str]:
     return [m.request_id for m in metrics]
+
+
+@pytest.mark.parametrize("method", ["query", "count", "get_summary_stats"])
+def test_jsonl_aware_time_bounds_are_inclusive(method: str, tmp_path: Path) -> None:
+    """Aware bounds preserve their UTC instant and include the exact boundary."""
+    boundary = datetime(2026, 4, 23, 23, 59, 59, 500000, tzinfo=timezone.utc)
+    local_boundary = boundary.astimezone(timezone(timedelta(hours=5, minutes=30)))
+    with JSONLStorage(str(tmp_path / "metrics.jsonl")) as storage:
+        for request_id, delta in [("before", -1), ("boundary", 0), ("after", 1)]:
+            storage.save(_metrics(request_id, boundary + timedelta(microseconds=delta)))
+        scenarios = [
+            ({"start_time": local_boundary}, ["after", "boundary"]),
+            ({"end_time": local_boundary}, ["boundary", "before"]),
+            ({"start_time": local_boundary, "end_time": local_boundary}, ["boundary"]),
+        ]
+        for filters, expected_ids in scenarios:
+            result = getattr(storage, method)(**filters)
+            if method == "query":
+                assert _ids(result) == expected_ids, filters
+            elif method == "count":
+                assert result == len(expected_ids), filters
+            else:
+                assert result["total_requests"] == len(expected_ids), filters
+                assert result["total_tokens_before"] == 1000 * len(expected_ids), filters
+                assert result["total_tokens_after"] == 800 * len(expected_ids), filters
 
 
 def _assert_timestamp_desc(metrics: list[RequestMetrics]) -> None:
@@ -244,3 +270,64 @@ class TestJSONLQuerySingleRowRegression:
 
         jsonl.close()
         sqlite.close()
+
+
+class TestJSONLCacheOptimizerMetrics:
+    """Cache-optimizer fields must survive a durable JSONL round trip (#4261)."""
+
+    def test_save_close_reopen_preserves_cache_optimizer_fields(self, tmp_path):
+        path = str(tmp_path / "metrics.jsonl")
+        metrics = RequestMetrics(
+            request_id="cache-repro",
+            timestamp=datetime(2025, 1, 6, 12, 0, 0),
+            model="claude-3-opus",
+            stream=False,
+            mode="optimize",
+            tokens_input_before=1000,
+            tokens_input_after=800,
+            cache_optimizer_used="anthropic-cache-optimizer",
+            cache_optimizer_strategy="explicit_breakpoints",
+            cacheable_tokens=789,
+            breakpoints_inserted=2,
+            estimated_cache_hit=True,
+            estimated_savings_percent=42.5,
+            semantic_cache_hit=True,
+        )
+
+        storage = JSONLStorage(path)
+        storage.save(metrics)
+        storage.close()
+
+        reopened = JSONLStorage(path)
+        restored = reopened.get("cache-repro")
+        reopened.close()
+
+        assert restored is not None
+        assert restored.cache_optimizer_used == "anthropic-cache-optimizer"
+        assert restored.cache_optimizer_strategy == "explicit_breakpoints"
+        assert restored.cacheable_tokens == 789
+        assert restored.breakpoints_inserted == 2
+        assert restored.estimated_cache_hit is True
+        assert restored.estimated_savings_percent == 42.5
+        assert restored.semantic_cache_hit is True
+
+    def test_legacy_jsonl_lines_get_cache_optimizer_defaults(self, tmp_path):
+        path = tmp_path / "metrics.jsonl"
+        path.write_text(
+            '{"id":"legacy-1","timestamp":"2025-01-06T12:00:00Z","model":"gpt-4o",'
+            '"stream":false,"mode":"audit","tokens_input_before":1000,'
+            '"tokens_input_after":800}\n'
+        )
+
+        storage = JSONLStorage(str(path))
+        restored = storage.get("legacy-1")
+        storage.close()
+
+        assert restored is not None
+        assert restored.cache_optimizer_used is None
+        assert restored.cache_optimizer_strategy is None
+        assert restored.cacheable_tokens == 0
+        assert restored.breakpoints_inserted == 0
+        assert restored.estimated_cache_hit is False
+        assert restored.estimated_savings_percent == 0.0
+        assert restored.semantic_cache_hit is False

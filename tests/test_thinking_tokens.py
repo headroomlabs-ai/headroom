@@ -219,6 +219,9 @@ class TestHandlerWiring:
 
     def test_helper_never_raises_on_junk(self):
         from headroom.proxy.handlers.anthropic import _thinking_tokens_for
+        from headroom.proxy.thinking_tokens import ThinkingTokens
 
         for junk in (None, "string", 42, [], {"content": "not a list"}):
-            assert _thinking_tokens_for(junk).tokens is None or True
+            result = _thinking_tokens_for(junk)
+            assert isinstance(result, ThinkingTokens)
+            assert not result.tokens  # nothing to count: unknown (None) or zero

@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from headroom.offline import guard_egress
+from headroom.offline import guard_egress, pin_litellm_cost_map_local
 
 if TYPE_CHECKING:
     from headroom.transforms.html_extractor import HTMLExtractor
@@ -316,6 +316,7 @@ class HTMLExtractionEvaluator:
 
         else:
             try:
+                pin_litellm_cost_map_local()
                 import litellm
 
                 def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
@@ -396,6 +397,7 @@ Answer concisely and factually based only on the content provided."""
             )
 
         else:
+            pin_litellm_cost_map_local()
             import litellm
 
             litellm_response = litellm.completion(

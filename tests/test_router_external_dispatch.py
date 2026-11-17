@@ -33,7 +33,6 @@ from headroom.transforms.compressor_registry import (
     CompressOutput,
 )
 from headroom.transforms.content_router import (
-    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
 )
@@ -250,21 +249,6 @@ def test_native_misclassification_keeps_git_status_format(_memory_ccr, monkeypat
     assert detected.metadata["format"] == "git_status"
 
 
-def test_external_dispatch_via_apply_strategy_returns_normal_shape(_memory_ccr):
-    comp = _RecordingExternal(name="ext_json", content_types=("application/json",))
-    router = _router_with_external(comp, ["ext_json"])
-
-    compressed, tokens, chain = router._apply_strategy_to_content(
-        _JSON_ARRAY, CompressionStrategy.SMART_CRUSHER, ""
-    )
-
-    assert chain == ["external:ext_json"]
-    assert "external-compressed" in compressed
-    # Tokens counted with the router's OWN estimator (a positive int), not the
-    # compressor's self-report.
-    assert isinstance(tokens, int) and tokens > 0
-
-
 # ─────────────────────────── (b) recoverable map ─────────────────────────────
 
 
@@ -281,15 +265,17 @@ def test_recoverable_map_is_retrievable(_memory_ccr):
     assert entry.compression_strategy == "external:ext_json"
 
 
-def test_non_hex_recoverable_hash_is_skipped_without_breaking(_memory_ccr):
-    # A malformed (non-hex) recovery hash must not break the request; the block
-    # is still compressed, only that entry is not retrievable.
+def test_non_hex_recoverable_hash_falls_back_to_builtin(_memory_ccr):
+    # A malformed (non-hex) recovery hash must not break the request; the store
+    # cannot keep that entry, so the external output (whose marker would point
+    # nowhere) is discarded and the built-in path runs.
     comp = _RecordingExternal(name="ext_json", content_types=("application/json",), bad_hash=True)
     router = _router_with_external(comp, ["ext_json"])
 
     result = router.compress(_JSON_ARRAY)
 
-    assert "external:ext_json" in result.strategy_chain
+    assert "external:ext_json" not in result.strategy_chain
+    assert "external-compressed" not in result.compressed
     assert get_compression_store().retrieve("zznothex") is None
 
 
@@ -408,3 +394,49 @@ def test_wildcard_selection_activates_registered_external(_memory_ccr):
 
     assert comp.calls
     assert "external:ext_json" in result.strategy_chain
+
+
+# ───────────── explicit passthrough code never reaches an external ─────────────
+
+_PY_FENCE = "\n".join(
+    ["import json", ""]
+    + [
+        f"def handler_{i}(event):\n    if event.get('k{i}'):\n        return json.dumps(event)\n    return None\n"
+        for i in range(30)
+    ]
+)
+_PROSE = " ".join(
+    ["The nightly job failed after the deploy and the operator wants a short summary."] * 40
+)
+
+
+def test_passthrough_code_section_is_not_offered_to_a_text_external(_memory_ccr):
+    # With prefer_code_aware_for_code=False the router keeps source code
+    # unmangled (PASSTHROUGH). A selected prose-only external compressor must
+    # not receive that code: mixed content splits the fence into its own section.
+    comp = _RecordingExternal(name="ext_text", content_types=("text/plain",))
+    router = ContentRouter(
+        _cfg(active_external_compressors=["ext_text"], prefer_code_aware_for_code=False)
+    )
+    router.compressor_registry.register(comp, replace=True)
+    router._active_external_compressors = router._resolve_active_external_compressors()
+    content = f"{_PROSE}\n\n```python\n{_PY_FENCE}\n```\n\n{_PROSE}"
+
+    result = router.compress(content)
+
+    assert all("def handler_0" not in call.content for call in comp.calls)
+    assert f"```python\n{_PY_FENCE}\n```" in result.compressed
+
+
+def test_passthrough_whole_code_block_is_not_offered_to_a_text_external(_memory_ccr):
+    comp = _RecordingExternal(name="ext_text", content_types=("text/plain",))
+    router = ContentRouter(
+        _cfg(active_external_compressors=["ext_text"], prefer_code_aware_for_code=False)
+    )
+    router.compressor_registry.register(comp, replace=True)
+    router._active_external_compressors = router._resolve_active_external_compressors()
+
+    result = router.compress(_PY_FENCE)
+
+    assert not comp.calls
+    assert result.compressed == _PY_FENCE

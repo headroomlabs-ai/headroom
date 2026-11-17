@@ -33,20 +33,40 @@ bucket_name = "headroom-telemetry"
 # Absent = R2 only, which is the right place to start.
 
 # Hourly compaction of sessions/ into rollup/ — see scheduled() in worker.js.
-# At :05 so the hour being rolled up is definitely closed. A >=1h interval also
-# buys the 15-minute CPU limit instead of 30s, which the backfill run needs.
+# At :05 so the hour being rolled up is definitely closed. The cron only
+# enqueues; the reading is done by the queue consumer below.
 [triggers]
 crons = ["5 * * * *"]
 
-# Every R2 binding call is a subrequest, and one hour is already ~4k objects.
-# The paid default of 10k would cap a run at two hours and stall the backfill
-# behind live traffic forever. This only raises a ceiling; a normal run spends
-# ~4k. READ_BUDGET in worker.js is what actually bounds the work.
+# One message is one slice (a sixteenth) of one hour. The queues must exist
+# before the first deploy that names them:
+#   npx wrangler queues create beacon-rollup
+#   npx wrangler queues create beacon-rollup-dlq
+# and, for `--env dev`, `npx wrangler queues create beacon-rollup-dev`.
+[[queues.producers]]
+binding = "ROLLUP_QUEUE"
+queue = "beacon-rollup"
+
+# max_batch_size = 1 so every slice is its own invocation: its own six
+# connections and its own 15 minutes, which is the entire point of the queue.
+# Concurrency is left to autoscale (up to 250), so a backlog drains in parallel.
+# A slice that keeps failing lands in the dead-letter queue, where it can be
+# inspected by hand until the queue's retention expires it — nothing reads or
+# alerts on that queue. scheduled() enqueues the hour again after three hours
+# either way, so the dead-letter queue is evidence, not the recovery path.
+[[queues.consumers]]
+queue = "beacon-rollup"
+max_batch_size = 1
+max_retries = 5
+dead_letter_queue = "beacon-rollup-dlq"
+
+# Every R2 binding call is a subrequest. A slice is ~1.5k reads today, under the
+# paid default of 10k, but that default is one fleet doubling or two away. This
+# only raises a ceiling.
 #
 # Workers Paid only — on the Free plan this key is rejected outright ("CPU
-# limits are not supported for the Free plan"), and the cron could not run
-# anyway: Free gives a scheduled handler 10ms of CPU, and parsing an hour of
-# heartbeats is tens of ms.
+# limits are not supported for the Free plan"), and Queues are a paid feature
+# as well.
 [limits]
 subrequests = 100000
 
@@ -61,10 +81,44 @@ enabled = true
 [observability.logs]
 invocation_logs = false
 
-# Rate limiting is configured in the Cloudflare dashboard, not here — this
-# endpoint is unauthenticated by design (anonymity is the product), so it is
-# the only thing between the Worker and a bored stranger:
-#   Security > WAF > Rate limiting rules
-#   otlp.headroomlabs.ai/v1/logs -> 60 requests / minute / IP
-# A real client sends ~2 requests/hour, so that is ~1000x headroom while still
-# capping a single abusive source hard.
+# Abuse bound for this unauthenticated endpoint, enforced in fetch(). One
+# shared key, not per-IP: the Worker never reads the sender's address, and a
+# per-IP key would mean reading it. Counters are per Cloudflare location, so
+# this caps each location, not the planet. Normal load is ~300 req/min in
+# total (~2 req/hour per client), so 3000/min per location is ~10x headroom
+# while still bounding what a flood can cost in Worker time and R2 writes.
+# Only 10 or 60 is accepted for `period`.
+[[ratelimits]]
+name = "RATE_LIMIT"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 3000
+  period = 60
+
+# Dev/test deployment: `npx wrangler deploy --env dev`. Its own Worker
+# (headroom-beacon-dev) and its own bucket, so test traffic can never land in
+# the production corpus. Bindings are not inherited by environments, so each
+# one is restated here.
+[env.dev]
+name = "headroom-beacon-dev"
+workers_dev = true
+
+[[env.dev.r2_buckets]]
+binding = "CORPUS"
+bucket_name = "headroom-telemetry-dev"
+
+[[env.dev.ratelimits]]
+name = "RATE_LIMIT"
+namespace_id = "1002"
+  [env.dev.ratelimits.simple]
+  limit = 600
+  period = 60
+
+[[env.dev.queues.producers]]
+binding = "ROLLUP_QUEUE"
+queue = "beacon-rollup-dev"
+
+[[env.dev.queues.consumers]]
+queue = "beacon-rollup-dev"
+max_batch_size = 1
+max_retries = 5

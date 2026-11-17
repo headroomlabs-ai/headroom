@@ -1,7 +1,8 @@
 """Session aggregation for the anonymous telemetry beacon.
 
 One wide event per session, emitted when the session goes idle. Everything here
-is off unless ``HEADROOM_TELEMETRY`` is explicitly on — see
+is on by default and off when the beacon is disabled (``HEADROOM_BEACON=off``,
+``HEADROOM_TELEMETRY=off``, ``DO_NOT_TRACK=1`` or offline mode) — see
 :mod:`headroom.telemetry.beacon`.
 
 # What counts as a session
@@ -90,6 +91,23 @@ type and its arithmetic, and the folding for the new signals is isolated in
   counted in ``errors`` and deliberately NOT folded into ``failures``, which
   has been 5xx-only in every row of the corpus and must stay that way.
 
+Later additions, same version (they are additive too, and a reader tells
+them apart by presence):
+
+* ``client_usage`` / ``model_usage`` — the session's tokens split by harness
+  and by model. ``clients`` and ``models`` only say who took part; a session
+  that mixed two harnesses, or Haiku with Opus, could not be divided or priced.
+  ``client_usage`` covers every turn, so traffic with no identified harness is
+  a visible row instead of a silent gap.
+* ``client_versions`` — the harness's own release (``claude-code 2.1.311``).
+  Harness releases change request shape far more often than Headroom does.
+* ``install`` — how old this install id is, and whether it lives in a
+  container or CI job. Separates a returning user from an id that is minted
+  fresh on every run.
+* A session that is at least half a day old is closed by the first request on
+  a later UTC day (``ended: "rollover"``), so an always-on proxy reports about
+  one row per day instead of a single total that grows for weeks.
+
 Everything added is a counter, a ratio, or a slug from a vocabulary that is
 closed in code. Two things are still refused on principle: anything derived
 from prompt or file content (which is why ``turn_id`` and TOIN's
@@ -117,6 +135,9 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from headroom.offline import pin_litellm_cost_map_local
+from headroom.utils import remember_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +364,80 @@ _WASTE_KEYS = (
 _STRATUM_TREATMENT = "output_shaper:stratum:"
 _STRATUM_CONTROL = "output_shaper:control:"
 
+# Per-turn token columns of `client_usage` and `model_usage`, in order. `n` is
+# turns. Every column is the raw per-turn counter, so each sums to its session
+# total.
+#
+# To price a row, do what `CostTracker.record` does: where a provider reports
+# no write count, Headroom infers one as input minus cached, and those are the
+# same tokens as `uncached`, never billed as a write. `cache_write_inferred`
+# is that part, so billed input is
+#     uncached + cache_read + (cache_write - cache_write_inferred)
+# and `cache_write_5m` / `cache_write_1h` split the billed writes by TTL, which
+# changes their rate.
+_USAGE_FIELDS = (
+    "n",
+    "original",
+    "saved",
+    "tool_saved",
+    "output",
+    "cache_read",
+    "cache_write",
+    "cache_write_inferred",
+    "cache_write_5m",
+    "cache_write_1h",
+    "uncached",
+)
+# Rows per usage table before the rest pool into "other". A session rarely
+# sees more than three harnesses or five models; every row is eleven numbers on
+# a payload that is re-sent every five minutes, and `_fit_to_wire` cannot shed
+# these rows, so the cap is what bounds them.
+MAX_USAGE_ROWS = 8
+MAX_CLIENT_VERSIONS = 16
+# Every harness name `client_usage` and `client_versions` may carry. The value
+# comes from `classify_client`, which returns the caller's own `X-Client`
+# header when one is sent, so a shape check alone would put whatever a caller
+# typed there on the wire with token volumes attached. Names outside this set
+# pool into "other". Mirrors `CLIENT_UA_MAP` in headroom/proxy/auth_policy.py
+# and `_KNOWN_WRAP_AGENTS` in context.py; duplicated because this package does
+# not import `headroom.proxy` (see `record_stack`), and a test holds them equal.
+_KNOWN_CLIENTS = frozenset(
+    {
+        "aider",
+        "anthropic_cli",
+        "antigravity",
+        "claude",
+        "claude_code",
+        "claude_vscode",
+        "codex",
+        "copilot",
+        "cursor",
+        "droid",
+        "grok_build",
+        "omp",
+        "openclaw",
+        "opencode",
+        "strands",
+        "zed",
+    }
+)
+# Labels for turns no harness claimed, so `client_usage` sums to
+# `session.turns`. Measured on the corpus: a quarter of sessions carried no
+# harness at all, and most of those turns came through /v1/compress.
+_CLIENT_VIA_MCP = "via_mcp"
+_CLIENT_VIA_COMPRESS = "via_compress_api"
+_CLIENT_UNIDENTIFIED = "unidentified"
+# A harness release as it appears in a User-Agent: up to three numeric parts.
+# Anything else (a build hash, a hostname) is not a version and is not sent.
+_VERSION_RE = re.compile(r"^\d{1,4}(?:\.\d{1,4}){0,2}$")
+# A session at least this old is closed by the first request on a later UTC
+# day. Long enough that an afternoon of work running past midnight UTC stays
+# one session; short enough that the pieces of an always-on proxy, which start
+# a few seconds after midnight, are old enough to close at the next one. The
+# first piece can therefore span two dates; every later one is a single day.
+ROLLOVER_MIN_AGE_S = 12 * 3600.0
+_INSTALL_AGE_CAP_DAYS = 9999
+
 # Environment variables whose values may be reported, by name. An allowlist,
 # never a dump of the environment: a variable absent from this tuple cannot
 # reach the wire whatever it holds, and every value that does is put through
@@ -408,6 +503,10 @@ _staged_shapes: dict[tuple[str, str], list[int]] = {}
 # tool-output shape slug -> [events, tokens_in, tokens_out]. The structural
 # descriptor only — never TOIN's `structure_hash`. See `record_tool_shape`.
 _staged_tool_shapes: dict[str, list[int]] = {}
+# (harness, version) -> requests. Staged because only the HTTP middleware sees
+# the User-Agent, and it runs before any outcome exists. See
+# `record_client_version`.
+_staged_client_versions: dict[tuple[str, str], int] = {}
 
 
 def _pct(numerator: float, denominator: float) -> float:
@@ -467,6 +566,76 @@ def _bump(counter: dict[str, int], key: str, *, cap: int = MAX_SHAPES) -> None:
     counter[key] = counter.get(key, 0) + 1
 
 
+def _tool_saved(tags: Any) -> int:
+    """Tool-schema tokens saved on one turn. These live only in tags — see the
+    same arithmetic in emit_request_outcome, which feeds the local dashboard."""
+    total = 0
+    if isinstance(tags, dict):
+        for tag in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
+            try:
+                total += int(tags.get(tag, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def _add_usage(table: dict[str, list[int]], key: str, values: tuple[int, ...]) -> None:
+    """Add one turn to a usage table. Past the cap, new keys pool into "other".
+
+    Pooled rather than dropped, unlike `_bump`: these tables exist to split the
+    session's totals, and a split that silently loses turns stops adding up.
+    """
+    if key not in table and len(table) >= MAX_USAGE_ROWS:
+        key = "other"
+    row = table.setdefault(key, [0] * len(values))
+    for index, value in enumerate(values):
+        row[index] += value
+
+
+def _known_client(value: Any) -> str:
+    """A harness name from `_KNOWN_CLIENTS`, else "other"."""
+    slug = _client_slug(value)
+    return slug if slug in _KNOWN_CLIENTS else "other"
+
+
+def _usage_rows(label: str, table: dict[str, list[int]]) -> list[dict[str, Any]]:
+    return [
+        {label: key, **dict(zip(_USAGE_FIELDS, row, strict=True))}
+        for key, row in sorted(table.items())
+    ]
+
+
+def _install_facts() -> dict[str, Any]:
+    """Age of this install id and where it is running. Three closed values.
+
+    The corpus could not tell a user who came back from an id minted fresh on
+    every container start: Linux proxies showed five times the installs of
+    macOS for the same traffic. `age_days` is how long ago the id file was
+    written, so it needs no new state and resets with the id. It is 0 when no
+    id is kept on disk (stateless mode, or a file that could not be written),
+    which is what an id minted per run looks like.
+    """
+    from headroom import paths
+
+    age_days = 0
+    if not paths.process_is_stateless():
+        try:
+            written = _install_id_path().stat().st_mtime
+        except OSError:
+            pass  # no id file: age stays 0
+        else:
+            age_days = min(max(int((time.time() - written) // 86400), 0), _INSTALL_AGE_CAP_DAYS)
+    return {
+        "age_days": age_days,
+        "container": bool(
+            os.environ.get("KUBERNETES_SERVICE_HOST")
+            or os.path.exists("/.dockerenv")
+            or os.path.exists("/run/.containerenv")
+        ),
+        "ci": os.environ.get("CI", "").strip().lower() in ("1", "true", "yes"),
+    }
+
+
 def _turn_kind(*, cached: bool, status: int, passthrough: bool, attempted: int, saved: int) -> str:
     """Classify one turn into the closed `_TURN_KINDS` alphabet.
 
@@ -508,7 +677,11 @@ def _config_snapshot() -> dict[str, str]:
     return out
 
 
+# Least-recently-used first. ``model`` comes from the request body, so the
+# entry count is capped (#4479); a model that falls out is simply looked up
+# again the next time it is seen.
 _model_cache: dict[str, str | None] = {}
+_MODEL_CACHE_MAXSIZE = 256
 
 
 def _public_model(model: str) -> str | None:
@@ -527,11 +700,17 @@ def _public_model(model: str) -> str | None:
     """
     if not model:
         return None
-    if model in _model_cache:
-        return _model_cache[model]
+    try:
+        cached = _model_cache[model]
+    except KeyError:
+        pass
+    else:
+        remember_bounded(_model_cache, model, cached, _MODEL_CACHE_MAXSIZE)
+        return cached
 
     resolved: str | None = None
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         registry = litellm.model_cost
@@ -542,9 +721,7 @@ def _public_model(model: str) -> str | None:
     except Exception:
         resolved = None
 
-    # ponytail: unbounded dict, but it is keyed by distinct model ids seen in
-    # one process — a handful. Cap it if a router ever fans out over hundreds.
-    _model_cache[model] = resolved
+    remember_bounded(_model_cache, model, resolved, _MODEL_CACHE_MAXSIZE)
     return resolved
 
 
@@ -757,6 +934,10 @@ class _Session:
     strata_turn_kind: dict[str, int] = field(default_factory=dict)
     strata_input_bucket: dict[str, int] = field(default_factory=dict)
     strata_tools: dict[str, int] = field(default_factory=dict)
+    # label -> one count per `_USAGE_FIELDS` column.
+    client_usage: dict[str, list[int]] = field(default_factory=dict)
+    model_usage: dict[str, list[int]] = field(default_factory=dict)
+    client_versions: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def observe(self, name: str, value: float) -> None:
         """Record one sample into a named histogram."""
@@ -1172,6 +1353,23 @@ class _Session:
             "config": [
                 {"key": key, "value": value} for key, value in sorted(_config_snapshot().items())
             ],
+            # The session's tokens split by harness and by model. Each table's
+            # `n` sums to `session.turns` and each token column to its total in
+            # `tokens`, so either one divides the session without residue.
+            # `clients` and `models` above are left exactly as they were.
+            "client_usage": _usage_rows("client", self.client_usage),
+            "model_usage": _usage_rows("model", self.model_usage),
+            # Requests by harness release. Counted at the HTTP layer, so `n` is
+            # requests, not turns: it includes ones that never became a turn,
+            # and a request that lands just before a session closes is counted
+            # in whichever session folds next. WebSocket sessions never pass
+            # that layer and are absent. Read it as "which releases, roughly
+            # how much", not as a split of the session.
+            "client_versions": [
+                {"client": client, "version": version, "n": count}
+                for (client, version), count in sorted(self.client_versions.items())
+            ],
+            "install": _install_facts(),
         }
 
 
@@ -1210,6 +1408,17 @@ class SessionAggregator:
                 # snapshots are cumulative.
                 if live is not None and now - live.last_seen >= self._idle_s:
                     pending.append(live.payload("idle"))
+                    live = None
+                # An always-on proxy never goes idle, so its one session grew
+                # for weeks and a day's activity could only be recovered by
+                # differencing heartbeats. Closing at the day boundary makes
+                # each row one day's work.
+                if (
+                    live is not None
+                    and now - live.started >= ROLLOVER_MIN_AGE_S
+                    and now // 86400 != live.started // 86400
+                ):
+                    pending.append(live.payload("rollover"))
                     live = None
                 if live is None:
                     live = _Session(
@@ -1333,14 +1542,9 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     # problem, not a compression problem, and the two are indistinguishable
     # from the token counts alone.
     tags = get("tags", None) or {}
+    tool_saved = _tool_saved(tags)
     if isinstance(tags, dict):
-        # Tool-schema savings live only in tags — see the same arithmetic in
-        # emit_request_outcome, which feeds the local dashboard.
-        for tag in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
-            try:
-                sess.tool_saved_tokens += int(tags.get(tag, 0) or 0)
-            except (TypeError, ValueError):
-                pass
+        sess.tool_saved_tokens += tool_saved
         for tag in _REASON_TAGS:
             if tag in tags:
                 key = f"{tag.removesuffix('_reason')}:{_safe_slug(tags[tag])}"
@@ -1365,7 +1569,7 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     # `_fold` before the caller's heartbeat check and costs a whole emission,
     # which is a v1 consequence for a v2 fault.
     try:
-        _fold_extra(sess, get, now, prev_seen, tags, status)
+        _fold_extra(sess, get, now, prev_seen, tags, status, source, tool_saved)
     except Exception:
         logger.debug("telemetry: v2 fold failed", exc_info=True)
 
@@ -1377,6 +1581,8 @@ def _fold_extra(
     prev_seen: float | None,
     tags: Any,
     status: int,
+    source: str = "proxy",
+    tool_saved: int = 0,
 ) -> None:
     """Fold the schema-v2 signals. Additive by construction.
 
@@ -1396,6 +1602,42 @@ def _fold_extra(
     is_dict_tags = isinstance(tags, dict)
     passthrough = is_dict_tags and "passthrough_reason" in tags
     cached = bool(get("from_response_cache", False))
+
+    # -- usage by harness and by model --------------------------------------
+    # The same per-turn quantities `_fold` adds to the session totals, so each
+    # table sums back to them. First in this function for that reason: a fault
+    # in a section below must not leave a turn counted in `tokens` and missing
+    # here.
+    cache_write = int(get("cache_write_tokens") or 0)
+    turn = (
+        1,
+        original,
+        saved,
+        tool_saved,
+        int(get("output_tokens") or 0),
+        int(get("cache_read_tokens") or 0),
+        cache_write,
+        cache_write if get("cache_inferred", False) else 0,
+        int(get("cache_write_5m_tokens") or 0),
+        int(get("cache_write_1h_tokens") or 0),
+        int(get("uncached_input_tokens") or 0),
+    )
+    client = get("client", None)
+    if client:
+        label = _known_client(client)
+    elif source == "mcp":
+        label = _CLIENT_VIA_MCP
+    elif get("provider", "") == "compress":
+        label = _CLIENT_VIA_COMPRESS
+    else:
+        label = _CLIENT_UNIDENTIFIED
+    _add_usage(sess.client_usage, label, turn)
+    # A model id no public registry vouches for can carry an org name (see
+    # `_public_model`), so it is pooled, never sent.
+    _add_usage(sess.model_usage, _public_model(str(get("model", "") or "")) or "other", turn)
+    for version_key, count in _drain_staged_client_versions().items():
+        if version_key in sess.client_versions or len(sess.client_versions) < MAX_CLIENT_VERSIONS:
+            sess.client_versions[version_key] = sess.client_versions.get(version_key, 0) + count
 
     # -- distributions ------------------------------------------------------
     sess.observe("turn_tokens", original)
@@ -1768,7 +2010,13 @@ def post_session_event(payload: dict[str, Any]) -> None:
     ponytail: unbounded thread spawn is safe only because the close rate is
     bounded by the idle timeout. Revisit if anything else starts emitting here.
     """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
     try:
+        # Re-checked at send time: a session buffered before an opt-out must
+        # not upload after it (heartbeats and idle closes send through here).
+        if not is_beacon_enabled():
+            return
         threading.Thread(
             target=_post_blocking,
             args=(payload,),
@@ -1812,8 +2060,16 @@ def _flush_at_exit() -> None:
     Still does not cover SIGKILL or a closed laptop. Heartbeats bound the loss
     there to one flush interval.
     """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
     aggregator = _aggregator
     if aggregator is None:
+        return
+    try:
+        if not is_beacon_enabled():  # opted out since the session was buffered
+            return
+    except Exception:
+        logger.debug("telemetry: beacon gate failed at exit", exc_info=True)
         return
     aggregator.flush_all(emit=lambda payload: _post_blocking(payload, timeout=_EXIT_POST_TIMEOUT_S))
 
@@ -1888,8 +2144,8 @@ def record_compression(strategy: str, original_tokens: int, compressed_tokens: i
     (``PrometheusMetrics.tokens_saved_by_strategy``); they just never left the
     process.
 
-    Same discipline as the rest of this module: off by default and cheap when
-    off, never raises. This runs once per routing decision, so it must not do
+    Same discipline as the rest of this module: cheap when the beacon is
+    disabled, never raises. This runs once per routing decision, so it must not do
     anything a request would notice.
     """
     from headroom.telemetry.beacon import is_beacon_enabled
@@ -2005,7 +2261,7 @@ def record_content_shape(
 
     Single-observation form of :func:`record_content_shapes`, which is what the
     router actually calls. Same discipline as everything else in this module:
-    off by default, cheap when off, never raises, and never touches the
+    cheap when the beacon is disabled, never raises, and never touches the
     aggregator lock.
     """
     record_content_shapes(((content_type, strategy, original_tokens, compressed_tokens),))
@@ -2150,6 +2406,37 @@ class BeaconCompressionObserver:
         record_compression(strategy, original_tokens, compressed_tokens)
 
 
+def record_client_version(client: Any, version: Any) -> None:
+    """Beacon entry point for one request's harness release.
+
+    Called from the proxy's HTTP middleware, the only place that sees the
+    User-Agent. Both parts are validated here rather than trusted: the harness
+    must slug cleanly and the version must be numeric, so a User-Agent that
+    carries anything else contributes nothing.
+    """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
+    if not is_beacon_enabled():
+        return
+    slug, text = _known_client(client), str(version or "")
+    if slug == "other" or not _VERSION_RE.match(text):
+        return
+    key = (slug, text)
+    with _staged_lock:
+        if key in _staged_client_versions or len(_staged_client_versions) < MAX_CLIENT_VERSIONS:
+            _staged_client_versions[key] = _staged_client_versions.get(key, 0) + 1
+
+
+def _drain_staged_client_versions() -> dict[tuple[str, str], int]:
+    """Take every staged (harness, version) request count."""
+    with _staged_lock:
+        if not _staged_client_versions:
+            return {}
+        drained = dict(_staged_client_versions)
+        _staged_client_versions.clear()
+        return drained
+
+
 def _drain_staged_strategies() -> dict[str, list[int]]:
     """Take everything staged since the last drain. Caller merges it."""
     with _staged_lock:
@@ -2183,8 +2470,8 @@ def _drain_staged_tool_shapes() -> dict[str, list[int]]:
 def record_outcome(outcome: Any) -> None:
     """Beacon entry point, called from the proxy's outcome funnel.
 
-    Off by default and cheap when off: the enabled check short-circuits before
-    the aggregator is ever constructed, so a user who never opted in pays one
+    Cheap when the beacon is disabled: the enabled check short-circuits before
+    the aggregator is ever constructed, so a user who has opted out pays one
     env lookup per request and allocates nothing.
     """
     from headroom.telemetry.beacon import is_beacon_enabled
@@ -2192,538 +2479,3 @@ def record_outcome(outcome: Any) -> None:
     if not is_beacon_enabled():
         return
     get_session_aggregator().record(outcome)
-
-
-def demo() -> None:
-    """Self-check: python -m headroom.telemetry.session"""
-
-    class FakeOutcome:
-        provider = "anthropic"
-        model = "claude-3-5-sonnet-20241022"
-        optimized_tokens = 100
-        output_tokens = 20
-        tokens_saved = 50
-        cache_read_tokens = 10
-        overhead_ms = 1.5
-        status_code = 200
-        # Widened so subclasses below can override with a different arity —
-        # RequestOutcome declares tuple[str, ...] too.
-        transforms_applied: tuple[str, ...] = ("crush", "dedupe")
-
-    # bool must not be encoded as int (bool subclasses int).
-    assert _any_value(True) == {"boolValue": True}
-    assert _any_value(1) == {"intValue": "1"}
-    assert _any_value(2.5) == {"doubleValue": 2.5}
-    assert _any_value({"a": [1, 2]})["kvlistValue"]["values"][0]["key"] == "a"
-    assert _any_value(None) == {}, "None must not serialise as the text 'None'"
-
-    # Ratios: the three the product is judged on, plus a zero-denominator guard.
-    assert _pct(25, 100) == 25.0
-    assert _pct(1, 3) == 33.33
-    assert _pct(5, 0) == 0.0
-
-    class Rich(FakeOutcome):
-        original_tokens = 1000
-        attempted_input_tokens = 400  # 40% eligible
-        tokens_saved = 300  # 30% overall, 75% yield on eligible
-        cache_read_tokens = 500  # 50% cache read
-        cache_write_tokens = 100
-        uncached_input_tokens = 400
-        total_latency_ms = 1000.0
-        overhead_ms = 50.0  # 5% overhead
-        from_response_cache = True
-        tags = {"tool_search_deferred_tokens": "800", "turn_hook_tools_saved_tokens": 200}
-
-    rates_out: list[dict[str, Any]] = []
-    ra = SessionAggregator(rates_out.append)
-    ra.record(Rich(), now=100.0)
-    ra.flush_all()
-    r = rates_out[0]
-    assert r["rates"]["saved_pct"] == 30.0, r["rates"]
-    assert r["rates"]["eligible_pct"] == 40.0, r["rates"]
-    assert r["rates"]["yield_pct"] == 75.0, r["rates"]
-    assert r["rates"]["cache_read_pct"] == 50.0, r["rates"]
-    assert r["rates"]["overhead_pct"] == 5.0, r["rates"]
-    # Tool savings are invisible in `saved` by design; they must not be lost.
-    assert r["tokens"]["tool_saved"] == 1000, r["tokens"]
-    # ...and the all-layers rates are the ones that do count them: 1300 saved
-    # of 2000 sent, 1300 of 1400 attempted. Both denominators grow too.
-    assert r["rates"]["all_layers_saved_pct"] == 65.0, r["rates"]
-    assert r["rates"]["all_layers_yield_pct"] == 92.86, r["rates"]
-    assert r["compression"]["response_cache_hits"] == 1
-    assert r["tokens"]["cache_write"] == 100 and r["tokens"]["uncached"] == 400
-
-    emitted: list[dict[str, Any]] = []
-    agg = SessionAggregator(emitted.append, idle_s=10.0)
-
-    agg.record(FakeOutcome(), now=1000.0)
-    agg.record(FakeOutcome(), now=1002.0)
-    assert emitted == [], "a live session must not emit"
-
-    # Quiet past the timeout, then activity -> the old burst closes.
-    agg.record(FakeOutcome(), now=1100.0)
-    assert len(emitted) == 1, emitted
-    event = emitted[0]
-    assert event["session"]["turns"] == 2
-    assert event["session"]["ended"] == "idle"
-    assert event["session"]["duration_s"] == 2
-    assert event["tokens"]["saved"] == 100
-    assert event["tokens"]["input"] == 200
-    assert event["compression"]["transforms"] == {"crush": 2, "dedupe": 2}
-    assert event["providers"] == ["anthropic"]
-    assert event["failures"] == 0
-    assert event["failure_statuses"] == {}
-
-    # The new burst is a distinct session, not a continuation.
-    agg.flush_all()
-    assert len(emitted) == 2, emitted
-    assert emitted[1]["session"]["turns"] == 1
-
-    # --- per-strategy compression -----------------------------------------
-    # Compression runs on the executor thread before its request's outcome
-    # arrives, so events are staged and drained by the next outcome. That is
-    # what keeps the first turn's numbers while letting only an outcome open a
-    # session. `_staged_*` is module state, so clear it between cases.
-    _staged_strategies.clear()
-    _staged_stacks.clear()
-
-    strat: list[dict[str, Any]] = []
-    sa = SessionAggregator(strat.append, idle_s=10.0)
-    record_compression("smart_crusher", 1000, 400)
-    record_compression("smart_crusher", 500, 300)
-    record_compression("code_aware", 800, 800)
-    assert sa._current is None, "a compression event must not open a session"
-    sa.record(FakeOutcome(), now=2000.0)
-    sa.flush_all()
-    by = {row["strategy"]: row for row in strat[-1]["compression"]["by_strategy"]}
-    assert by["smart_crusher"] == {
-        "strategy": "smart_crusher",
-        "n": 2,
-        "tokens_in": 1500,
-        "tokens_out": 700,
-    }, by
-    # A strategy that ran and saved nothing must still appear: "ran 800 tokens
-    # through and removed none" is the finding, and dropping it would make
-    # every strategy look effective.
-    assert by["code_aware"]["tokens_in"] == by["code_aware"]["tokens_out"] == 800, by
-    assert strat[-1]["session"]["turns"] == 1, "compression events are not turns"
-    # A list of records, not an object keyed by strategy: the type must not
-    # change as strategies are added. See the note in payload().
-    assert isinstance(strat[-1]["compression"]["by_strategy"], list)
-    assert [r["strategy"] for r in strat[-1]["compression"]["by_strategy"]] == sorted(
-        r["strategy"] for r in strat[-1]["compression"]["by_strategy"]
-    ), "sorted so heartbeats are byte-comparable"
-
-    # Draining is exhaustive: a second session must not re-count the first
-    # session's events.
-    assert not _staged_strategies, "record() drains everything it staged"
-    again: list[dict[str, Any]] = []
-    sb = SessionAggregator(again.append, idle_s=10.0)
-    sb.record(FakeOutcome(), now=3000.0)
-    sb.flush_all()
-    assert again[-1]["compression"]["by_strategy"] == [], again[-1]
-
-    # An abandoned request — compression ran, the outcome never arrived — must
-    # not invent a session. Before staging, this emitted a phantom turns=0 row
-    # with all-zero tokens that inflated fleet session and install counts.
-    ghost: list[dict[str, Any]] = []
-    sc = SessionAggregator(ghost.append, idle_s=10.0)
-    record_compression("smart_crusher", 900, 100)
-    sc.flush_all()
-    assert ghost == [], "no outcome, no session"
-    _staged_strategies.clear()
-
-    # Over the cardinality cap, extra strategies are dropped rather than
-    # allowed to grow the payload without bound.
-    cap: list[dict[str, Any]] = []
-    cc = SessionAggregator(cap.append, idle_s=10.0)
-    for i in range(MAX_STRATEGIES + 5):
-        record_compression(f"s{i}", 100, 50)
-    cc.record(FakeOutcome(), now=4000.0)
-    cc.flush_all()
-    assert len(cap[-1]["compression"]["by_strategy"]) == MAX_STRATEGIES, cap[-1]
-    _staged_strategies.clear()
-
-    # Strategy names are slugged, never passed through: the observer protocol
-    # takes a free string and this is the only chokepoint before the wire.
-    assert _safe_slug("smart_crusher") == "smart_crusher"
-    assert _safe_slug("../../etc/passwd") == "other"
-
-    # --- stack detection ---------------------------------------------------
-    # Environment-only detection answers "proxy" for every install that points
-    # an agent at a persistent proxy instead of using `headroom wrap` — i.e.
-    # most of the fleet. The per-request slugs are the only real signal.
-    _staged_stacks.clear()
-    for _ in range(9):
-        record_stack("wrap_claude")
-    record_stack("wrap_cursor")
-    assert resource_attributes()["headroom.stack"] == "wrap_claude", "dominant stack wins"
-    _staged_stacks.clear()
-    for _ in range(5):
-        record_stack("wrap_claude")
-    for _ in range(5):
-        record_stack("wrap_cursor")
-    assert resource_attributes()["headroom.stack"] == "mixed", "no dominant stack"
-    _staged_stacks.clear()
-    record_stack("../../etc/passwd")
-    assert not _staged_stacks, "junk slugs never reach the wire"
-    assert resource_attributes()["headroom.stack"] == "proxy", "falls back with no signal"
-
-    assert emitted[1]["session"]["id"] != emitted[0]["session"]["id"]
-    assert emitted[1]["session"]["ended"] == "shutdown"
-
-    # Nothing derived from prompt content or the model id reaches the wire.
-    wire = json.dumps(emitted)
-    assert "sonnet" not in wire and "claude" not in wire, wire
-
-    # Model ids reach the wire only when a public registry knows them. A
-    # fine-tune id carries an org name and must never survive.
-    assert _public_model("ft:gpt-4o:acme-corp:internal-bot:abc123") is None
-    assert _public_model("acme-internal-llama") is None
-    assert _public_model("") is None
-    if _public_model("gpt-4o") is None:
-        print("  (litellm unavailable — model field degrades to absent)")
-    else:
-        assert _public_model("gpt-4o") == "gpt-4o"
-
-    # Reason slugs are validated, not trusted.
-    assert _safe_slug("bypass_header") == "bypass_header"
-    assert _safe_slug("/Users/me/secret/path.py") == "other"
-    assert _safe_slug(None) == "other"
-
-    # Low compression must be explainable: a passthrough session and a
-    # ran-but-found-nothing session must not look the same.
-    class Bypassed(FakeOutcome):
-        original_tokens = 5000
-        attempted_input_tokens = 0
-        tokens_saved = 0
-        transforms_applied = ()
-        tags = {"passthrough_reason": "bypass_header"}
-
-    class Barren(FakeOutcome):
-        original_tokens = 5000
-        attempted_input_tokens = 4000
-        tokens_saved = 12
-        tags: dict[str, str] = {}
-
-    diag: list[dict[str, Any]] = []
-    agg_bypassed = SessionAggregator(diag.append)
-    agg_bypassed.record(Bypassed(), now=5000.0)
-    agg_bypassed.flush_all()
-    agg_barren = SessionAggregator(diag.append)
-    agg_barren.record(Barren(), now=6000.0)
-    agg_barren.flush_all()
-
-    bypassed, barren = diag[0], diag[1]
-    assert bypassed["tokens"]["attempted"] == 0
-    assert bypassed["skips"] == {"passthrough:bypass_header": 1}
-    assert bypassed["compression"]["passthrough_turns"] == 1
-    assert barren["tokens"]["attempted"] == 4000
-    assert barren["skips"] == {}
-    # Both saved ~nothing, but the reason is now distinguishable.
-    assert bypassed["tokens"]["saved"] == 0 and barren["tokens"]["saved"] == 12
-
-    # A live session heartbeats under ONE id with cumulative totals, so the
-    # highest-seq row is the whole session and dedupe is last-write-wins.
-    beats: list[dict[str, Any]] = []
-    hb = SessionAggregator(beats.append, idle_s=900.0, flush_s=100.0)
-    hb.record(FakeOutcome(), now=7000.0)
-    hb.record(FakeOutcome(), now=7050.0)
-    assert beats == [], "must not emit before the flush interval"
-
-    hb.record(FakeOutcome(), now=7100.0)  # first heartbeat
-    hb.record(FakeOutcome(), now=7150.0)
-    hb.record(FakeOutcome(), now=7250.0)  # second heartbeat
-    hb.flush_all()  # final
-
-    assert len(beats) == 3, beats
-    ids = {b["session"]["id"] for b in beats}
-    assert len(ids) == 1, f"one session must not fragment into {len(ids)} ids"
-    assert [b["session"]["seq"] for b in beats] == [0, 1, 2]
-    assert [b["session"]["final"] for b in beats] == [False, False, True]
-    assert [b["session"]["ended"] for b in beats] == ["active", "active", "shutdown"]
-
-    # Cumulative, not deltas: turns and tokens only ever climb, and the last
-    # row alone reconstructs the session.
-    assert [b["session"]["turns"] for b in beats] == [3, 5, 5]
-    assert [b["tokens"]["saved"] for b in beats] == [150, 250, 250]
-
-    # Dedupe by (install, session id), keep max seq -> exactly one row.
-    latest: dict[str, dict[str, Any]] = {}
-    for b in beats:
-        key = b["session"]["id"]
-        if key not in latest or b["session"]["seq"] > latest[key]["session"]["seq"]:
-            latest[key] = b
-    assert len(latest) == 1
-    only = next(iter(latest.values()))
-    assert only["session"]["turns"] == 5 and only["tokens"]["saved"] == 250
-
-    # Losing a heartbeat costs nothing — the survivor still restates everything.
-    survivors = [beats[0], beats[2]]
-    assert max(s["session"]["seq"] for s in survivors) == 2
-    assert survivors[-1]["session"]["turns"] == 5
-
-    # Going quiet starts a genuinely new session, not a continuation.
-    hb.record(FakeOutcome(), now=90000.0)
-    hb.flush_all()
-    assert beats[-1]["session"]["id"] != beats[0]["session"]["id"]
-    assert beats[-1]["session"]["turns"] == 1
-
-    # A transform label carrying a stratum suffix must be reduced to its prefix
-    # — otherwise output_shaper smuggles the model tier and a size bucket out.
-    class Shaped(FakeOutcome):
-        transforms_applied = ("output_shaper:stratum:sonnet|tool_result|8k", "crush")
-
-    shaped: list[dict[str, Any]] = []
-    agg_s = SessionAggregator(shaped.append)
-    agg_s.record(Shaped(), now=1500.0)
-    agg_s.flush_all()
-    assert shaped[0]["compression"]["transforms"] == {"output_shaper": 1, "crush": 1}
-    assert "sonnet" not in json.dumps(shaped[0]), shaped[0]
-
-    # A 5xx counts as a failure without poisoning the token stats.
-    class Failed(FakeOutcome):
-        status_code = 529
-
-    class Broke(FakeOutcome):
-        status_code = 500
-
-    agg2 = SessionAggregator(emitted.append)
-    agg2.record(Failed(), now=2000.0)
-    agg2.record(Failed(), now=2001.0)
-    agg2.record(Broke(), now=2002.0)
-    agg2.flush_all()
-    assert emitted[-1]["failures"] == 3
-    # Provider load-shedding and our own 500s have to be separable, or the
-    # count says "0.7% of turns failed" and nothing about whose fault it is.
-    assert emitted[-1]["failure_statuses"] == {"529": 2, "500": 1}
-
-    # Flushing an empty aggregator is a no-op, not a null event.
-    before = len(emitted)
-    SessionAggregator(emitted.append).flush_all()
-    assert len(emitted) == before
-
-    # MCP turns must be distinguishable from proxy turns in the same session.
-    # Blending them would corrupt eligible_pct: everything handed to the tool is
-    # eligible by construction, so MCP turns always read 100% and would drag the
-    # proxy's real eligibility ceiling upward.
-    mixed: list[dict[str, Any]] = []
-    mx = SessionAggregator(mixed.append)
-    mx.record(FakeOutcome(), now=9000.0)
-    mx.record(
-        _McpCompression(
-            original_tokens=1000,
-            attempted_input_tokens=1000,
-            optimized_tokens=300,
-            tokens_saved=700,
-        ),
-        source="mcp",
-        now=9001.0,
-    )
-    mx.flush_all()
-    mixed_ev = mixed[0]
-    assert mixed_ev["sources"] == {"proxy": 1, "mcp": 1}, mixed_ev["sources"]
-    assert mixed_ev["session"]["turns"] == 2
-    # An MCP-only shim contributes tokens but no provider and no latency.
-    assert mixed_ev["tokens"]["saved"] == 700 + 50
-    assert mixed_ev["providers"] == ["anthropic"]  # only the proxy turn had one
-
-    mcp_only: list[dict[str, Any]] = []
-    mo = SessionAggregator(mcp_only.append)
-    mo.record(
-        _McpCompression(
-            original_tokens=800,
-            attempted_input_tokens=800,
-            optimized_tokens=200,
-            tokens_saved=600,
-        ),
-        source="mcp",
-        now=9100.0,
-    )
-    mo.flush_all()
-    only_ev = mcp_only[0]
-    assert only_ev["sources"] == {"mcp": 1}
-    assert only_ev["rates"]["eligible_pct"] == 100.0
-    assert only_ev["rates"]["yield_pct"] == 75.0
-    assert only_ev["rates"]["saved_pct"] == 75.0
-    assert only_ev["providers"] == [] and only_ev["models"] == []
-    # No upstream call means no latency, and the ratio must not divide by zero.
-    assert only_ev["rates"]["overhead_pct"] == 0.0
-
-    # record_mcp_compression: a real call records, a degenerate one does not.
-    # Beacon forced on for this block so the assertions cannot pass merely
-    # because the ambient environment has it disabled.
-    _prev_agg = _aggregator
-    _prev_env = {
-        k: os.environ.get(k) for k in ("HEADROOM_BEACON", "DO_NOT_TRACK", "HEADROOM_OFFLINE")
-    }
-    os.environ["HEADROOM_BEACON"] = "on"
-    # DO_NOT_TRACK and offline mode outrank an explicit opt-in, so they have to
-    # be cleared here or these assertions test the wrong thing.
-    os.environ.pop("DO_NOT_TRACK", None)
-    os.environ.pop("HEADROOM_OFFLINE", None)
-    try:
-        globals()["_aggregator"] = SessionAggregator(lambda _p: None)
-        record_mcp_compression(original_tokens=0, compressed_tokens=0)
-        assert globals()["_aggregator"]._current is None, "zero-token call recorded"
-
-        record_mcp_compression(original_tokens=500, compressed_tokens=100)
-        live = globals()["_aggregator"]._current
-        assert live is not None, "valid MCP call did not record"
-        assert live.sources == {"mcp": 1}
-        assert live.tokens_saved == 400
-
-        # A compression that grew the content must not report negative savings.
-        record_mcp_compression(original_tokens=100, compressed_tokens=250)
-        assert globals()["_aggregator"]._current.tokens_saved == 400
-
-        # DO_NOT_TRACK outranks an explicit HEADROOM_BEACON=on.
-        os.environ["DO_NOT_TRACK"] = "1"
-        globals()["_aggregator"] = SessionAggregator(lambda _p: None)
-        record_mcp_compression(original_tokens=500, compressed_tokens=100)
-        assert globals()["_aggregator"]._current is None, "DO_NOT_TRACK was ignored"
-        os.environ.pop("DO_NOT_TRACK", None)
-    finally:
-        globals()["_aggregator"] = _prev_agg
-        for _k, _v in _prev_env.items():
-            if _v is None:
-                os.environ.pop(_k, None)
-            else:
-                os.environ[_k] = _v
-
-    # flush_all must honour an emit override. The atexit path depends on this:
-    # the normal sink defers to a daemon thread, and daemon threads are killed
-    # before they finish once the interpreter is shutting down, so a thread
-    # started there never posts. Without the override, every session shorter
-    # than FLUSH_INTERVAL_S would report nothing at all.
-    default_sink: list[dict[str, Any]] = []
-    override_sink: list[dict[str, Any]] = []
-    ex = SessionAggregator(default_sink.append)
-    ex.record(FakeOutcome(), now=8000.0)
-    ex.flush_all(emit=override_sink.append)
-    assert override_sink and not default_sink, "flush_all ignored the emit override"
-    assert override_sink[0]["session"]["final"] is True
-
-    # An emit that blows up must not propagate to the caller.
-    def boom(_payload: dict[str, Any]) -> None:
-        raise RuntimeError("collector down")
-
-    agg3 = SessionAggregator(boom, idle_s=1.0)
-    agg3.record(FakeOutcome(), now=3000.0)
-    agg3.record(FakeOutcome(), now=3100.0)
-    agg3.flush_all()
-
-    # A malformed outcome must not raise either.
-    SessionAggregator(emitted.append).record(object(), now=4000.0)
-
-    # --- schema v2 ---------------------------------------------------------
-    # The full v2 surface is covered by tests/test_beacon_schema_v2.py. What
-    # belongs here is the part that has to hold for the module on its own: the
-    # additions are additive, and the two things they read that nobody had read
-    # before — the environment, and the output_shaper stratum label — cannot
-    # carry anything out with them.
-    _staged_shapes.clear()
-    _staged_tool_shapes.clear()
-
-    class V2(FakeOutcome):
-        original_tokens = 1000
-        attempted_input_tokens = 400
-        tokens_saved = 300
-        ttfb_ms = 300.0
-        num_messages = 30
-        # Hyphenated, as `classify_client` really returns it.
-        client = "claude-code"
-        cache_write_5m_tokens = 80
-        cache_write_1h_tokens = 20
-        waste_signals = {"reread": 900, "reread_compressed": 400, "json_bloat": 50}
-        # Carries a model family, a turn kind and a size bucket. Only the last
-        # two may leave, and neither the label nor the family may.
-        transforms_applied = ("output_shaper:stratum:sonnet|tool_result|l|tools", "crush")
-
-    class V2Limited(V2):
-        status_code = 429
-
-    v2_out: list[dict[str, Any]] = []
-    v2 = SessionAggregator(v2_out.append)
-    v2.record(V2(), now=10_000.0)
-    v2.record(V2Limited(), now=10_045.0)
-    v2.record(V2(), now=10_090.0)
-    v2.flush_all()
-    row = v2_out[-1]
-
-    # v1 is untouched by all of it. A 4xx in particular must not reach the
-    # failure counters, which have been 5xx-only in every row of the corpus.
-    assert row["failures"] == 0 and row["failure_statuses"] == {}, row
-    assert row["errors"] == {"count": 1, "by_status": {"429": 1}}, row["errors"]
-    assert row["compression"]["transforms"] == {"output_shaper": 3, "crush": 3}
-
-    # The regret label: saved_pct alone cannot say whether compression cost the
-    # agent anything, and this is the counter-pressure on it.
-    assert row["quality"]["reread_compressed_tokens"] == 1200, row["quality"]
-    assert row["quality"]["waste"] == [{"kind": "json_bloat", "tokens": 150}], (
-        "waste kinds are allowlisted"
-    )
-
-    # Distributions ship their bucket edges, so a row is readable without
-    # knowing which client version wrote it.
-    assert row["hist"]["turn_tokens"]["edges"] == list(_HIST_EDGES["turn_tokens"])
-    assert sum(row["hist"]["turn_tokens"]["counts"]) == 3
-    assert len(row["hist"]["saved_pct"]["counts"]) == len(_HIST_EDGES["saved_pct"]) + 1
-
-    # Cumulative like every v1 counter, so max(seq) still reconstructs the
-    # session and a dropped heartbeat still costs nothing.
-    assert sum(row["trajectory"]["turns"]) == row["session"]["turns"]
-    assert row["trajectory"]["kinds"] == "s1e1s1", row["trajectory"]
-    assert set(row["trajectory"]["kinds"]) - set("0123456789") <= _TURN_KINDS
-
-    # The first turn has no predecessor, so the cache curve counts turns - 1.
-    assert sum(row["cache"]["hits"]) + sum(row["cache"]["misses"]) == 2
-
-    # Strata reach the wire as validated enums; the model family does not.
-    # Hyphenated client ids must survive; _safe_slug alone would drop them.
-    assert row["clients"] == [{"client": "claude_code", "n": 3}], row["clients"]
-    # Lists of records, never objects keyed by a value that came from data —
-    # an object's COLUMN TYPE in DuckDB is a function of which keys showed up.
-    assert {"dim": "arm", "value": "treatment", "n": 3} in row["strata"], row["strata"]
-    assert {"dim": "input_bucket", "value": "l", "n": 3} in row["strata"], row["strata"]
-    assert isinstance(row["config"], list) and isinstance(row["quality"]["waste"], list)
-    assert "sonnet" not in json.dumps(row), "the stratum label leaked a model family"
-
-    # Structural descriptor only, never TOIN's structure_hash.
-    assert _tool_shape_key(object()) is None
-    assert (
-        _tool_shape_key(
-            type(
-                "Sig",
-                (),
-                {"field_count": 17, "max_depth": 3, "has_arrays": True, "has_id_like_field": True},
-            )()
-        )
-        == "f16d3_ai"
-    )
-
-    # The environment is read through an allowlist, and every value that gets
-    # past it is slugged — so a variable holding a path or a URL reports
-    # "other" rather than its contents.
-    _cfg_prev = {k: os.environ.get(k) for k in ("HEADROOM_MODE", "HEADROOM_KOMPRESS_ENDPOINT")}
-    try:
-        os.environ["HEADROOM_MODE"] = "/Users/someone/private"
-        os.environ["HEADROOM_KOMPRESS_ENDPOINT"] = "https://secret.internal/v1"
-        snapshot = _config_snapshot()
-        assert snapshot.get("mode") == "other", snapshot
-        assert "kompress_endpoint" not in snapshot, snapshot
-    finally:
-        for _k, _v in _cfg_prev.items():
-            if _v is None:
-                os.environ.pop(_k, None)
-            else:
-                os.environ[_k] = _v
-
-    _staged_shapes.clear()
-    _staged_tool_shapes.clear()
-
-    print("ok")
-
-
-if __name__ == "__main__":
-    demo()

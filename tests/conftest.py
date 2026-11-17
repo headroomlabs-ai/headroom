@@ -19,6 +19,37 @@ import pytest
 from tests._skip_helpers import external_model_skip_reason
 
 
+@pytest.fixture
+def gemini_request():
+    """A real ASGI request whose JSON arrives in two stream messages."""
+    from starlette.requests import Request
+
+    body = json.dumps({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}).encode()
+    middle = len(body) // 2
+    messages = iter(
+        [
+            {"type": "http.request", "body": body[:middle], "more_body": True},
+            {"type": "http.request", "body": body[middle:], "more_body": False},
+        ]
+    )
+
+    async def receive():
+        return next(messages, {"type": "http.disconnect"})
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1beta/models/gemini-pro:generateContent",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "scheme": "https",
+            "server": ("gemini.example", 443),
+        },
+        receive,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _undo_process_trust_injection():
     """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
@@ -63,8 +94,48 @@ def _skip_proxy_dependency_gate_unless_exercised(
     monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
 
 
+# `headroom proxy` refuses to start when its port is already bound. Tests that
+# invoke it with a stubbed run_server use the default 8787, which a developer's
+# own running proxy holds, so the check is off unless a test exercises it.
 @pytest.fixture(autouse=True)
-def _scrub_developer_headroom_env(monkeypatch, tmp_path):
+def _skip_proxy_port_preflight_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if request.node.get_closest_marker("proxy_port_preflight") is not None:
+        return
+    try:
+        from headroom.cli import proxy
+    except ModuleNotFoundError:
+        return
+    monkeypatch.setattr(proxy, "_refuse_busy_port", lambda *args, **kwargs: None)
+
+
+# Credentials the Copilot code reads from the environment (copilot_quota.py,
+# copilot_auth.py). Any test that enters the proxy lifespan starts the Copilot
+# quota poller, which sends such a token to api.github.com; a developer's real
+# GITHUB_TOKEN must never be used by a test. A test that needs one sets it with
+# monkeypatch.setenv, which runs after this fixture.
+_COPILOT_TOKEN_ENV_VARS = (
+    "GITHUB_COPILOT_GITHUB_TOKEN",
+    "GITHUB_COPILOT_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
+    "GITHUB_COPILOT_API_TOKEN",
+    "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT",
+    "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_developer_copilot_tokens(monkeypatch):
+    for key in _COPILOT_TOKEN_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_developer_headroom_env(monkeypatch, tmp_path, tmp_path_factory):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
@@ -73,6 +144,11 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
     monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+    # The proxy's compression cache keeps results on disk; never in the
+    # developer's ~/.headroom, never shared between tests, and not in tmp_path,
+    # which tests assert stays empty when nothing is persisted.
+    cache_dir = tmp_path_factory.mktemp("compression-cache")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_PATH", str(cache_dir / "compression_cache.db"))
     # The scrub also deletes the HEADROOM_HARD_WATCHDOG_SECS=0 opt-out CI sets
     # (#3845), so every test that enters the proxy lifespan armed the 90s
     # production watchdog inside pytest; it hard-exits the process with code 1

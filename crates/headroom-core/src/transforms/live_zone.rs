@@ -58,9 +58,9 @@
 //!   per-content-type byte thresholds. The gate and the threshold
 //!   plumbing already shipped; **this PR** completes the item by wiring
 //!   the two remaining compressor arms — `SourceCode` →
-//!   CodeAwareCompressor (falling back to cached Kompress when the
-//!   compressor returns its input unchanged) and `PlainText` → cached
-//!   Kompress — and by moving the `SourceCode` / `PlainText` thresholds
+//!   CodeAwareCompressor (left unchanged when the compressor returns its
+//!   input unchanged: code is never handed to the prose model, #4214) and
+//!   `PlainText` → cached Kompress — and by moving the `SourceCode` / `PlainText` thresholds
 //!   off their placeholder 512 to the specified 2048 / 5120. `Html`
 //!   stays no-op.
 //! - **PR-B7** wires CCR retrieval-marker injection.
@@ -115,6 +115,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
+use super::pipeline::JsonMinifier;
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
@@ -132,10 +133,8 @@ const STRATEGY_SEARCH_COMPRESSOR: &str = "search_compressor";
 const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 /// Strategy tag emitted when CodeAwareCompressor rewrote a source-code block.
 const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
-/// Strategy tag emitted when Kompress rewrote a plain-text block (also
-/// used by the SourceCode arm's passthrough fallback — see
-/// [`dispatch_compressor`]). Only the `ml` build has a Kompress arm to
-/// emit it.
+/// Strategy tag emitted when Kompress rewrote a plain-text block. Only
+/// the `ml` build has a Kompress arm to emit it.
 #[cfg(feature = "ml")]
 const STRATEGY_KOMPRESS: &str = "kompress";
 
@@ -644,11 +643,18 @@ pub fn kompress_init_runs() -> usize {
 #[cfg(feature = "ml")]
 fn run_kompress_init() {
     KOMPRESS_INIT_RUNS.fetch_add(1, Ordering::Relaxed);
-    let slot = match Kompress::from_cache(KompressConfig::default()) {
-        Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
-        Err(e) => {
-            tracing::warn!(event = "kompress_init_failed", error = %e);
-            None
+    // Before any `ort` call: unsupported CPU => SIGILL, unpinned loader =>
+    // deadlock. Same guards magika and the embedding scorer run first.
+    let slot = if let Err((reason, error)) = super::kompress::ort_session_preconditions() {
+        tracing::warn!(event = "kompress_init_skipped", reason, error = %error);
+        None
+    } else {
+        match Kompress::from_cache(KompressConfig::default()) {
+            Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
+            Err(e) => {
+                tracing::warn!(event = "kompress_init_failed", error = %e);
+                None
+            }
         }
     };
     let ready = slot.is_some();
@@ -696,14 +702,9 @@ fn kompress_cached() -> Option<&'static Kompress> {
 }
 
 /// Route `text` through Kompress when the model is cache-resident;
-/// otherwise fall back to a deterministic no-op. Shared by the
-/// `PlainText` arm and the `SourceCode` arm's passthrough fallback.
-///
-/// Not a full port of the Python router's fallback chain: that one also
-/// re-runs Kompress when the code compressor returns *changed but not
-/// smaller* output, whereas this arm sends only an exact passthrough
-/// here and leaves the changed-but-not-smaller case to the
-/// tokenizer-rejection gate in `compress_one_block`.
+/// otherwise fall back to a deterministic no-op. Only the `PlainText`
+/// arm calls it: source code that the code compressor declines is
+/// deliberately not routed here (Kompress drops keywords from code).
 #[cfg(feature = "ml")]
 fn kompress_or_noop(text: &str, content_type: ContentType) -> DispatchResult {
     if let Some(k) = kompress_cached() {
@@ -797,10 +798,9 @@ fn warm_kompress_blocking() -> bool {
 // arms to a deterministic no-op, bypassing their compressor entirely.
 //
 // One operator-facing caveat: granularity is per ARM, not per
-// compressor. `plain_text` alone does not stop Kompress runs reached
-// through the SourceCode arm's passthrough fallback; disabling
-// `source_code` as well is what removes Kompress from traffic entirely
-// (at the cost of also disabling the code compressor).
+// compressor. Only the `PlainText` arm reaches Kompress, so disabling
+// `plain_text` removes Kompress from traffic; `source_code` governs
+// the code compressor alone.
 
 /// Parse the comma-separated arm list. Blank entries are skipped;
 /// unknown names are ignored with a warning rather than failing the
@@ -1176,8 +1176,11 @@ fn compress_one_block(
             // stays honest — the marker costs ~6 tokens and we'd
             // rather forward the original than ship a bigger payload
             // for a 5-byte block.
-            let (compressed_for_replacement, ccr_hash_emitted) =
-                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
+            let (compressed_for_replacement, ccr_hash_emitted) = if strategy == "json_minifier" {
+                (compressed, None)
+            } else {
+                maybe_inject_ccr_marker(content_text, &compressed, ccr_store)
+            };
             let compressed_bytes = compressed_for_replacement.len();
             // 3. Tokenizer-validated rejection. Per PR-B4 spec we
             //    count both the original and compressed strings
@@ -1626,8 +1629,8 @@ enum DispatchResult {
 /// - `BuildOutput` → LogCompressor
 /// - `SearchResults` → SearchCompressor
 /// - `GitDiff` → DiffCompressor
-/// - `SourceCode` → CodeAwareCompressor, falling back to cached
-///   Kompress on exact passthrough (PR-B4)
+/// - `SourceCode` → CodeAwareCompressor; an exact passthrough stays a
+///   no-op, never Kompress (PR-B4, #4214)
 /// - `PlainText` → cached Kompress, cache-cold → no-op (PR-B4)
 /// - `Html` → no-op (no compressor)
 ///
@@ -1659,6 +1662,12 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             // arrays, and returns the input.
             let result = smart_crusher().crush(text, EMPTY_QUERY, DEFAULT_BIAS);
             if !result.was_modified {
+                if let Ok(Some(minified)) = JsonMinifier.minify(text) {
+                    return DispatchResult::Compressed {
+                        strategy: "json_minifier",
+                        compressed: minified,
+                    };
+                }
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
                 };
@@ -1709,21 +1718,20 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // syntax errors, a min-token floor, and a compression-ratio
         // guard), so this arm only has to compare its output against
         // the input; the tokenizer-rejection gate in
-        // `compress_one_block` applies on top of that. When the code
-        // compressor doesn't shrink the block (e.g. it's already
-        // dense, or tree-sitter reverted on a parse error), fall back
-        // to Kompress rather than giving up — mirrors the Python
-        // router's no-shrink → Kompress fallback.
+        // `compress_one_block` applies on top of that.
+        //
+        // When the code compressor declines (exact passthrough), the block
+        // is left UNCHANGED. It is deliberately NOT handed to Kompress:
+        // that is a prose model that drops low-salience words, and for code
+        // those are keywords such as `for`, `in` and `if` (#4214). Mirrors
+        // the Python router, which no longer falls back from code to prose
+        // ML compression either.
         ContentType::SourceCode => {
             let result = code_compressor().compress(text);
             if result.compressed == text {
-                // Exact passthrough only: the compressor declined
-                // (min-token floor, unknown language, parse failure,
-                // ratio guard), so hand the block to Kompress. A
-                // rewrite that changed bytes without shrinking tokens
-                // is NOT retried here — `compress_one_block`'s
-                // tokenizer gate rejects it and forwards the original.
-                return kompress_or_noop(text, content_type);
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
             }
             DispatchResult::Compressed {
                 strategy: STRATEGY_CODE_COMPRESSOR,

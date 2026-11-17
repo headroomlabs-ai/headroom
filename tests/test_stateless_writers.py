@@ -13,11 +13,6 @@ pytest.importorskip("fastapi")
 
 from headroom import paths
 from headroom.proxy.output_savings import SavingsRecorder
-from headroom.relevance.embedding import (
-    _DEFAULT_MODEL_PINNED_REVISION,
-    DEFAULT_MODEL_NAME,
-    _pinned_revision,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -100,23 +95,3 @@ def test_memory_disabled_under_stateless(tmp_path, monkeypatch):
     proxy = app.state.proxy
     assert proxy.memory_handler is None
     assert not workspace.exists()
-
-
-# ---- fastembed model pinning ----------------------------------------------
-
-
-def test_fastembed_default_model_is_pinned_to_sha(monkeypatch):
-    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
-    rev = _pinned_revision(DEFAULT_MODEL_NAME)
-    assert rev == _DEFAULT_MODEL_PINNED_REVISION
-    assert len(rev) == 40 and all(c in "0123456789abcdef" for c in rev)
-
-
-def test_fastembed_custom_model_not_pinned(monkeypatch):
-    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
-    assert _pinned_revision("intfloat/e5-small-v2") is None
-
-
-def test_fastembed_pin_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("HEADROOM_HF_PIN", "off")
-    assert _pinned_revision(DEFAULT_MODEL_NAME) is None

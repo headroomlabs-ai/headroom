@@ -384,30 +384,30 @@ async def test_secret_headers_not_logged(
 
 
 # ---------------------------------------------------------------------------
-# Test: (d2) redaction unit — _should_redact_key / redact_for_wire_debug
+# Test: (d2) redaction unit — should_redact_key / redact_for_wire_debug
 # ---------------------------------------------------------------------------
 
 
 def test_redaction_is_load_bearing() -> None:
     """Redaction of authorization and x-goog-api-key is structurally enforced.
 
-    This test is deliberately coupled to _should_redact_key and
+    This test is deliberately coupled to should_redact_key and
     redact_for_wire_debug so that removing or weakening either function
     causes a failure here, making this a load-bearing regression guard.
     """
-    from headroom.proxy.helpers import (
-        _CODEX_WIRE_REDACTED,
-        _should_redact_key,
-        redact_for_wire_debug,
+    from headroom.proxy.helpers import redact_for_wire_debug
+    from headroom.proxy.wire_debug_redaction_policy import (
+        WIRE_DEBUG_REDACTED,
+        should_redact_key,
     )
 
-    # 1. _should_redact_key must flag both sensitive header names.
-    assert _should_redact_key("authorization"), "authorization must be redacted"
-    assert _should_redact_key("Authorization"), "Authorization (mixed case) must be redacted"
-    assert _should_redact_key("x-goog-api-key"), "x-goog-api-key must be redacted"
-    assert _should_redact_key("X-Goog-Api-Key"), "X-Goog-Api-Key (mixed case) must be redacted"
+    # 1. should_redact_key must flag both sensitive header names.
+    assert should_redact_key("authorization"), "authorization must be redacted"
+    assert should_redact_key("Authorization"), "Authorization (mixed case) must be redacted"
+    assert should_redact_key("x-goog-api-key"), "x-goog-api-key must be redacted"
+    assert should_redact_key("X-Goog-Api-Key"), "X-Goog-Api-Key (mixed case) must be redacted"
 
-    # 2. redact_for_wire_debug must replace values with _CODEX_WIRE_REDACTED.
+    # 2. redact_for_wire_debug must replace values with WIRE_DEBUG_REDACTED.
     secret_auth = "Bearer supersecret-token-xyz"
     secret_api_key = "AIzaSySecret1234"
     headers = {
@@ -416,11 +416,11 @@ def test_redaction_is_load_bearing() -> None:
         "content-type": "application/json",
     }
     redacted = redact_for_wire_debug(headers)
-    assert redacted["authorization"] == _CODEX_WIRE_REDACTED, (
-        f"authorization must be {_CODEX_WIRE_REDACTED!r}, got {redacted['authorization']!r}"
+    assert redacted["authorization"] == WIRE_DEBUG_REDACTED, (
+        f"authorization must be {WIRE_DEBUG_REDACTED!r}, got {redacted['authorization']!r}"
     )
-    assert redacted["x-goog-api-key"] == _CODEX_WIRE_REDACTED, (
-        f"x-goog-api-key must be {_CODEX_WIRE_REDACTED!r}, got {redacted['x-goog-api-key']!r}"
+    assert redacted["x-goog-api-key"] == WIRE_DEBUG_REDACTED, (
+        f"x-goog-api-key must be {WIRE_DEBUG_REDACTED!r}, got {redacted['x-goog-api-key']!r}"
     )
     # Non-secret headers must pass through unchanged.
     assert redacted["content-type"] == "application/json"

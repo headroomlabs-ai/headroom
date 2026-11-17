@@ -1145,3 +1145,131 @@ def test_no_proxy_does_not_create_startup_lock(monkeypatch: pytest.MonkeyPatch) 
 
     assert wrap_mod._ensure_proxy(8787, True) == (None, 8787)
     assert entered is False
+
+
+# ---------------------------------------------------------------------------
+# _launch_tool — the wrapped agent inherits the *real* proxy port via
+# HEADROOM_PORT, so `headroom dashboard` run inside that session lands on the
+# right proxy even when wrap fell back off the requested port.
+# ---------------------------------------------------------------------------
+
+
+def _launch_tool_capturing_env(
+    monkeypatch: pytest.MonkeyPatch, *, requested_port: int, actual_port: int
+) -> dict[str, str]:
+    """Drive `_launch_tool` with everything external stubbed, return the child env."""
+    captured: dict[str, dict[str, str]] = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, env=None, **kwargs):  # type: ignore[no-untyped-def]
+        captured["env"] = dict(env or {})
+        return _Result()
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (None, actual_port))
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda port: None)
+    monkeypatch.setattr(wrap_mod, "_unregister_proxy_client", lambda port: None)
+    monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda port, no_proxy: None)
+    monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: lambda *a, **kw: None)
+    monkeypatch.setattr(wrap_mod, "_configure_quiet_cli_env", lambda env: [])
+    monkeypatch.setattr(wrap_mod, "_print_telemetry_notice", lambda: None)
+    monkeypatch.setattr(wrap_mod.signal, "signal", lambda *a, **kw: None)
+    monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
+
+    runner = CliRunner()
+
+    @click.command()
+    def _cmd() -> None:
+        wrap_mod._launch_tool(
+            binary="fake-agent",
+            args=(),
+            env={"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{requested_port}"},
+            port=requested_port,
+            no_proxy=False,
+            tool_label="FAKE",
+            env_vars_display=[],
+        )
+
+    result = runner.invoke(_cmd)
+    assert result.exit_code == 0, result.output
+    return captured["env"]
+
+
+def test_launch_tool_exports_headroom_port_to_child() -> None:
+    """The wrapped agent must see HEADROOM_PORT even with no port fallback."""
+    with pytest.MonkeyPatch.context() as mp:
+        env = _launch_tool_capturing_env(mp, requested_port=8787, actual_port=8787)
+
+    assert env["HEADROOM_PORT"] == "8787"
+
+
+def test_launch_tool_exports_actual_port_after_fallback() -> None:
+    """Regression: wrap bumped to 8788 (e.g. copilot-subscription proxy), so the
+    child env must advertise 8788 — not the 8787 that was merely requested."""
+    with pytest.MonkeyPatch.context() as mp:
+        env = _launch_tool_capturing_env(mp, requested_port=8787, actual_port=8788)
+
+    assert env["HEADROOM_PORT"] == "8788"
+    # The existing URL-rewrite behaviour must keep working alongside it.
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8788"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            ["wrap", "aider"],
+            "Error: 'aider' not found in PATH.\nInstall aider: pip install aider-chat",
+        ),
+        (["wrap", "goose"], "Error: 'goose' not found in PATH."),
+        (["wrap", "kimi"], "Error: 'kimi' (or 'kimi-cli') not found in PATH."),
+    ],
+)
+def test_missing_binary_error_goes_to_stderr_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, argv: list[str], expected: str
+) -> None:
+    """The missing-binary error is a ClickException on stderr; stdout stays empty."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: None)
+
+    def no_proxy(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("a missing binary must fail before any proxy start")
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", no_proxy)
+
+    result = CliRunner().invoke(main, argv)
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.startswith(expected)
+
+
+def test_start_proxy_passes_carried_extensions_as_a_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    proc = _FakeProxyProc()
+
+    def fake_popen(command: list[str], **kwargs: object) -> _FakeProxyProc:
+        captured["command"] = command
+        return proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda port=None: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    wrap_mod._start_proxy(8788, proxy_extensions=["observability", "routemegood"])
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[command.index("--proxy-extension") + 1] == "observability,routemegood"
+
+    wrap_mod._start_proxy(8788)
+    assert "--proxy-extension" not in captured["command"]

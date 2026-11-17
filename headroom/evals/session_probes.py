@@ -47,7 +47,8 @@ _CCR_MARKER_RE = re.compile(CCR_MARKER_ALTERNATION)
 # A number with its immediate key context ("retry_limit: 3", "port=8787",
 # JSON's '"latency_ms": 12'). Bare numbers are skipped: without context they
 # are unverifiable noise.
-_NUMERIC_RE = re.compile(r"[A-Za-z_][\w.-]{0,24}\"?[ =:]{1,3}\d+(?:\.\d+)?")
+# Do not extract a decimal prefix from unsupported exponents or numeric suffixes.
+_NUMERIC_RE = re.compile(r"[A-Za-z_][\w.-]{0,24}\"?[ =:]{1,3}\d+(?:\.\d+)?(?!\w|\.\d)")
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+")
 _PATH_RE = re.compile(r"(?:~/|\.{1,2}/|/)?(?:[\w.-]+/){2,}[\w.@-]+")
 # Requires at least one a-f so bare decimal runs (timestamps, row counts) are
@@ -234,6 +235,21 @@ def _normalize(text: str) -> str:
 
 
 def _target_survives(dimension: str, value: str, haystack: str, normalized_haystack: str) -> bool:
+    if dimension == "numerics":
+        # Check numbers before substring shortcuts: 80 is not retained in
+        # 8080, 80.5 or -80. A trailing sentence period is still punctuation.
+        # Format conversions (JSON -> table) may separate key from value.
+        match = _NUMERIC_SPLIT_RE.match(value)
+        if match:
+            key, number = match.groups()
+            normalized_key = _normalize(key)
+            if (
+                normalized_key
+                and normalized_key in normalized_haystack
+                and re.search(rf"(?<![\w.-]){re.escape(number)}(?!\w|\.\d)", normalized_haystack)
+            ):
+                return True
+        return False
     if value in haystack:
         return True
     normalized_value = _normalize(value)
@@ -245,19 +261,6 @@ def _target_survives(dimension: str, value: str, haystack: str, normalized_hayst
         _, _, remainder = normalized_value.partition(" ")
         if len(remainder) >= _MIN_TARGET_LEN and remainder in normalized_haystack:
             return True
-    if dimension == "numerics":
-        # Format conversions (JSON -> table) separate key from value; count the
-        # probe as retained only when both still appear.
-        match = _NUMERIC_SPLIT_RE.match(value)
-        if match:
-            key, number = match.groups()
-            normalized_key = _normalize(key)
-            if (
-                normalized_key
-                and normalized_key in normalized_haystack
-                and re.search(rf"\b{re.escape(number)}\b", normalized_haystack)
-            ):
-                return True
     return False
 
 

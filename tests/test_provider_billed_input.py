@@ -29,6 +29,7 @@ from headroom.proxy.prometheus_metrics import PrometheusMetrics
 from headroom.proxy.provider_usage import (
     billed_input_for_provider,
     billed_input_from_usage,
+    usage_int,
 )
 from headroom.proxy.server import HeadroomProxy
 from headroom.telemetry.reporter import UsageReporter
@@ -295,3 +296,19 @@ def test_estimated_input_is_reported_as_estimated() -> None:
     assert payload["tokens_after"] == 400
     assert payload["tokens_after_provider_reported"] == 0
     assert payload["tokens_after_estimated"] == 400
+
+
+@pytest.mark.parametrize(
+    ("value", "default", "expected"),
+    [
+        (12, 0, 12),
+        ("7", 0, 7),
+        (-3, 0, 0),
+        (None, 0, 0),
+        (None, 41, 41),
+        ("n/a", 5, 5),
+        (True, 0, 0),
+    ],
+)
+def test_usage_int_coerces_upstream_counts(value, default, expected) -> None:
+    assert usage_int(value, default) == expected

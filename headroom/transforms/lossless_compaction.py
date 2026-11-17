@@ -14,6 +14,7 @@ unchanged. Nothing here raises.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
@@ -31,6 +32,11 @@ __all__ = [
     "diff_strip_index",
     "compact_lossless",
 ]
+
+from ..exceptions import CompressionError
+from ..log_safety import describe_exception, safe_id
+
+logger = logging.getLogger(__name__)
 
 # ANSI CSI SGR (color/style) escape sequences: ESC [ ... m. Color is
 # non-semantic, so stripping it is a safe (one-way) lossless-of-meaning op.
@@ -69,8 +75,16 @@ _HEADING_ROW_RE = re.compile(r"^(?P<line>\d+):(?P<content>.*)$")
 _TIMESTAMP_ROW_RE = re.compile(
     r"^\s*\[?(?:"
     r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}"  # 2026-09-02 14:30 / ISO 8601 'T'
+    r"|\d{4}/\d{2}/\d{2}[ T]\d{1,2}:\d{2}"  # Go log, nginx error log: 2026/09/02 14:30
     r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
     r"|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2}"  # syslog: Aug 16 11:02
+    r"|[IWEF]\d{4}\s+\d{1,2}:\d{2}"  # klog/glog: E0902 14:30
+    # Common/combined access log: 10.0.0.7 - - [02/Sep/2026:14:30:00. The
+    # fields hold no ':', so a `grep -n` row (`path:12:10.0.0.7 - - [...`) is
+    # not claimed. The host takes name/IPv4 characters only, capped at 255
+    # (DNS names are at most 253), so a grep row's path or a long unbroken
+    # line is not scanned to its end.
+    r"|[\w.-]{1,255} [^\s:]+ [^\s:]+ \[\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}"
     r"|\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|$)"  # bare 15:03:53 / [15:03:53]
     r")"
 )
@@ -131,11 +145,47 @@ def collapse_runs(text: str) -> str:
     return _join(out, had_trailing)
 
 
-def expand_runs(text: str) -> str:
-    """Exact inverse of :func:`collapse_runs`."""
+class _ExpansionLimitExceeded(CompressionError):
+    """An inverse would produce more text than its ``max_chars`` allows."""
+
+
+class _OutputBudget:
+    """Characters an inverse may still emit (``None`` = unlimited).
+
+    A line costs its length plus its newline, so the budget also bounds the
+    line count. Checked before each append, so an oversized expansion is
+    refused before it is allocated.
+    """
+
+    def __init__(self, max_chars: int | None, had_trailing: bool) -> None:
+        self.max_chars = max_chars
+        self.used = 0
+        # Without a trailing newline, the join drops the newline charged to
+        # the last line, so one more character fits.
+        self.slack = 0 if had_trailing else 1
+
+    def take(self, chars: int) -> None:
+        if self.max_chars is None:
+            return
+        self.used += chars
+        if self.used > self.max_chars + self.slack:
+            raise _ExpansionLimitExceeded(
+                "Lossless inverse would exceed its size limit",
+                details={"max_chars": self.max_chars, "requested": self.used},
+            )
+
+
+def expand_runs(text: str, max_chars: int | None = None) -> str:
+    """Exact inverse of :func:`collapse_runs`.
+
+    Repeat counts are read from the text itself, so a marker line already in
+    the input can ask for any amount of output. With ``max_chars`` set, a line
+    or marker that would take the output past it raises before allocating.
+    """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
+    budget = _OutputBudget(max_chars, had_trailing)
     out: list[str] = []
     i = 0
     n = len(lines)
@@ -145,9 +195,11 @@ def expand_runs(text: str) -> str:
             m = _RUN_MARKER_RE.match(lines[i + 1])
             if m:
                 count = int(m.group(1))
+                budget.take(count * (len(line) + 1))
                 out.extend([line] * count)
                 i += 2
                 continue
+        budget.take(len(line) + 1)
         out.append(line)
         i += 1
     return _join(out, had_trailing)
@@ -216,11 +268,16 @@ def _remember(positions: dict[str, list[int]], line: str, index: int) -> None:
         del bucket[0]
 
 
-def unfold_repeated_blocks(text: str) -> str:
-    """Exact inverse of :func:`fold_repeated_blocks`."""
+def unfold_repeated_blocks(text: str, max_chars: int | None = None) -> str:
+    """Exact inverse of :func:`fold_repeated_blocks`.
+
+    ``max_chars`` bounds the output as in :func:`expand_runs`; without it,
+    chained markers can double the output once per marker line.
+    """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
+    budget = _OutputBudget(max_chars, had_trailing)
     out: list[str] = []
     for line in lines:
         m = _BLOCK_MARKER_RE.match(line)
@@ -228,8 +285,12 @@ def unfold_repeated_blocks(text: str) -> str:
             length, dist = int(m.group(1)), int(m.group(2))
             start = len(out) - dist
             if start >= 0 and length <= dist:
+                # Cost the block before copying it; same order of work as
+                # the copy, no extra allocation.
+                budget.take(sum(len(out[k]) + 1 for k in range(start, start + length)))
                 out.extend(out[start : start + length])
                 continue
+        budget.take(len(line) + 1)
         out.append(line)
     return _join(out, had_trailing)
 
@@ -381,8 +442,14 @@ def diff_strip_index(text: str) -> str:
 # A whole-line file path: optional ``./``/``../`` root, >=1 directory segment,
 # then a basename. No whitespace or ':' (so grep ``path:line:content`` rows —
 # handled by search_heading — are excluded). Directory-only lines (trailing '/')
-# don't match (empty basename), which keeps the fold unambiguous.
-_PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:]+/)+)(?P<base>[^/\s:]+)$")
+# don't match (empty basename), which keeps the fold unambiguous. Markup is
+# not a path either: no '<', '>' or ';' (``</body>``, ``&lt;/body&gt;``), and
+# every directory segment holds a letter, digit or '_', so a template closer
+# such as ``{{/if}}`` is not dir ``{{`` + base ``if}}``. Folded, those still
+# round-trip, but the model reads broken markup and writes it back.
+_PATH_ROW_RE = re.compile(
+    r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
+)
 
 
 def path_heading(text: str) -> str:
@@ -390,20 +457,27 @@ def path_heading(text: str) -> str:
     into ripgrep-heading form: each parent directory printed once on its own
     line (ending in ``/``), then the bare basenames beneath it.
 
+    Every non-blank line must be a path row, and there must be >=2 of them.
+    Text that merely holds path-shaped lines (a template's ``{{/if}}``
+    closers, a ``N/A`` table column) passes through: folding it round-trips,
+    but the model only sees the folded side and reads fragments.
     Reversibility is not assumed here — ``compact_lossless`` verifies the exact
-    round-trip via :func:`path_unheading` and discards the fold on any mismatch
-    (e.g. a stray no-slash line mistaken for a basename), so mixed content is
-    always safe. Requires >=2 path rows or there is nothing to group.
+    round-trip via :func:`path_unheading` and discards the fold on any mismatch.
     Complements ``search_heading``, which only handles the ``path:line:content``
     grep shape, not plain path lists.
     """
     lines, had_trailing = _split_keep_trailing(text)
-    if sum(1 for ln in lines if _PATH_ROW_RE.match(ln)) < 2:
+    matches = []
+    for ln in lines:
+        m = _PATH_ROW_RE.match(ln)
+        if ln and not m:  # not a pure listing; stop at the first such line
+            return text
+        matches.append(m)
+    if sum(1 for m in matches if m) < 2:
         return text
     out: list[str] = []
     current: str | None = None
-    for line in lines:
-        m = _PATH_ROW_RE.match(line)
+    for line, m in zip(lines, matches):
         if m:
             d = m.group("dir")
             if d != current:
@@ -488,7 +562,7 @@ def compact_lossless(content: str, kind: str) -> str:
             # exactly reversible against the de-ANSI'd baseline.
             baseline = strip_ansi(content)
             candidate = collapse_runs(baseline)
-            if expand_runs(candidate) != baseline:
+            if expand_runs(candidate, len(baseline)) != baseline:
                 return content
             return candidate if _smaller(candidate, content) else content
 
@@ -522,17 +596,36 @@ def compact_lossless(content: str, kind: str) -> str:
         if kind == "text":
             # Collapse blank-line runs; reversible against itself.
             candidate = collapse_runs(content)
-            if expand_runs(candidate) != content:
+            if expand_runs(candidate, len(content)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
 
         if kind == "config":
             # Structured config (YAML/TOML/INI): single-line runs first, then
             # repeated multi-line stanzas. Inverse applies in reverse order.
-            candidate = fold_repeated_blocks(collapse_runs(content))
-            if expand_runs(unfold_repeated_blocks(candidate)) != content:
+            # The block inverse must reproduce the run-collapsed text, which
+            # can be longer than the content (a run marker outgrows a short
+            # repeated line), so each inverse is bounded by its own target.
+            collapsed = collapse_runs(content)
+            candidate = fold_repeated_blocks(collapsed)
+            unfolded = unfold_repeated_blocks(candidate, len(collapsed))
+            if expand_runs(unfolded, len(content)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
-    except Exception:
+    except _ExpansionLimitExceeded:
+        # The input itself carried marker lines asking for more lines than it
+        # has, so the fold cannot round-trip; leave the content as it is.
+        return content
+    except Exception as e:
+        # The exception text can quote the content, so no level logs it;
+        # describe_exception keeps only types and code locations.
+        logger.warning(
+            "Lossless compaction (%s) failed (%s) on %d chars; leaving content as-is",
+            kind,
+            safe_id(e),
+            len(content),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Lossless compaction failure detail: %s", describe_exception(e))
         return content
     return content

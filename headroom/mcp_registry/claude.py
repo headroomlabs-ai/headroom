@@ -34,9 +34,19 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from headroom import fsutil
 from headroom._subprocess import run
 
-from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
+from .base import (
+    MCPRegistrar,
+    RegisterResult,
+    RegisterStatus,
+    ServerSpec,
+    _diff_specs,
+    _entry_to_spec,
+    _spec_to_entry,
+    _specs_equivalent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +194,10 @@ class ClaudeRegistrar(MCPRegistrar):
                 raise ClaudeConfigMutationError(
                     f"could not read Claude config {config_path}: {exc}"
                 ) from exc
+            except UnicodeDecodeError as exc:
+                raise ClaudeConfigMutationError(
+                    f"Claude config {config_path} is not valid UTF-8; refusing to mutate"
+                ) from exc
             try:
                 config = json.loads(raw)
             except json.JSONDecodeError as exc:
@@ -321,27 +335,22 @@ class ClaudeRegistrar(MCPRegistrar):
     def _remove_from_file(self, path: Path, server_name: str, scope: str) -> bool:
         if not path.exists():
             return False
-        try:
-            config = _read_json(path)
-        except OSError:
-            return False
+        config = _read_json(path)
         servers = self._servers_map(config, scope)
         if servers is None or server_name not in servers:
             return False
         del servers[server_name]
         try:
             _write_json(path, config)
-        except OSError:
+        except OSError as exc:
+            logger.warning("could not remove %r from %s: %s", server_name, path, exc)
             return False
         return True
 
     def _read_server_entry(self, path: Path, server_name: str, scope: str) -> ServerSpec | None:
         if not path.exists():
             return None
-        try:
-            config = _read_json(path)
-        except OSError:
-            return None
+        config = _read_json(path)
         servers = self._servers_map(config, scope)
         if servers is None:
             return None
@@ -498,7 +507,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
     if not isinstance(data, dict):
         return {}
@@ -561,7 +570,10 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
     """
     if not path.exists():
         return {}
-    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    try:
+        raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    except UnicodeDecodeError as exc:
+        raise _MalformedConfigError(f"not valid UTF-8: {exc}") from exc
     if not raw.strip():
         return {}
     try:
@@ -575,57 +587,4 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-
-
-def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
-    entry: dict[str, Any] = {"command": spec.command}
-    if spec.args:
-        entry["args"] = list(spec.args)
-    if spec.env:
-        entry["env"] = dict(spec.env)
-    return entry
-
-
-def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
-    args_value = entry.get("args", [])
-    if isinstance(args_value, list):
-        args = tuple(str(x) for x in args_value)
-    else:
-        args = ()
-    env_value = entry.get("env", {})
-    env: dict[str, str] = {}
-    if isinstance(env_value, dict):
-        env = {str(k): str(v) for k, v in env_value.items()}
-    return ServerSpec(
-        name=name,
-        command=str(entry.get("command", "")),
-        args=args,
-        env=env,
-    )
-
-
-def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
-    """Two specs match when every field is equal."""
-    return (
-        a.name == b.name
-        and a.command == b.command
-        and tuple(a.args) == tuple(b.args)
-        and dict(a.env) == dict(b.env)
-    )
-
-
-def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
-    """Render the difference between two specs for human consumption."""
-    parts: list[str] = []
-    if existing.command != requested.command:
-        parts.append(f"command {existing.command!r} -> {requested.command!r}")
-    if tuple(existing.args) != tuple(requested.args):
-        parts.append(f"args {list(existing.args)} -> {list(requested.args)}")
-    if dict(existing.env) != dict(requested.env):
-        parts.append(f"env {dict(existing.env)} -> {dict(requested.env)}")
-    if not parts:
-        return "spec differs in unidentified field(s)"
-    return "; ".join(parts)
+    fsutil.write_text(path, json.dumps(data, indent=2) + "\n")

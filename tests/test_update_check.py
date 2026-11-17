@@ -69,6 +69,18 @@ def test_select_latest_skips_fully_yanked():
     assert uc._select_latest(data, allow_pre=False) == "0.26.0"
 
 
+def test_select_latest_skips_release_with_no_files():
+    data = {"releases": {"1.0.0": [{"yanked": False}], "9.9.9": []}}
+    assert uc._select_latest(data, allow_pre=False) == "1.0.0"
+
+
+def test_select_latest_no_fallback_when_every_release_is_unavailable():
+    data = {"releases": {"9.9.9": []}, "info": {"version": "9.9.9"}}
+    assert uc._select_latest(data, allow_pre=False) is None
+    data = {"releases": {"9.9.9": [{"yanked": True}]}, "info": {"version": "9.9.9"}}
+    assert uc._select_latest(data, allow_pre=False) is None
+
+
 def test_select_latest_falls_back_to_info_version():
     data = {"releases": {}, "info": {"version": "0.26.0"}}
     assert uc._select_latest(data, allow_pre=False) == "0.26.0"

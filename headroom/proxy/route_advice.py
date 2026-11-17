@@ -34,6 +34,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.copilot_auth import is_copilot_upstream_url
+from headroom.offline import pin_litellm_cost_map_local
+
 log = logging.getLogger(__name__)
 
 STATE_ATTR = "headroom_route"
@@ -108,6 +111,7 @@ class BackendResolver:
         *,
         body: dict | None = None,
         native_providers: tuple[str, ...] = _NATIVE,
+        upstream_url: str | None = None,
     ) -> Any:
         """The backend to serve this request. Falls back to the default.
 
@@ -120,6 +124,12 @@ class BackendResolver:
         short-circuited to the default backend. One proxy instance serves both
         wires from a single shared resolver, so native-ness cannot live on the
         resolver; it must be supplied per dispatch site.
+
+        ``upstream_url`` is where the caller sends this request when no backend
+        is used. When it is GitHub Copilot, cross-provider advice is ignored and
+        the body is left alone: Copilot serves every model family on the one
+        upstream, and the proxy holds a Copilot token, not a key for the
+        provider a translating backend would call.
         """
         advice = advice_from(request)
         if advice is None:
@@ -130,6 +140,14 @@ class BackendResolver:
             # Same protocol the proxy already speaks -- a `body["model"]`
             # rewrite is enough and the extension has already done it. Nothing
             # to switch.
+            return self._default
+        if is_copilot_upstream_url(upstream_url):
+            if body is not None:
+                log.info(
+                    "route advice ignored: %s via %s; the upstream is GitHub Copilot",
+                    advice.model,
+                    provider,
+                )
             return self._default
         if provider in self._failed:
             return self._default
@@ -202,6 +220,7 @@ def resolver_for(handler: Any) -> BackendResolver:
 def _known_provider(provider: str) -> bool:
     """Is this a provider litellm actually knows about?"""
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         names = {getattr(p, "value", None) or str(p) for p in getattr(litellm, "provider_list", [])}
@@ -215,6 +234,7 @@ def _provider_of(model: str) -> str:
     if "/" in model:
         return model.split("/", 1)[0]
     try:
+        pin_litellm_cost_map_local()
         import litellm
 
         entry = litellm.model_cost.get(model) or {}
