@@ -7,7 +7,7 @@
 # the runtime libc.so.6 doesn't have. Building inside the manylinux_2_28
 # container (AlmaLinux 8, glibc 2.28 baseline) guarantees the wheel works
 # on any glibc 2.28+ runtime, including bookworm.
-FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder
+FROM quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c AS builder
 
 # No OpenSSL system deps required. As of the rustls-everywhere refactor,
 # all HTTP+TLS in our Rust crates goes through `rustls`. fastembed's
@@ -42,8 +42,13 @@ ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 # trixie's default python3.13 is too new for aider. The manylinux image
 # has python interpreters for every version at /opt/python/cpXY-cpXY/.
 # Stage 2 uses `python:3.11-slim` (now trixie-based, glibc 2.41).
-RUN /opt/python/cp311-cp311/bin/pip install 'maturin>=1.5,<2.0' && \
-    /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11
+# Exact build tools, and the runtime dependency set uv.lock resolved for
+# [proxy], so the runtime stage installs reviewed versions instead of
+# re-resolving pyproject.toml's ranges against PyPI.
+RUN /opt/python/cp311-cp311/bin/pip install maturin==1.16.0 uv==0.11.18 && \
+    /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11 && \
+    /opt/python/cp311-cp311/bin/uv export --frozen --no-dev --no-emit-project --no-hashes \
+      --extra proxy --format requirements-txt -o /constraints.txt
 
 # ─── Stage 2: python+node runtime ───────────────────────────────────────────
 # Base on `python:3.11-slim` (now trixie, glibc 2.41) instead of
@@ -61,7 +66,7 @@ FROM node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9
 # We need Python 3.11 here (aider-chat==0.86.2 requires Python <3.12).
 # Trixie's default `python3` is 3.13 — too new for aider. python:3.11-slim
 # gives us Python 3.11 + trixie glibc + apt access for installing Node.
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
 ENV DEBIAN_FRONTEND=noninteractive \
     AIDER_CHAT_VERSION=0.86.2 \
@@ -112,6 +117,7 @@ WORKDIR /workspace
 
 # Bring in the prebuilt manylinux wheel from stage 1.
 COPY --from=builder /dist/*.whl /tmp/wheels/
+COPY --from=builder /constraints.txt /tmp/constraints.txt
 
 # `sdk/typescript` and `plugins/openclaw` are wired into the wrap-e2e
 # harness (e2e/wrap/run.py invokes `npx openclaw`). DO NOT copy
@@ -128,11 +134,11 @@ COPY scripts/install-opencode.sh /tmp/install-opencode.sh
 # wheel's `_core.so` was compiled against glibc 2.28, so it loads cleanly
 # against bookworm's glibc 2.36 at runtime.
 RUN python -m venv /opt/headroom-venv && \
-    /opt/headroom-venv/bin/python -m pip install --upgrade pip && \
-    /opt/headroom-venv/bin/python -m pip install "$(ls /tmp/wheels/headroom_ai-*.whl)[proxy]" && \
+    /opt/headroom-venv/bin/python -m pip install pip==26.3 && \
+    /opt/headroom-venv/bin/python -m pip install -c /tmp/constraints.txt "$(ls /tmp/wheels/headroom_ai-*.whl)[proxy]" && \
     /opt/headroom-venv/bin/python -c "from headroom._core import DiffCompressor; print('headroom._core OK')" && \
     python -m venv /opt/aider-venv && \
-    /opt/aider-venv/bin/python -m pip install --upgrade pip && \
+    /opt/aider-venv/bin/python -m pip install pip==26.3 && \
     /opt/aider-venv/bin/python -m pip install "aider-chat==${AIDER_CHAT_VERSION}" && \
     sh /tmp/install-opencode.sh "${OPENCODE_VERSION}"
 

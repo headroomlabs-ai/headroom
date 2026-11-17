@@ -2,7 +2,10 @@ version: 2
 updates:
   # Docker base image digest updates
   - package-ecosystem: docker
-    directory: /
+    directories:
+      - /
+      - /e2e/init
+      - /e2e/wrap
     schedule:
       interval: weekly
     commit-message:
