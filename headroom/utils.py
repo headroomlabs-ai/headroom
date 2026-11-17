@@ -120,6 +120,25 @@ def _strip_system_reminders(text: str) -> str:
     return "".join(parts).strip()
 
 
+_TOOL_LOADED_NOTE = "Tool loaded."
+
+
+def _is_tool_search_load(content: list[Any]) -> bool:
+    """A tool_result turn answering Claude Code's ToolSearch: its
+    ``tool_reference`` blocks come with a "Tool loaded." text block that is a
+    harness note, not the user's question."""
+    return any(
+        isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and isinstance(block.get("content"), list)
+        and any(
+            isinstance(ref, dict) and ref.get("type") == "tool_reference"
+            for ref in block["content"]
+        )
+        for block in content
+    )
+
+
 def extract_user_query(
     messages: list[dict[str, Any]], *, latest_user_turn_only: bool = False
 ) -> str:
@@ -146,12 +165,14 @@ def extract_user_query(
                 if user_text:
                     return user_text
             if isinstance(content, list):
+                # Drop only the ToolSearch note; other text in that turn still counts.
+                load_note = _TOOL_LOADED_NOTE if _is_tool_search_load(content) else None
                 user_text = "\n".join(
                     text
                     for block in content
                     if isinstance(block, dict) and block.get("type") == "text"
                     for text in (_strip_system_reminders(str(block.get("text", ""))),)
-                    if text
+                    if text and text != load_note
                 )
                 if user_text:
                     return user_text

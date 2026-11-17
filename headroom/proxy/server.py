@@ -34,7 +34,9 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -84,8 +86,10 @@ from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
     CacheAlignerConfig,
     ReadLifecycleConfig,
+    resolve_omlx_target_api_url,
 )
 from headroom.dashboard import get_dashboard_html
+from headroom.exceptions import ConfigurationError
 from headroom.log_safety import describe_exception, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
@@ -132,6 +136,7 @@ from headroom.proxy.cost import (
     build_prefix_cache_stats,
     build_session_summary,
     merge_cost_stats,
+    request_cost_usd,
 )
 from headroom.proxy.helpers import (
     COMPRESSION_CACHE_MAX_ENTRIES,
@@ -163,6 +168,7 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
 from headroom.proxy.models import (
+    PROXY_CONFIG_SECRET_FIELDS,
     ProxyConfig,
     default_periodic_malloc_trim,
 )
@@ -187,6 +193,10 @@ from headroom.proxy.project_context import (
 )
 from headroom.proxy.project_policy import split_project_path
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.query_log_policy import (
+    install_access_log_query_filter,
+    redact_query_string_for_log,
+)
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter
 from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
 from headroom.proxy.request_logger import RequestLogger
@@ -597,6 +607,72 @@ class CompressionQuarantinedError(asyncio.TimeoutError):
 
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
+# The workers' copy of the config's credentials travels in an owner-only file,
+# not in the environment every child process inherits; this names the file.
+_MULTI_WORKER_SECRETS_ENV = "HEADROOM_PROXY_CONFIG_SECRETS_FILE"
+
+
+def _save_prefix_state_on_exit_signal(store: Any, path: str) -> Callable[[], None]:
+    """Save prefix-tracker state as soon as an exit signal arrives.
+
+    ``HeadroomProxy.shutdown`` saves it too, but uvicorn runs the lifespan
+    shutdown only after waiting up to ``timeout_graceful_shutdown`` for
+    in-flight requests, so a supervisor that SIGKILLs sooner (a desktop app's
+    short stop, systemd's ``TimeoutStopSec``) loses that save whenever a request
+    is open. This wraps the handler uvicorn installed (the lifespan runs inside
+    its ``capture_signals``), so uvicorn's shutdown is unchanged and the later
+    save still writes the newer state. The save runs on the event loop, never
+    inside the signal handler, so it cannot read a tracker that a paused
+    coroutine was midway through updating.
+
+    Returns the undo, for the lifespan's shutdown: it restores each handler
+    that is still this wrapper (one another owner installed since is left
+    alone) and turns the wrapper into a pass-through, so a wrapper that could
+    not be removed never schedules onto this lifespan's closed loop.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None  # signals are only delivered to the main thread
+    loop = asyncio.get_running_loop()
+    active = True
+    saved = False
+
+    def save() -> None:
+        nonlocal saved
+        if not saved:
+            saved = True
+            store.save_state(path)
+
+    def chained(previous: Callable[[int, Any], Any]) -> Callable[[int, Any], None]:
+        def handler(signum: int, frame: Any) -> None:
+            if active:
+                with contextlib.suppress(RuntimeError):  # loop closed without a shutdown
+                    loop.call_soon_threadsafe(save)
+            previous(signum, frame)
+
+        return handler
+
+    installed: list[tuple[int, Any, Callable[[int, Any], None]]] = []
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if sig is None:
+            continue
+        previous = signal.getsignal(sig)
+        if not callable(previous):
+            continue  # nobody installed a handler: keep the default exit
+        handler = chained(previous)
+        signal.signal(sig, handler)
+        installed.append((sig, previous, handler))
+
+    def undo() -> None:
+        nonlocal active
+        active = False
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig, previous, handler in installed:
+            if signal.getsignal(sig) is handler:
+                signal.signal(sig, previous)
+
+    return undo
+
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
 # Default behavior: hard-fail at startup if `headroom._core` is unimportable
@@ -797,6 +873,64 @@ from headroom.proxy.handlers import (  # noqa: E402
     OpenAIHandlerMixin,
     StreamingMixin,
 )
+from headroom.proxy.handlers.openai import (  # noqa: E402
+    _is_allowed_websocket_origin,
+    _is_loopback_ws_origin,
+    _normalize_origin,
+)
+
+
+def _is_cors_listed_origin(origin: str) -> bool:
+    """True when ``origin`` is listed in HEADROOM_CORS_ORIGINS (``*`` lists nothing)."""
+    normalized = _normalize_origin(origin)
+    if normalized is None:
+        return False
+    listed = (
+        _normalize_origin(entry.strip())
+        for entry in os.environ.get("HEADROOM_CORS_ORIGINS", "").split(",")
+        if entry.strip() and entry.strip() != "*"
+    )
+    return normalized in listed
+
+
+def _is_refused_browser_request(request: Request) -> bool:
+    """Return True for a browser request from a page the proxy does not trust.
+
+    The proxy adds operator credentials (extra headers, the Copilot token,
+    provider env keys) to what it forwards, and loopback callers skip the
+    proxy token, so a page open in the user's browser must not be able to
+    drive it with a "simple" request (``text/plain`` body, no preflight).
+
+    Requests without ``Origin`` (CLI tools, SDKs, coding agents) pass. With
+    ``Origin``, these pass: loopback pages (the dashboard), the origins the
+    WebSocket routes accept (``HEADROOM_WS_ORIGINS`` / ``HEADROOM_CORS_ORIGINS``),
+    and, for a non-loopback peer, a page served from this proxy's own address
+    (a remote dashboard). A loopback peer gets no same-origin pass: there a
+    non-loopback Host means a page's hostname was pointed at 127.0.0.1.
+    A cross-site subresource load (``<img>``, ``<script>``) carries no
+    ``Origin`` on GET, so ``Sec-Fetch-Site: cross-site`` is refused too, except
+    for a top-level navigation.
+    """
+    headers = request.headers
+    origin = headers.get("origin")
+    if origin:
+        if (
+            _is_loopback_ws_origin(origin)
+            or _is_allowed_websocket_origin(dict(headers))
+            or _is_cors_listed_origin(origin)
+        ):
+            return False
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        host_header = headers.get("host")
+        return (
+            is_loopback_host(peer)
+            or not host_header
+            or not _request_has_same_origin_or_no_provenance(request, host_header)
+        )
+    fetch_site = (headers.get("sec-fetch-site") or "").lower()
+    fetch_mode = (headers.get("sec-fetch-mode") or "").lower()
+    return fetch_site == "cross-site" and fetch_mode != "navigate"
 
 
 def _apply_stateless_persistence(config: ProxyConfig) -> None:
@@ -844,11 +978,35 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     detach_compression_store()
 
 
+# Hop-by-hop fields (RFC 9110 7.6.1) describe the client's connection to the
+# proxy, not the proxy's connection to the provider. Handlers copy the inbound
+# headers, so a client's `Connection: close` reached the provider and made
+# every pooled upstream connection single-use: a fresh DNS lookup, TCP connect
+# and TLS handshake per request. Framing (content-length, transfer-encoding)
+# is httpx's own by the time the hook runs and is never touched.
+_HOP_BY_HOP_REQUEST_HEADERS = frozenset(
+    {"connection", "keep-alive", "proxy-connection", "te", "trailer", "upgrade"}
+)
+_FRAMING_REQUEST_HEADERS = frozenset({"host", "content-length", "transfer-encoding"})
+
+
+async def _drop_hop_by_hop_request_headers(request: httpx.Request) -> None:
+    named = {
+        token.strip().lower()
+        for token in request.headers.get_list("connection", split_commas=True)
+        if token.strip()
+    }
+    for name in (_HOP_BY_HOP_REQUEST_HEADERS | named) - _FRAMING_REQUEST_HEADERS:
+        if name in request.headers:
+            del request.headers[name]
+
+
 def _provider_httpx_client_options(
     config: ProxyConfig,
     verify: Any,
 ) -> tuple[bool, dict[str, Any]]:
     client_kwargs: dict[str, Any] = {
+        "event_hooks": {"request": [_drop_hop_by_hop_request_headers]},
         "timeout": httpx.Timeout(
             connect=config.connect_timeout_seconds,
             read=config.request_timeout_seconds,
@@ -1226,6 +1384,7 @@ class HeadroomProxy(
         self.shared_compress_sessions = open_shared_sessions()
         # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
         self._prefix_state_file: str | None = None
+        self._undo_exit_signal_save: Callable[[], None] | None = None
 
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
@@ -1314,9 +1473,10 @@ class HeadroomProxy(
         #      sharing the loop's default executor (file IO, etc.).
         #   2. Tasks that exceed ``COMPRESSION_TIMEOUT_SECONDS`` and complete
         #      *after* the asyncio future was cancelled are counted in the
-        #      ``compression_leaked_threads`` gauge — Python cannot preempt
-        #      the worker, so this is the only signal that some pool slots
-        #      are sitting on stuck work.
+        #      ``compression_timed_out_workers_total`` counter — Python cannot
+        #      preempt the worker, so this is the only signal that some pool
+        #      slots sat on work past its deadline. Cumulative: it counts
+        #      workers that finished late, not threads still stuck (#3653).
         _compression_max_cfg = config.compression_max_workers
         if _compression_max_cfg is None:
             _compression_max = max(1, os.cpu_count() or 1)
@@ -1362,9 +1522,12 @@ class HeadroomProxy(
         self._compression_in_flight_max: int = 0
         self._compression_run_seconds_total: float = 0.0
         self._compression_run_seconds_max: float = 0.0
-        # Counter: threads that finished AFTER their asyncio future hit the
-        # timeout. Stuck-thread leak indicator.
-        self._compression_leaked_threads: int = 0
+        # Counter: workers that finished AFTER their asyncio future hit the
+        # timeout. Cumulative total, never decremented: a late-finishing
+        # worker is counted once when it exits. It does NOT report live
+        # stuck threads — a steady value means past timeouts, not a
+        # growing leak (#3653).
+        self._compression_timed_out_workers_total: int = 0
         # Timeout-debt quarantine. Python cannot preempt a worker after its
         # asyncio waiter times out, so accepting more compression while those
         # workers are still running can multiply slow calls into a saturated
@@ -1619,7 +1782,7 @@ class HeadroomProxy(
         preempt running CPython bytecode or in-flight Rust calls. The
         worker keeps running to completion, ignored. We detect this by
         marking the call timed out on the asyncio side and incrementing
-        ``_compression_leaked_threads`` from the worker's ``finally``
+        ``_compression_timed_out_workers_total`` from the worker's ``finally``
         block after it eventually finishes. While such workers hold half the
         pool (``_compression_quarantine_threshold``), new calls raise
         :class:`CompressionQuarantinedError` immediately so callers apply the
@@ -1633,11 +1796,11 @@ class HeadroomProxy(
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
                 raise asyncio Cancellation; if it does, the wrapper still
-                decrements the in-flight gauge but the leaked-thread
+                decrements the in-flight gauge but the timed-out-worker
                 counter may double-count.
             timeout: Wall-clock timeout for the asyncio side. The
-                executor worker keeps running past this (Python limitation
-                — see above), but at least the awaiter unblocks.
+            executor worker keeps running past this (Python limitation
+            — see above), but at least the awaiter unblocks.
 
         Returns:
             Whatever ``fn()`` returns.
@@ -1768,7 +1931,7 @@ class HeadroomProxy(
                     if elapsed > self._compression_run_seconds_max:
                         self._compression_run_seconds_max = elapsed
                     if state["timed_out"]:
-                        self._compression_leaked_threads += 1
+                        self._compression_timed_out_workers_total += 1
                     if state["timeout_debt_recorded"]:
                         self._compression_timed_out_in_flight -= 1
                         state["timeout_debt_recorded"] = False
@@ -2120,6 +2283,9 @@ class HeadroomProxy(
             self._prefix_state_file = None
         if self._prefix_state_file:
             self.session_tracker_store.load_state(self._prefix_state_file)
+            self._undo_exit_signal_save = _save_prefix_state_on_exit_signal(
+                self.session_tracker_store, self._prefix_state_file
+            )
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -2470,6 +2636,9 @@ class HeadroomProxy(
         # First, before any await can hit the shutdown step timeout.
         if self._prefix_state_file:
             self.session_tracker_store.save_state(self._prefix_state_file)
+        if self._undo_exit_signal_save is not None:
+            self._undo_exit_signal_save()
+            self._undo_exit_signal_save = None
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -2479,6 +2648,11 @@ class HeadroomProxy(
 
         if self.memory_handler and hasattr(self.memory_handler, "close"):
             await self.memory_handler.close()
+
+        if self.shared_compress_sessions is not None:
+            with contextlib.suppress(Exception):
+                self.shared_compress_sessions.close()
+            self.shared_compress_sessions = None
 
         with contextlib.suppress(Exception):
             from headroom.models.ml_models import MLModelRegistry
@@ -2873,7 +3047,7 @@ def _register_memory_components(proxy: HeadroomProxy, tracker: MemoryTracker) ->
     # registered when the memory system is initialized with specific backends.
 
 
-def _request_is_loopback(request: Request) -> bool:
+def _request_is_loopback(request: Request, *, allow_gateway_peer: bool = True) -> bool:
     """Return True iff the caller is on loopback by *both* peer IP and Host header.
 
     Mirrors the two-gate check in :func:`loopback_guard.require_loopback`
@@ -2882,6 +3056,9 @@ def _request_is_loopback(request: Request) -> bool:
     payload — serving sensitive sub-blocks (upstream URLs, per-request logs)
     only to loopback callers — rather than 404ing network callers that still
     have a legitimate use for the non-sensitive aggregate fields.
+
+    ``allow_gateway_peer=False`` drops the trusted-gateway-CIDR equivalence
+    below, for callers (settings writes) that need a genuine loopback peer.
     """
     from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 
@@ -2899,6 +3076,8 @@ def _request_is_loopback(request: Request) -> bool:
     # Genuine loopback peer (native run, or curl inside the container).
     if is_loopback_host(client_host):
         return True
+    if not allow_gateway_peer:
+        return False
 
     # Containerized dashboards: when Headroom runs in a bridge-network
     # container, a browser on the host reaches it via the container's
@@ -2919,9 +3098,11 @@ def _request_is_loopback(request: Request) -> bool:
 def _request_can_view_dashboard_metadata(
     request: Request,
     trusted_dashboard_client_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+    *,
+    allow_gateway_peer: bool = True,
 ) -> bool:
     """Authorize sensitive ``/stats`` metadata without widening admin access."""
-    if _request_is_loopback(request):
+    if _request_is_loopback(request, allow_gateway_peer=allow_gateway_peer):
         return True
 
     from headroom.proxy.forwarded_headers import peer_is_trusted_gateway, resolve_client_ip
@@ -2948,6 +3129,29 @@ def _request_can_view_dashboard_metadata(
         resolve_client_ip(request),
         trusted_dashboard_client_cidrs,
     )
+
+
+def _request_can_view_stats_metadata(
+    request: Request,
+    trusted_dashboard_client_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+) -> bool:
+    """Authorize per-request ``/stats`` metadata (ids, providers, models, errors).
+
+    Everything :func:`_request_can_view_dashboard_metadata` allows, plus callers
+    that proved they hold ``HEADROOM_PROXY_TOKEN``: the security gate sets
+    ``request.state.proxy_authenticated`` only after a constant-time token match.
+    That is what a dashboard fronted by an authenticating reverse proxy sends
+    (the proxy adds the token after its own sign-in). Such a caller reaches
+    ``/stats`` with a domain ``Host`` and a peer outside any trusted CIDR, so
+    the Host/CIDR rule above can never admit it, and the dashboard's
+    "Recent Requests" table stays empty. This widens what the token grants:
+    every holder sees the request metadata of every caller on this proxy
+    (docs/content/docs/security-model.mdx, "What the proxy token unlocks").
+    The settings routes and the loopback-only routes keep their own guards.
+    """
+    if getattr(request.state, "proxy_authenticated", False) is True:
+        return True
+    return _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
 
 
 def _request_has_same_origin_or_no_provenance(request: Request, host_header: str) -> bool:
@@ -3335,6 +3539,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # the port must be known first, and it is always present (``port`` defaults
     # to 8787), so this is accepted.
     config = config or ProxyConfig()
+
+    # Every process that serves the app (each --workers N worker builds its
+    # own) keeps query values out of uvicorn's access log.
+    install_access_log_query_filter()
 
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
@@ -3785,6 +3993,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return KOMPRESS_DETAIL_NOT_INSTALLED
 
     def _health_checks() -> dict[str, dict[str, Any]]:
+        from headroom.cache.redis_client import states as _redis_states
+
+        features = _redis_states()
         kompress_enabled = _reconcile_kompress_health()
         memory_status = (
             proxy.memory_handler.health_status()
@@ -3799,6 +4010,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         memory_enabled = bool(memory_status.get("enabled", False))
         memory_initialized = bool(memory_status.get("initialized", False))
+        session_store_enabled = bool(features)
+        session_store_ready = session_store_enabled and all(
+            v == "available" for v in features.values()
+        )
         return {
             "startup": _component_health(
                 enabled=True,
@@ -3838,6 +4053,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 backend=proxy.warmup.kompress.info.get("backend", None),
                 detail=_kompress_detail(),
             ),
+            "session_store": _component_health(
+                enabled=session_store_enabled,
+                ready=session_store_ready,
+                optional=True,
+                features=features,
+            ),
         }
 
     def _runtime_payload() -> dict[str, Any]:
@@ -3858,7 +4079,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_in_flight_max = proxy._compression_in_flight_max
             _comp_run_total = proxy._compression_run_seconds_total
             _comp_run_max = proxy._compression_run_seconds_max
-            _comp_leaked = proxy._compression_leaked_threads
+            _comp_leaked = proxy._compression_timed_out_workers_total
             _comp_timed_out_in_flight = proxy._compression_timed_out_in_flight
             _comp_quarantine_active = (
                 _comp_timed_out_in_flight >= proxy._compression_quarantine_threshold
@@ -3894,6 +4115,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
+                # Canonical name: this is a cumulative count of workers that
+                # finished after their deadline, not live stuck threads.
+                # `leaked_threads_total` is kept as a deprecated alias so
+                # existing dashboards and watchdogs keep working (#3653).
+                "timed_out_workers_total": _comp_leaked,
                 "quarantine_active": _comp_quarantine_active,
                 "timed_out_workers": _comp_timed_out_in_flight,
                 "timed_out_workers_max": _comp_timed_out_in_flight_max,
@@ -3949,9 +4175,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
-        # Kompress is an optional soft component: model downloads lazily on
-        # first use, so "not ready" (cold cache) must not degrade overall health.
-        ready = all(check["ready"] for name, check in checks.items() if name != "kompress")
+        # Optional soft components (kompress, session_store) must not degrade
+        # overall health: a cold model cache or a Redis backoff is not a failure.
+        ready = all(
+            check["ready"]
+            for name, check in checks.items()
+            if name not in ("kompress", "session_store")
+        )
         payload: dict[str, Any] = {
             "service": "headroom-proxy",
             "status": "healthy" if ready else "unhealthy",
@@ -4006,6 +4236,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
+                "factory_api_url": config.factory_api_url,
                 "savings_profile": config.savings_profile,
                 # Enabled extension names only (no plugin state): `headroom
                 # wrap` carries them over when it has to start a dedicated
@@ -4218,7 +4449,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             inbound_id,
             method,
             path,
-            query,
+            redact_query_string_for_log(query),
             client_addr,
             request.headers.get("content-length", ""),
             json.dumps(safe_headers, ensure_ascii=False, default=str),
@@ -4343,6 +4574,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # whose licence gate raises is absent, not fatal — the feature fails closed,
     # the process does not.
     #
+    # The exception is an extension that marks its install() `fail_closed`
+    # (e.g. one that mints the upstream credential): running without it would
+    # relay the client's own Authorization upstream, so `install_all` re-raises
+    # and create_app fails instead of serving mis-authenticated. See #4737.
+    #
     # Installed HERE, before the body limit and the security gate are
     # registered, so any middleware an extension adds sits INSIDE both (see the
     # ordering contract above). Routes an extension registers are unaffected
@@ -4364,6 +4600,26 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def _security_gate(request, call_next):
+        # 0) Browser provenance. Runs before the token check because loopback
+        #    callers skip that check, and a page in the user's browser reaches
+        #    the proxy as a loopback caller.
+        if _is_refused_browser_request(request):
+            logger.warning(
+                "event=proxy_browser_origin_rejected method=%s path=%s origin=%s",
+                request.method,
+                _auth_rejection_path(request.url.path),
+                _auth_rejection_path(request.headers.get("origin") or "-"),
+            )
+            rejection = JSONResponse(
+                status_code=403,
+                content={
+                    "error": "cross-origin request rejected",
+                    "hint": "add this page's origin to HEADROOM_WS_ORIGINS to allow it",
+                },
+            )
+            _apply_security_headers(rejection)
+            return rejection
+
         # 1) Optional inbound auth. When a token is configured, require it on
         #    non-loopback requests; loopback callers and health probes are
         #    exempt. Loopback is the same trust boundary the admin/debug
@@ -4504,6 +4760,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
             raise HTTPException(status_code=404)
 
+    def _require_loopback_or_trusted_dashboard_client_for_write(request: Request) -> None:
+        """Like the read guard, but a trusted-gateway peer is not loopback.
+
+        The gateway-CIDR equivalence exists for read-only dashboard views; it
+        must not confer settings writes (nor /settings/apply's restart).
+        """
+        if not _request_can_view_dashboard_metadata(
+            request, trusted_dashboard_client_cidrs, allow_gateway_peer=False
+        ):
+            raise HTTPException(status_code=404)
+
     def _authenticated_at_gate(request: Request) -> bool:
         """True when the security gate verified this request's proxy token.
 
@@ -4595,7 +4862,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         already an IP-literal-Host, CIDR-trusted dashboard client. Loopback
         callers keep the stricter loopback-only origin check unchanged.
         """
-        if not _request_is_loopback(request):
+        if not _request_is_loopback(request, allow_gateway_peer=False):
             origin = request.headers.get("origin")
             host_header = request.headers.get("host")
             if (
@@ -4603,7 +4870,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 and origin != "null"
                 and host_header
                 and _request_has_same_origin_or_no_provenance(request, host_header)
-                and _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
+                and _request_can_view_dashboard_metadata(
+                    request, trusted_dashboard_client_cidrs, allow_gateway_peer=False
+                )
             ):
                 return
         _require_same_origin(request)
@@ -4822,7 +5091,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
@@ -4872,7 +5141,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings/apply",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
@@ -5018,6 +5287,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "total_latency_ms": _recent_request_optional_number(log, "total_latency_ms"),
                     "has_exact_tokens": token_accounting_status == "complete",
                     "token_accounting_status": token_accounting_status,
+                    # Best-effort list-price estimate; null means unavailable,
+                    # never fabricated zero. ``turn_id`` lets a consumer group
+                    # every priced row by turn, not only the raw log tail.
+                    "cost_usd": request_cost_usd(proxy.cost_tracker, log),
+                    "turn_id": log.get("turn_id"),
                     "transforms_applied": log.get("transforms_applied", []),
                     "savings_breakdown": log.get("savings_breakdown", []),
                     "waste_signals": log.get("waste_signals"),
@@ -5725,11 +5999,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         snapshot to avoid rebuilding the full payload on every UI poll.
 
         ``recent_requests`` / ``request_logs`` (per-request ids, providers,
-        models, errors) and ``config`` (backend + savings profile) are embedded
-        only for loopback callers — the local dashboard. Network callers still
-        get the aggregate counters but never the per-request metadata.
+        models, errors), ``config`` (backend + savings profile), per-project
+        savings and the provider quota sections are embedded only for callers
+        :func:`_request_can_view_stats_metadata` admits: loopback (the local
+        dashboard), a trusted dashboard CIDR peer, or a caller that passed the
+        proxy token check. Other network callers still get the aggregate
+        counters but never the per-request metadata.
         """
-        include_sensitive = _request_can_view_dashboard_metadata(
+        include_sensitive = _request_can_view_stats_metadata(
             request,
             trusted_dashboard_client_cidrs,
         )
@@ -5747,13 +6024,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
+            # Same fields /stats-lifetime and /quota withhold from this caller.
+            # Rebuild the nested dicts: the cached snapshot is shared.
+            for tracker in get_quota_registry().trackers:
+                payload.pop(tracker.key, None)
+            for section, key in (("savings", "per_project"), ("persistent_savings", "projects")):
+                nested = payload.get(section)
+                if isinstance(nested, dict):
+                    payload[section] = {k: v for k, v in nested.items() if k != key}
         return payload
 
     @app.get("/stats-lifetime")
     async def stats_lifetime(request: Request):
         """Return persisted lifetime aggregates with sensitive fields gated."""
         payload = dict(proxy.metrics.savings_tracker.lifetime_response())
-        include_sensitive = _request_can_view_dashboard_metadata(
+        include_sensitive = _request_can_view_stats_metadata(
             request,
             trusted_dashboard_client_cidrs,
         )
@@ -6549,13 +6834,55 @@ def _settings_runtime_values(config: ProxyConfig) -> dict[str, Any]:
     return values
 
 
+def _write_worker_secrets(payload: dict[str, Any]) -> Path | None:
+    """Move the credential fields out of ``payload`` into an owner-only file.
+
+    Returns the file's path, or None when the config holds no credential.
+    """
+    secrets = {name: payload.pop(name) for name in PROXY_CONFIG_SECRET_FIELDS if payload.get(name)}
+    if not secrets:
+        return None
+    # mkstemp creates the file with mode 0600.
+    fd, raw_path = tempfile.mkstemp(prefix="headroom-proxy-config-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(secrets, fh)
+    return Path(raw_path)
+
+
+def _read_worker_secrets() -> dict[str, Any]:
+    """Read the credentials the parent wrote for this worker.
+
+    Raises instead of returning nothing when the file is named but unreadable:
+    a worker that fell back to env defaults would come up without the proxy
+    token while still bound to the parent's host.
+    """
+    path = os.environ.get(_MULTI_WORKER_SECRETS_ENV)
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError(
+            f"Worker cannot read its credentials file {path!r} ({type(exc).__name__}). "
+            "The parent proxy writes it at startup and removes it on exit; restart the proxy."
+        ) from exc
+    if not isinstance(values, dict):
+        raise ConfigurationError(
+            f"Worker credentials file {path!r} does not hold a JSON object; restart the proxy."
+        )
+    return values
+
+
 def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
+        worker_secrets = _read_worker_secrets()
         try:
             values = json.loads(raw_config)
             if not isinstance(values, dict):
                 raise TypeError("proxy config JSON must be an object")
+            values.update(worker_secrets)
             if "_rollout_snapshot" in values:
                 rollout_value = values.pop("_rollout_snapshot")
                 from headroom.rollout import RolloutSnapshot
@@ -6598,11 +6925,20 @@ def _proxy_config_from_env() -> ProxyConfig:
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         ccr_buffered_chat_streaming=_get_env_bool("HEADROOM_CCR_BUFFERED_CHAT_STREAMING", False),
+        ccr_inject_system_instructions=(
+            False
+            if (
+                _get_env_bool("HEADROOM_NO_CCR", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
+            )
+            else _get_env_bool("HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS", False)
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
+        omlx_target_api_url=resolve_omlx_target_api_url(environ=os.environ),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
+        factory_api_url=os.environ.get("FACTORY_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
@@ -6640,6 +6976,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         model_router=ModelRouterConfig.from_env(
             os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
             os.environ.get("HEADROOM_MODEL_ROUTES"),
+            os.environ.get("HEADROOM_MODEL_ROUTER_LOG_ONLY"),
         ),
     )
 
@@ -6826,67 +7163,82 @@ def run_server(
 
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
+    worker_secrets_path: Path | None = None
+    # Worker hand-off variables as they were before this run, restored on exit
+    # so a later run in the same process starts from the same state.
+    prior_worker_env = {
+        name: os.environ.get(name) for name in (_MULTI_WORKER_CONFIG_ENV, _MULTI_WORKER_SECRETS_ENV)
+    }
     if sys.platform == "win32":
         _configure_windows_uvicorn_loop(uvicorn_kwargs)
-    if workers > 1:
-        # CompressionCache and PrefixTracker are always per-worker instance vars.
-        # Python CompressionStore defaults to InMemoryBackend (per-process), so
-        # CCR markers written on worker A are invisible to worker B unless a
-        # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
-        # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
-        if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
-            logger.warning(
-                "Headroom is running with workers=%d. Compression cache, "
-                "prefix tracker, TOIN state, and CostTracker are all per-process; "
-                "multi-worker deployments produce avoidable cache busts and an "
-                "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
-                "hits a different worker's partial total) when sessions land on "
-                "different workers. Run --workers 1 or place a sticky-session load "
-                "balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        else:
-            logger.warning(
-                "Headroom is running with workers=%d. The in-memory CCR store, "
-                "compression cache (incl. off-path background compression), prefix "
-                "tracker, TOIN state, and CostTracker are all "
-                "per-process; multi-worker deployments produce silent CCR retrieval "
-                "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
-                "hero tile (each /stats poll hits a different worker's partial total) when "
-                "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
-                "persistent cross-worker CCR store, run --workers 1, or place a "
-                "sticky-session load balancer in front of multiple --workers 1 processes. "
-                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
-                workers,
-            )
-        os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
-        app_target = "headroom.proxy.server:create_app_from_env"
-        uvicorn_kwargs["factory"] = True
-    else:
-        app_target = create_app(config)
-
-    # "warning" keeps the default terminal quiet (uvicorn's access log is one line
-    # per request). It was previously hardcoded, which left deployed proxies with
-    # no way to turn request logging on: operators diagnosing a production
-    # incident could not see uvicorn's view of the traffic at all, with no env var
-    # and no CLI flag to change it. Overridable now; the default is unchanged.
-    uvicorn_log_level = _resolve_uvicorn_log_level()
-
-    # Bind target: a Unix socket when one is configured, otherwise host:port.
-    # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
-    # here rather than passed together.
-    bind_kwargs: dict[str, Any]
     uds_path: Path | None = None
-    if config.uds:
-        from headroom.proxy.uds import prepare_uds_path
-
-        uds_path = prepare_uds_path(config.uds)
-        bind_kwargs = {"uds": str(uds_path)}
-    else:
-        bind_kwargs = {"host": config.host, "port": config.port}
-
+    # Everything from here runs under the cleanup below: once the worker
+    # secrets file exists, any startup failure (a bad --uds path, for
+    # example) must still delete it and restore the hand-off variables.
     try:
+        if workers > 1:
+            # CompressionCache and PrefixTracker are always per-worker instance vars.
+            # Python CompressionStore defaults to InMemoryBackend (per-process), so
+            # CCR markers written on worker A are invisible to worker B unless a
+            # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
+            # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
+            if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
+                logger.warning(
+                    "Headroom is running with workers=%d. Compression cache, "
+                    "prefix tracker, TOIN state, and CostTracker are all per-process; "
+                    "multi-worker deployments produce avoidable cache busts and an "
+                    "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
+                    "hits a different worker's partial total) when sessions land on "
+                    "different workers. Run --workers 1 or place a sticky-session load "
+                    "balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            else:
+                logger.warning(
+                    "Headroom is running with workers=%d. The in-memory CCR store, "
+                    "compression cache (incl. off-path background compression), prefix "
+                    "tracker, TOIN state, and CostTracker are all "
+                    "per-process; multi-worker deployments produce silent CCR retrieval "
+                    "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
+                    "hero tile (each /stats poll hits a different worker's partial total) when "
+                    "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
+                    "persistent cross-worker CCR store, run --workers 1, or place a "
+                    "sticky-session load balancer in front of multiple --workers 1 processes. "
+                    "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                    workers,
+                )
+            worker_config = _proxy_config_payload(config)
+            worker_secrets_path = _write_worker_secrets(worker_config)
+            # A path left by an earlier run in this process names a deleted file.
+            os.environ.pop(_MULTI_WORKER_SECRETS_ENV, None)
+            if worker_secrets_path is not None:
+                os.environ[_MULTI_WORKER_SECRETS_ENV] = str(worker_secrets_path)
+            os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(worker_config)
+            app_target = "headroom.proxy.server:create_app_from_env"
+            uvicorn_kwargs["factory"] = True
+        else:
+            app_target = create_app(config)
+
+        # "warning" keeps the default terminal quiet (uvicorn's access log is one line
+        # per request). It was previously hardcoded, which left deployed proxies with
+        # no way to turn request logging on: operators diagnosing a production
+        # incident could not see uvicorn's view of the traffic at all, with no env var
+        # and no CLI flag to change it. Overridable now; the default is unchanged.
+        uvicorn_log_level = _resolve_uvicorn_log_level()
+
+        # Bind target: a Unix socket when one is configured, otherwise host:port.
+        # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
+        # here rather than passed together.
+        bind_kwargs: dict[str, Any]
+        if config.uds:
+            from headroom.proxy.uds import prepare_uds_path
+
+            uds_path = prepare_uds_path(config.uds)
+            bind_kwargs = {"uds": str(uds_path)}
+        else:
+            bind_kwargs = {"host": config.host, "port": config.port}
+
         _run_uvicorn(
             app_target,
             bind_kwargs,
@@ -6900,6 +7252,14 @@ def run_server(
             from headroom.proxy.uds import remove_uds_path
 
             remove_uds_path(uds_path)
+        if worker_secrets_path is not None:
+            worker_secrets_path.unlink(missing_ok=True)
+        if workers > 1:
+            for name, value in prior_worker_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _run_uvicorn(
@@ -7103,6 +7463,10 @@ if __name__ == "__main__":
         "--vertex-api-url",
         help=f"Custom Vertex AI regional API URL (default: {DEFAULT_VERTEX_API_URL})",
     )
+    parser.add_argument(
+        "--omlx-api-url",
+        help="Custom local oMLX API URL (env: HEADROOM_OMLX_BASE_URL or OMLX_TARGET_API_URL)",
+    )
 
     # Backend (anthropic direct, bedrock, openrouter, anyllm, or litellm-<provider>)
     parser.add_argument(
@@ -7128,6 +7492,14 @@ if __name__ == "__main__":
             "Custom Bedrock InvokeModel upstream for the /model/{id}/invoke "
             "passthrough routes — point at a re-signing gateway, not raw AWS "
             "(env: BEDROCK_TARGET_API_URL)"
+        ),
+    )
+    parser.add_argument(
+        "--factory-api-url",
+        help=(
+            "Factory Droid upstream for /api/* — /api/llm/a/v1/messages is "
+            "compressed, other /api/* paths pass through "
+            "(env: FACTORY_TARGET_API_URL)"
         ),
     )
     parser.add_argument(
@@ -7424,11 +7796,15 @@ if __name__ == "__main__":
             min_value=0,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        omlx_target_api_url=resolve_omlx_target_api_url(
+            getattr(args, "omlx_api_url", None), os.environ
+        ),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
         bedrock_profile=args.bedrock_profile or os.environ.get("AWS_PROFILE"),
         bedrock_api_url=_get_env_str("BEDROCK_TARGET_API_URL", args.bedrock_api_url),
+        factory_api_url=_get_env_str("FACTORY_TARGET_API_URL", args.factory_api_url),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", args.anyllm_provider),
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),

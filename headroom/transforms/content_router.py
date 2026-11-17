@@ -880,9 +880,72 @@ def _command_segments(command: str) -> list[str]:
 
     Splits on ``;``, ``&&`` and ``||`` — never on a single ``|``. Pipelines are kept
     whole so the segment's own writes (``cat a.py | tee b.py``) stay visible; the
-    reduction to the first stage happens in :func:`_segment_is_read`.
+    reduction to the first stage happens in :func:`_segment_is_read`. Separators inside
+    quotes (``sed -n '/a;b/p' foo.py``) are part of an argument, not a new command.
     """
-    return [seg.strip() for seg in _CMD_SEPARATOR_RE.split(command) if seg.strip()]
+    masked = _mask_quoted(command)
+    segments: list[str] = []
+    start = 0
+    for m in _CMD_SEPARATOR_RE.finditer(masked):
+        segments.append(command[start : m.start()])
+        start = m.end()
+    segments.append(command[start:])
+    return [seg.strip() for seg in segments if seg.strip()]
+
+
+def _mask_quoted(command: str) -> str:
+    """Return ``command`` with quoted, escaped and commented characters replaced by ``_``.
+
+    The result has the same length, so match positions map back onto ``command``.
+    Shell operators inside quotes (``sed -n '/x >/p' foo.py``), after a backslash, or
+    inside a comment are not shell syntax, and a search over the masked string does
+    not mistake them for a redirect, pipe or command separator. The quote characters
+    themselves are kept.
+
+    Two shell rules keep word boundaries intact: a backslash-newline is a line
+    continuation, so both characters become spaces (``cat a.py \\<newline>> b.py``
+    still writes ``b.py``); and a ``#`` at the start of a word starts a comment that
+    runs to the end of the line, so quote marks inside it do not open a quote that
+    would hide the next line's separators.
+    """
+    out = list(command)
+    quote = ""
+    i = 0
+    n = len(command)
+    word_start = True
+    while i < n:
+        char = command[i]
+        if char == "\\" and quote != "'":
+            if i + 1 < n and command[i + 1] == "\n":
+                # Line continuation: the shell removes both characters.
+                out[i] = out[i + 1] = " "
+                word_start = True
+            else:
+                out[i] = "_"
+                if i + 1 < n:
+                    out[i + 1] = "_"
+                word_start = False
+            i += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                out[i] = "_"
+        elif char in {"'", '"'}:
+            quote = char
+            word_start = False
+        elif char == "#" and word_start:
+            # Comment to end of line; the newline itself stays visible.
+            while i < n and command[i] != "\n":
+                out[i] = "_"
+                i += 1
+            word_start = True
+            continue
+        else:
+            word_start = char.isspace() or char in ";&|()"
+        i += 1
+    return "".join(out)
 
 
 def _segment_is_read(c: str) -> bool:
@@ -890,9 +953,15 @@ def _segment_is_read(c: str) -> bool:
     # A redirect or `tee` in THIS segment means the segment writes a file rather than
     # reading one (`cat a.py > copy.py`, `cat a.py | tee copy.py`). Checked on the whole
     # segment — pipeline included — before reducing to the stage that touches the file.
-    if re.search(r"(^|\s)(>>?|tee\b)", c):
+    # Both checks run on the quote-masked segment: a `>` or `|` inside a quoted sed
+    # script (`sed -n '/x >/p' a.py`) is part of the argument, not shell syntax.
+    masked = _mask_quoted(c)
+    if re.search(r"(^|\s)(>>?|tee\b)", masked):
         return False
-    c = c.split("|", 1)[0].strip()
+    pipe = masked.find("|")
+    if pipe != -1:
+        c = c[:pipe]
+    c = c.strip()
     if not c:
         return False
     # Parse the real program with the SAME structural parser the search-fold uses
@@ -1213,6 +1282,11 @@ def _resolve_detect_backend() -> str:
 
 _DETECT_TIMEOUT_ENV = "HEADROOM_DETECT_TIMEOUT_SECS"
 _DEFAULT_DETECT_TIMEOUT_SECS = 5.0
+
+# A complete document starts with a DOCTYPE or the root element. The HTML
+# detector scores tags anywhere in the sample, so this is what separates a real
+# page from a fenced example embedded in prose.
+_TOP_LEVEL_HTML_DOCUMENT = re.compile(r"^\s*(?:<!doctype\s+html|<html[\s>])", re.IGNORECASE)
 
 
 def _detect_timeout_secs() -> float:
@@ -1808,6 +1882,9 @@ class CompressionCache:
         # the earlier ones, which may hold an older row (another worker can
         # write the shared store between them).
         self._disk_reads: dict[str, set[int]] = {}
+        # Only in-flight writes are tracked. A replacement or invalidation
+        # revokes the previous token even if its result left the memory budget.
+        self._disk_writes: dict[str, object] = {}
         self._read_seq = 0
         # Callbacks invoked (outside the lock) whenever ``clear()`` runs, so
         # sibling state keyed by the same content keys (e.g. the router's
@@ -1826,8 +1903,8 @@ class CompressionCache:
         self._total_lookup_ns = 0
         self._lookup_count = 0
         self._lock = threading.Lock()
-        # Orders put()'s disk writes, so an older result cannot overwrite or
-        # delete the disk row of a newer one for the same key.
+        # Orders disk writes and invalidations. Mutators release _lock before
+        # acquiring this lock; while holding both, the order is disk then memory.
         self._disk_lock = threading.Lock()
         # Serializes get()'s disk reads (only memory misses read the disk), so
         # a read numbered later also fetched later and saw a row at least as
@@ -1935,19 +2012,26 @@ class CompressionCache:
         with self._lock:
             self._disk_reads.pop(key, None)
             has_marker = self._admit_locked(key, compressed, ratio, strategy)
+            token = object()
+            if self._store is not None:
+                self._disk_writes[key] = token
         if self._store is None:
             return
-        with self._disk_lock:
+        try:
+            with self._disk_lock:
+                with self._lock:
+                    if self._disk_writes.get(key) is not token:
+                        return
+                if has_marker:
+                    # Never kept on disk; nor may an earlier marker-free result for
+                    # this key come back from there once this one leaves memory.
+                    self._store.delete(self._namespace + key)
+                else:
+                    self._store.put(self._namespace + key, compressed, ratio, strategy)
+        finally:
             with self._lock:
-                current = self._results.get(key)
-            if current is not None and current[0] != compressed:
-                return  # a later put() replaced it; its disk write wins
-            if has_marker:
-                # Never kept on disk; nor may an earlier marker-free result for
-                # this key come back from there once this one leaves memory.
-                self._store.delete(self._namespace + key)
-            else:
-                self._store.put(self._namespace + key, compressed, ratio, strategy)
+                if self._disk_writes.get(key) is token:
+                    del self._disk_writes[key]
 
     def mark_skip(self, key: str) -> None:
         """Mark content as non-compressible (Tier 1).  Thread-safe."""
@@ -1957,12 +2041,16 @@ class CompressionCache:
     def move_to_skip(self, key: str) -> None:
         """Move a result to skip set (threshold tightened, no longer qualifies).
         Thread-safe."""
-        with self._lock:
-            self._disk_reads.pop(key, None)
-            self._drop_locked(key)
-            self._skip_locked(key)
-        if self._store is not None:
-            self._store.delete(self._namespace + key)
+        with self._disk_lock:
+            with self._lock:
+                self._disk_reads.pop(key, None)
+                self._disk_writes.pop(key, None)
+                self._drop_locked(key)
+                self._skip_locked(key)
+                # As in clear(), no new disk reader may start until the row
+                # is gone, or it could re-admit the result after invalidation.
+                if self._store is not None:
+                    self._store.delete(self._namespace + key)
 
     def _admit_locked(self, key: str, compressed: str, ratio: float, strategy: str) -> bool:
         """Add a result, evicting least recently used ones over budget; returns
@@ -2033,15 +2121,17 @@ class CompressionCache:
     def clear(self) -> None:
         """Clear all entries, including this router's rows on disk (other
         workers with the same config share them).  Thread-safe."""
-        with self._lock:
-            self._results.clear()
-            self._bytes = 0
-            self._skip.clear()
-            self._disk_reads.clear()
-            # Under the lock, so no disk read can start before the rows are
-            # gone and bring a cleared result back into memory.
-            if self._store is not None:
-                self._store.clear_prefix(self._namespace)
+        with self._disk_lock:
+            with self._lock:
+                self._results.clear()
+                self._bytes = 0
+                self._skip.clear()
+                self._disk_reads.clear()
+                self._disk_writes.clear()
+                # Under the lock, so no disk read can start before the rows are
+                # gone and bring a cleared result back into memory.
+                if self._store is not None:
+                    self._store.clear_prefix(self._namespace)
         # Fire callbacks outside the lock to avoid cross-lock ordering issues.
         for callback in self._on_clear:
             callback()
@@ -3507,6 +3597,31 @@ class ContentRouter(Transform):
             # trust it over the regex heuristics.
             if detection.content_type == ContentType.SOURCE_CODE and detection.confidence >= 0.8:
                 return self._strategy_from_detection(detection)
+            # Same false-positive shape on a complete HTML document: embedded
+            # JSON (``<script type="application/ld+json">``) or ordinary body
+            # prose trips ``has_json_blocks``/``has_prose``, so a page with a
+            # clear DOCTYPE/``<html>`` root still gets routed through MIXED —
+            # split section-by-section instead of reaching the HTML extractor.
+            # The split JSON section can compress well in isolation while the
+            # surrounding markup never gets HTML-specific extraction, and the
+            # split sections lose the parent HTML type entirely.
+            #
+            # No confidence gate here on purpose. ``detect_content_type`` only
+            # returns HTML when its own score clears 0.7 (content_detector
+            # ``_try_detect_html``), and the native backend hardcodes
+            # ``confidence=1.0`` for every result, so a threshold at this call
+            # site would read as "high-confidence only" while never filtering
+            # anything. The detector's gate is the real one.
+            if detection.content_type == ContentType.HTML:
+                # Only a complete top-level document gets the override. The
+                # detector scores tags anywhere in the sample, so a fenced HTML
+                # example inside a prose answer also reads as HTML; extracting
+                # the whole response would drop the surrounding instructions and
+                # the fence lines. Keep that shape on MIXED.
+                document = _strip_detection_envelope(content)
+                if _TOP_LEVEL_HTML_DOCUMENT.match(document):
+                    return self._strategy_from_detection(detection)
+                return CompressionStrategy.MIXED
             return CompressionStrategy.MIXED
 
         # 2. Not mixed — map the detected type straight to a strategy.
@@ -5400,6 +5515,10 @@ class ContentRouter(Transform):
                     self._code_compressor = CodeAwareCompressor(
                         CodeCompressorConfig(
                             enable_ccr=self.config.ccr_inject_marker,
+                            # The code compressor's Kompress fallback builds its
+                            # own KompressCompressor, so it must honour the same
+                            # switch as _get_kompress() (#4719).
+                            fallback_to_kompress=self.config.enable_kompress,
                         )
                     )
                 else:
@@ -5824,6 +5943,9 @@ class ContentRouter(Transform):
           (model weights are cached at module level in kompress_compressor.py,
           so repeated calls with the same model_id are cheap)
         """
+        if not self.config.enable_kompress:
+            return None
+
         model_id = getattr(self, "_runtime_kompress_model", None)
 
         # Explicitly disabled — no ML compression
@@ -6258,8 +6380,9 @@ class ContentRouter(Transform):
             )
         )
 
-        # Pre-process: Read lifecycle management (stale/superseded detection)
-        if self.config.read_lifecycle.enabled:
+        # Pre-process: Read lifecycle management (stale/superseded detection).
+        # Lossless mode keeps every Read: a stale notice drops the bytes.
+        if self.config.read_lifecycle.enabled and not self.config.lossless:
             from .read_lifecycle import ReadLifecycleManager
 
             # is None (not truthiness) so falsy test doubles are honored;
@@ -6273,9 +6396,11 @@ class ContentRouter(Transform):
                 except ImportError:
                     pass
 
+            # Marker-free modes get the notice without a hash nobody can redeem.
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
                 compression_store=injected_store,
+                retrieval_markers=self.config.ccr_inject_marker,
             )
             lifecycle_result = lifecycle_mgr.apply(
                 messages,
@@ -6457,6 +6582,14 @@ class ContentRouter(Transform):
             ),
             num_messages,
         )
+        last_assistant_index = max(
+            (
+                idx
+                for idx, msg in enumerate(messages)
+                if isinstance(msg, dict) and msg.get("role") == "assistant"
+            ),
+            default=-1,
+        )
         model_limit = kwargs.get("model_limit", 0)
 
         # Adaptive Read protection: protect a fraction of recent messages
@@ -6566,6 +6699,7 @@ class ContentRouter(Transform):
             analysis_intent = self._detect_analysis_intent(messages)
 
         frozen_message_count = kwargs.get("frozen_message_count", 0)
+        mutable_turn_start = max(frozen_message_count, last_assistant_index + 1)
 
         # ------------------------------------------------------------------
         # Two-pass parallel compression.
@@ -6721,6 +6855,7 @@ class ContentRouter(Transform):
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
                     prefix_replay_guaranteed=prefix_replay_guaranteed,
                     protect_prompt_text=prompt_turn,
+                    in_mutable_window=(i >= mutable_turn_start),
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -7783,6 +7918,7 @@ class ContentRouter(Transform):
         compress_assistant_text_blocks: bool = False,
         prefix_replay_guaranteed: bool = False,
         protect_prompt_text: bool = False,
+        in_mutable_window: bool | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -7885,14 +8021,13 @@ class ContentRouter(Transform):
         else:
             protect_text_blocks = True
 
-        # The final user/tool message is this turn's fresh content: not yet
-        # forwarded, so its cache_control marker names a key the provider has
-        # not written. Everything earlier may already be cached under its
-        # marker and stays byte-exact (contract 1). Only tool_result blocks
-        # are released; a marked text block is the user's prompt.
-        fresh_turn = (
-            prefix_replay_guaranteed and messages_from_end == 1 and role in ("user", "tool")
-        )
+        # User/tool messages in the mutable turn suffix are this turn's
+        # fresh content: not yet forwarded, so a cache_control marker names a key
+        # the provider has not written. Everything earlier may already be cached
+        # under its marker and stays byte-exact (contract 1). Only tool_result
+        # blocks are released; a marked text block is the user's prompt.
+        is_fresh = in_mutable_window if in_mutable_window is not None else (messages_from_end == 1)
+        fresh_turn = prefix_replay_guaranteed and is_fresh and role in ("user", "tool")
 
         for block in content_blocks:
             if not isinstance(block, dict):
