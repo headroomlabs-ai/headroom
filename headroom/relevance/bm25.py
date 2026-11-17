@@ -242,19 +242,23 @@ class BM25Scorer(RelevanceScorer):
         # redo identical work per item.
         context_freq = Counter(context_tokens)
 
-        # Compute average document length for normalization
-        all_tokens = [self._tokenize(item) for item in items]
-        avg_len = sum(len(t) for t in all_tokens) / max(len(items), 1)
+        # Retain corpus statistics, not the tokens for the entire batch.
+        total_len = 0
+        n_docs = 0
+        doc_freq_across: Counter[str] = Counter()
+        for item in items:
+            tokens = self._tokenize(item)
+            total_len += len(tokens)
+            n_docs += 1
+            doc_freq_across.update({token for token in tokens if token in context_freq})
+            del tokens
+        avg_len = total_len / max(len(items), 1)
 
         # Compute corpus IDF per query term. Unlike single-item scoring,
         # a batch is a real corpus, so document frequency is meaningful:
         # terms that appear in many items are down-weighted while rare,
         # discriminative terms (IDs, UUIDs) are boosted. This is what makes
         # the ranking BM25 rather than plain term-frequency weighting.
-        n_docs = len(all_tokens)
-        doc_freq_across: Counter[str] = Counter()
-        for tokens in all_tokens:
-            doc_freq_across.update(set(tokens))
         idf_map = {
             term: self._compute_idf(term, n_docs, doc_freq_across[term])
             for term in set(context_tokens)
@@ -262,7 +266,9 @@ class BM25Scorer(RelevanceScorer):
         }
 
         results = []
-        for item_tokens in all_tokens:
+        reasons = {0: "BM25: no matches"}
+        for item in items:
+            item_tokens = self._tokenize(item)
             raw_score, matched = self._bm25_score(
                 item_tokens,
                 context_tokens,
@@ -270,6 +276,7 @@ class BM25Scorer(RelevanceScorer):
                 idf_map=idf_map,
                 query_freq=context_freq,
             )
+            del item_tokens
 
             # Normalize
             if self.normalize_score:
@@ -283,10 +290,9 @@ class BM25Scorer(RelevanceScorer):
                 normalized = min(1.0, normalized + 0.3)
 
             match_count = len(matched)
-            if match_count == 0:
-                reason = "BM25: no matches"
-            else:
-                reason = f"BM25: {match_count} terms"
+            if match_count not in reasons:
+                reasons[match_count] = f"BM25: {match_count} terms"
+            reason = reasons[match_count]
 
             results.append(
                 RelevanceScore(
