@@ -151,6 +151,24 @@ def test_source_output_from_search_command_untouched(tokenizer):
     assert out == CODE
 
 
+GO_LOG = "".join(
+    f"2026/09/02 14:{30 + i // 60:02d}:{i % 60:02d} ERROR handler: upstream timeout req={i}\n"
+    for i in range(40)
+)
+
+
+@pytest.mark.parametrize("command", ["grep ERROR /var/log/api.log", "cat /var/log/api.log"])
+def test_go_log_keeps_its_timestamps(command, tokenizer):
+    # Split as path:line:content, `2026/09/02 14:30:00 ...` would fold into a
+    # `2026/09/02 14` header over `30:00 ...` rows. `cat` reaches the search
+    # fold through the router's lossless-first stage, `grep` through the
+    # bash-search fold.
+    out, transforms = _anthropic(command, GO_LOG, tokenizer)
+    assert "router:bash:lossless_search" not in transforms
+    assert "router:tool_result:lossless_search" not in transforms
+    assert "2026/09/02 14" not in out.split("\n")
+
+
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----
 from headroom.transforms.lossless_compaction import (
     compact_lossless as _cl,
