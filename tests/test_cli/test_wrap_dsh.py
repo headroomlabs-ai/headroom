@@ -142,6 +142,10 @@ def test_wrap_dsh_establishes_managed_entry_before_launch_without_home(
     dsh_home = tmp_path / "dsh"
     assert not dsh_home.exists()
 
+    # Serena is opt-in since the code-memory selector landed; the entry this
+    # test asserts on only registers when it is selected.
+    monkeypatch.setenv("HEADROOM_CODE_MEMORY", "serena")
+
     captured: dict[str, object] = {}
     launch_saw_entry: list[bool] = []
 
