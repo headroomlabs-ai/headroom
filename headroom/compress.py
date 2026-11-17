@@ -625,7 +625,7 @@ def _verify_and_revert(
     out: list[dict[str, Any]] = []
     reverted = 0
     for orig, comp in zip(original, compressed):
-        if orig == comp or _message_is_lossless(orig, comp):
+        if _message_is_lossless(orig, comp):
             out.append(comp)
         else:
             out.append(orig)
@@ -655,6 +655,8 @@ def _collect_string_pairs(orig: Any, comp: Any, pairs: list[tuple[str, str]]) ->
     Returns False if the structures diverge in shape (different types, lengths,
     or dict keys) — a shape we cannot verify and must conservatively revert.
     """
+    if orig is comp:
+        return True
     if isinstance(orig, str) and isinstance(comp, str):
         if orig != comp:
             pairs.append((orig, comp))
@@ -669,7 +671,7 @@ def _collect_string_pairs(orig: Any, comp: Any, pairs: list[tuple[str, str]]) ->
         return all(_collect_string_pairs(o, c, pairs) for o, c in zip(orig, comp))
     # Scalars (int/float/bool/None) must match exactly; transforms only touch
     # strings, so a changed non-string is unexpected.
-    return bool(orig == comp)
+    return type(orig) is type(comp) and bool(orig == comp)
 
 
 def _string_pair_is_lossless(original: str, compressed: str) -> bool:
