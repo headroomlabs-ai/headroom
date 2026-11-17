@@ -40,6 +40,25 @@ def _is_tool_result_message(msg: dict) -> bool:
     return False
 
 
+def _tool_result_units(msg: dict) -> list[tuple[int | None, dict]]:
+    """Expose each parallel result to the single-result shape/replay helpers.
+
+    The index identifies its block in the original Anthropic message; OpenAI
+    tool messages contain one result and use None. The wrappers borrow their
+    blocks for reading only: rewriting still goes through the copying helper.
+    """
+    if msg.get("role") == "tool":
+        return [(None, msg)]
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        (i, {"role": msg.get("role"), "content": [block]})
+        for i, block in enumerate(content)
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+
 def _extract_text_from_blocks(blocks: list) -> str | None:
     """Extract joined text from a list-of-blocks content (e.g. Anthropic list-of-text-blocks).
 
@@ -281,8 +300,8 @@ class CompressionCache:
         """Mark all tool_result hashes in messages[:up_to] as stable."""
         with self._lock:
             for msg in messages[:up_to]:
-                if _is_tool_result_message(msg):
-                    content = _extract_tool_result_content(msg)
+                for _, unit in _tool_result_units(msg):
+                    content = _extract_tool_result_content(unit)
                     if content is not None:
                         self._mark_stable_locked(self.content_hash(content))
 
@@ -373,29 +392,29 @@ class CompressionCache:
         with self._lock:
             count = 0
             for msg in messages:
-                if _is_tool_result_message(msg):
+                for _, unit in _tool_result_units(msg):
                     # A joined-text cache/stable hash cannot prove replay for
                     # shapes that apply_cached deliberately leaves untouched.
                     # Anthropic textless results retain their no-rewrite path.
-                    if not _can_swap_tool_result_content(msg):
+                    if not _can_swap_tool_result_content(unit):
                         break
-                    content = _extract_tool_result_content(msg)
+                    content = _extract_tool_result_content(unit)
                     if content is not None:
                         h = self.content_hash(content)
                         if h not in self._cache and h not in self._stable_hashes:
                             break
-                    elif _carries_tool_result_text(msg):
-                        # Text after a textless first tool_result: the cache
-                        # keys a message by its first one, so this text was
-                        # never stored and cannot be byte-replayed.
+                    elif _carries_tool_result_text(unit):
                         break
                     # A tool_result with no text at all (a ToolSearch
                     # tool_reference list, an image) gives the cache nothing
                     # to replay, so it is stable. As a miss it stopped the
                     # count for the rest of the session.
-                # Regular user/assistant/system messages and assistant+tool_use
-                # are always stable — fall through.
-                count += 1
+                else:
+                    # A message freezes only when every parallel result can
+                    # be replayed. Textless results need no cached replacement.
+                    count += 1
+                    continue
+                break
             # Reserve the trailing message as the live zone. `max(0, ...)`
             # handles the empty-list edge case cleanly.
             return min(count, max(0, len(messages) - 1))
@@ -412,25 +431,31 @@ class CompressionCache:
         with self._lock:
             result: list[dict] = []
             for msg in messages:
-                if not _can_swap_tool_result_content(msg):
-                    result.append(msg)
-                    continue
-                if _is_tool_result_message(msg):
-                    content = _extract_tool_result_content(msg)
+                replacement = msg
+                for index, unit in _tool_result_units(msg):
+                    if not _can_swap_tool_result_content(unit):
+                        continue
+                    content = _extract_tool_result_content(unit)
                     if content is not None:
                         h = self.content_hash(content)
                         compressed = self.get_compressed(h)
                         if compressed is not None:
-                            result.append(_swap_tool_result_content(msg, compressed))
-                            continue
-                result.append(msg)
+                            swapped = _swap_tool_result_content(unit, compressed)
+                            if index is None:
+                                replacement = swapped
+                            else:
+                                if replacement is msg:
+                                    replacement = copy.deepcopy(msg)
+                                replacement["content"][index] = swapped["content"][0]
+                result.append(replacement)
             return result
 
     def update_from_result(self, originals: list[dict], compressed: list[dict]) -> None:
         """Cache new compressions by comparing original and compressed messages.
 
-        Index-aligned: for each position, if both are tool results and the
-        content differs, store the mapping original_hash -> compressed_content.
+        Compare messages by position and parallel results by tool-call ID.
+        Each result gets its own original_hash -> compressed_content mapping;
+        text in a later result must not disappear behind the first result's hit.
         """
         if len(originals) != len(compressed):
             logger.warning(
@@ -444,14 +469,28 @@ class CompressionCache:
         # (RLock) safely.
         with self._lock:
             for orig, comp in zip(originals, compressed):
-                orig_content = _extract_tool_result_content(orig)
-                comp_content = _extract_tool_result_content(comp)
-                if orig_content is None or comp_content is None:
+                orig_units = _tool_result_units(orig)
+                comp_units = _tool_result_units(comp)
+                if len(orig_units) != len(comp_units):
                     continue
-                if orig_content == comp_content:
-                    # Content unchanged — mark as stable for frozen count walk
-                    self._mark_stable_locked(self.content_hash(orig_content))
-                    continue
-                h = self.content_hash(orig_content)
-                tokens_saved = len(orig_content) // 4 - len(comp_content) // 4
-                self.store_compressed(h, comp_content, tokens_saved=max(tokens_saved, 0))
+                for (orig_index, orig_unit), (comp_index, comp_unit) in zip(orig_units, comp_units):
+                    if orig_index is None or comp_index is None:
+                        aligned = orig_index == comp_index and orig.get("tool_call_id") == comp.get(
+                            "tool_call_id"
+                        )
+                    else:
+                        aligned = orig_unit["content"][0].get("tool_use_id") == comp_unit[
+                            "content"
+                        ][0].get("tool_use_id")
+                    if not aligned:
+                        continue
+                    orig_content = _extract_tool_result_content(orig_unit)
+                    comp_content = _extract_tool_result_content(comp_unit)
+                    if orig_content is None or comp_content is None:
+                        continue
+                    if orig_content == comp_content:
+                        self._mark_stable_locked(self.content_hash(orig_content))
+                        continue
+                    h = self.content_hash(orig_content)
+                    tokens_saved = len(orig_content) // 4 - len(comp_content) // 4
+                    self.store_compressed(h, comp_content, tokens_saved=max(tokens_saved, 0))
