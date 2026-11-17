@@ -51,6 +51,12 @@ def main() -> None:
         "plugins/headroom-agent-hooks/.github/plugin/plugin.json": _read_json_version(
             ROOT / "plugins/headroom-agent-hooks/.github/plugin/plugin.json"
         ),
+        "plugins/headroom-skill/.claude-plugin/plugin.json": _read_json_version(
+            ROOT / "plugins/headroom-skill/.claude-plugin/plugin.json"
+        ),
+        "plugins/headroom-skill/.github/plugin/plugin.json": _read_json_version(
+            ROOT / "plugins/headroom-skill/.github/plugin/plugin.json"
+        ),
     }
     versions.update(_read_marketplace_versions(ROOT / ".claude-plugin/marketplace.json"))
     versions.update(_read_marketplace_versions(ROOT / ".github/plugin/marketplace.json"))

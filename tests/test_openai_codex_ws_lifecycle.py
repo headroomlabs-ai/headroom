@@ -129,6 +129,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.metrics = _DummyMetrics()
         self.config = SimpleNamespace(
             optimize=False,
+            mode="token",
             retry_max_attempts=1,
             retry_base_delay_ms=1,
             retry_max_delay_ms=1,
@@ -341,6 +342,162 @@ class _FakeUpstream:
         if self._hold_after_events:
             # Wait forever — until the task is cancelled by the handler.
             await asyncio.Event().wait()
+
+
+def _delta_compression_handler():
+    from types import MethodType
+
+    from headroom.transforms.content_router import (
+        CompressionStrategy,
+        ContentRouter,
+        RouterCompressionResult,
+    )
+
+    router = ContentRouter()
+
+    def compress(self, content, **kwargs):
+        return RouterCompressionResult(
+            original=content,
+            compressed="ordinary output compressed",
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+    return handler
+
+
+async def _relay_delta_outputs(handler, calls, call_ids):
+    """Compact Codex wire fixture: the continuation omits its producing calls."""
+    output = " ".join(f"synthetic_original_{i}" for i in range(300))
+    deltas = [
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "previous_response_id": "resp_tools",
+                "input": [
+                    {"type": "custom_tool_call_output", "call_id": call_id, "output": output}
+                ],
+            },
+        }
+        for call_id in call_ids
+    ]
+    completed = asyncio.Event()
+
+    class DeltaClient(_FakeWebSocket):
+        first = True
+
+        async def receive_text(self):
+            if not self.first:
+                await completed.wait()
+            self.first = False
+            return await super().receive_text()
+
+        async def send_text(self, text):
+            await super().send_text(text)
+            if json.loads(text).get("type") == "response.completed":
+                completed.set()
+
+    client = DeltaClient(frames=[_first_frame(), *(json.dumps(frame) for frame in deltas)])
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "resp_tools"}}),
+            *(json.dumps({"type": "response.output_item.done", "item": call}) for call in calls),
+            json.dumps({"type": "response.completed", "response": {"id": "resp_tools"}}),
+        ],
+        hold_after_events=True,
+    )
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client), timeout=2.0)
+    forwarded = [json.loads(frame)["response"] for frame in upstream.sent[1:]]
+    return output, deltas, forwarded
+
+
+def _retrieval_call(call_id):
+    return {
+        "type": "custom_tool_call",
+        "call_id": call_id,
+        "name": "exec",
+        "input": 'const r = await tools.mcp__headroom__headroom_retrieve({hash: "fixture"});text(r);',
+    }
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_retrieval_outputs_and_retries_stay_verbatim():
+    handler = _delta_compression_handler()
+    original, deltas, forwarded = await _relay_delta_outputs(
+        handler, [_retrieval_call("call_delta")], ["call_delta", "call_delta"]
+    )
+
+    assert len(forwarded) == 2
+    assert forwarded == [frame["response"] for frame in deltas]
+    assert all(frame["input"][0]["output"] == original for frame in forwarded)
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_retrieval_old_compressor_signature_fails_open():
+    handler = _delta_compression_handler()
+    calls = 0
+
+    def old_compress(
+        payload,
+        *,
+        model,
+        request_id,
+        timing=None,
+        client=None,
+        savings_tags=None,
+        deadline_started_at=None,
+    ):
+        nonlocal calls
+        calls += 1
+        return {"model": model, "input": "legacy compressed"}, True, 5, ["text"], None, 10, 5, 10
+
+    handler._compress_openai_responses_payload = old_compress
+    original, deltas, forwarded = await _relay_delta_outputs(
+        handler, [_retrieval_call("call_old")], ["call_old", "call_old"]
+    )
+
+    assert calls == 1  # Only the first frame, before any retrieval identity exists.
+    assert forwarded == [frame["response"] for frame in deltas]
+    assert all(frame["input"][0]["output"] == original for frame in forwarded)
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_retrieval_context_does_not_cross_connections():
+    handler = _delta_compression_handler()
+    await _relay_delta_outputs(handler, [_retrieval_call("reused_id")], ["reused_id"])
+    ordinary = {
+        "type": "custom_tool_call",
+        "call_id": "ordinary_id",
+        "name": "exec",
+        "input": 'const r = await tools.exec_command({cmd: "echo synthetic"});text(r);',
+    }
+    original, _deltas, forwarded = await _relay_delta_outputs(
+        handler, [ordinary], ["ordinary_id", "reused_id"]
+    )
+
+    assert len(forwarded) == 2
+    assert all(frame["input"][0]["output"] != original for frame in forwarded)
+
+
+@pytest.mark.asyncio
+async def test_ws_delta_tool_context_limit_preserves_untracked_outputs(monkeypatch, caplog):
+    monkeypatch.setattr(openai_module, "_OPENAI_RESPONSES_TOOL_CONTEXT_LIMIT", 1, raising=False)
+    handler = _delta_compression_handler()
+    original, deltas, forwarded = await _relay_delta_outputs(
+        handler,
+        [_retrieval_call("call_first"), _retrieval_call("call_overflow")],
+        ["call_first", "call_overflow"],
+    )
+
+    assert len(forwarded) == 2
+    assert forwarded == [frame["response"] for frame in deltas]
+    assert all(frame["input"][0]["output"] == original for frame in forwarded)
+    assert "WS retrieval context limit reached" in caplog.text
 
 
 def _make_fake_websockets_module(
@@ -2044,6 +2201,113 @@ async def test_ws_memory_enabled_non_memory_response_streams_completion():
     assert forwarded_initial["include"] == ["reasoning.encrypted_content"]
     assert client_ws.sent_text == upstream_events
     assert len(upstream.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_context_lookup_exception_fails_open_and_survives_subsequent_traffic():
+    import sqlite3
+
+    class _FailingWsContextMemoryHandler(_MemoryWsHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config.inject_context = True
+            self.config.inject_tools = False
+            self.call_count = 0
+
+        async def search_and_format_context(self, user_id, messages, **kwargs):
+            self.call_count += 1
+            raise sqlite3.OperationalError("unable to open database file")
+
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "turn 1 original",
+            },
+        }
+    )
+    second_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "turn 2 original",
+            },
+        }
+    )
+    turn1_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    turn2_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-2"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-2"}}),
+    ]
+    expected_events = turn1_events + turn2_events
+
+    first_sent = asyncio.Event()
+    second_sent = asyncio.Event()
+    turn1_done = asyncio.Event()
+    turn2_done = asyncio.Event()
+    both_completed = asyncio.Event()
+
+    class _CoordinatedUpstream(_FakeUpstream):
+        async def send(self, payload: str) -> None:
+            self.sent.append(payload)
+            if len(self.sent) == 1:
+                first_sent.set()
+            elif len(self.sent) == 2:
+                second_sent.set()
+
+        async def _iter(self):
+            await first_sent.wait()
+            for ev in turn1_events:
+                yield ev
+            await second_sent.wait()
+            for ev in turn2_events:
+                yield ev
+            await both_completed.wait()
+
+    class _CoordinatedClientWebSocket(_FakeWebSocket):
+        async def send_text(self, text: str) -> None:
+            await super().send_text(text)
+            if '"id": "r-1"' in text and "response.completed" in text:
+                turn1_done.set()
+            elif '"id": "r-2"' in text and "response.completed" in text:
+                turn2_done.set()
+                both_completed.set()
+
+        async def receive_text(self) -> str:
+            if not first_sent.is_set():
+                return first_frame
+            await turn1_done.wait()
+            if not second_sent.is_set():
+                return second_frame
+            await turn2_done.wait()
+            raise _FakeWebSocketDisconnect("client closed")
+
+    upstream = _CoordinatedUpstream([])
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _CoordinatedClientWebSocket([])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    memory_handler = _FailingWsContextMemoryHandler()
+    handler.memory_handler = memory_handler
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=5.0)
+
+    # Both turns must reach upstream without injected memory
+    assert len(upstream.sent) == 2
+    sent0 = json.loads(upstream.sent[0])["response"]
+    sent1 = json.loads(upstream.sent[1])["response"]
+    assert sent0["input"] == "turn 1 original"
+    assert sent1["input"] == "turn 2 original"
+
+    # Streaming socket connection survived and client received all upstream events
+    assert client_ws.sent_text == expected_events
+    assert memory_handler.call_count == 2
 
 
 @pytest.mark.asyncio

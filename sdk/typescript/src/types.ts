@@ -5,12 +5,22 @@
 
 import type { CompressionHooks } from "./hooks.js";
 import type { CompressRequestConfig } from "./types/config.js";
+import type { MessageFormat } from "./utils/format.js";
 
 // --- Message types (OpenAI chat format) ---
+
+/**
+ * Provider-specific options as the Vercel AI SDK attaches them to messages and
+ * parts (`{ anthropic: { cacheControl }, google: { thoughtSignature }, ... }`).
+ * The SDK carries them through `/v1/compress` unchanged so the AI SDK provider
+ * sees exactly what it produced; they are never sent to an OpenAI endpoint.
+ */
+export type ProviderOptions = Record<string, Record<string, unknown>>;
 
 export interface TextContentPart {
   type: "text";
   text: string;
+  providerOptions?: ProviderOptions;
 }
 
 export interface ImageContentPart {
@@ -18,22 +28,53 @@ export interface ImageContentPart {
   image_url: { url: string; detail?: "auto" | "low" | "high" };
 }
 
-export type ContentPart = TextContentPart | ImageContentPart;
+/**
+ * A Vercel AI SDK `reasoning` part (the assistant's thinking, with the
+ * provider's signature or redacted data in `providerOptions`). Carried verbatim
+ * through `/v1/compress`, which passes unknown parts through, so the provider
+ * gets its reasoning back on the next step of a tool loop.
+ */
+export interface ReasoningContentPart {
+  type: "reasoning";
+  text: string;
+  providerOptions?: ProviderOptions;
+}
+
+/**
+ * Other Vercel AI SDK assistant parts with no OpenAI equivalent, carried verbatim
+ * the same way: `reasoning-file`, `custom`, provider-executed `tool-result`,
+ * `tool-approval-request`.
+ */
+export interface PassthroughContentPart {
+  type: "reasoning-file" | "custom" | "tool-result" | "tool-approval-request";
+  [key: string]: unknown;
+}
+
+export type ContentPart =
+  | TextContentPart
+  | ImageContentPart
+  | ReasoningContentPart
+  | PassthroughContentPart;
 
 export interface ToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+  /** Vercel AI SDK: the call was executed by the provider. Carried, never sent to OpenAI. */
+  providerExecuted?: boolean;
+  providerOptions?: ProviderOptions;
 }
 
 export interface SystemMessage {
   role: "system";
   content: string;
+  providerOptions?: ProviderOptions;
 }
 
 export interface UserMessage {
   role: "user";
   content: string | ContentPart[];
+  providerOptions?: ProviderOptions;
 }
 
 export interface AssistantMessage {
@@ -44,12 +85,37 @@ export interface AssistantMessage {
    */
   content: string | ContentPart[] | null;
   tool_calls?: ToolCall[];
+  providerOptions?: ProviderOptions;
+}
+
+/**
+ * A member of a Vercel AI SDK tool-result `content` output other than text: a
+ * LanguageModelV4 `file` or `custom` part, or a LanguageModelV3 `file-data`,
+ * `file-url`, `file-id`, `image-data`, `image-url` or `image-file-id` part.
+ * Carried verbatim through `/v1/compress`, which passes unknown parts through.
+ */
+export interface ToolResultMediaPart {
+  type: string;
+  [key: string]: unknown;
 }
 
 export interface ToolMessage {
   role: "tool";
-  content: string;
+  /**
+   * The tool output. A Vercel AI SDK `content` output keeps its member list: the
+   * proxy compresses the text members as fragments of one tool result and passes
+   * the rest through.
+   */
+  content: string | Array<TextContentPart | ToolResultMediaPart>;
   tool_call_id: string;
+  /**
+   * Vercel AI SDK: the result's `output` without its `value`, which travels as
+   * `content`. Brings the output kind (`error-text`, `execution-denied`, ...), the
+   * denial reason and the output's own providerOptions back. Carried, never sent
+   * to OpenAI.
+   */
+  output?: { type: string; reason?: string; providerOptions?: ProviderOptions };
+  providerOptions?: ProviderOptions;
 }
 
 export type OpenAIMessage =
@@ -77,6 +143,11 @@ export interface CompressOptions {
   /** Per-call /v1/compress config, merged over the client-level config
    *  (per-call keys override at the top level). */
   config?: CompressRequestConfig;
+  /**
+   * The format of `messages`, when the caller knows it. Skips autodetection,
+   * which cannot tell a text-only Vercel AI SDK prompt from OpenAI messages.
+   */
+  format?: MessageFormat;
 }
 
 export interface CompressResult {

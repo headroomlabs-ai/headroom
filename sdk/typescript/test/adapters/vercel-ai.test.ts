@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { LanguageModelV3, LanguageModelV4FilePart, LanguageModelV4Prompt } from "@ai-sdk/provider";
+import type { LanguageModelV3, LanguageModelV3Prompt, LanguageModelV4FilePart, LanguageModelV4Prompt } from "@ai-sdk/provider";
 import {
   headroomMiddleware,
   compressVercelMessages,
@@ -510,5 +510,138 @@ describe("withHeadroom", () => {
     } as any);
 
     expect(fakeModel.doGenerate).toHaveBeenCalled();
+  });
+});
+
+describe("headroomMiddleware carries provider reasoning state", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("restores reasoning parts and providerOptions after a compressed round trip", async () => {
+    // Step two of a thinking-enabled tool loop, as the AI SDK hands it to transformParams.
+    const prompt: LanguageModelV3Prompt = [
+      { role: "system", content: "Be brief.", providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } },
+      { role: "user", content: [{ type: "text", text: "Read the gateway log." }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "I should read the log first.", providerOptions: { anthropic: { signature: "SIG-abc123" } } },
+          { type: "text", text: "Reading the log now.", providerOptions: { google: { thoughtSignature: "TS-text" } } },
+          {
+            type: "tool-call",
+            toolCallId: "call_01",
+            toolName: "fetch_gateway_metrics",
+            input: { path: "/var/log/gateway.json" },
+            providerOptions: { google: { thoughtSignature: "TS-999" } },
+          },
+        ],
+        providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call_01",
+            toolName: "fetch_gateway_metrics",
+            output: { type: "text", value: "row 1\nrow 2\nrow 3\nrow 4" },
+            providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+          },
+        ],
+      },
+    ];
+    // The proxy rewrites only the tool message's content and passes everything else through.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => {
+      const messages = JSON.parse(init.body).messages;
+      messages[3] = { ...messages[3], content: "[4 rows]" };
+      return mockCompressResponse(messages);
+    });
+
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v3" }, type: "generate" });
+
+    const expected = structuredClone(prompt) as any[];
+    expected[3].content[0].output = { type: "text", value: "[4 rows]" };
+    expect(out.prompt).toEqual(expected);
+  });
+});
+
+describe("headroomMiddleware keeps provider-executed tool calls in place", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("returns an interleaved web-search turn in its original order after the round trip", async () => {
+    const prompt: LanguageModelV3Prompt = [
+      { role: "user", content: [{ type: "text", text: "What is Headroom?" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "Search first.", providerOptions: { openai: { itemId: "rs_1" } } },
+          { type: "tool-call", toolCallId: "ws_1", toolName: "web_search", input: { query: "Headroom" }, providerExecuted: true },
+          { type: "tool-result", toolCallId: "ws_1", toolName: "web_search", output: { type: "json", value: { hits: 3 } } },
+          { type: "reasoning", text: "Three hits.", providerOptions: { openai: { itemId: "rs_2" } } },
+          { type: "text", text: "Headroom is a context-compression proxy." },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "Now read the gateway log." }] },
+    ];
+    // The proxy passes this prompt through unchanged.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => mockCompressResponse(JSON.parse(init.body).messages));
+
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v3" }, type: "generate" });
+
+    expect(out.prompt).toEqual(prompt);
+  });
+});
+
+describe("headroomMiddleware keeps tool-result output kinds", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  it("returns denied, multi-part and error results exactly as the AI SDK sent them", async () => {
+    const prompt: LanguageModelV4Prompt = [
+      { role: "user", content: [{ type: "text", text: "Deploy, then screenshot the dashboard." }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "call_1", toolName: "deploy", input: { env: "prod" } },
+          { type: "tool-call", toolCallId: "call_2", toolName: "screenshot", input: {} },
+          { type: "tool-call", toolCallId: "call_3", toolName: "fetch_gateway_metrics", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "call_1", toolName: "deploy", output: { type: "execution-denied", reason: "Not from CI." } },
+          {
+            type: "tool-result",
+            toolCallId: "call_2",
+            toolName: "screenshot",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "Dashboard at 12:00." },
+                { type: "file", data: { type: "data", data: "iVBORw0KGgo=" }, mediaType: "image/png", filename: "dashboard.png" },
+              ],
+            },
+          },
+          { type: "tool-result", toolCallId: "call_3", toolName: "fetch_gateway_metrics", output: { type: "error-text", value: "ECONNREFUSED 10.0.0.7:443" } },
+        ],
+      },
+    ];
+    // The proxy passes this prompt through unchanged.
+    mockFetch.mockImplementationOnce(async (_url: string, init: any) => mockCompressResponse(JSON.parse(init.body).messages));
+
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v4" }, type: "generate" });
+
+    expect(out.prompt.slice(0, 2)).toEqual(prompt.slice(0, 2));
+    // One OpenAI tool message per result, so a multi-result tool message comes back as one
+    // message per result; the results themselves are the AI SDK's own.
+    expect(out.prompt.slice(2).flatMap((m: any) => m.content)).toEqual(prompt[2].content);
   });
 });

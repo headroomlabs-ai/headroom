@@ -12,12 +12,15 @@ scripts/
 !scripts/
 scripts/*
 !scripts/install.sh
+!scripts/install-rustup.sh
+!scripts/install-opencode.sh
 !scripts/install.ps1
 !scripts/version-sync.py
 !scripts/sync-plugin-versions.py
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
 !scripts/verify-ruff-version.py
+!scripts/normalize_release_pr_bodies.py
 !scripts/pr-governance.py
 !scripts/bootstrap-windows-dev.ps1
 !scripts/codeql_triage.sh

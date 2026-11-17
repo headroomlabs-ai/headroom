@@ -25,7 +25,7 @@ Model: `gpt-4o-mini` | Suite cost: ~$3 | Duration: ~15 min
 ## Installation
 
 ```bash
-pip install "headroom-ai[all]"    # Everything including evals (recommended)
+pip install "headroom-ai[all,evals]"    # CLI/proxy feature set plus evaluation dependencies
 pip install "headroom-ai[evals]"  # Evaluation framework only
 ```
 
@@ -234,7 +234,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: pip install -e ".[all]"
+      - run: pip install -e ".[all,evals]"
       - name: CCR Round-trip (zero cost)
         run: |
           python -c "
