@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import warnings
 from typing import TYPE_CHECKING, Any
 
 from .config import Block, WasteSignals
@@ -539,7 +540,16 @@ def find_tool_units(messages: list[dict[str, Any]]) -> list[tuple[int, list[int]
 
     Returns:
         List of (assistant_index, [tool_response_indices]) tuples.
+
+    .. deprecated::
+        Nothing in Headroom uses it since the rolling-window stage was
+        retired. It has no replacement.
     """
+    warnings.warn(
+        "find_tool_units is deprecated and will be removed in a future release; it has no replacement.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     units: list[tuple[int, list[int]]] = []
 
     # Build map of tool_call_id -> message index for tool responses
@@ -608,7 +618,16 @@ def find_tool_units(messages: list[dict[str, Any]]) -> list[tuple[int, list[int]
 
 
 def get_message_content_text(message: dict[str, Any]) -> str:
-    """Extract text content from a message."""
+    """Extract text content from a message.
+
+    .. deprecated::
+        Nothing in Headroom uses it. It has no replacement.
+    """
+    warnings.warn(
+        "get_message_content_text is deprecated and will be removed in a future release; it has no replacement.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     content = message.get("content")
     if content is None:
         return ""

@@ -73,8 +73,14 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from ._ort import ensure_ort_dylib_pinned
+from ._ort import disable_ort_telemetry_by_default, ensure_ort_dylib_pinned
 from ._version import __version__  # noqa: F401
+from .offline import pin_litellm_cost_map_local
+
+# Must run before any ONNX Runtime initializes (Python package or the Rust
+# core's dylib): ORT reads ORT_DISABLE_TELEMETRY once, at startup, and
+# otherwise uploads usage telemetry to Microsoft. See `headroom/_ort.py`.
+disable_ort_telemetry_by_default()
 
 # Must run before anything can import `headroom._core`: on Windows the
 # Rust core resolves onnxruntime.dll at runtime (ort load-dynamic), and
@@ -82,6 +88,12 @@ from ._version import __version__  # noqa: F401
 # deadlocks ort session init (Win11 24H2+). Windows-gated, idempotent,
 # ~microseconds. See `headroom/_ort.py` for the full story.
 ensure_ort_dylib_pinned()
+
+# Under HEADROOM_OFFLINE, litellm must not fetch its pricing table from GitHub
+# at import time. Each litellm import in this package pins that itself; this
+# call also covers a host that imports litellm after Headroom. A no-op unless
+# the switch is set. See `headroom/offline.py`.
+pin_litellm_cost_map_local()
 
 from .compress import (  # noqa: E402
     CompressConfig,

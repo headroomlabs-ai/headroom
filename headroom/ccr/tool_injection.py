@@ -154,6 +154,8 @@ def create_ccr_tool_definition(
 def create_system_instructions(
     hashes: list[str],
     retrieval_endpoint: str = "/v1/retrieve",
+    *,
+    retrieval_tool_name: str = CCR_TOOL_NAME,
 ) -> str:
     """Create system message instructions for CCR retrieval.
 
@@ -163,6 +165,7 @@ def create_system_instructions(
     Args:
         hashes: List of hash keys for compressed content in this context.
         retrieval_endpoint: The endpoint path for retrieval.
+        retrieval_tool_name: Executable tool name from the client's registry.
 
     Returns:
         Instruction text to append to system message.
@@ -173,10 +176,10 @@ def create_system_instructions(
 ## Compressed Context Available
 
 Some tool outputs have been compressed to reduce context size. If you need
-the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
+the full uncompressed data, you can retrieve it using the `{retrieval_tool_name}` tool.
 
 **How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
+- Call `{retrieval_tool_name}(hash="<hash>")` to get the full original content back
 
 **Available hashes:** {hash_list}
 
@@ -456,11 +459,10 @@ class CCRToolInjector:
 
         tools = tools or []
 
-        # Check if already present (e.g., from MCP server)
-        for tool in tools:
-            tool_name = tool.get("name") or tool.get("function", {}).get("name")
-            if tool_name == CCR_TOOL_NAME:
-                return tools, False  # Already present, skip injection
+        from .tool_calls import client_retrieval_tool_name
+
+        if client_retrieval_tool_name(tools):
+            return tools, False  # Already present, skip injection
 
         # Add CCR tool
         ccr_tool = create_ccr_tool_definition(self.provider)
@@ -469,11 +471,13 @@ class CCRToolInjector:
     def inject_into_system_message(
         self,
         messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Inject retrieval instructions into system message.
 
         Args:
             messages: List of messages.
+            tools: Available tool definitions for selecting an executable retrieval name.
 
         Returns:
             Updated messages with instructions added to system message.
@@ -481,9 +485,12 @@ class CCRToolInjector:
         if not self.inject_system_instructions or not self.has_compressed_content:
             return messages
 
+        from .tool_calls import client_retrieval_tool_name
+
         instructions = create_system_instructions(
             self._detected_hashes,
             self.retrieval_endpoint,
+            retrieval_tool_name=client_retrieval_tool_name(tools) or CCR_TOOL_NAME,
         )
 
         # Find and update system message
@@ -567,7 +574,7 @@ class CCRToolInjector:
         updated_tools, was_injected = self.inject_tool_definition(
             tools, session_has_done_ccr=session_has_done_ccr
         )
-        updated_messages = self.inject_into_system_message(messages)
+        updated_messages = self.inject_into_system_message(messages, tools=updated_tools)
 
         return updated_messages, updated_tools if updated_tools else None, was_injected
 

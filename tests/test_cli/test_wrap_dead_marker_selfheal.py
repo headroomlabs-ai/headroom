@@ -49,23 +49,6 @@ def _listening_port() -> Iterator[int]:
         s.close()
 
 
-# --- _wrap_marker_proxy_is_dead -------------------------------------------
-
-
-def test_proxy_is_dead_when_port_not_listening() -> None:
-    assert wrap_cli._wrap_marker_proxy_is_dead({"port": _closed_port()}) is True
-
-
-def test_proxy_is_not_dead_when_port_listening() -> None:
-    with _listening_port() as port:
-        assert wrap_cli._wrap_marker_proxy_is_dead({"port": port}) is False
-
-
-def test_proxy_is_not_dead_when_no_port_recorded() -> None:
-    # No port → fall back to PID-based staleness, so not "dead" by port here.
-    assert wrap_cli._wrap_marker_proxy_is_dead({}) is False
-
-
 # --- _check_and_clear_dead_wrap_marker ------------------------------------
 
 
@@ -334,3 +317,74 @@ def test_selfheal_command_preserves_live_marker(tmp_path: Path, monkeypatch) -> 
 def test_selfheal_never_raises_without_settings(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     wrap_cli._selfheal_dead_wrap_base_url()  # no .claude dir at all — silent no-op
+
+
+def test_wrap_selfheal_hook_overwrites_drifted_command(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup|resume",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"/usr/bin/claude wrap selfheal --marker {_HOOK_MARKER}",
+                                    "timeout": 10,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    wrap_cli._ensure_claude_wrap_selfheal_hook(path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    entries = payload["hooks"]["SessionStart"]
+    assert len(entries) == 1
+    command = entries[0]["hooks"][0]["command"]
+    assert "/usr/bin/claude" not in command
+    assert "wrap selfheal" in command
+    assert _HOOK_MARKER in command
+
+
+def test_wrap_selfheal_hook_skips_malformed_sessionstart_entries(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        "not-a-dict",
+                        {"matcher": "startup", "hooks": "not-a-list"},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    wrap_cli._ensure_claude_wrap_selfheal_hook(path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    entries = payload["hooks"]["SessionStart"]
+    assert entries[0] == "not-a-dict"
+    assert entries[1] == {"matcher": "startup", "hooks": "not-a-list"}
+    marked = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("hooks"), list)
+        and any(_HOOK_MARKER in h.get("command", "") for h in entry["hooks"])
+    ]
+    assert len(marked) == 1

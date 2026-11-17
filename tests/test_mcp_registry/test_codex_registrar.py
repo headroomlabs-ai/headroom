@@ -228,6 +228,42 @@ def test_register_appends_to_existing_config_preserves_other_keys(tmp_path: Path
     assert parsed["mcp_servers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
 
 
+def test_evict_foreign_tables_ignores_header_text_inside_string() -> None:
+    # TOML allows U+2028 in a single-line string, so "[foreign]" here is part
+    # of the value, not a table header to move out of the span.
+    from headroom.mcp_registry.codex import _MARKER_END, _MARKER_START, _evict_foreign_tables
+
+    content = (
+        f"{_MARKER_START}\n"
+        "[mcp_servers.headroom]\n"
+        'note = "x [foreign] #"\n'
+        f"{_MARKER_END}\n"
+        'model = "gpt-5"\n'
+    )
+    assert _evict_foreign_tables(content, "headroom", _MARKER_START, _MARKER_END) == content
+
+
+def test_register_accepts_multiline_inline_table(tmp_path: Path) -> None:
+    # Codex accepts an inline table split across lines (#4378); registering must
+    # not refuse the file as invalid TOML, and the user's text must be kept as is.
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = (
+        "[mcp_servers.dingtalk]\n"
+        'command = "npx"\n'
+        "env = {\n"
+        '  DINGTALK_Client_ID = "**********",\n'
+        "  \n"
+        "    }\n"
+    )
+    cfg.write_text(original)
+    result = _make_registrar(tmp_path).register_server(_spec())
+    assert result.status == RegisterStatus.REGISTERED, result.detail
+    text = cfg.read_text()
+    assert text.startswith(original)
+    assert "[mcp_servers.headroom]" in text
+
+
 def test_register_includes_env_subtable(tmp_path: Path) -> None:
     spec = _spec(env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"})
     _make_registrar(tmp_path).register_server(spec)

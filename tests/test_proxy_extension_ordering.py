@@ -104,6 +104,31 @@ class _BufferingExtension:
         await self.app(scope, replay_receive, send)
 
 
+class _DenyAllExtension:
+    """Raw ASGI middleware that refuses every HTTP request with 403.
+
+    Mirrors an extension that enforces its own access policy (an allowlist, a
+    licence gate) on everything the proxy serves.
+    """
+
+    seen: list[str] = []
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        type(self).seen.append(scope.get("path"))
+        await send({"type": "http.response.start", "status": 403, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+
+def _install_deny_all(app: Any, config: Any) -> None:
+    app.add_middleware(_DenyAllExtension)
+
+
 def _install_recording(app: Any, config: Any) -> None:
     app.add_middleware(_RecordingExtension)
 
@@ -116,6 +141,7 @@ def _install_buffering(app: Any, config: Any) -> None:
 def _reset_state() -> None:
     _RecordingExtension.seen = []
     _BufferingExtension.max_seen = 0
+    _DenyAllExtension.seen = []
 
 
 def _make_app(monkeypatch, install, **overrides) -> Any:
@@ -162,6 +188,16 @@ class TestExtensionMiddlewareIsInsideTheSecurityGate:
             resp = c.post("/", json={})
         assert resp.status_code == 200
         assert [s["path"] for s in _RecordingExtension.seen] == ["/"]
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD"])
+    def test_api_hello_probe_still_runs_extension_policy(self, monkeypatch, method):
+        """The token-less /api/hello probe passes the token gate, but an
+        extension that refuses everything still refuses it."""
+        app = _make_app(monkeypatch, _install_deny_all, proxy_token=TOKEN)
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            resp = c.request(method, "/api/hello")
+        assert resp.status_code == 403
+        assert _DenyAllExtension.seen == ["/api/hello"]
 
     def test_health_probe_stays_exempt_with_extension_installed(self, monkeypatch):
         app = _make_app(monkeypatch, _install_recording, proxy_token=TOKEN)

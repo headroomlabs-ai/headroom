@@ -215,17 +215,23 @@ def detect_content_type(content: str) -> DetectionResult:
     if html_result and html_result.confidence >= 0.7:
         return html_result
 
-    # 4. Check for search results (file:line: format)
+    # Git's human-readable status is structured state, not prose. Recognize it
+    # before the lossy search/log/plain-text routes.
+    git_status_result = _try_detect_git_status(content)
+    if git_status_result:
+        return git_status_result
+
+    # 5. Check for search results (file:line: format)
     search_result = _try_detect_search(content)
     if search_result and search_result.confidence >= 0.6:
         return search_result
 
-    # 5. Check for build/log output
+    # 6. Check for build/log output
     log_result = _try_detect_log(content)
     if log_result and log_result.confidence >= 0.5:
         return log_result
 
-    # 6. Check for tabular data (CSV/TSV, markdown tables). Runs after
+    # 7. Check for tabular data (CSV/TSV, markdown tables). Runs after
     #    search/log so colon-delimited search output and freeform logs claim
     #    their content first; tabular requires a consistent multi-column
     #    delimiter or a markdown header+separator pair.
@@ -233,26 +239,73 @@ def detect_content_type(content: str) -> DetectionResult:
     if tabular_result and tabular_result.confidence >= 0.6:
         return tabular_result
 
-    # 7. Check for structured config (YAML/TOML/INI). Runs after tabular so
+    # 8. Check for structured config (YAML/TOML/INI). Runs after tabular so
     #    delimited data keeps its claim, and before code so config files with
     #    code-ish lines route to the structure-aware config compressor.
     config_result = _try_detect_structured_config(content)
     if config_result and config_result.confidence >= 0.6:
         return config_result
 
-    # 8. Check for source code
+    # 9. Check for source code
     code_result = _try_detect_code(content)
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 9. Space-aligned command output (`ls -l`, `ps aux`, `docker ps`). Last,
-    #    so it only claims content that would otherwise be plain text.
+    # 10. Space-aligned command output is last, only claims what would
+    #     otherwise be plain text.
     fixed_width_result = _try_detect_fixed_width(content)
     if fixed_width_result:
         return fixed_width_result
 
-    # 10. Fallback to plain text
+    # 11. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
+
+
+_GIT_STATUS_HEADERS = frozenset(
+    {
+        "Changes to be committed:",
+        "Changes not staged for commit:",
+        "Untracked files:",
+        "Unmerged paths:",
+    }
+)
+_GIT_STATUS_ENTRY_RE = re.compile(
+    r"^\s+(?:new file|modified|deleted|renamed|copied|typechange|"
+    r"both modified|both added|both deleted|added by us|deleted by us|"
+    r"added by them|deleted by them):\s+\S"
+)
+
+
+def _try_detect_git_status(content: str) -> DetectionResult | None:
+    """Recognize standard ``git status`` headings and path entries narrowly."""
+    first = content.partition("\n")[0]
+    if not first.startswith(("On branch ", "HEAD detached at ", "HEAD detached from ")):
+        return None
+    lines = content.splitlines()
+
+    has_heading = False
+    has_path = False
+    section: str | None = None
+    for line in lines[1:]:
+        if line in _GIT_STATUS_HEADERS:
+            has_heading = True
+            section = line
+        elif line in {"", "Changes not staged for commit:", "nothing to commit"}:
+            continue
+        elif line.startswith("Your branch ") or line.startswith("  (use "):
+            continue
+        elif section == "Untracked files:" and line.startswith("\t") and line[1:].strip():
+            has_path = True
+        elif section in {
+            "Changes to be committed:",
+            "Changes not staged for commit:",
+            "Unmerged paths:",
+        } and _GIT_STATUS_ENTRY_RE.match(line):
+            has_path = True
+
+    if not (has_heading and has_path):
+        return None
+    return DetectionResult(ContentType.TABULAR, 1.0, {"format": "git_status"})
 
 
 _JSON_DECODER = json.JSONDecoder()
@@ -717,9 +770,50 @@ def _try_detect_tabular(content: str) -> DetectionResult | None:
 
     md_result = _try_detect_markdown_table(lines)
     if md_result:
-        return md_result
+        # The tabular compressor replaces the whole payload with the table's
+        # rows, so a table with a heading, prose or other output around it is
+        # not tabular content: every line outside the table would be dropped.
+        if _is_whole_markdown_table(content):
+            return md_result
+        # It can still be CSV holding markdown in a quoted field. Its pipes
+        # belong to that markdown, so they are never the delimiter here.
+        delimited = _try_detect_delimited(lines)
+        if delimited and delimited.metadata.get("delimiter") != "|":
+            return delimited
+        return None
 
     return _try_detect_delimited(lines)
+
+
+def _is_whole_markdown_table(content: str) -> bool:
+    """True when ``content`` is one markdown table and nothing else.
+
+    A blank line ends a markdown table, so every line after the header and
+    separator has to be a row: written in the header's leading-pipe style,
+    and neither another separator nor a list item. A note or a second table
+    straight after the rows means the content is not just the table.
+
+    Every row must also split into exactly the header's cells, the way the
+    tabular parser splits it, or the records built from it would truncate or
+    pad the row. The parser does not unescape ``\\|``, so a table that uses it
+    is left alone too.
+    """
+    if "\\|" in content:
+        return False
+    rows = content.strip().split("\n")
+    if len(rows) < 3 or not _is_md_separator(rows[1]):
+        return False
+    cols = _md_cell_count(rows[0])
+    if cols < 2:
+        return False
+    leading_pipe = rows[0].lstrip().startswith("|")
+    return all(
+        _md_cell_count(row) == cols
+        and row.lstrip().startswith("|") == leading_pipe
+        and not _is_md_separator(row)
+        and not _FIXED_WIDTH_LIST_RE.match(row)
+        for row in rows[2:]
+    )
 
 
 # Fixed-width (space-aligned) command output: `ls -l`, `ps aux`, `df -h`,
@@ -955,21 +1049,4 @@ def _try_detect_code(content: str) -> DetectionResult | None:
         ContentType.SOURCE_CODE,
         confidence,
         {"language": best_lang, "pattern_matches": best_score},
-    )
-
-
-def is_json_array_of_dicts(content: str) -> bool:
-    """Quick check if content is a JSON array of dictionaries.
-
-    This is the format SmartCrusher can handle natively.
-
-    Args:
-        content: The content to check.
-
-    Returns:
-        True if content is a JSON array where all items are dicts.
-    """
-    result = detect_content_type(content)
-    return result.content_type == ContentType.JSON_ARRAY and result.metadata.get(
-        "is_dict_array", False
     )

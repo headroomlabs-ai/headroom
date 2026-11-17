@@ -21,7 +21,6 @@ from headroom.learn.analyzer import (
     _strip_fenced_json,
 )
 from headroom.learn.models import (
-    AnalysisResult,
     ErrorCategory,
     ProjectInfo,
     RecommendationTarget,
@@ -71,7 +70,7 @@ class TestDigestBuilder:
         sessions = [SessionData(session_id="s1", tool_calls=[_tc()])]
         digest = _build_digest(project, sessions)
         assert "test-project" in digest
-        assert "/tmp/test-project" in digest
+        assert str(project.project_path) in digest
 
     def test_includes_session_stats(self):
         sessions = [
@@ -410,6 +409,40 @@ class TestLLMResponseParser:
         recs = _parse_llm_response(raw)
         assert recs == []
 
+    def test_handles_null_rule_lists_and_fields(self):
+        # The model controls this JSON. A present-but-null rules list or a null
+        # section/content must be treated like an absent value, not crash the
+        # iteration / `.strip()`.
+        assert _parse_llm_response({"context_file_rules": None, "memory_file_rules": None}) == []
+        assert (
+            _parse_llm_response({"context_file_rules": [{"section": None, "content": "x"}]}) == []
+        )
+        assert _parse_llm_response({"memory_file_rules": [{"section": "s", "content": None}]}) == []
+
+        # A truthy non-string section/content (number, list, object) is also
+        # model-controlled and must not crash `.strip()`; it is dropped like null.
+        assert _parse_llm_response({"context_file_rules": [{"section": 123, "content": "x"}]}) == []
+        assert _parse_llm_response({"context_file_rules": [{"section": "s", "content": 123}]}) == []
+        assert (
+            _parse_llm_response({"memory_file_rules": [{"section": ["s"], "content": "x"}]}) == []
+        )
+        assert (
+            _parse_llm_response({"memory_file_rules": [{"section": "s", "content": {"a": 1}}]})
+            == []
+        )
+
+        # A valid rule alongside the null shapes is still parsed.
+        recs = _parse_llm_response(
+            {
+                "context_file_rules": [
+                    None,
+                    {"section": "Large Files", "content": "use offset", "evidence_count": 3},
+                ]
+            }
+        )
+        assert [r.section for r in recs] == ["Large Files"]
+        assert recs[0].evidence_count == 3
+
 
 # =============================================================================
 # Full Analyzer Integration Tests (mocked LLM)
@@ -476,11 +509,22 @@ class TestSessionAnalyzer:
         assert result.recommendations == []
         assert result.analysis_error == "API key not set"
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "`claude -p` failed (exit 1):\nPrompt is too long",
+            # What codex exec printed on a real learn run: it refuses a prompt over 2**20 chars.
+            "`codex exec` failed (exit 1):\nError: turn/start: turn/start failed: Input exceeds "
+            "the maximum length of 1048576 characters. (code -32602), data: "
+            '{"input_error_code":"input_too_large","max_chars":1048576,"actual_chars":1786526}',
+        ],
+        ids=["claude", "codex"],
+    )
     @patch("headroom.learn.analyzer._call_llm")
-    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock):
+    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock, error):
         """A context-overflow error rebuilds the digest at half the budget and retries."""
         mock_call_llm.side_effect = [
-            RuntimeError("`claude -p` failed (exit 1):\nPrompt is too long"),
+            RuntimeError(error),
             {"context_file_rules": [], "memory_file_rules": []},
         ]
 
@@ -742,6 +786,19 @@ class TestStripFencedJson:
     def test_invalid_json_raises(self):
         with pytest.raises(json.JSONDecodeError):
             _strip_fenced_json("not json at all")
+
+    def test_non_object_json_raises(self):
+        # A model may return valid JSON that is not an object (a bare array,
+        # string, number, ...). The contract is to raise JSONDecodeError so
+        # callers do not receive a non-dict and crash on `.get`.
+        for raw in ("[1, 2, 3]", '["a", "b"]', '[{"a": 1}, {"b": 2}]', '"a string"', "42", "true"):
+            with pytest.raises(json.JSONDecodeError):
+                _strip_fenced_json(raw)
+
+    def test_array_wrapping_a_single_object_is_extracted(self):
+        # The lenient first-{ .. last-} slice still recovers a single object a
+        # model wrapped in an array; only genuinely object-less JSON raises.
+        assert _strip_fenced_json('[{"key": "value"}]') == {"key": "value"}
 
     def test_prose_preamble_before_fence(self):
         # Models sometimes add a preamble before the fence despite being told
@@ -1445,20 +1502,3 @@ class TestCallLlmRouting:
         mock_cli.return_value = {}
         _call_llm("digest", "codex-cli")
         mock_cli.assert_called_once_with("digest", "codex-cli", on_progress=None)
-
-
-# =============================================================================
-# Legacy Compatibility
-# =============================================================================
-
-
-class TestFailureAnalyzerCompat:
-    @patch("headroom.learn.analyzer._call_llm")
-    def test_legacy_alias_works(self, mock_call_llm: MagicMock):
-        from headroom.learn.analyzer import FailureAnalyzer
-
-        mock_call_llm.return_value = {"context_file_rules": [], "memory_file_rules": []}
-
-        analyzer = FailureAnalyzer()
-        result = analyzer.analyze(_project(), [])
-        assert isinstance(result, AnalysisResult)

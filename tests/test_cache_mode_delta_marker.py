@@ -151,8 +151,11 @@ def test_tool_use_caller_annotation_ignored():
     assert len(out[1]) == 1
 
 
-def test_tool_use_different_input_still_falls_back():
-    # Safety: a real change to the tool command must still bail.
+def test_tool_use_different_input_forwards_the_clients_version():
+    # The last recorded message is the model's raw reply, which clients re-serialize
+    # (Claude Code strips "cd <cwd> &&" from Bash). The client's version is what gets
+    # forwarded, never the recorded one, so a changed command reaches the provider
+    # exactly as the client sent it.
     def _asst(cmd):
         return {
             "role": "assistant",
@@ -164,6 +167,36 @@ def test_tool_use_different_input_still_falls_back():
     prev_orig = [B("user", "task"), _asst("ls")]
     prev_fwd = copy.deepcopy(prev_orig)
     cur = [B("user", "task"), _asst("rm -rf /"), _tr("t1", "out", as_string=True)]
+    out = delta(cur, prev_orig, prev_fwd)
+    assert out is not None
+    assert out[0][-1] == cur[1]
+    assert out[1] == cur[2:]
+
+
+def test_tool_use_changed_earlier_in_history_still_falls_back():
+    # A change BEFORE the last recorded reply is a real divergence.
+    def _asst(cmd):
+        return {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu1", "name": "bash", "input": {"command": cmd}}
+            ],
+        }
+
+    prev_orig = [
+        B("user", "task"),
+        _asst("ls"),
+        _tr("tu1", "out", as_string=True),
+        B("assistant", "done"),
+    ]
+    prev_fwd = copy.deepcopy(prev_orig)
+    cur = [
+        B("user", "task"),
+        _asst("rm -rf /"),
+        _tr("tu1", "out", as_string=True),
+        B("assistant", "done"),
+        B("user", "next"),
+    ]
     assert delta(cur, prev_orig, prev_fwd) is None
 
 

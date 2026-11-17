@@ -53,9 +53,14 @@ and two separate guards bound it.
 on a private, loopback, link-local, or otherwise non-public address: the confused-deputy
 case where the proxy is used to reach cloud metadata (`169.254.169.254`) or RFC1918
 hosts the caller cannot reach directly. NAT64-embedded IPv4 is unwrapped before the
-check, so it cannot be smuggled through an IPv6 literal. A rejected override is
-**ignored rather than fatal** — the request proceeds to the configured upstream and a
-warning is logged. `HEADROOM_ALLOWED_BASE_URLS` (comma-separated hosts or URLs)
+check, so it cannot be smuggled through an IPv6 literal. Every route that reads the
+header **rejects** such a request with HTTP 400 (`Rejected unsafe upstream base URL`)
+and logs a warning, before contacting any upstream: the OpenAI Chat Completions and
+Responses handlers (with their unprefixed and Codex/ChatGPT-backend aliases), Anthropic
+Messages and token counting, the native Gemini routes, model listing, embeddings,
+moderations, audio, and the generic passthrough. The request is never sent to the
+configured upstream instead, since it carries a prompt and an `Authorization` meant for
+the gateway the client named. `HEADROOM_ALLOWED_BASE_URLS` (comma-separated hosts or URLs)
 re-permits specific internal endpoints as an explicit operator choice: a bare host
 permits every safe scheme and port on that host, a full URL permits only its exact
 normalized origin. DNS resolution is bounded by `HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S`
@@ -63,13 +68,14 @@ normalized origin. DNS resolution is bounded by `HEADROOM_UPSTREAM_RESOLVE_TIMEO
 
 **What may ride along with it.** The operator's own `*_extra_headers` secrets — the two
 credential-shaped maps in [the settings store](#the-settings-store) — travel only to a
-host the operator designated. Designated means one of the resolved provider API targets
-(`ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and the Gemini/Vertex/Bedrock/Cloud
-Code equivalents), the default `api.anthropic.com` / `api.openai.com`, or a host listed
-in `HEADROOM_UPSTREAM_ALLOWED_HOSTS`. Matching is exact equality on the *parsed*
-hostname, never the URL string, so neither
+host the operator designated for that provider. Designated means that provider's own
+API target (`OPENAI_TARGET_API_URL` or the default `https://api.openai.com` for the OpenAI
+headers; `ANTHROPIC_TARGET_API_URL`, the oMLX target or the default
+`https://api.anthropic.com` for the Anthropic headers), or an entry in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (a bare host means https on port 443;
+`host:port` and full URLs name exactly that origin). Matching is exact equality on the
+*parsed* origin (scheme, hostname, port), never the URL string, so neither
 `https://api.anthropic.com@evil.example` nor `https://api.anthropic.com.evil.example`
-matches. An undesignated destination is still proxied — it simply does not receive those
+matches, and `http://` or another port of a designated host does not either. An undesignated destination is still proxied — it simply does not receive those
 headers — and the drop is warned once per host rather than once per request.
 
 Read the pair for what it is: it stops a client redirecting the *operator's* stored
@@ -97,7 +103,7 @@ and both the memory store and the Copilot token can be relocated independently. 
 | License cache | `<workspace>/license_cache.json` | Cached license envelope | Per envelope | No | Inherits umask |
 | Settings store | `<workspace>/settings.json`, or `$HEADROOM_SETTINGS_PATH` | Dashboard-managed knob values — **including two header maps that carry credentials**, see [The settings store](#the-settings-store) | Until deleted | No | `0600`, inherited from `mkstemp` |
 | Proxy log | `<workspace>/logs/proxy.log` + 5 rotations | INFO-level operational log, always on; carries the admin audit stream | 10 MB × 5 backups, then rotated out | No | Inherits umask |
-| Request log | Opt-in, `--log-file` / `$HEADROOM_LOG_FILE` | JSONL per-request records; **full request and response content** when `--log-messages` is on | Until deleted | No | Inherits umask |
+| Request log | Opt-in, `--log-file` / `$HEADROOM_LOG_FILE` | JSONL per-request records; **full request and response content** when `--log-messages` is on | Until deleted | No | `0600`, owner-only |
 
 The config directory is `$HEADROOM_CONFIG_DIR`, else `$HEADROOM_WORKSPACE_DIR/config`,
 else `~/.headroom/config`.
@@ -107,7 +113,7 @@ rests on filesystem permissions and on the security of the account the proxy run
 
 ### The settings store
 
-The dashboard settings GUI persists a curated set of 59 knobs to
+The dashboard settings GUI persists a curated set of 64 knobs to
 `<workspace>/settings.json`. Two of them are marked secret, and both are credential-shaped:
 `ANTHROPIC_TARGET_API_HEADERS` and `OPENAI_TARGET_API_HEADERS` are free-form JSON header
 maps merged into forwarded requests — the field's own help text gives
@@ -253,6 +259,22 @@ still names the attacker's page, and that is what this gate rejects. Requests wi
 `Origin` at all (CLI tools, curl) pass, which is the intended behaviour for a
 locally-driven surface.
 
+The provider routes (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, the
+passthrough) add operator credentials to what they forward, so every HTTP request goes
+through the same browser check in the security gate before routing: a request whose
+`Origin` is not a loopback page, an origin listed in `HEADROOM_WS_ORIGINS` /
+`HEADROOM_CORS_ORIGINS`, or (for a non-loopback caller) the proxy's own address is
+refused with **403**. A cross-site subresource load, which carries no `Origin`, is
+refused by `Sec-Fetch-Site: cross-site` unless it is a top-level navigation. Requests
+with no `Origin` (SDKs, coding agents, curl) are unaffected.
+
+A reverse proxy on the same host that forwards a public hostname to `127.0.0.1` needs the
+page's origin (`https://name`) listed in `HEADROOM_WS_ORIGINS`: the proxy sees a loopback
+peer with a non-loopback `Host`, which is indistinguishable from a re-pointed hostname.
+Only `http`, `https`, `ws` and `wss` origins can be listed. Pages that send an app scheme (such as
+`tauri://localhost`) or `Origin: null` (sandboxed iframes, `file://` pages) are always
+refused; a desktop app should call the proxy from its native side, which sends no `Origin`.
+
 ### The two CIDR allowlists
 
 Two environment variables can extend this beyond loopback. Both default to empty, so the
@@ -261,13 +283,40 @@ the boundary and should say so in their own threat model.
 
 | Variable | Effect |
 |---|---|
-| `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` | Peers in these CIDRs reach `/settings`, `/settings/schema`, `/dashboard/settings`, and the settings *writes* **without being on loopback** — and additionally see the fields `/stats` and `/stats-lifetime` otherwise withhold from network callers (per-request ids, providers, models, errors, project names, backend config). Added so the settings UI works behind a reverse proxy. |
+| `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` | Peers in these CIDRs reach `/settings`, `/settings/schema`, `/dashboard/settings`, and the settings *writes* **without being on loopback** — and additionally see the fields `/stats` and `/stats-lifetime` otherwise withhold from network callers (per-request ids, providers, models, errors, project names, backend config). Added so the settings UI works behind a reverse proxy. A caller holding `HEADROOM_PROXY_TOKEN` sees those `/stats` fields too, but none of the settings routes; see [What the proxy token unlocks](#what-the-proxy-token-unlocks). |
 | `HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS` | Peers in these CIDRs are trusted to supply `X-Forwarded-*` headers, which is what makes the client IP the *forwarded* one rather than the gateway's. |
 
 Both parse strictly: a malformed CIDR raises at startup rather than silently emptying the
 allowlist. Note the interaction — trusting a gateway for `X-Forwarded-For` means the
 dashboard CIDR check is applied to a client-supplied header, so the two must be configured
 together and pointed at infrastructure you control.
+
+### What the proxy token unlocks
+
+With `HEADROOM_PROXY_TOKEN` set, a non-loopback caller that presents the token
+(`X-Headroom-Proxy-Token` or `Authorization: Bearer`) can use the provider routes and the
+read-only operator routes (`/stats-history`, `/quota`, `/subscription-window`, `/metrics`).
+It also sees the per-request metadata that `/stats` and `/stats-lifetime` withhold from other
+network callers, the same fields a dashboard CIDR peer sees:
+
+| Endpoint | Fields a token holder also sees |
+|---|---|
+| `/stats` (and `/stats?cached=1`) | `recent_requests` and `request_logs`: request ids, timestamps, providers, models, token counts, transforms applied, tags, error text. Never prompt or response content. Plus `config`: backend and savings profile; `savings.per_project` and `persistent_savings.projects` (per-project savings); and the provider quota sections (the same data as `/quota`). |
+| `/stats-lifetime` | `projects` (per-project savings) and `persistence.error` |
+
+That is what a dashboard behind an authenticating reverse proxy needs. The reverse proxy
+adds the token after its own sign-in, then reaches `/stats` with a domain `Host:` from a
+peer outside any dashboard CIDR, which the CIDR rule never admits.
+
+The token opens nothing else in this section. `/settings`, `/settings/schema`,
+`/dashboard/settings` and the settings writes still need loopback or a dashboard CIDR peer.
+The `require_loopback` routes (`/admin/*`, `/debug/*`, `/cache/clear`, `/stats/reset`,
+`/transformations/feed`, `/v1/retrieve*` and the rest listed above) still need loopback.
+
+The token is one shared secret, not a per-caller identity. Every holder sees the request
+metadata of every caller on that proxy: which models they use, their error text, their
+project names. If you hand the token to several clients that should not see each other's
+traffic metadata, run one proxy per client.
 
 ### What `POST /admin/runtime-env` can change
 
@@ -279,11 +328,14 @@ accept arbitrary environment variables — writes are restricted to a hardcoded 
 |---|---|
 | `HEADROOM_OUTPUT_SHAPER` | Master switch for output-token shaping |
 | `HEADROOM_VERBOSITY_LEVEL` | Verbosity steering level |
-| `HEADROOM_EFFORT_ROUTER` | Lower effort on mechanical continuations |
-| `HEADROOM_MECHANICAL_EFFORT` | Effort value for those continuations |
 | `HEADROOM_VERBOSITY_AUTOTUNE` | AIMD verbosity controller state |
 | `HEADROOM_OUTPUT_HOLDOUT` | Output-shaping holdout fraction |
 | `HEADROOM_INTERCEPT_READ_MIN_CHARS` | ast-grep read-interception threshold |
+| `HEADROOM_VERIFY_TRUNCATION_ON_DISK` | Verify ast-grep Read truncation against disk when no client banner is found. Always returns `UNKNOWN` on Windows, where `dir_fd` / `O_NOFOLLOW` support is unavailable. |
+| `HEADROOM_VERIFY_TRUNCATION_MAX_BYTES` | Max on-disk file size (bytes) the disk-verify fallback will read |
+| `HEADROOM_DEFERRED_TOOL_AFFINITY` | Keep `defer_loading` tools out of the Anthropic prefix-tracker lineage key (default on; `0` counts them again) |
+| `HEADROOM_WEB_SEARCH_HISTORY` | Drop `web_search_call` history from a Responses request that declares no web_search tool (default on; `0` disables) |
+| `HEADROOM_BUFFERED_UPSTREAM_STREAM` | Send buffered CCR requests (and their continuations) upstream as `stream: true` and fold the reply (default on; `0` sends `stream: false`) |
 
 Keys outside this list are ignored, and `/admin/upstream` is read-only — there is no
 write route on the admin surface, specifically so a caller cannot redirect
@@ -293,7 +345,7 @@ credential-bearing traffic through it.
 
 The settings routes are the wider surface, and they should be read as part of the same
 threat model as `/admin/*` rather than as a separate UI concern. `POST /settings`
-validates against the 59-field registry described under
+validates against the 64-field registry described under
 [The settings store](#the-settings-store) and writes the result to disk;
 `POST /settings/apply` does the same and then **restarts the proxy** so the values take
 effect (self-restarting on service deployments, returning the host command under Docker).
@@ -327,7 +379,7 @@ logger, not a file of its own, so in a default install it lands in
 
 The loopback and same-origin gates are an effective boundary against remote and
 browser-based attackers. They are not a boundary against local ones. Any process that can
-bind a loopback socket as your user can flip the seven runtime knobs, write the 59
+bind a loopback socket as your user can flip the ten runtime knobs, write the 64
 settings and restart the proxy to apply them, read `/v1/retrieve*`, and reach the debug
 routes. There is no token, no mTLS, and no per-caller authorization — the guards
 distinguish *where a request came from*, not *who sent it*.
@@ -342,15 +394,18 @@ Beyond your configured LLM providers, Headroom may contact:
 
 | Destination | Purpose | Default | Disable / pre-provision |
 |---|---|---|---|
-| `headroom-beacon.headroom-beacon.workers.dev` | Anonymous session summaries to Headroom Labs | **On** — see [The beacon](#the-beacon-is-on-by-default) | `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or `HEADROOM_OFFLINE` |
+| `headroom-beacon.headroom-beacon.workers.dev` | Anonymous session summaries to Headroom Labs | **On** — see [The beacon](#the-beacon-is-on-by-default) | `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off`, `DO_NOT_TRACK=1`, or `HEADROOM_OFFLINE` |
 | `pypi.org` | Daily version check for update notices | On | `HEADROOM_UPDATE_CHECK=off`; also skipped in `--stateless`, in CI, and from source checkouts |
 | `huggingface.co` | Downloads models for the optional ML compression paths | On first use of those features | Pre-provision the model cache, or leave the features disabled |
 | `app.headroomlabs.ai` | License validation and usage reporting | Only with a license key configured | Omit the license key |
+| `api.anthropic.com` | Subscription usage poll (`/api/oauth/usage`) for the quota panel; sends your Claude OAuth token as a bearer credential | On, but it only polls when a token is found (`CLAUDE_CODE_OAUTH_TOKEN` or the Claude credentials file); every 300 s | `HEADROOM_NO_SUBSCRIPTION_TRACKING=1` or `HEADROOM_OFFLINE` |
+| `api.github.com` | GitHub Copilot quota poll (`/copilot_internal/user`); sends a GitHub token as a bearer credential | On, but it only polls when one of `GITHUB_COPILOT_GITHUB_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` or `GITHUB_COPILOT_API_TOKEN` is set; every 60 s | No dedicated switch found. Unset those variables, or use `HEADROOM_OFFLINE` |
+| `mobile.events.data.microsoft.com` | ONNX Runtime's own usage telemetry to Microsoft (ORT 1.31+ on Linux and macOS): hashed device id, model file and graph names, model hashes, execution providers, hardware ids | **Off**: importing `headroom` sets `ORT_DISABLE_TELEMETRY=1` unless it is already set | Leave `ORT_DISABLE_TELEMETRY` unset or `1`; setting it to `0` turns ORT's telemetry back on |
 
 ### The beacon is on by default
 
-This is the one egress path that is enabled without any action from you, so it warrants
-its own treatment. It is governed by `HEADROOM_BEACON` and is **opt-out**
+This is the one egress path that is enabled by default whatever credentials you have, so it
+warrants its own treatment. It is governed by `HEADROOM_BEACON` and is **opt-out**
 (`BEACON_DEFAULT_ON = True`). Session summaries are POSTed to
 `https://headroom-beacon.headroom-beacon.workers.dev/v1/logs`, currently a Cloudflare
 `workers.dev` address.
@@ -368,6 +423,16 @@ snapshot — not a delta — carrying:
   latency/overhead in milliseconds, passthrough turns, and response-cache hits.
 - **Context**: request sources (`proxy` / `mcp`), the sorted provider and model names seen,
   a failure count, and those failures split by HTTP status code.
+- **Schema v2 additions** (`schema_version: 2`, additive over v1): `quality` (tokens re-read
+  because compression removed them), `hist` (fixed-bucket distributions), `shapes` (content
+  type and strategy counts, plus a bucketed structural descriptor per tool output: field
+  count rounded down to a power of two, nesting depth and shape-flag letters, never field
+  names or TOIN's structure hash), `cache` (prompt-cache hit rate by gap since the previous
+  turn), `trajectory`, `clients` (harness name and turn count), `errors` (4xx counts by
+  status), `strata` (output-shaper A/B arm and request features), and `config` (the values
+  of 15 allow-listed `HEADROOM_*` variables, each reduced to a short slug; the list is
+  `_CONFIG_ENV_KEYS` in `headroom/telemetry/session.py`). `headroom telemetry --show` prints
+  the exact payload.
 
 Alongside each report go resource attributes: a random per-install UUID, Headroom version,
 OS type, CPU architecture, and — when known — install mode and detected stack.
@@ -378,13 +443,16 @@ Prompts, completions, file contents, tool results, and file paths are **not** in
 payload. The install id is a random UUID rather than a machine fingerprint, and resets
 if you delete `<config dir>/install_id`.
 
-Three controls switch it off, checked in this order:
+Four controls switch it off, checked in this order:
 
 ```bash
-HEADROOM_OFFLINE=1     # offline mode — disables all egress, not just the beacon
-DO_NOT_TRACK=1         # the cross-tool convention, honoured
-HEADROOM_BEACON=off    # also false / 0 / no / disable / disabled
+HEADROOM_OFFLINE=1      # offline mode — disables all egress, not just the beacon
+DO_NOT_TRACK=1          # the cross-tool convention, honoured
+HEADROOM_BEACON=off     # also false / 0 / no / disable / disabled; =on keeps it on
+HEADROOM_TELEMETRY=off  # same off-values; also what --no-telemetry sets
 ```
+
+`headroom telemetry` names the setting that turned it off.
 
 The destination can also be redirected with `HEADROOM_TELEMETRY_ENDPOINT`, which is
 useful if you would rather terminate the reports at a receiver you control than block
@@ -400,8 +468,8 @@ assuming a typo fails safe.
 
 `HEADROOM_TELEMETRY` is a **different switch**, off by default and opt-in. It aggregates
 stats locally for the in-process collector and the `/stats` and `/v1/telemetry`
-endpoints, and sends nothing off-host. Enabling it does not authorise beacon upload, and
-disabling it does not suppress the beacon — the two are deliberately independent.
+endpoints, and sends nothing off-host. Enabling it does not authorise beacon upload; an
+explicit `HEADROOM_TELEMETRY=off` does suppress the beacon, unless `HEADROOM_BEACON=on`.
 
 Operational metrics are separate again: OpenTelemetry export
 (`HEADROOM_OTEL_METRICS_*`) is opt-in and targets a collector you specify.

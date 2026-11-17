@@ -28,12 +28,15 @@ def test_is_grok_cli_request_matches_known_user_agents() -> None:
         is True
     )
     assert is_grok_cli_request({"user-agent": "grok-shell/0.2.112"}) is True
+    # Grok Build stamps grok/<version>; per-request xAI routing must recognize
+    # it too, matching the repo's own client classification (CLIENT_UA_MAP).
+    assert is_grok_cli_request({"user-agent": "grok/1.2.3"}) is True
     # Non-Grok OpenAI-compatible clients must not match, including wrappers
-    # whose name merely contains "grok" — they carry OpenAI credentials.
+    # whose name merely contains "grok" — they carry OpenAI credentials. The
+    # prefix anchor keeps them out: only a token starting with "grok/" matches.
     assert is_grok_cli_request({"user-agent": "codex-tui/0.146.0"}) is False
     assert is_grok_cli_request({"user-agent": "litellm-grok/1.0"}) is False
     assert is_grok_cli_request({"user-agent": "my-grok-shell/1.0"}) is False
-    assert is_grok_cli_request({"user-agent": "grok/0.1.0"}) is False
     assert is_grok_cli_request({}) is False
 
 

@@ -741,6 +741,10 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     home = tmp_path
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "auth.json").write_text(
+        '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+    )
 
     wrap_mod._inject_codex_provider_config(8787)
 
@@ -763,6 +767,8 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     assert "requires_openai_auth" not in content, (
         f"requires_openai_auth must be absent from the injected provider block; got:\n{content}"
     )
+    assert "auth = { command =" in content
+    assert "sk-test-only" not in content
     # openai_base_url must be in the top-level block, NOT inside [model_providers.*]
     lines = content.splitlines()
     in_provider_section = False
@@ -950,6 +956,67 @@ def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Planner-level antigravity smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_resolves_antigravity_as_install_target() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["antigravity"])
+    assert "antigravity" in targets
+
+
+def test_planner_antigravity_in_supported_targets_enum() -> None:
+    from headroom.install.models import ToolTarget
+    from headroom.install.planner import PROVIDER_SCOPE_TARGETS, SUPPORTED_TARGETS
+
+    assert ToolTarget.ANTIGRAVITY in SUPPORTED_TARGETS
+    assert ToolTarget.ANTIGRAVITY not in PROVIDER_SCOPE_TARGETS
+
+
+def test_planner_antigravity_rejected_in_provider_scope() -> None:
+    import click
+    import pytest
+
+    from headroom.install.planner import resolve_targets
+
+    with pytest.raises(click.ClickException, match="unsupported targets"):
+        resolve_targets("manual", ["antigravity"], scope="provider")
+
+
+def test_planner_build_tool_envs_includes_antigravity() -> None:
+    from headroom.install.planner import build_tool_envs
+
+    envs = build_tool_envs(port=8787, backend="anthropic", targets=["antigravity"])
+    assert "antigravity" in envs
+    assert envs["antigravity"]["OPENAI_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert envs["antigravity"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+
+
+def test_planner_resolve_all_includes_antigravity() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("all", [])
+    assert "antigravity" in targets
+
+
+def test_planner_detect_targets_ignores_bare_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path as StdPath
+
+    from headroom.install.planner import detect_targets
+
+    # Gemini CLI keeps its own session data under ~/.gemini/, so the shared
+    # home directory alone must not count as an Antigravity install.
+    (tmp_path / ".gemini").mkdir()
+    monkeypatch.setattr(StdPath, "home", classmethod(lambda cls: tmp_path))
+
+    assert "antigravity" not in detect_targets()
+
+
+# ---------------------------------------------------------------------------
 # Opencode revert OSError fallback
 # ---------------------------------------------------------------------------
 
@@ -1069,3 +1136,51 @@ def test_unix_env_failure_restores_earlier_targets_when_existing_target_rejects_
         providers._apply_unix_env_scope(manifest)
     assert bashrc.read_text(encoding="utf-8") == "# bash\n"
     assert zshrc.read_text(encoding="utf-8") == "# zsh\n"
+
+
+def test_unix_env_block_round_trips_shell_special_values(monkeypatch, tmp_path: Path) -> None:
+    import shlex
+    import shutil
+    import subprocess
+    import sys
+
+    from headroom.install import providers
+
+    # System32 bash.exe is the WSL launcher and cannot open a Windows fixture path.
+    if sys.platform == "win32":
+        pytest.skip("Unix shell rc round-trip is not supported on Windows")
+    shell = shutil.which("bash")
+    if shell is None:
+        pytest.skip("bash not available")
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    manifest.base_env = {
+        "HTTPS_PROXY": "http://bob:pa$$w0rd@proxy:3128",
+        "HEADROOM_JSON": '{"a": "b"}',
+        "HEADROOM_TICK": "`id`",
+    }
+    bashrc = tmp_path / "dir with spaces" / ".bashrc"
+    bashrc.parent.mkdir()
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc])
+
+    providers._apply_unix_env_scope(manifest)
+    # Re-apply over the existing block, with a value containing backslashes.
+    manifest.base_env["HEADROOM_WORKSPACE_DIR"] = r"C:\new\dir \d+"
+    providers._apply_unix_env_scope(manifest)
+
+    quoted = shlex.quote(str(bashrc))
+    readable = subprocess.run(
+        [shell, "-c", f"test -r {quoted}"],
+        capture_output=True,
+        text=True,
+    )
+    if readable.returncode != 0:
+        pytest.skip("selected shell cannot read the fixture path")
+
+    names = list(manifest.base_env)
+    prints = " && ".join(f'printf "%s\\0" "${name}"' for name in names)
+    # A failed source must fail the script; a following printf must not mask it.
+    script = f"source {quoted} && {prints}"
+    result = subprocess.run([shell, "-c", script], capture_output=True, text=True, check=True)
+    assert result.stdout.split("\0")[:-1] == list(manifest.base_env.values())
+    assert bashrc.read_text(encoding="utf-8").count("# >>> headroom persistent env >>>") == 1

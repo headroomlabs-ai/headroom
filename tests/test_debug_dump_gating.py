@@ -189,10 +189,25 @@ def test_upstream_dump_never_writes_url_credentials(dump_dir, monkeypatch, mode)
     assert path is not None
     text = path.read_text()
     assert "AIzaSECRET" not in text
-    assert json.loads(text)["url"] == (
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini:streamGenerateContent"
-        "?<redacted>"
-    )
+    if mode == "full":  # the content opt-in keeps the route, still never the key
+        expected = (
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini:streamGenerateContent"
+        )
+    else:  # a path segment can carry a credential, so it is dropped without the opt-in
+        expected = "https://generativelanguage.googleapis.com/<path>"
+    assert json.loads(text)["url"] == expected + "?<redacted>"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://upstream.example/botCANARY/v1/messages", "https://upstream.example/bot%43ANARY/v1"],
+)
+def test_redacted_dump_never_writes_path_credentials(dump_dir, monkeypatch, url):
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "redacted")
+    path = _write(url=url)
+    assert path is not None
+    text = path.read_text()
+    assert "CANARY" not in text and "%43ANARY" not in text
 
 
 def test_upstream_dump_keeps_query_free_url(dump_dir, monkeypatch):

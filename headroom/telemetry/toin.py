@@ -68,7 +68,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Final
 
 from .models import FieldSemantics, ToolSignature
@@ -77,10 +77,6 @@ logger = logging.getLogger(__name__)
 
 # Environment variable for custom TOIN storage path
 TOIN_PATH_ENV_VAR = "HEADROOM_TOIN_PATH"
-
-# Default TOIN storage directory and file
-DEFAULT_TOIN_DIR = ".headroom"
-DEFAULT_TOIN_FILE = "toin.json"
 
 # ── Aggregation-key defaults ────────────────────────────────────────────
 # Used when callers haven't plumbed auth-mode / model-family detection
@@ -413,9 +409,16 @@ class ToolPattern:
             "last_updated",
         }
         filtered = {k: v for k, v in data.items() if k in valid_fields}
+        # A value of the wrong kind (a string where a list belongs) would be
+        # accepted as-is and then iterated or added to when patterns merge.
+        for name, value in filtered.items():
+            if not isinstance(value, _PATTERN_FIELD_KINDS.get(name, object)):
+                raise TypeError(f"{name} is a {type(value).__name__}")
 
         # Handle seen_instance_hashes (serialized without underscore prefix)
         seen_hashes = data.get("seen_instance_hashes", [])
+        if not isinstance(seen_hashes, list) or not all(isinstance(h, str) for h in seen_hashes):
+            raise TypeError("seen_instance_hashes is not a list of strings")
 
         pattern = cls(**filtered)
         pattern._seen_instance_hashes = seen_hashes[:100]  # Limit on load
@@ -442,6 +445,38 @@ class ToolPattern:
         return pattern
 
 
+# What each stored ToolPattern field may hold, by the base of its annotation.
+# Merges store some counts as floats, so numeric fields accept either.
+_KIND_BY_ANNOTATION: Final[dict[str, type | tuple[type, ...]]] = {
+    "str": str,
+    "int": (int, float),
+    "float": (int, float),
+    "bool": bool,
+    "list": list,
+    "dict": dict,
+}
+_PATTERN_FIELD_KINDS: Final[dict[str, type | tuple[type, ...]]] = {
+    f.name: _KIND_BY_ANNOTATION.get(str(f.type).split("[")[0], object) for f in fields(ToolPattern)
+}
+_PATTERN_CONTAINER_FIELDS: Final = tuple(
+    f.name for f in fields(ToolPattern) if f.default_factory in (list, dict, set)
+)
+
+
+def _detached_copy(pattern: ToolPattern) -> ToolPattern:
+    """Copy ``pattern`` so that merging into the copy leaves the original intact.
+
+    ``_merge_patterns`` reassigns scalars and adds to the pattern's lists, dicts
+    and sets, so those containers are the parts that need their own copies.
+    """
+    import copy
+
+    clone = copy.copy(pattern)
+    for name in _PATTERN_CONTAINER_FIELDS:
+        setattr(clone, name, getattr(pattern, name).copy())
+    return clone
+
+
 @dataclass
 class TOINConfig:
     """Configuration for the Tool Output Intelligence Network."""
@@ -454,7 +489,7 @@ class TOINConfig:
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
     max_patterns: int = DEFAULT_MAX_PATTERNS
-    max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES
+    max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES  # Filesystem load and save limit
 
     # Network learning thresholds
     min_samples_for_recommendation: int = 10
@@ -543,6 +578,7 @@ class ToolIntelligenceNetwork:
 
         # Tracking
         self._last_save_time = time.time()
+        self._last_auto_save_attempt = 0.0
         self._dirty = False
 
         # Load existing data from backend
@@ -915,10 +951,10 @@ class ToolIntelligenceNetwork:
         )
 
     def _sanitize_loaded_pattern(self, pattern: ToolPattern) -> bool:
-        """Remove legacy raw query keys from a loaded pattern."""
+        """Remove legacy query keys (raw text or unhashed field names) from a loaded pattern."""
         import re
 
-        safe_pattern = re.compile(r"(?:\w+:\*)(?:\s+\w+:\*)*")
+        safe_pattern = re.compile(r"[0-9a-f]{8}:\*(?:\s+[0-9a-f]{8}:\*)*")
         changed = False
         frequencies: dict[str, int] = {}
         for raw_key, count in pattern.query_pattern_frequency.items():
@@ -1213,8 +1249,10 @@ class ToolIntelligenceNetwork:
     def _anonymize_query_pattern(self, query: str) -> str | None:
         """Extract anonymized pattern from a query.
 
-        Keeps structural patterns, removes specific values.
-        E.g., "status:error AND user:john" -> "status:* AND user:*"
+        Keeps the shape of field/value predicates and drops the values. Field
+        names are hashed like every other TOIN field name: the text before a
+        ``:`` can itself be a credential (``<token>:x-oauth-basic``).
+        E.g., "status:error AND user:john" -> "<hash(status)>:* <hash(user)>:*"
         """
         if not query:
             return None
@@ -1231,7 +1269,7 @@ class ToolIntelligenceNetwork:
 
         # Preserve useful field shape while dropping operators, values, and
         # all unrelated text (which may contain arbitrary prompt data).
-        pattern = " ".join(f"{field}:*" for field in matches)
+        pattern = " ".join(f"{self._hash_field_name(field)}:*" for field in matches)
 
         # Remove if it's just generic
         if not pattern or len(pattern) > MAX_QUERY_PATTERN_LENGTH:
@@ -1395,45 +1433,76 @@ class ToolIntelligenceNetwork:
         Args:
             data: Exported pattern data.
         """
-        if not self._config.enabled:
-            return
+        self._import_patterns(data)
 
+    def _import_patterns(self, data: dict[str, Any]) -> bool:
+        """Body of ``import_patterns``; True when a legacy query key was dropped."""
+        if not self._config.enabled:
+            return False
+
+        sanitized = False
         patterns_data = data.get("patterns", {})
         source_instance = data.get("instance_id", "unknown")
 
+        skipped = 0
+        first_error: Exception | None = None
         with self._lock:
             for serialized_key, pattern_dict in patterns_data.items():
-                key = _deserialize_pattern_key(serialized_key)
-                imported = ToolPattern.from_dict(pattern_dict)
-                self._sanitize_loaded_pattern(imported)
-                # Make sure dataclass fields agree with the dict key — pre-F3
-                # dumps don't carry tenant_key on the pattern, and pre-B5
-                # dumps don't carry auth_mode/model_family either; promote
-                # from the (possibly default) key.
-                imported.tenant_key = key[0]
-                imported.auth_mode = key[1]
-                imported.model_family = key[2]
+                # Each entry is parsed, tracked and merged into a pattern that is
+                # only stored once all of that succeeds. One unreadable entry must
+                # not abort the rest (the store that did load would be saved over
+                # the whole file) or leave a half-merged pattern behind.
+                try:
+                    key = _deserialize_pattern_key(serialized_key)
+                    imported = ToolPattern.from_dict(pattern_dict)
+                    sanitized = self._sanitize_loaded_pattern(imported) or sanitized
+                    # Make sure dataclass fields agree with the dict key — pre-F3
+                    # dumps don't carry tenant_key on the pattern, and pre-B5
+                    # dumps don't carry auth_mode/model_family either; promote
+                    # from the (possibly default) key.
+                    imported.tenant_key = key[0]
+                    imported.auth_mode = key[1]
+                    imported.model_family = key[2]
 
-                if key in self._patterns:
-                    # Merge with existing
-                    self._merge_patterns(self._patterns[key], imported)
-                else:
-                    # Add new pattern - need to track source instance
-                    self._patterns[key] = imported
+                    existing = self._patterns.get(key)
+                    if existing is not None:
+                        # Merge with existing
+                        pattern = _detached_copy(existing)
+                        self._merge_patterns(pattern, imported)
+                    else:
+                        # Add new pattern - need to track source instance
+                        pattern = imported
 
-                    # For NEW patterns from another instance, track the source in
-                    # _seen_instance_hashes so user_count reflects cross-user data
-                    if source_instance != self._instance_id:
-                        pattern = self._patterns[key]
-                        if source_instance not in pattern._seen_instance_hashes:
-                            # Limit storage to 100 unique instances to bound memory
-                            if len(pattern._seen_instance_hashes) < 100:
-                                pattern._seen_instance_hashes.append(source_instance)
-                            # CRITICAL: Always increment user_count (even after cap)
-                            pattern.user_count += 1
+                        # For NEW patterns from another instance, track the source in
+                        # _seen_instance_hashes so user_count reflects cross-user data
+                        if source_instance != self._instance_id:
+                            if source_instance not in pattern._seen_instance_hashes:
+                                # Limit storage to 100 unique instances to bound memory
+                                if len(pattern._seen_instance_hashes) < 100:
+                                    pattern._seen_instance_hashes.append(source_instance)
+                                # CRITICAL: Always increment user_count (even after cap)
+                                pattern.user_count += 1
+                except (AttributeError, TypeError, ValueError) as e:
+                    skipped += 1
+                    first_error = first_error or e
+                    continue
+                self._patterns[key] = pattern
 
             self._prune_patterns_locked()
             self._dirty = True
+
+        if first_error is not None:
+            logger.warning(
+                "TOIN skipped malformed patterns on import",
+                extra={
+                    "event": "toin_import_skipped",
+                    "skipped": skipped,
+                    "imported": len(patterns_data) - skipped,
+                    "error_type": type(first_error).__name__,
+                    "error": str(first_error),
+                },
+            )
+        return sanitized
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
         """Merge imported pattern into existing."""
@@ -1660,15 +1729,12 @@ class ToolIntelligenceNetwork:
         if self._backend is None:
             return
 
+        changed = False
         try:
             data = self._backend.load()
             if data:
-                self.import_patterns(data)
+                changed = self._import_patterns(data)
                 with self._lock:
-                    changed = any(
-                        self._sanitize_loaded_pattern(pattern)
-                        for pattern in self._patterns.values()
-                    )
                     before = len(self._patterns)
                     self._prune_patterns_locked()
                     changed = changed or len(self._patterns) != before
@@ -1683,6 +1749,10 @@ class ToolIntelligenceNetwork:
                     "error": str(e),
                 },
             )
+        if changed:
+            # Rewrite at once: a dropped legacy query key can hold a credential,
+            # and waiting for the next observation would leave it on disk.
+            self.save()
 
     def _maybe_auto_save(self) -> None:
         """Auto-save if enough time has passed.
@@ -1700,8 +1770,12 @@ class ToolIntelligenceNetwork:
             if not self._dirty:
                 return
 
-            elapsed = time.time() - self._last_save_time
+            now = time.time()
+            elapsed = now - max(self._last_save_time, self._last_auto_save_attempt)
             if elapsed >= self._config.auto_save_interval:
+                # Failed saves retain dirty state, but must not turn every
+                # observation into synchronous disk I/O and another warning.
+                self._last_auto_save_attempt = now
                 # save() uses the same RLock, so this is safe
                 self.save()
 

@@ -121,6 +121,46 @@ def test_inject_memories_handles_empty_and_inserts_context() -> None:
     }
 
 
+def test_inject_memories_keeps_multimodal_content_parts() -> None:
+    """List (multimodal) user content keeps its parts; the context is a new text part.
+
+    See https://github.com/headroomlabs-ai/headroom/issues/4362 (item 10).
+    """
+    client, _response = make_client()
+    fake_memory = FakeMemory()
+    wrapper = MemoryWrapper(client, user_id="alice", _memory=fake_memory)
+    fake_memory.search_results = [
+        SimpleNamespace(memory=SimpleNamespace(content="Prefers Python")),
+    ]
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    parts = [{"type": "text", "text": "What is in this chart?"}, image]
+    original = [{"role": "user", "content": parts}]
+
+    injected = wrapper._inject_memories(original)
+
+    assert original[0]["content"] == parts
+    assert injected[0]["content"] == [
+        {"type": "text", "text": "<context>\n- Prefers Python\n</context>"},
+        {"type": "text", "text": "What is in this chart?"},
+        image,
+    ]
+    assert fake_memory.last_search["query"] == "What is in this chart?"
+
+
+def test_inject_memories_skips_search_for_content_without_text() -> None:
+    client, _response = make_client()
+    fake_memory = FakeMemory()
+    wrapper = MemoryWrapper(client, user_id="alice", _memory=fake_memory)
+    fake_memory.search_results = [
+        SimpleNamespace(memory=SimpleNamespace(content="Prefers Python")),
+    ]
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    messages = [{"role": "user", "content": [image]}]
+
+    assert wrapper._inject_memories(messages) == messages
+    assert not hasattr(fake_memory, "last_search")
+
+
 def test_store_memories_persists_only_nonempty_content() -> None:
     client, _response = make_client()
     fake_memory = FakeMemory()

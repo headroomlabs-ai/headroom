@@ -218,3 +218,66 @@ def test_a_compressor_that_cannot_take_the_deadline_is_not_handed_one(monkeypatc
 
     assert fake.deadlines, "the stub should still have been called"
     assert all(d is None for d in fake.deadlines), fake.deadlines
+
+
+def _chunked_kompress(monkeypatch, chunk_s: float):
+    """Kompress over a fake model; each chunk advances a fake monotonic clock."""
+    clock = {"now": 0.0, "chunks": 0}
+
+    class _Enc(dict):
+        def word_ids(self, batch_index=0):
+            return self["_word_ids"]
+
+    class _Tok:
+        def __call__(self, chunk_words, **kw):
+            n = len(chunk_words)
+            return _Enc(input_ids=[[0] * n], attention_mask=[[1] * n], _word_ids=list(range(n)))
+
+    class _Model:
+        def get_keep_mask(self, input_ids, attention_mask):
+            clock["now"] += chunk_s
+            clock["chunks"] += 1
+            n = len(input_ids[0])
+            return [[i < n // 2 for i in range(n)]]
+
+        def get_scores(self, input_ids, attention_mask):  # the batched path
+            return [
+                [0.9 if keep else 0.1 for keep in row]
+                for row in self.get_keep_mask(input_ids, attention_mask)
+            ]
+
+    monkeypatch.setattr(kc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _Tok(), "onnx"))
+    monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "0")
+    monkeypatch.delenv(kc.KOMPRESS_TIME_BUDGET_ENV, raising=False)
+
+    comp = kc.KompressCompressor(kc.KompressConfig(min_input_words=10))
+    comp.config.chunk_words = 100
+    monkeypatch.setattr(comp, "_should_batch_single_content", lambda *a, **k: False)
+    monkeypatch.setattr(comp, "_should_use_sequential_fallback", lambda: False)
+    return comp, clock
+
+
+def test_time_budget_cap_stops_a_call_and_returns_it_unchanged(monkeypatch):
+    """The router hands Kompress what is left of its ML budget, so the first
+    call of a request -- which has no measured cost to be refused on -- stops
+    at a chunk boundary instead of running to the 20s per-call budget. The
+    block comes back byte-identical, so it is stable on later turns."""
+    comp, clock = _chunked_kompress(monkeypatch, chunk_s=0.6)
+    content = " ".join(f"w{i}" for i in range(500))  # five chunks, 3.0s uncapped
+
+    result = comp.compress(content, _time_budget_cap_seconds=1.0)
+
+    assert clock["chunks"] == 2, "must stop at the first chunk boundary past the cap"
+    assert result.compressed == content
+
+
+def test_time_budget_cap_bounds_the_batched_path_too(monkeypatch):
+    comp, clock = _chunked_kompress(monkeypatch, chunk_s=0.6)
+    content = " ".join(f"w{i}" for i in range(500))
+
+    [result] = comp.compress_batch([content], batch_size=1, _time_budget_cap_seconds=1.0)
+
+    assert clock["chunks"] == 2
+    assert result.compressed == content

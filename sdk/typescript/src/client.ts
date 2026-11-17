@@ -16,7 +16,13 @@ import type {
   ProxyCompressResponse,
   ProxyErrorResponse,
 } from "./types.js";
-import { mapProxyError, HeadroomConnectionError, HeadroomAuthError, HeadroomCompressError } from "./errors.js";
+import {
+  mapProxyError,
+  HeadroomError,
+  HeadroomConnectionError,
+  HeadroomAuthError,
+  HeadroomCompressError,
+} from "./errors.js";
 import { deepCamelCase, deepSnakeCase } from "./utils/case.js";
 import { parseSSE } from "./utils/stream.js";
 import type { CompressRequestConfig, HeadroomMode } from "./types/config.js";
@@ -65,6 +71,20 @@ function makeFallbackResult(messages: OpenAIMessage[]): CompressResult {
   };
 }
 
+/**
+ * True for a proxy error response below 500, whichever class `mapProxyError`
+ * picked. Typed classes carry the status in `details.statusCode`.
+ */
+function isClientError(error: unknown): boolean {
+  const status =
+    error instanceof HeadroomCompressError
+      ? error.statusCode
+      : error instanceof HeadroomError
+        ? error.details?.statusCode
+        : undefined;
+  return typeof status === "number" && status < 500;
+}
+
 // --- Headroom request params ---
 
 export interface HeadroomParams {
@@ -73,6 +93,16 @@ export interface HeadroomParams {
   headroomOutputBufferTokens?: number;
   headroomKeepTurns?: number;
   headroomToolProfiles?: Record<string, Record<string, any>>;
+}
+
+/**
+ * Strip trailing "/" characters. A loop rather than a `+$` regex, which
+ * backtracks quadratically on inputs with long runs of slashes.
+ */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
 }
 
 // --- Sub-clients ---
@@ -211,11 +241,9 @@ export class HeadroomClient implements HeadroomClientInterface {
   readonly messages: Messages;
 
   constructor(options: ExtendedClientOptions = {}) {
-    this.baseUrl = (
-      options.baseUrl ??
-      getEnv("HEADROOM_BASE_URL") ??
-      DEFAULT_BASE_URL
-    ).replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes(
+      options.baseUrl ?? getEnv("HEADROOM_BASE_URL") ?? DEFAULT_BASE_URL,
+    );
     this.apiKey = options.apiKey ?? getEnv("HEADROOM_API_KEY");
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
     this.fallback = options.fallback ?? true;
@@ -247,12 +275,7 @@ export class HeadroomClient implements HeadroomClientInterface {
       } catch (error) {
         lastError = error;
         if (error instanceof HeadroomAuthError) throw error;
-        if (
-          error instanceof HeadroomCompressError &&
-          error.statusCode < 500
-        ) {
-          throw error;
-        }
+        if (isClientError(error)) throw error;
       }
     }
 
@@ -451,7 +474,7 @@ export class HeadroomClient implements HeadroomClientInterface {
       return deepCamelCase(await resp.json());
     },
     getTool: async (signatureHash: string): Promise<any> => {
-      const resp = await this._fetch(`/v1/telemetry/tools/${signatureHash}`, { method: "GET" });
+      const resp = await this._fetch(`/v1/telemetry/tools/${encodeURIComponent(signatureHash)}`, { method: "GET" });
       return deepCamelCase(await resp.json());
     },
   };

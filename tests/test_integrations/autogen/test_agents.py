@@ -1,16 +1,13 @@
 """Tests for AutoGen agent tool integration.
 
 Tests cover:
-1. ToolCompressionMetrics - Dataclass for tool compression metrics
-2. ToolMetricsCollector - Collector for compression metrics
-3. HeadroomToolWrapper - Wrapper for AutoGen FunctionTool with compression
-4. wrap_tools_with_headroom - Convenience function for wrapping multiple tools
-5. get_tool_metrics / reset_tool_metrics - Global metrics access
+1. HeadroomToolWrapper - Wrapper for AutoGen FunctionTool with compression
+2. wrap_tools_with_headroom - Convenience function for wrapping multiple tools
+3. get_tool_metrics / reset_tool_metrics - Global metrics access
 """
 
 import asyncio
 import json
-from datetime import datetime
 from unittest.mock import patch
 
 import pytest
@@ -52,71 +49,6 @@ def small_lookup(query: str) -> str:
 async def async_lookup(query: str) -> str:
     """Async tool that returns a large result."""
     return _make_large_output()
-
-
-class TestToolCompressionMetrics:
-    """Tests for ToolCompressionMetrics dataclass."""
-
-    def test_create_metrics(self):
-        from headroom.integrations.autogen.agents import ToolCompressionMetrics
-
-        metrics = ToolCompressionMetrics(
-            tool_name="search",
-            timestamp=datetime.now(),
-            chars_before=5000,
-            chars_after=2000,
-            chars_saved=3000,
-            compression_ratio=0.4,
-            was_compressed=True,
-        )
-
-        assert metrics.tool_name == "search"
-        assert metrics.chars_before == 5000
-        assert metrics.chars_saved == 3000
-        assert metrics.was_compressed is True
-
-    def test_metrics_all_fields_required(self):
-        from headroom.integrations.autogen.agents import ToolCompressionMetrics
-
-        with pytest.raises(TypeError):
-            ToolCompressionMetrics()  # type: ignore[call-arg]
-
-
-class TestToolMetricsCollector:
-    """Tests for ToolMetricsCollector."""
-
-    def test_empty_summary(self):
-        from headroom.integrations.autogen.agents import ToolMetricsCollector
-
-        collector = ToolMetricsCollector()
-        summary = collector.get_summary()
-        assert summary["total_invocations"] == 0
-        assert summary["total_compressions"] == 0
-
-    def test_add_and_summary(self):
-        from headroom.integrations.autogen.agents import (
-            ToolCompressionMetrics,
-            ToolMetricsCollector,
-        )
-
-        collector = ToolMetricsCollector()
-        collector.add(
-            ToolCompressionMetrics(
-                tool_name="search",
-                timestamp=datetime.now(),
-                chars_before=5000,
-                chars_after=2000,
-                chars_saved=3000,
-                compression_ratio=0.4,
-                was_compressed=True,
-            )
-        )
-
-        summary = collector.get_summary()
-        assert summary["total_invocations"] == 1
-        assert summary["total_compressions"] == 1
-        assert summary["total_chars_saved"] == 3000
-        assert "search" in summary["by_tool"]
 
 
 class TestGlobalMetrics:

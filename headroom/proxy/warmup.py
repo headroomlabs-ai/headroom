@@ -111,21 +111,27 @@ class WarmupRegistry:
         ``error`` statuses must be set explicitly by the caller.
         """
 
-        def _apply(slot: WarmupSlot, value: str | None) -> None:
+        def _apply(slot: WarmupSlot, value: str | None, **info: Any) -> None:
             if value is None:
                 return
             v = value.strip().lower()
             if v in {"enabled", "ready"} or v.startswith("loaded"):
                 # Preserve whatever handle/info was set already.
                 if slot.status != "loaded":
-                    slot.mark_loaded(handle=slot.handle, source_status=value)
+                    slot.mark_loaded(handle=slot.handle, source_status=value, **info)
                 else:
                     slot.info.setdefault("source_status", value)
             else:
                 if slot.status != "loaded":
                     slot.info["source_status"] = value
 
-        _apply(self.kompress, status.get("kompress"))
+        # A remote endpoint is ready at startup; /readyz reports its backend.
+        kompress_backend = status.get("kompress_backend")
+        _apply(
+            self.kompress,
+            status.get("kompress"),
+            **({"backend": kompress_backend} if kompress_backend == "remote" else {}),
+        )
         _apply(self.magika, status.get("magika"))
         _apply(self.code_aware, status.get("code_aware"))
         _apply(self.tree_sitter, status.get("tree_sitter"))
