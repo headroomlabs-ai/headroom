@@ -1,11 +1,13 @@
-import childProcess from "node:child_process";
+import childProcess, { type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { installHeadroomTransport, uninstallHeadroomTransport } from "./transport.js";
+import { installHeadroomTransport, setHeadroomWireRoots, uninstallHeadroomTransport } from "./transport.js";
 
 afterEach(() => {
   uninstallHeadroomTransport();
@@ -292,7 +294,7 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("still routes provider-rooted wire paths, including a bare endpoint and other version prefixes (#4747)", async () => {
+  it("still routes provider-rooted wire paths and other version prefixes (#4747)", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -300,20 +302,57 @@ describe("Headroom OpenCode transport", () => {
     installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
 
     const init = { method: "POST" };
-    await fetch("https://api.example.com/messages", init);
-    await fetch("https://api.example.com/responses", init);
     await fetch("https://gateway.example.com/api/chat/completions", init);
     await fetch("https://gateway.example.com/api/v2/chat/completions", init);
     await fetch("https://gateway.example.com/openai/deployments/x/chat/completions", init);
     await fetch("https://opencode.ai/zen/v1/responses", init);
     await fetch("https://cloud.example.com/backend-api/codex/responses", init);
 
-    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     for (const call of fetchMock.mock.calls as FetchCall[]) {
       expect(call[0]).toBeInstanceOf(URL);
       expect(new Headers(call[1]?.headers).get("x-headroom-base-url")).not.toBeNull();
     }
 
+    globalThis.fetch = originalFetch;
+  });
+
+  it("leaves a POST to a host's bare /messages or /responses alone unless that base is configured (#4781)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    // MessageBird's legacy SMS API is POST https://rest.messagebird.com/messages
+    // with `Authorization: AccessKey ...`: a non-LLM credential that must not
+    // travel to the proxy. No base URL is configured for these origins.
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    const init = { method: "POST", headers: { authorization: "AccessKey FAKE-TEST-VALUE" }, body: "{}" };
+    await fetch("https://rest.messagebird.com/messages", init);
+    await fetch("https://api.example.com/messages", init);
+    await fetch("https://api.example.com/responses", init);
+    await fetch("https://api.example.com/chat/completions", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    for (const call of fetchMock.mock.calls as FetchCall[]) {
+      expect(typeof call[0]).toBe("string");
+      expect(call[1]).toBe(init);
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get("x-headroom-base-url")).toBeNull();
+      expect(headers.get("x-headroom-original-path")).toBeNull();
+    }
+
+    // A provider mounted at the origin root is still routed, because the base
+    // URL itself is the configured wire root.
+    setHeadroomWireRoots("https://rest.messagebird.com");
+    await fetch("https://rest.messagebird.com/messages", init);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls[4][0]).toEqual(new URL("http://127.0.0.1:8787/messages"));
+    expect(new Headers(fetchMock.mock.calls[4][1]?.headers).get("x-headroom-base-url")).toBe(
+      "https://rest.messagebird.com",
+    );
+
+    uninstallHeadroomTransport();
     globalThis.fetch = originalFetch;
   });
 
@@ -942,6 +981,51 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("percent-encodes a non-Latin-1 project name instead of throwing on routed fetch calls", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    // Thai, Chinese, Cyrillic and a Polish letter above U+00FF, plus a path separator.
+    const project = "/home/u/โลลิ/中文/Привет/ł";
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", project });
+
+    await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const value = new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-project");
+    expect(value).toBe(encodeURIComponent(project));
+    expect(value).toMatch(/^[\x20-\x7e]*$/);
+    expect(decodeURIComponent(value ?? "")).toBe(project);
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("percent-encodes a non-Latin-1 project name on routed Node https.request calls", async () => {
+    const proxy = await proxyServer();
+    const project = "โลลิปืนดุ";
+    installHeadroomTransport({ proxyUrl: proxy.url, project });
+
+    await new Promise<void>((resolve, reject) => {
+      const req = https.request(
+        "https://api.anthropic.com/v1/messages",
+        { method: "POST" },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{}");
+    });
+
+    const value = proxy.seen[0].headers["x-headroom-project"] as string;
+    expect(value).toBe(encodeURIComponent(project));
+    expect(decodeURIComponent(value)).toBe(project);
+
+    await proxy.close();
+  });
+
   it("omits x-headroom-project header when project is not set", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
@@ -1307,6 +1391,141 @@ describe("Headroom OpenCode transport", () => {
 
     firstDispose();
     globalThis.fetch = originalFetch;
+  });
+
+  describe("child_process wrappers with omitted or null args/options slots", () => {
+    // Real children, not mocks: the bug is that Node reads the injected env
+    // object from the wrong parameter, so only a real call shows it. The shim
+    // preload is switched off because the checkout has no dist/ for it to load.
+    function probeScript(): { dir: string; script: string; run: string } {
+      const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "headroom-cp-")));
+      const script = path.join(dir, "probe.cjs");
+      fs.writeFileSync(
+        script,
+        "process.stdout.write(JSON.stringify({cwd: process.cwd(), proxy: process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL}));",
+      );
+      return { dir, script, run: `"${process.execPath}" "${script}"` };
+    }
+
+    function collect(child: ChildProcess): Promise<{ cwd: string; proxy?: string }> {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("child did not finish")), 5000);
+        let out = "";
+        child.stdout?.on("data", (chunk) => {
+          out += chunk;
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", () => {
+          clearTimeout(timer);
+          try {
+            resolve(JSON.parse(out));
+          } catch {
+            reject(new Error(`child printed ${JSON.stringify(out)}`));
+          }
+        });
+      });
+    }
+
+    function viaCallback(
+      call: (cb: (err: Error | null, stdout: string | Buffer) => void) => unknown,
+    ): Promise<{ cwd: string; proxy?: string }> {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("callback was never called")), 3000);
+        call((err, stdout) => {
+          clearTimeout(timer);
+          if (err) reject(err);
+          else resolve(JSON.parse(String(stdout)));
+        });
+      });
+    }
+
+    const cp = childProcess as unknown as Record<string, (...args: unknown[]) => any>;
+
+    // Earlier tests in this file can leave a mock behind in child_process, so
+    // start from the functions Node loaded.
+    const real = {
+      spawn: childProcess.spawn,
+      exec: childProcess.exec,
+      execFile: childProcess.execFile,
+      fork: childProcess.fork,
+    };
+    beforeEach(() => {
+      Object.assign(childProcess, real);
+    });
+
+    function install(): void {
+      vi.spyOn(fs, "existsSync").mockReturnValue(false);
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+    }
+
+    const plainShapes: Array<[string, (p: { dir: string; script: string; run: string }) => Promise<{ cwd: string }>]> = [
+      ["spawn(file, [args], { cwd })", (p) => collect(cp.spawn(process.execPath, [p.script], { cwd: p.dir }))],
+      ["spawn(cmd, { cwd, shell })", (p) => collect(cp.spawn(p.run, { cwd: p.dir, shell: true }))],
+      ["exec(cmd, { cwd }, cb)", (p) => viaCallback((cb) => cp.exec(p.run, { cwd: p.dir }, cb))],
+      ["exec(cmd, cb)", (p) => viaCallback((cb) => cp.exec(p.run, cb)).then((r) => ({ ...r, cwd: p.dir }))],
+      ["execFile(file, [args], { cwd }, cb)", (p) => viaCallback((cb) => cp.execFile(process.execPath, [p.script], { cwd: p.dir }, cb))],
+      ["execFile(file, [args], cb)", (p) => viaCallback((cb) => cp.execFile(process.execPath, [p.script], cb)).then((r) => ({ ...r, cwd: p.dir }))],
+      ["fork(module, [args], { cwd })", (p) => collect(cp.fork(p.script, [], { cwd: p.dir, silent: true }))],
+      ["fork(module, { cwd })", (p) => collect(cp.fork(p.script, { cwd: p.dir, silent: true }))],
+    ];
+
+    it.each(plainShapes)("plain shape %s is unchanged", async (_name, call) => {
+      const probe = probeScript();
+      install();
+      const seen = await call(probe);
+      expect(seen.cwd).toBe(probe.dir);
+    });
+
+    it.each([undefined, null])("spawn(cmd, %s, { cwd }) keeps cwd and still injects the env", async (args) => {
+      const { dir, run } = probeScript();
+      install();
+      const seen = await collect(cp.spawn(run, args, { cwd: dir, shell: true }));
+      expect(seen.cwd).toBe(dir);
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it.each([undefined, null])("fork(module, %s, { cwd }) keeps cwd and still injects the env", async (args) => {
+      const { dir, script } = probeScript();
+      install();
+      const seen = await collect(cp.fork(script, args, { cwd: dir, silent: true }));
+      expect(seen.cwd).toBe(dir);
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it.each([undefined, null])("exec(cmd, %s, callback) still calls the callback", async (options) => {
+      const { run } = probeScript();
+      install();
+      const seen = await viaCallback((cb) => cp.exec(run, options, cb));
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it.each([undefined, null])("execFile(file, args, %s, callback) still calls the callback", async (options) => {
+      const { script } = probeScript();
+      install();
+      const seen = await viaCallback((cb) => cp.execFile(process.execPath, [script], options, cb));
+      expect(seen.proxy).toBe("http://127.0.0.1:8787/v1");
+    });
+
+    it("execFile(file, null, callback) and execFile(file, callback) still call the callback", async () => {
+      install();
+      for (const call of [
+        (cb: any) => cp.execFile(process.execPath, null, cb),
+        (cb: any) => cp.execFile(process.execPath, cb),
+      ]) {
+        // no script: node starts, reads the closed stdin and exits; only the callback matters
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("callback was never called")), 3000);
+          const child = call(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+          child.stdin?.end();
+        });
+      }
+    });
   });
 
   it.each(["", "127.0.0.1:8787"])("leaves all traffic alone when the proxy URL is unusable (%j)", async (proxyUrl) => {

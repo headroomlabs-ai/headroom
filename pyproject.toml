@@ -68,7 +68,7 @@ dependencies = [
     "litellm>=1.96.2,<2.0",
     "click>=8.5.0",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
-    "opentelemetry-api>=1.45.1",  # CVE-2026-114603: bounded, linear-time tracestate parsing
+    "opentelemetry-api>=1.45.2",  # CVE-2026-114603 tracestate parsing; CVE-2026-126360 traceparent ReDoS
     # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
     # that PyPI release was a compromised supply-chain build shipping an
     # info-stealer `sg.exe` (Trojan:Win64/Lazy!MTB) alongside the real binary
@@ -330,6 +330,11 @@ bedrock = [
 redis = [
     "redis>=5.0.0",
 ]
+# System tray icon (opt-in: `headroom proxy --tray` / `headroom tray`; Windows first)
+tray = [
+    "pystray>=0.19.5",
+    "pillow>=12.3.0",
+]
 # HTML content extraction
 html = [
     "trafilatura>=1.6.0",
@@ -340,7 +345,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "jsonschema>=4.23.0,<5.0",  # Validate versioned release evidence contracts
-    "ruff==0.17.3",
+    "ruff==0.17.4",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -602,7 +607,10 @@ ignore_errors = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+# "-m 'not live'": tests marked live call real provider APIs with the developer's
+# keys, so they never run by default. Opt in with `pytest -m live <file>` (a later
+# -m replaces this one).
+addopts = "-v --tb=short -m 'not live'"
 asyncio_mode = "auto"
 filterwarnings = [
     # pyo3 Unsendable parsers emit an unraisable warning when GC drops them on a
