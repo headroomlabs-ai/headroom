@@ -117,6 +117,68 @@ def test_refuses_a_source_copy_nested_in_another_repository(tmp_path: Path) -> N
     assert _hooks(parent / ".git") == set()
 
 
+def _push_setup(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
+    """A checkout with the hooks installed, a bare remote, and a fake ``make``
+    that logs each call instead of running ci-precheck."""
+    repo = _checkout(tmp_path / "repo")
+    env = _env(tmp_path)
+    assert _run(repo, env).returncode == 0
+    make_log = tmp_path / "make.log"
+    fake_make = tmp_path / "fake-bin" / "make"
+    fake_make.write_text(f'#!/bin/sh\necho "$*" >> "{make_log}"\n')
+    fake_make.chmod(0o755)
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "-q", "--bare", str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+    return repo, env, make_log
+
+
+def _push(repo: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "push", "-q", "origin", *args],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _make_calls(make_log: Path) -> list[str]:
+    return make_log.read_text().splitlines() if make_log.exists() else []
+
+
+def test_pre_push_runs_ci_precheck_for_a_branch_update(tmp_path: Path) -> None:
+    repo, env, make_log = _push_setup(tmp_path)
+
+    result = _push(repo, env, "HEAD:refs/heads/feature")
+
+    assert result.returncode == 0, result.stderr
+    assert _make_calls(make_log) == ["ci-precheck"]
+
+
+def test_pre_push_skips_ci_precheck_for_a_delete_only_push(tmp_path: Path) -> None:
+    repo, env, make_log = _push_setup(tmp_path)
+    _git(repo, "push", "-q", "--no-verify", "origin", "HEAD:refs/heads/feature")
+
+    result = _push(repo, env, "--delete", "feature")
+
+    assert result.returncode == 0, result.stderr
+    assert _make_calls(make_log) == []
+    assert _git(repo, "ls-remote", "--heads", "origin", "feature") == ""
+
+
+def test_pre_push_runs_ci_precheck_when_a_push_mixes_a_delete_and_an_update(
+    tmp_path: Path,
+) -> None:
+    repo, env, make_log = _push_setup(tmp_path)
+    _git(repo, "push", "-q", "--no-verify", "origin", "HEAD:refs/heads/old")
+
+    result = _push(repo, env, ":old", "HEAD:refs/heads/new")
+
+    assert result.returncode == 0, result.stderr
+    assert _make_calls(make_log) == ["ci-precheck"]
+
+
 def test_refuses_a_directory_outside_git(tmp_path: Path) -> None:
     loose = tmp_path / "loose"
     (loose / "scripts").mkdir(parents=True)

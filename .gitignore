@@ -12,6 +12,8 @@ scripts/
 !scripts/
 scripts/*
 !scripts/install.sh
+!scripts/install-rustup.sh
+!scripts/install-opencode.sh
 !scripts/install.ps1
 !scripts/version-sync.py
 !scripts/sync-plugin-versions.py

@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -98,15 +99,33 @@ OUTLINE_MARKER = "    # ... (body elided by Headroom; Read a specific line range
 _TRUNCATION_SIGNATURES: tuple[re.Pattern[str], ...] = (
     # Claude Code: "[Truncated: PARTIAL view -- <path>: showing lines A-B of
     # T total (...). Call Read with offset=N to see more.]"
+    # Matched in two linear steps (see _iter_banners): this pattern is only the
+    # body of one bracket-free span, never run against the rest of the output.
     re.compile(
-        r"\[\s*truncated\s*:\s*partial\s+view\b"
-        r"[^\[\]]*?"
         r"showing\s+lines?\s+(?P<start_line>\d+)\s*[-–]\s*(?P<end_line>\d+)"
-        r"\s+of\s+(?P<total_lines>\d+)\s+total"
-        r"[^\[\]]*\]",
+        r"\s+of\s+(?P<total_lines>\d+)\s+total",
         re.IGNORECASE,
     ),
 )
+_BANNER_OPENER = re.compile(r"\[\s*truncated\s*:\s*partial\s+view\b", re.IGNORECASE)
+_BRACKET = re.compile(r"[\[\]]")
+
+
+def _iter_banners(source: str, body: re.Pattern[str]) -> Iterator[re.Match[str]]:
+    """Yield body matches inside each ``[truncated: partial view ... ]`` span.
+
+    A span runs from the opener to the next bracket and counts only when that
+    bracket is ``]``. Spans cannot overlap (the next opener starts with ``[``),
+    so total work is linear. A single regex with unbounded runs on both sides of
+    the phrase rescanned the unclosed tail once per phrase: quadratic.
+    """
+    for opener in _BANNER_OPENER.finditer(source):
+        close = _BRACKET.search(source, opener.end())
+        if close is None or close.group() != "]":
+            continue
+        m = body.search(source, opener.end(), close.start())
+        if m:
+            yield m
 
 
 def _is_plausible_truncation_range(
@@ -123,7 +142,7 @@ def _detect_truncation(source: str) -> tuple[int, int] | None:
     internally-consistent upstream truncation banner, else None."""
     source_line_count = len(source.splitlines())
     for pattern in _TRUNCATION_SIGNATURES:
-        for m in pattern.finditer(source):
+        for m in _iter_banners(source, pattern):
             start_line = int(m.group("start_line"))
             end_line = int(m.group("end_line"))
             total_lines = int(m.group("total_lines"))
