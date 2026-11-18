@@ -159,6 +159,35 @@ class TestLogLevelDetection:
         assert stats["warnings"] == 3
         assert stats["info"] == 2
 
+    def test_ansi_colored_levels_counted_and_errors_kept(self):
+        """ANSI SGR codes before level names (e.g. tracing-subscriber) still classify."""
+        lines = []
+        for i in range(200):
+            ts = f"\x1b[2m2026-11-17T22:44:{i % 60:02d}.000000Z\x1b[0m"
+            if i % 25 == 24:
+                lines.append(
+                    f"{ts} \x1b[31mERROR\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m "
+                    f"upstream timeout req_id={i}"
+                )
+            elif i % 25 == 10:
+                lines.append(
+                    f"{ts} \x1b[33m WARN\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m "
+                    f"slow response req_id={i}"
+                )
+            else:
+                lines.append(
+                    f"{ts} \x1b[32m INFO\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m "
+                    f"request handled req_id={i}"
+                )
+        content = "\n".join(lines)
+        result = LogCompressor(LogCompressorConfig(enable_ccr=False)).compress(content)
+        assert result.stats["errors"] == 8
+        assert result.stats["warnings"] == 8
+        assert result.stats["info"] == 184
+        kept_errors = [line for line in result.compressed.splitlines() if "ERROR" in line]
+        assert len(kept_errors) == 8
+        assert result.original == content
+
 
 class TestStackTraceDetection:
     """Stack-trace lines survive compression. Python, Go, Rust-panic, .NET and

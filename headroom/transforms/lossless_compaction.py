@@ -73,7 +73,9 @@ _HEADING_ROW_RE = re.compile(r"^(?P<line>\d+):(?P<content>.*)$")
 # and has to reconstruct the clock itself. The fold round-trips exactly, so the
 # inverse-check in compact_lossless cannot catch it -- it must be excluded here.
 _TIMESTAMP_ROW_RE = re.compile(
-    r"^\s*\[?(?:"
+    # Leading ANSI SGR color codes (e.g. Rust tracing-subscriber's
+    # `\x1b[2m2026-11-17T22:44:17Z\x1b[0m`) must not hide the timestamp.
+    r"^\s*(?:\x1b\[[0-9;]*m)*(?:\[(?:\x1b\[[0-9;]*m)*)?(?:"
     r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}"  # 2026-09-02 14:30 / ISO 8601 'T'
     r"|\d{4}/\d{2}/\d{2}[ T]\d{1,2}:\d{2}"  # Go log, nginx error log: 2026/09/02 14:30
     r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
@@ -86,7 +88,7 @@ _TIMESTAMP_ROW_RE = re.compile(
     # (DNS names are at most 253), so a grep row's path or a long unbroken
     # line is not scanned to its end.
     r"|[\w.-]{1,255} [^\s:]+ [^\s:]+ \[\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}"
-    r"|\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|$)"  # bare 15:03:53 / [15:03:53]
+    r"|\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|\x1b\[|$)"  # bare 15:03:53 / [15:03:53]
     r")"
 )
 

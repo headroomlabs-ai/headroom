@@ -64,6 +64,15 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
             for m in range(60)
         ),
         _ruby_logger_log(),
+        "\n".join(
+            f"\x1b[2m2026-11-17T22:45:{m:02d}.806331Z\x1b[0m \x1b[31mERROR\x1b[0m "
+            f"\x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m upstream timeout req_id={m}"
+            for m in range(60)
+        ),
+        "\n".join(
+            f"\x1b[2m15:{m:02d}:53\x1b[0m \x1b[32mINFO\x1b[0m worker heartbeat {m}"
+            for m in range(60)
+        ),
     ],
     ids=[
         "iso-datetime",
@@ -76,6 +85,8 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
         "access-log",
         "access-log-longest-host",
         "ruby-logger",
+        "ansi-tracing-subscriber",
+        "ansi-bare-clock",
     ],
 )
 def test_timestamped_logs_are_never_folded(sample: str) -> None:
@@ -90,8 +101,12 @@ def test_timestamped_logs_are_never_folded(sample: str) -> None:
         ("logs/controller.log", "E0902 14:30:{s:02d}.000000       1 reflector.go:100] list failed"),
         ("/var/log/nginx/access.log", '10.0.0.7 - - [02/Sep/2026:14:30:{s:02d} +0000] "GET /" 500'),
         ("log/production.log", "I, [2026-09-02T14:30:{s:02d}.000000 #1]  INFO -- : 200 OK"),
+        (
+            "logs/service.log",
+            "\x1b[2m2026-11-17T22:45:{s:02d}.806331Z\x1b[0m \x1b[31mERROR\x1b[0m timeout",
+        ),
     ],
-    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger"],
+    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger", "ansi-tracing-subscriber"],
 )
 def test_grep_rows_over_those_logs_still_fold(path: str, row: str) -> None:
     """``grep -n`` output starts with the file path, so it is not a log row."""
