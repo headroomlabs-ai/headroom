@@ -896,13 +896,26 @@ class TestCallCliLlm:
             '{"disableAllHooks":true}',
         ]
 
-    def test_claude_cli_drops_strict_mcp_config_under_an_enterprise_mcp_config(self):
+    _ENTERPRISE_REFUSAL = (
+        "You cannot use --strict-mcp-config when an enterprise MCP config is present\n"
+    )
+
+    def test_claude_cli_enterprise_mcp_refusal_fails_closed_without_the_opt_in(self, monkeypatch):
+        monkeypatch.delenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", raising=False)
+        popen = _fake_claude_popen(
+            stdout_lines=[], stderr_lines=[self._ENTERPRISE_REFUSAL], returncode=1
+        )
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            with pytest.raises(RuntimeError, match="HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP=1"):
+                _call_cli_llm("test digest", "claude-cli")
+        assert popen.call_count == 1
+
+    def test_claude_cli_retries_without_strict_mcp_config_and_with_mcp_denied_on_opt_in(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", "1")
         refused = _fake_claude_popen(
-            stdout_lines=[],
-            stderr_lines=[
-                "You cannot use --strict-mcp-config when an enterprise MCP config is present\n"
-            ],
-            returncode=1,
+            stdout_lines=[], stderr_lines=[self._ENTERPRISE_REFUSAL], returncode=1
         )
         ok = _fake_claude_popen(
             stdout_lines=[_result_event('{"context_file_rules": [], "memory_file_rules": []}')]
@@ -916,6 +929,22 @@ class TestCallCliLlm:
         retry = popen.call_args_list[1][0][0]
         assert "--strict-mcp-config" not in retry
         assert retry[retry.index("--tools") + 1] == ""
+        assert retry[retry.index("--disallowedTools") + 1] == "mcp__*"
+
+    def test_claude_cli_refusal_text_outside_stderr_does_not_trigger_the_retry(self, monkeypatch):
+        # Model output can echo session text, so only stderr counts.
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", "1")
+        popen = _fake_claude_popen(
+            stdout_lines=[
+                _stream_event("assistant", message={"content": self._ENTERPRISE_REFUSAL}),
+                _result_event(self._ENTERPRISE_REFUSAL),
+            ],
+            returncode=1,
+        )
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            with pytest.raises(RuntimeError, match="failed.*exit 1"):
+                _call_cli_llm("test digest", "claude-cli")
+        assert popen.call_count == 1
 
     def test_claude_cli_progress_callback_is_throttled(self):
         stdout = [
