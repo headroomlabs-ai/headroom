@@ -3,7 +3,6 @@
 # expand ARGs) can refresh the digests. PYTHON_VERSION must match the python
 # base images; the builder stage fails if it does not.
 ARG PYTHON_VERSION=3.13
-ARG UV_VERSION=0.11.18
 ARG PYTHON_SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 
 # ---- Build stage: compile native extensions, build wheel ----
@@ -13,7 +12,6 @@ ARG PYTHON_VERSION
 RUN actual="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')" && \
     [ "$actual" = "${PYTHON_VERSION}" ] || { echo "PYTHON_VERSION=${PYTHON_VERSION} but the base image has Python $actual; update the FROM lines and PYTHON_VERSION together" >&2; exit 1; }
 
-ARG UV_VERSION
 ARG PYTHON_SITE_PACKAGES
 ARG HEADROOM_BUILD_VERSION=""
 
@@ -32,7 +30,8 @@ RUN apt-get update && \
     patchelf \
   && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir uv==${UV_VERSION}
+COPY docker/uv.txt /tmp/uv.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary :all: -r /tmp/uv.txt
 
 # Rust toolchain for the headroom._core extension. With single-wheel
 # architecture (post-#355), `pip install -e .` invokes maturin via

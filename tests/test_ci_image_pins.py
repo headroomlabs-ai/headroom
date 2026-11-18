@@ -48,12 +48,14 @@ CONSTRAINED_INSTALL = re.compile(r"pip install\b[^\n]*?(?:-c|--constraints) /tmp
 MATURIN_SPEC = re.compile(r"maturin\s*([<>=!~]=?)")
 TOOL_VERSION = {
     "maturin": re.compile(r"maturin==(\d[\w.]*)|ARG MATURIN_VERSION=(\d[\w.]*)"),
-    "uv": re.compile(r"\buv==(\d[\w.]*)|ARG UV_VERSION=(\d[\w.]*)"),
+    "uv": re.compile(r"\buv==(\d[\w.]*)()"),
 }
 
 
-COPIED_REQUIREMENTS = re.compile(r"^COPY\s+(e2e/\S+\.txt)\s", re.M)
-HASHED_INSTALL = re.compile(r"pip install --require-hashes --only-binary :all: -r (/tmp/\S+\.txt)")
+COPIED_REQUIREMENTS = re.compile(r"^COPY\s+((?:e2e|docker)/\S+\.txt)\s", re.M)
+HASHED_INSTALL = re.compile(
+    r"pip install (?:--no-cache-dir )?--require-hashes --only-binary :all: -r (/tmp/\S+\.txt)"
+)
 
 
 def _install_text(dockerfile: str) -> str:
@@ -89,9 +91,16 @@ def test_build_tools_are_the_same_version_in_every_ci_dockerfile() -> None:
         assert len(set().union(*found.values())) == 1, (tool, found)
 
 
-@pytest.mark.parametrize("dockerfile", ("e2e/init/Dockerfile", "e2e/wrap/Dockerfile"))
-def test_e2e_tool_installs_check_wheel_hashes(dockerfile: str) -> None:
-    """uv, maturin and pip run inside the E2E images before anything else is
+@pytest.mark.parametrize(
+    ("dockerfile", "hashed"),
+    [
+        ("Dockerfile", {"/tmp/uv.txt"}),
+        ("e2e/init/Dockerfile", {"/tmp/build-tools.txt", "/tmp/pip.txt"}),
+        ("e2e/wrap/Dockerfile", {"/tmp/build-tools.txt", "/tmp/pip.txt"}),
+    ],
+)
+def test_tool_installs_check_wheel_hashes(dockerfile: str, hashed: set[str]) -> None:
+    """uv, maturin and pip run inside these images before anything else is
     verified, so they come from wheels whose sha256 is committed here."""
     text = (ROOT / dockerfile).read_text(encoding="utf-8")
     assert not re.search(r"pip install [^\n]*\b(?:uv|maturin|pip)==", text), (
@@ -99,7 +108,7 @@ def test_e2e_tool_installs_check_wheel_hashes(dockerfile: str) -> None:
     )
     copied = {f"/tmp/{Path(path).name}": path for path in COPIED_REQUIREMENTS.findall(text)}
     installed = HASHED_INSTALL.findall(text)
-    assert {"/tmp/build-tools.txt", "/tmp/pip.txt"} <= set(installed), installed
+    assert hashed <= set(installed), installed
     for target in installed:
         lines = [
             line
@@ -108,7 +117,7 @@ def test_e2e_tool_installs_check_wheel_hashes(dockerfile: str) -> None:
         ]
         assert lines, copied[target]
         for line in lines:
-            assert re.fullmatch(r"[a-z0-9-]+==[\w.]+ --hash=sha256:[0-9a-f]{64}", line), (
+            assert re.fullmatch(r"[a-z0-9-]+==[\w.]+( --hash=sha256:[0-9a-f]{64})+", line), (
                 f"{copied[target]}: {line!r} needs an exact version and its sha256"
             )
 
