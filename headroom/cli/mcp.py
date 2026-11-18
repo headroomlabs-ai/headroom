@@ -5,6 +5,9 @@ Claude Code subscription users to use CCR (Compress-Cache-Retrieve) without
 needing API key access.
 """
 
+import os
+from pathlib import Path
+
 import click
 
 from .main import main
@@ -230,6 +233,95 @@ def mcp_reconcile(adopt: bool) -> None:
         click.echo(
             f"  action: disable it so only one Serena runs: claude plugin disable {plugin_id}"
         )
+
+
+@mcp.command("doctor")
+@click.option(
+    "--probe",
+    is_flag=True,
+    help="Also run Serena's own health check on the project (real symbol calls; may take minutes).",
+)
+@click.option(
+    "--project",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Project for --probe (default: current directory).",
+)
+@click.option(
+    "--timeout",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Seconds before --probe gives up (default: 300).",
+)
+def mcp_doctor(probe: bool, project: Path | None, timeout: int | None) -> None:
+    """Diagnose why the Serena MCP server times out or cannot start.
+
+    \b
+    Read-only. Checks what Serena would actually run: where uvx, node, npm
+    and npx resolve on this PATH (Windows binaries under /mnt/ on WSL),
+    node toolchains ~/.bashrc only sets up for interactive shells,
+    language-server launchers Serena cannot execute, and the errors in
+    Serena's latest log. Paths are redacted so the output can be shared.
+
+    \b
+    Run it from the terminal you start your agent from: that PATH is the
+    one `headroom wrap` passes to the agent, and the agent passes to Serena.
+
+    \b
+    Exit codes:
+        0  no problems found
+        1  warnings only
+        2  at least one failure
+    """
+    from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, build_serena_spec
+    from headroom.mcp_registry import serena_doctor as sd
+
+    home = Path.home()
+    serena_dir = sd.serena_home(os.environ, home)
+    tools = sd.resolve_toolchain(os.environ.get("PATH"))
+    bashrc = home / ".bashrc"
+
+    findings = sd.check_toolchain(tools, home)
+    optional = (
+        sd.check_bashrc_guard(bashrc.read_text(errors="replace") if bashrc.is_file() else None),
+        sd.check_language_server_launchers(serena_dir, home),
+        sd.check_mcp_log(sd.latest_mcp_log(serena_dir), home),
+    )
+    findings.extend(finding for finding in optional if finding is not None)
+    if probe:
+        findings.append(
+            sd.run_health_check(
+                build_serena_spec(CLAUDE_SERENA_CONTEXT),
+                project or Path.cwd(),
+                home,
+                timeout=timeout or sd.DEFAULT_PROBE_TIMEOUT_S,
+            )
+        )
+
+    click.echo("Serena MCP doctor")
+    click.echo("Resolved on this PATH (what Serena runs):")
+    for tool in tools:
+        if tool.found is None:
+            click.echo(f"  {tool.name:<5} not found")
+            continue
+        shown = sd.redact(tool.found, home)
+        real = sd.redact(tool.real or tool.found, home)
+        click.echo(f"  {tool.name:<5} {shown}" + (f" -> {real}" if real != shown else ""))
+    click.echo("")
+
+    glyphs = {sd.Severity.OK: "✓", sd.Severity.WARN: "!", sd.Severity.FAIL: "✗"}
+    for finding in findings:
+        click.echo(f"{glyphs[finding.severity]} {finding.summary}")
+        for line in (finding.hint or "").splitlines():
+            click.echo(f"    {line}")
+    click.echo("")
+    click.echo(sd.RECOVERY_STEPS)
+
+    severities = {finding.severity for finding in findings}
+    if sd.Severity.FAIL in severities:
+        raise SystemExit(2)
+    if sd.Severity.WARN in severities:
+        raise SystemExit(1)
 
 
 @mcp.command("status")
