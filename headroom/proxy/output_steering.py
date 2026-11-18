@@ -134,18 +134,11 @@ def _input_already_steered(items: Any) -> bool:
         if item.get("type") not in (None, "message"):
             continue
         content = item.get("content")
-        texts = (
-            [content]
-            if isinstance(content, str)
-            else [
-                part.get("text")
-                for part in content
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-            ]
-            if isinstance(content, list)
-            else []
-        )
-        for text in texts:
+        parts = content if isinstance(content, list) else [{"text": content}]
+        for part in parts:
+            text = part.get("text") if isinstance(part, dict) else None
+            if not isinstance(text, str):
+                continue
             stripped = text.rstrip()
             if stripped.endswith(_STEERING_SUFFIX) and _STEERING_SENTINEL in stripped:
                 return True
