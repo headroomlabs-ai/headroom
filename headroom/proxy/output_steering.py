@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from headroom.proxy.output_verbosity_policy import (
     STEERING_SENTINEL as _STEERING_SENTINEL,
+)
+from headroom.proxy.output_verbosity_policy import (
+    STEERING_SUFFIX as _STEERING_SUFFIX,
 )
 from headroom.proxy.output_verbosity_policy import (
     replace_or_append_steering_block,
@@ -114,6 +116,40 @@ def apply_openai_chat_verbosity_steering(
     return False
 
 
+def _input_already_steered(items: Any) -> bool:
+    """True when a user message in a Responses ``input`` ends with a steering block.
+
+    Only user messages are read, and only a block at the very end counts: that is where
+    ``replace_or_append_steering_block`` puts it. Tool outputs and quoted source can contain the
+    marker text (this module's own policy file does) without anything having been steered, and
+    must not switch core's steering off.
+    """
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        if item.get("type") not in (None, "message"):
+            continue
+        content = item.get("content")
+        texts = (
+            [content]
+            if isinstance(content, str)
+            else [
+                part.get("text")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ]
+            if isinstance(content, list)
+            else []
+        )
+        for text in texts:
+            stripped = text.rstrip()
+            if stripped.endswith(_STEERING_SUFFIX) and _STEERING_SENTINEL in stripped:
+                return True
+    return False
+
+
 def apply_openai_responses_verbosity_steering(
     body: dict[str, Any],
     level: int,
@@ -129,7 +165,7 @@ def apply_openai_responses_verbosity_steering(
     text = steering_text(level)
     if text is None:
         return False
-    if _STEERING_SENTINEL in json.dumps(body.get("input"), ensure_ascii=False):
+    if _input_already_steered(body.get("input")):
         return False
 
     instructions = body.get("instructions")

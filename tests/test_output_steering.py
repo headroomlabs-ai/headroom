@@ -71,6 +71,49 @@ def test_openai_responses_steering_skips_a_body_already_steered_in_input() -> No
     assert body == {"input": [{"role": "user", "content": steered}]}
 
 
+def test_openai_responses_steering_ignores_the_marker_quoted_in_tool_output() -> None:
+    """Reading this repo's own steering source puts the marker in a tool result; that is not a
+    steered body, so core must still steer it."""
+    body = {
+        "instructions": "You are Codex.",
+        "input": [
+            {"role": "user", "content": "show me the steering policy"},
+            {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": 'STEERING_SENTINEL = "<headroom_output_shaping>"\n'
+                'STEERING_SUFFIX = "</headroom_output_shaping>"',
+            },
+        ],
+    }
+    assert apply_openai_responses_verbosity_steering(body, 2) is True
+    assert steering_text(2) in body["instructions"]
+
+
+def test_openai_responses_steering_ignores_a_user_quoting_the_marker_mid_message() -> None:
+    body = {
+        "input": [{"role": "user", "content": "why does <headroom_output_shaping> appear here?"}]
+    }
+    assert apply_openai_responses_verbosity_steering(body, 2) is True
+    assert body["instructions"] == steering_text(2)
+
+
+def test_openai_responses_steering_skips_input_text_parts_already_steered() -> None:
+    steered = f"fix it\n\n{steering_text(3)}"
+    body = {
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": steered}],
+            }
+        ]
+    }
+    assert apply_openai_responses_verbosity_steering(body, 3) is False
+    assert "instructions" not in body
+
+
 def test_openai_chat_steering_appends_to_system_message() -> None:
     from headroom.proxy.output_steering import apply_openai_chat_verbosity_steering
 
