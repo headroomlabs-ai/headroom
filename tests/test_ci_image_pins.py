@@ -52,13 +52,26 @@ TOOL_VERSION = {
 }
 
 
+COPIED_REQUIREMENTS = re.compile(r"^COPY\s+(e2e/\S+\.txt)\s", re.M)
+HASHED_INSTALL = re.compile(r"pip install --require-hashes --only-binary :all: -r (/tmp/\S+\.txt)")
+
+
+def _install_text(dockerfile: str) -> str:
+    """The Dockerfile plus the requirement files it copies in and installs."""
+    text = (ROOT / dockerfile).read_text(encoding="utf-8")
+    copied = [
+        (ROOT / path).read_text(encoding="utf-8") for path in COPIED_REQUIREMENTS.findall(text)
+    ]
+    return "\n".join([text, *copied])
+
+
 def _tool_versions(text: str, tool: str) -> set[str]:
     return {a or b for a, b in TOOL_VERSION[tool].findall(text)}
 
 
 @pytest.mark.parametrize("dockerfile", CI_DOCKERFILES)
 def test_installs_use_exact_versions(dockerfile: str) -> None:
-    text = (ROOT / dockerfile).read_text(encoding="utf-8")
+    text = _install_text(dockerfile)
     assert "--upgrade pip" not in text, f"{dockerfile}: pin pip instead of upgrading it"
     specs = MATURIN_SPEC.findall(text)
     assert specs and set(specs) == {"=="}, (
@@ -71,12 +84,33 @@ def test_installs_use_exact_versions(dockerfile: str) -> None:
 
 def test_build_tools_are_the_same_version_in_every_ci_dockerfile() -> None:
     for tool in TOOL_VERSION:
-        found = {
-            name: _tool_versions((ROOT / name).read_text(encoding="utf-8"), tool)
-            for name in CI_DOCKERFILES
-        }
+        found = {name: _tool_versions(_install_text(name), tool) for name in CI_DOCKERFILES}
         assert all(len(versions) == 1 for versions in found.values()), (tool, found)
         assert len(set().union(*found.values())) == 1, (tool, found)
+
+
+@pytest.mark.parametrize("dockerfile", ("e2e/init/Dockerfile", "e2e/wrap/Dockerfile"))
+def test_e2e_tool_installs_check_wheel_hashes(dockerfile: str) -> None:
+    """uv, maturin and pip run inside the E2E images before anything else is
+    verified, so they come from wheels whose sha256 is committed here."""
+    text = (ROOT / dockerfile).read_text(encoding="utf-8")
+    assert not re.search(r"pip install [^\n]*\b(?:uv|maturin|pip)==", text), (
+        f"{dockerfile}: install uv, maturin and pip from a hashed requirements file"
+    )
+    copied = {f"/tmp/{Path(path).name}": path for path in COPIED_REQUIREMENTS.findall(text)}
+    installed = HASHED_INSTALL.findall(text)
+    assert {"/tmp/build-tools.txt", "/tmp/pip.txt"} <= set(installed), installed
+    for target in installed:
+        lines = [
+            line
+            for line in (ROOT / copied[target]).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        assert lines, copied[target]
+        for line in lines:
+            assert re.fullmatch(r"[a-z0-9-]+==[\w.]+ --hash=sha256:[0-9a-f]{64}", line), (
+                f"{copied[target]}: {line!r} needs an exact version and its sha256"
+            )
 
 
 def test_bind_security_probe_image_is_pinned_by_digest() -> None:

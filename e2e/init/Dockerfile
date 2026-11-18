@@ -27,7 +27,8 @@ ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 # Exact build tools, and the runtime dependency set uv.lock resolved for
 # [proxy], so the runtime stage installs reviewed versions instead of
 # re-resolving pyproject.toml's ranges against PyPI.
-RUN /opt/python/cp311-cp311/bin/pip install maturin==1.16.0 uv==0.11.18 && \
+COPY e2e/build-tools.txt /tmp/build-tools.txt
+RUN /opt/python/cp311-cp311/bin/pip install --require-hashes --only-binary :all: -r /tmp/build-tools.txt && \
     /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11 && \
     /opt/python/cp311-cp311/bin/uv export --frozen --no-dev --no-emit-project --no-hashes \
       --extra proxy --format requirements-txt -o /constraints.txt
@@ -65,6 +66,7 @@ WORKDIR /workspace
 
 COPY --from=builder /dist/*.whl /tmp/wheels/
 COPY --from=builder /constraints.txt /tmp/constraints.txt
+COPY e2e/pip.txt /tmp/pip.txt
 
 # Init e2e harness imports from e2e._lib + .claude-plugin assets.
 # DO NOT copy `headroom/` or `pyproject.toml` from the workspace —
@@ -78,7 +80,7 @@ COPY e2e/_lib ./e2e/_lib
 COPY e2e/init ./e2e/init
 
 RUN python -m venv /opt/headroom-venv && \
-    /opt/headroom-venv/bin/python -m pip install pip==26.3 && \
+    /opt/headroom-venv/bin/python -m pip install --require-hashes --only-binary :all: -r /tmp/pip.txt && \
     /opt/headroom-venv/bin/python -m pip install -c /tmp/constraints.txt "$(ls /tmp/wheels/headroom_ai-*.whl)[proxy]" && \
     /opt/headroom-venv/bin/python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 

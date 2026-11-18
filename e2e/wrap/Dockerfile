@@ -45,7 +45,8 @@ ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 # Exact build tools, and the runtime dependency set uv.lock resolved for
 # [proxy], so the runtime stage installs reviewed versions instead of
 # re-resolving pyproject.toml's ranges against PyPI.
-RUN /opt/python/cp311-cp311/bin/pip install maturin==1.16.0 uv==0.11.18 && \
+COPY e2e/build-tools.txt /tmp/build-tools.txt
+RUN /opt/python/cp311-cp311/bin/pip install --require-hashes --only-binary :all: -r /tmp/build-tools.txt && \
     /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11 && \
     /opt/python/cp311-cp311/bin/uv export --frozen --no-dev --no-emit-project --no-hashes \
       --extra proxy --format requirements-txt -o /constraints.txt
@@ -118,6 +119,7 @@ WORKDIR /workspace
 # Bring in the prebuilt manylinux wheel from stage 1.
 COPY --from=builder /dist/*.whl /tmp/wheels/
 COPY --from=builder /constraints.txt /tmp/constraints.txt
+COPY e2e/pip.txt /tmp/pip.txt
 
 # `sdk/typescript` and `plugins/openclaw` are wired into the wrap-e2e
 # harness (e2e/wrap/run.py invokes `npx openclaw`). DO NOT copy
@@ -134,11 +136,11 @@ COPY scripts/install-opencode.sh /tmp/install-opencode.sh
 # wheel's `_core.so` was compiled against glibc 2.28, so it loads cleanly
 # against bookworm's glibc 2.36 at runtime.
 RUN python -m venv /opt/headroom-venv && \
-    /opt/headroom-venv/bin/python -m pip install pip==26.3 && \
+    /opt/headroom-venv/bin/python -m pip install --require-hashes --only-binary :all: -r /tmp/pip.txt && \
     /opt/headroom-venv/bin/python -m pip install -c /tmp/constraints.txt "$(ls /tmp/wheels/headroom_ai-*.whl)[proxy]" && \
     /opt/headroom-venv/bin/python -c "from headroom._core import DiffCompressor; print('headroom._core OK')" && \
     python -m venv /opt/aider-venv && \
-    /opt/aider-venv/bin/python -m pip install pip==26.3 && \
+    /opt/aider-venv/bin/python -m pip install --require-hashes --only-binary :all: -r /tmp/pip.txt && \
     /opt/aider-venv/bin/python -m pip install "aider-chat==${AIDER_CHAT_VERSION}" && \
     sh /tmp/install-opencode.sh "${OPENCODE_VERSION}"
 
