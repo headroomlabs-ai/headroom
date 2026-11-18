@@ -121,6 +121,7 @@ from headroom.proxy.auth_mode import (
 from headroom.proxy.buffered_ccr_response import (
     DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
     OPENAI_ERROR_FORMAT,
+    OPENAI_RESPONSES_ERROR_FORMAT,
     buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
@@ -7834,18 +7835,15 @@ class OpenAIHandlerMixin:
                                 "handling; failing closed"
                             )
 
-                            async def _residual_ccr_error_sse():
-                                error_event = {
-                                    "type": "error",
-                                    "error": {
-                                        "message": "Unable to safely complete streamed CCR retrieval.",
-                                    },
-                                }
-                                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
-
-                            return StreamingResponse(
-                                _residual_ccr_error_sse(),
-                                media_type="text/event-stream",
+                            # Same split as the Chat twin: a plain JSON error
+                            # works on both sides of the commit. The wrapper
+                            # turns it into the typed stream event if SSE is
+                            # already on the wire.
+                            return Response(
+                                content=OPENAI_RESPONSES_ERROR_FORMAT.json_body(
+                                    "Unable to safely complete streamed CCR retrieval."
+                                ),
+                                media_type="application/json",
                                 headers=sse_headers,
                                 status_code=502,
                             )
@@ -7916,7 +7914,7 @@ class OpenAIHandlerMixin:
                 # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
                 _buffered_call = buffered_ccr_asgi_call(
                     operation=operation,
-                    fmt=OPENAI_ERROR_FORMAT,
+                    fmt=OPENAI_RESPONSES_ERROR_FORMAT,
                     grace_seconds=getattr(
                         self.config,
                         "buffered_ccr_grace_seconds",
