@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from headroom.proxy.output_verbosity_policy import (
@@ -117,9 +118,18 @@ def apply_openai_responses_verbosity_steering(
     body: dict[str, Any],
     level: int,
 ) -> bool:
-    """Append or replace steering in OpenAI Responses ``instructions``."""
+    """Append or replace steering in OpenAI Responses ``instructions``.
+
+    Leaves the body alone when a steering block already rides in ``input``. A
+    client whose upstream rejects ``instructions`` (Kiro's runtime returns 400
+    for it) has its steering placed in the user turns by an extension's
+    ``on_responses_create`` hook; adding a second copy here would break that
+    request outright.
+    """
     text = steering_text(level)
     if text is None:
+        return False
+    if _STEERING_SENTINEL in json.dumps(body.get("input"), ensure_ascii=False):
         return False
 
     instructions = body.get("instructions")

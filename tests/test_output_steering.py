@@ -61,6 +61,16 @@ def test_openai_responses_steering_is_idempotent() -> None:
     assert body == snapshot
 
 
+def test_openai_responses_steering_skips_a_body_already_steered_in_input() -> None:
+    """An upstream that rejects ``instructions`` gets its steering in the user turn
+    from an extension hook; core must not add ``instructions`` on top of it."""
+    steered = f"fix it\n\n{steering_text(3)}"
+    body = {"input": [{"role": "user", "content": steered}]}
+
+    assert apply_openai_responses_verbosity_steering(body, 3) is False
+    assert body == {"input": [{"role": "user", "content": steered}]}
+
+
 def test_openai_chat_steering_appends_to_system_message() -> None:
     from headroom.proxy.output_steering import apply_openai_chat_verbosity_steering
 
