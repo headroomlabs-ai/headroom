@@ -202,7 +202,9 @@ def claude_settings_path() -> Path:
 
     configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
     base = Path(configured).expanduser() if configured else Path.home() / ".claude"
-    return base / "settings.json"
+    # Absolute: the provider installer records this path for a later cleanup that may
+    # run from another directory.
+    return Path(os.path.abspath(base)) / "settings.json"
 
 
 def codex_home_dir() -> Path:

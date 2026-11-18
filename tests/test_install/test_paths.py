@@ -87,6 +87,12 @@ def test_claude_settings_path_honors_claude_config_dir(monkeypatch, tmp_path: Pa
         install_paths.claude_settings_path() == Path("~/rel-claude").expanduser() / "settings.json"
     )
 
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "rel-dir")
+    relative = install_paths.claude_settings_path()
+    assert relative.is_absolute()
+    assert relative == tmp_path / "rel-dir" / "settings.json"
+
     for blank in ("", "   "):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", blank)
         assert (
