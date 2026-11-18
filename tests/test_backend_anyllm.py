@@ -756,6 +756,62 @@ def test_error_response_classifies_common_failures(monkeypatch: pytest.MonkeyPat
     assert generic.body["error"]["type"] == "api_error"
 
 
+@pytest.mark.parametrize(
+    "message",
+    ["Failed to generate response", "This model's maximum context length is 8192 tokens"],
+)
+def test_error_response_ignores_substrings_inside_other_words(
+    monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    response = backend._error_response(RuntimeError(message))
+
+    assert response.status_code == 500
+    assert response.body["error"]["type"] == "api_error"
+
+
+@pytest.mark.parametrize(
+    ("message", "status"),
+    [("Rate limit reached", 429), ("HTTP 429 Too Many Requests", 429), ("Model not found", 404)],
+)
+def test_error_response_phrase_matches_keep_status(
+    monkeypatch: pytest.MonkeyPatch, message: str, status: int
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    assert backend._error_response(RuntimeError(message)).status_code == status
+
+
+class _StatusError(Exception):
+    def __init__(self, message: str, status_code: object) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def test_error_response_prefers_status_carried_by_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    # Text says rate limit, the exception says 400: the exception wins.
+    bad = backend._error_response(_StatusError("rate limit in the text", 400))
+    assert bad.status_code == 400
+    assert bad.body["error"]["type"] == "invalid_request_error"
+
+    rate = backend._error_response(_StatusError("slow down", 429), openai_format=True)
+    assert rate.status_code == 429
+    assert rate.body["error"]["type"] == "rate_limit_exceeded"
+
+    missing = backend._error_response(_StatusError("gone", 404))
+    assert missing.status_code == 404
+    assert missing.body["error"]["type"] == "not_found_error"
+
+    # A non-4xx or non-int status is ignored and the text path decides.
+    assert backend._error_response(_StatusError("boom", 503)).status_code == 500
+    assert backend._error_response(_StatusError("rate limit", "429")).status_code == 429
+
+
 @pytest.mark.asyncio
 async def test_close_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)

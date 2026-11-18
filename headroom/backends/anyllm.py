@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -19,6 +20,11 @@ from .base import Backend, BackendResponse, StreamEvent
 from .litellm import _convert_anthropic_tool, _convert_tool_choice
 
 logger = logging.getLogger(__name__)
+
+# Whole-phrase matches only: bare "rate"/"limit"/"model" also occur inside
+# "generate", "context length limit", "This model's maximum ...".
+_RATE_LIMIT_RE = re.compile(r"\brate[ _-]?limit|\btoo many requests\b|\b429\b")
+_NOT_FOUND_RE = re.compile(r"\bnot found\b|\b404\b")
 
 try:
     from any_llm import AnyLLM
@@ -574,13 +580,22 @@ class AnyLLMBackend(Backend):
         # to the public vocabulary (see proxy/public_errors).
         error_message = client_message(e, format_exception_message(e))
         error_str = str(e).lower()
-        if "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
+        # A status carried by the exception wins over matching its text.
+        upstream = getattr(e, "status_code", None)
+        if isinstance(upstream, int) and not isinstance(upstream, bool) and 400 <= upstream <= 499:
+            status_code = upstream
+            error_type = {
+                401: "invalid_api_key" if openai_format else "authentication_error",
+                404: "model_not_found" if openai_format else "not_found_error",
+                429: "rate_limit_exceeded" if openai_format else "rate_limit_error",
+            }.get(upstream, "invalid_request_error")
+        elif "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
             error_type = "invalid_api_key" if openai_format else "authentication_error"
             status_code = 401
-        elif "rate" in error_str or "limit" in error_str:
+        elif _RATE_LIMIT_RE.search(error_str):
             error_type = "rate_limit_exceeded" if openai_format else "rate_limit_error"
             status_code = 429
-        elif "not found" in error_str or "model" in error_str:
+        elif _NOT_FOUND_RE.search(error_str):
             error_type = "model_not_found" if openai_format else "not_found_error"
             status_code = 404
 
