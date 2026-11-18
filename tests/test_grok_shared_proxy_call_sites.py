@@ -206,7 +206,7 @@ def test_configured_gateway_outranks_grok_and_keeps_operator_extras(
         (
             _run_chat,
             "https://api.x.ai/v1",
-            "https://api.x.ai/v1/v1/chat/completions",
+            "https://api.x.ai/v1/chat/completions",
             True,
         ),
         (
