@@ -11,6 +11,8 @@ from fastapi import Request
 from fastapi.responses import Response
 from starlette.requests import ClientDisconnect
 
+from headroom.copilot_auth import build_copilot_upstream_url
+
 logger = logging.getLogger("headroom.providers.openai.responses")
 
 
@@ -61,8 +63,13 @@ OPENAI_RESPONSES_SUBPATH_ROUTES: tuple[OpenAIResponsesSubpathRoute, ...] = (
 
 
 def openai_responses_subpath_url(api_base_url: str, sub_path: str, query: str = "") -> str:
-    """Build an OpenAI Responses API subpath URL."""
-    url = f"{api_base_url.rstrip('/')}/v1/responses/{sub_path}"
+    """Build an OpenAI Responses API subpath URL.
+
+    Joined through ``build_copilot_upstream_url`` like the main ``/v1/responses``
+    route, so a base that already ends in an API version (``.../api/v3``) does not
+    get ``/v1`` stacked on top of it.
+    """
+    url = build_copilot_upstream_url(api_base_url, f"/v1/responses/{sub_path}")
     if query:
         url = f"{url}?{query}"
     return url
