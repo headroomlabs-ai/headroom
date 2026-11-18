@@ -172,6 +172,8 @@ class RequestLogger:
 
     def get_recent(self, n: int = 100) -> list[dict]:
         """Get recent log entries (without request/compressed messages and response_content)."""
+        if n <= 0:  # [-0:] would be the whole log
+            return []
         # Convert deque to list for slicing (deque doesn't support slicing)
         entries = list(self._logs)[-n:]
         # Not asdict(): that deep-copies every field BEFORE the heavy ones are
@@ -197,6 +199,8 @@ class RequestLogger:
         full copy of each transcript (~160 KB per Claude Code turn, ~44 MB per
         ``limit=100`` feed pull) on the event loop.
         """
+        if n <= 0:
+            return []
         entries = list(self._logs)[-n:]
         if include_messages:
             return [asdict(e) for e in entries]
