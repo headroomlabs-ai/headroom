@@ -306,6 +306,7 @@ def run_request_hooks(
     *,
     stream_safe_only: bool = False,
     system_forwarded: Callable[[TurnContext], bool] | None = None,
+    measured_messages: Callable[[TurnContext], Any] | None = None,
 ) -> None:
     """Run each hook's ``on_request``. Inert when none registered; never raises.
 
@@ -313,6 +314,11 @@ def run_request_hooks(
     handler will send ``ctx.system`` as the hooks left it. When it will not
     (the Responses system item a hook removed), the system deltas are not
     booked: what reaches the provider is the message delta alone.
+
+    ``measured_messages`` gives the messages whose delta is booked, when that is
+    not ``ctx.messages`` itself: a Responses system item the handler overwrites
+    with ``ctx.system`` is booked as a system delta, so an edit of the item
+    through the messages must not be booked as a message delta as well.
 
     ``on_request`` mutates the outbound request before the upstream send, so it is
     safe on a streamed turn *as long as the hook needs no later re-drive*. A hook
@@ -333,6 +339,7 @@ def run_request_hooks(
     gains: list[tuple[str, int, dict[str, int]]] = []
     sequence_net = system_net = 0
     count_messages = ctx.count_messages
+    measured = measured_messages or (lambda c: c.messages)
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
@@ -343,7 +350,7 @@ def run_request_hooks(
         before_messages = before_system = before_tools = None
         try:
             if count_messages is not None:
-                before_messages = count_messages(ctx.messages)
+                before_messages = count_messages(measured(ctx))
                 before_system = count_system_tokens(count_messages, ctx.system)
             if ctx.count_tools is not None:
                 before_tools = tools_before_hook(
@@ -359,7 +366,7 @@ def run_request_hooks(
             # fold alone. Booked only when the net is a saving.
             message_saved = system_saved = 0
             if count_messages is not None and before_messages is not None:
-                message_saved = before_messages - count_messages(ctx.messages)
+                message_saved = before_messages - count_messages(measured(ctx))
             after_system = count_system_tokens(count_messages, ctx.system)
             if before_system is not None and after_system is not None:
                 system_saved = before_system - after_system

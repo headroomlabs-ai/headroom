@@ -833,3 +833,28 @@ def test_namespaces_sharing_a_tool_name_are_charged_apart(
     assert working["input"][0]["output"] == "folded"  # the hook did run
     assert headline == ledger
     assert (headline == 0) == charged
+
+
+def test_a_developer_item_edited_through_messages_and_system_is_booked_once() -> None:
+    # The hook shortens the developer item both ways. Only ctx.system is
+    # forwarded, so the turn saves what the system-only edit saves, not twice.
+    def payload() -> dict[str, Any]:
+        return {
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "developer", "content": [{"type": "input_text", "text": LONG_SYSTEM}]},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+
+    def system_only(ctx: Any) -> None:
+        ctx.system = [{"type": "input_text", "text": "short"}]
+
+    def both(ctx: Any) -> None:
+        ctx.messages[0]["content"][0]["text"] = "short"
+        system_only(ctx)
+
+    control = _responses_headline(system_only, payload())
+    headline, ledger, working = _responses_headline(both, payload())
+    assert working == control[2]
+    assert headline == ledger == control[0] == control[1] > 0

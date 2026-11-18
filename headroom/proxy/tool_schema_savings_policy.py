@@ -356,6 +356,17 @@ def _debit_hook_rows(tags: dict[str, Any], amount: int) -> None:
         amount -= take
 
 
+def _realized_row_tokens(tags: dict[str, Any]) -> int:
+    """The tokens on the realized, measured ledger rows: the by-source total."""
+    from headroom.proxy.savings_attribution import from_tags
+
+    return sum(
+        int(row.get("tokens") or 0)
+        for row in from_tags(tags)
+        if row.get("realized") and not row.get("estimated")
+    )
+
+
 def reconcile_deferred_tokens(
     tags: object,
     booking: DeferredBooking | None,
@@ -457,9 +468,14 @@ def net_hook_tool_saving(
     ``proxy_cost`` is the part of the deficit the proxy added after the hooks
     ran (steering, the retrieve tool). The hooks' ledger rows already net
     their own growth, but not that: what it takes from the hooks' tags comes
-    off their rows too, so ``/stats`` by-source agrees with the headline.
+    off their rows too, so ``/stats`` by-source agrees with the headline. So
+    does the part it takes from the message saving, as far as the realized
+    rows would otherwise top the headline (a saving no row claims, such as
+    compression, absorbs it first).
     """
     raw = int(raw_saved)
+    cost = max(0, int(proxy_cost or 0))
+    from_messages = min(cost, max(0, raw + cost))
     booked = max(0, int(hook_tool_saved or 0))
     hook_debit = 0
     if raw < 0 and booked > 0 and isinstance(tags, dict):
@@ -476,7 +492,7 @@ def net_hook_tool_saving(
             raw += offset
             hook_debit += offset
     if isinstance(tags, dict):
-        _debit_hook_rows(tags, min(hook_debit, max(0, int(proxy_cost or 0))))
+        _debit_hook_rows(tags, min(hook_debit, cost))
     if raw < 0 and isinstance(tags, dict):
         try:
             credit = max(0, int(tags.get("tool_search_deferred_tokens") or 0))
@@ -489,6 +505,9 @@ def net_hook_tool_saving(
             if entry is not None:
                 entry["tokens"] = max(0, int(entry.get("tokens") or 0) - offset)
             raw += offset
+    if from_messages and isinstance(tags, dict):
+        headline = max(0, raw) + tool_schema_saved_from_tags(tags)
+        _debit_hook_rows(tags, min(from_messages, _realized_row_tokens(tags) - headline))
     return max(0, raw)
 
 

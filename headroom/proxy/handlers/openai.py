@@ -219,6 +219,18 @@ def _system_item_index(items: Any, item: dict[str, Any]) -> int | None:
     return index
 
 
+def _with_system_baseline(items: Any, item: dict[str, Any], baseline: Any, system: Any) -> Any:
+    """``items`` as their delta is booked: with ``item`` back at its ``baseline``
+    content when a hook's ``system`` differs from it. That system is written over
+    the item and booked as a system delta, so the item's own edit is not sent."""
+    if system == baseline:
+        return items
+    index = _system_item_index(items, item)
+    if index is None:
+        return items
+    return [*items[:index], {**items[index], "content": baseline}, *items[index + 1 :]]
+
+
 def _write_responses_system(
     body: dict[str, Any], item_key: str | None, item: dict[str, Any] | None, system: Any
 ) -> bool:
@@ -3459,6 +3471,15 @@ class OpenAIHandlerMixin:
                 count_tools=_count_responses_tools,
                 conversation=conversation,
             )
+
+            # A system item is sent as ctx.system once that differs from the
+            # baseline, overwriting any edit made to the item through the messages:
+            # that edit is not sent, so it is not booked as a message delta either.
+            def _measured_messages(ctx: TurnContext) -> Any:
+                if not _system_in_item or _system_item is None:
+                    return ctx.messages
+                return _with_system_baseline(ctx.messages, _system_item, _system_before, ctx.system)
+
             # Streaming turns get fold-only hooks, same rule as the
             # chat-completions path. A hook that defers work to `on_response`
             # cannot run here: the response side is wired on the buffered branch
@@ -3474,6 +3495,7 @@ class OpenAIHandlerMixin:
             run_request_hooks(
                 _req_ctx,
                 stream_safe_only=bool(payload.get("stream")),
+                measured_messages=_measured_messages,
                 # A rewrite of a system item the hooks removed is not sent
                 # (_write_responses_system), so the ledger must not book it.
                 system_forwarded=(
@@ -3492,7 +3514,7 @@ class OpenAIHandlerMixin:
             if _msg_key and _mt_before:
                 try:
                     _mt_after = self.openai_provider.get_token_counter(model).count_text(
-                        _json_debug_dumps(working.get(_msg_key) or [])
+                        _json_debug_dumps(_measured_messages(_req_ctx) or [])
                     )
                     # Signed: message text a hook added offsets its other savings.
                     tokens_saved += _mt_before - _mt_after

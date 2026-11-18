@@ -470,3 +470,31 @@ def test_steering_comes_off_the_hook_ledger_row_with_its_tag(monkeypatch) -> Non
     headline = headline_tokens_saved(outcome.tokens_saved, outcome.tags)
     assert 0 < headline < _resident_saving()  # steering cost was netted
     assert sum(r["tokens"] for r in from_tags(outcome.tags) if r["realized"]) == headline
+
+
+class _ShortenMessage:
+    """Replaces the user's message: a message-side saving, no tool or system part."""
+
+    name = savings_source = "message_trim"
+    stream_safe = True
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.messages = [{"role": "user", "content": "short"}]
+
+
+def test_steering_comes_off_a_message_only_hook_row(monkeypatch) -> None:
+    # With no tool or system credit the steering cost comes out of the message
+    # saving; the hook's row must lose it too, or by-source tops the headline.
+    from headroom.proxy.savings_attribution import from_tags
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+    register_turn_hook(_ShortenMessage())
+    outcome, upstream = _send_outcome(
+        monkeypatch, {"messages": [{"role": "user", "content": "some words " * 400}]}
+    )
+    assert upstream["messages"] == [{"role": "user", "content": "short"}]
+    headline = headline_tokens_saved(outcome.tokens_saved, outcome.tags)
+    (row,) = from_tags(outcome.tags)
+    assert row["tokens"] == headline > 0
