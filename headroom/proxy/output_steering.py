@@ -124,6 +124,8 @@ def _input_already_steered(items: Any) -> bool:
     marker text (this module's own policy file does) without anything having been steered, and
     must not switch core's steering off.
     """
+    if isinstance(items, str):  # Responses accepts a bare string as one user message
+        items = [{"role": "user", "content": items}]
     if not isinstance(items, list):
         return False
     for item in items:

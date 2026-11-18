@@ -114,6 +114,13 @@ def test_openai_responses_steering_skips_input_text_parts_already_steered() -> N
     assert "instructions" not in body
 
 
+def test_openai_responses_steering_skips_a_string_input_already_steered() -> None:
+    steered = f"fix it\n\n{steering_text(3)}"
+    body = {"input": steered}
+    assert apply_openai_responses_verbosity_steering(body, 3) is False
+    assert body == {"input": steered}
+
+
 def test_openai_chat_steering_appends_to_system_message() -> None:
     from headroom.proxy.output_steering import apply_openai_chat_verbosity_steering
 
