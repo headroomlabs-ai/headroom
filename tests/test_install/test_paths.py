@@ -66,12 +66,35 @@ def test_env_target_and_config_paths(monkeypatch, tmp_path: Path) -> None:
         Path("/etc/bashrc"),
     ]
 
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert install_paths.claude_settings_path() == tmp_path / ".claude" / "settings.json"
     assert install_paths.codex_config_path() == tmp_path / ".codex" / "config.toml"
     assert install_paths.openclaw_config_path() == tmp_path / ".openclaw" / "openclaw.json"
     assert (
         install_paths.opencode_config_path() == tmp_path / ".config" / "opencode" / "opencode.json"
     )
+
+
+def test_claude_settings_path_honors_claude_config_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    custom = tmp_path / "custom-claude"
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+    assert install_paths.claude_settings_path() == custom / "settings.json"
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/rel-claude")
+    assert (
+        install_paths.claude_settings_path() == Path("~/rel-claude").expanduser() / "settings.json"
+    )
+
+    for blank in ("", "   "):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", blank)
+        assert (
+            install_paths.claude_settings_path() == tmp_path / "home" / ".claude" / "settings.json"
+        )
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert install_paths.claude_settings_path() == tmp_path / "home" / ".claude" / "settings.json"
 
 
 def test_opencode_config_path_honors_opencode_home(monkeypatch, tmp_path: Path) -> None:

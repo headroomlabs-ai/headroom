@@ -193,9 +193,16 @@ def unix_system_env_targets() -> list[Path]:
 
 
 def claude_settings_path() -> Path:
-    """Return the Claude user settings path."""
+    """Return the Claude user settings path, honoring ``CLAUDE_CONFIG_DIR``.
 
-    return Path.home() / ".claude" / "settings.json"
+    Claude Code reads ``settings.json`` from ``CLAUDE_CONFIG_DIR`` when it is
+    set (falling back to ``~/.claude``); Headroom must write and inspect the
+    same file or the routing silently never applies.
+    """
+
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    base = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    return base / "settings.json"
 
 
 def codex_home_dir() -> Path:
