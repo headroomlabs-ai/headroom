@@ -1087,6 +1087,18 @@ class PrometheusMetrics:
                         cache_model = model
                     else:
                         cache_model = bounded_model
+                    # Bound cache history independently of the display map:
+                    # raw keys can outnumber display keys (int/str pairs
+                    # share one bucket; distinct NaNs all display as "nan"),
+                    # so admit a new raw key only while the map still has
+                    # room below the cap; beyond that, attribute to "other".
+                    # The cap reserves one slot for "other", so the map never
+                    # exceeds MAX_DISTINCT_MODELS + 1 entries.
+                    if (
+                        cache_model not in self._cache_requests_by_model
+                        and len(self._cache_requests_by_model) >= MAX_DISTINCT_MODELS
+                    ):
+                        cache_model = _OTHER_MODEL
                     model_req_num = self._cache_requests_by_model[cache_model]
                     self._cache_requests_by_model[cache_model] += 1
                     if provider == "anthropic" and model_req_num > 0:
