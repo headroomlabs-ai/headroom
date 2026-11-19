@@ -340,3 +340,79 @@ def test_sentence_transformer_default_is_pinned(monkeypatch):
     from headroom.onnx_runtime import _resolve_revision
 
     assert _resolve_revision(ML_MODEL_DEFAULTS.sentence_transformer, None) is not None
+
+
+# ---------------------------------------------------------------------------
+# Offline upgrade path (GH #4939 review)
+#
+# A deployment that cached the *default-branch* snapshot before the pin existed
+# has the old bytes under its refs, not the pin. Pinning makes that a cache
+# miss, so the loader falls back to estimation — silently, once, for the life of
+# the process (lru_cache). Correct by design: serving the old vocabulary would
+# defeat the pin and quietly change every count. But the operator has to be told
+# to pre-seed the SHA first, so this test locks the behaviour in place.
+# ---------------------------------------------------------------------------
+
+
+def test_offline_tolerates_only_the_pinned_snapshot(monkeypatch):
+    """An old default-branch snapshot is a miss under a pin, and refusing is the point."""
+    monkeypatch.delenv("HEADROOM_HF_TOKENIZER_REVISIONS", raising=False)
+    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
+    import sys
+    import types
+
+    from headroom.tokenizers import huggingface as hf_mod
+
+    pin = hf_mod._TOKENIZER_REVISIONS["Qwen/Qwen2.5-7B"]
+    calls: list[dict] = []
+
+    class _Auto:
+        @staticmethod
+        def from_pretrained(name, **kwargs):
+            calls.append(kwargs)
+            # The cache holds the default branch only: the rev the operator
+            # seeded long ago is not the pin, so asking for the pin misses.
+            raise OSError("Requested revision not found in cache")
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=_Auto))
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    hf_mod._load_tokenizer.cache_clear()
+    try:
+        # The old snapshot is a miss, and offline means no network fallback, so
+        # the answer is None (estimation), never the old vocabulary.
+        assert hf_mod._load_tokenizer("Qwen/Qwen2.5-7B") is None
+        assert [c["revision"] for c in calls] == [pin]
+        assert calls[0]["local_files_only"] is True
+    finally:
+        hf_mod._load_tokenizer.cache_clear()
+
+
+def test_a_cache_seeded_at_the_pin_is_used_offline(monkeypatch):
+    """The documented fix: pre-seed the SHA, and an offline box keeps real counts."""
+    monkeypatch.delenv("HEADROOM_HF_TOKENIZER_REVISIONS", raising=False)
+    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
+    import sys
+    import types
+
+    from headroom.tokenizers import huggingface as hf_mod
+
+    pin = hf_mod._TOKENIZER_REVISIONS["Qwen/Qwen2.5-7B"]
+    calls: list[dict] = []
+
+    class _Auto:
+        @staticmethod
+        def from_pretrained(name, **kwargs):
+            calls.append(kwargs)
+            if kwargs.get("revision") != pin:
+                raise OSError("only the pin is cached")
+            return "pinned-tokenizer"
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=_Auto))
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    hf_mod._load_tokenizer.cache_clear()
+    try:
+        assert hf_mod._load_tokenizer("Qwen/Qwen2.5-7B") == "pinned-tokenizer"
+    finally:
+        hf_mod._load_tokenizer.cache_clear()
+
+    assert calls == [{"revision": pin, "trust_remote_code": False, "local_files_only": True}]
