@@ -828,7 +828,13 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         if project_tag:
             log_tags["project"] = project_tag
         for dimension, label in attribution.items():
-            log_tags.setdefault(dimension, label)
+            # A listed dimension's label is its resolver's, which outranks the
+            # ``X-Headroom-<name>`` tag a client sent. Any other label never
+            # replaces a tag the handler set.
+            if dimension in listed:
+                log_tags[dimension] = label
+            else:
+                log_tags.setdefault(dimension, label)
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,
