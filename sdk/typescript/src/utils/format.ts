@@ -813,16 +813,21 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   pdf: "application/pdf",
 };
 
-// Private key carrying the Gemini fields that have no OpenAI counterpart. It rides on the
-// OpenAI message, the content block or the tool call, exactly where the part that owned it
-// lands — the proxy copies messages and content blocks with their extra keys and never
-// rewrites tool calls, so the values come back from /v1/compress as they went in. The bag
-// holds every field of the part beside its data field (`thought`, `thoughtSignature`,
-// `videoMetadata`, `mediaProcessing`, `partMetadata`, ...) and, under `call`, every field of
-// a functionCall / functionResponse the tool call or tool message cannot hold (`id`, a
-// response's `name`, `parts`, `willContinue`, `scheduling`, ...). Restoring them matters:
-// Gemini 3 answers a function-call turn whose first functionCall lost its `thoughtSignature`
-// with a 400 (issue #4770).
+// Private key carrying what the OpenAI shape has no slot for. It rides on the OpenAI message,
+// the content block or the tool call, exactly where the part that owned it lands — the proxy
+// copies messages and content blocks with their extra keys and never rewrites tool calls, so
+// the values come back from /v1/compress as they went in. The bag holds:
+//   part      every field of the part beside its data field (`thought`, `thoughtSignature`,
+//             `videoMetadata`, `mediaProcessing`, `partMetadata`, ...)
+//   call      every field of a functionCall / functionResponse the tool call or tool message
+//             cannot hold (`id`, a response's `name`, `parts`, `willContinue`, `scheduling`, ...)
+//   position  on a tool call: how many content parts preceded the functionCall in its turn
+//   sameTurn  on a message: it continues the Gemini turn of the message before it
+// Gemini's own field names live only under `part` and `call`, so they cannot collide with the
+// two keys the converter adds.
+// Restoring all of it matters: Gemini 3 answers a function-call turn whose first functionCall
+// lost its `thoughtSignature` with a 400 (issue #4770), and a turn has to come back as one
+// turn with its parts in the order they were sent.
 const GEMINI_EXTRAS_KEY = "_headroomGemini";
 
 // The part kinds the converter translates. A part of any other kind — executableCode,
@@ -831,7 +836,8 @@ const GEMINI_EXTRAS_KEY = "_headroomGemini";
 const TRANSLATED_PART_KINDS = new Set(["text", "inlineData", "fileData", "functionCall", "functionResponse"]);
 
 function geminiPartExtras(part: any): Record<string, any> | undefined {
-  return definedEntries(part, (key) => !TRANSLATED_PART_KINDS.has(key));
+  const rest = definedEntries(part, (key) => !TRANSLATED_PART_KINDS.has(key));
+  return rest ? { part: rest } : undefined;
 }
 
 // The fields of a functionCall (beside `name` / `args`) or functionResponse (beside `response`)
@@ -852,11 +858,16 @@ function withGeminiExtras<T extends object>(target: T, extras: Record<string, an
   return target;
 }
 
-// The carried bag, split into the part-level fields and the functionCall / functionResponse ones.
-function geminiExtras(source: any): { part: Record<string, any>; call: Record<string, any> } {
-  const extras = source?.[GEMINI_EXTRAS_KEY];
-  const { call, ...part } = extras && typeof extras === "object" ? extras : {};
-  return { part, call: call && typeof call === "object" ? call : {} };
+// The carried bag, with `part` and `call` always present.
+function geminiExtras(source: any): {
+  part: Record<string, any>;
+  call: Record<string, any>;
+  position?: number;
+  sameTurn?: boolean;
+} {
+  const record = (value: any) => (value && typeof value === "object" ? value : {});
+  const bag = record(source?.[GEMINI_EXTRAS_KEY]);
+  return { ...bag, part: record(bag.part), call: record(bag.call) };
 }
 
 // Merge the extra bags of one source part, dropping the entry entirely when empty so plain
@@ -918,14 +929,26 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
   for (const msg of messages) {
     const role = msg.role === "model" ? "assistant" : "user";
     const parts: any[] = msg.parts ?? [];
-    const blocks = parts.map(geminiPartToBlock).filter((b: any) => b !== null);
 
     if (role === "user") {
-      if (blocks.length > 0) {
-        result.push({ role: "user", content: geminiBlocksToContent(blocks) });
-      }
-      for (const fr of parts.filter((p: any) => p.functionResponse)) {
-        const call = fr.functionResponse;
+      // OpenAI has no single message for this turn: each functionResponse is a tool message
+      // and the parts between them are user messages. They go out in source order, and every
+      // message after the turn's first carries `sameTurn`, so the reverse conversion rebuilds
+      // one turn with each part where it was.
+      const first = result.length;
+      let run: any[] = [];
+      const flushRun = () => {
+        if (run.length > 0) result.push({ role: "user", content: geminiBlocksToContent(run) });
+        run = [];
+      };
+      for (const p of parts) {
+        if (!p.functionResponse) {
+          const block = geminiPartToBlock(p);
+          if (block) run.push(block);
+          continue;
+        }
+        flushRun();
+        const call = p.functionResponse;
         // The response may omit its id; fall back to the call of the same name that is
         // still unanswered, so both sides of the round trip agree on one id.
         const pending = pendingCallIds.get(call.name);
@@ -941,18 +964,37 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
           role: "tool",
           content: JSON.stringify(call.response),
           tool_call_id: id,
-        }, mergeGeminiExtras(geminiPartExtras(fr), geminiCallExtras(call, ["response"]))));
+        }, mergeGeminiExtras(geminiPartExtras(p), geminiCallExtras(call, ["response"]))));
+      }
+      flushRun();
+      for (const sibling of result.slice(first + 1)) {
+        withGeminiExtras(sibling, { ...(sibling as any)[GEMINI_EXTRAS_KEY], sameTurn: true });
       }
       continue;
     }
 
     if (role === "assistant") {
-      const content: AssistantMessage["content"] = blocks.length > 0 ? geminiBlocksToContent(blocks) : null;
+      // Content blocks in source order; each functionCall remembers how many preceded it.
+      const blocks: any[] = [];
+      const funcCalls: Array<{ p: any; position: number }> = [];
+      for (const p of parts) {
+        if (p.functionCall) {
+          funcCalls.push({ p, position: blocks.length });
+          continue;
+        }
+        const block = geminiPartToBlock(p);
+        if (block) blocks.push(block);
+      }
+      // OpenAI lists tool calls after the content. A call that sat before a content part
+      // carries its `position` so the reverse conversion puts it back there, and the turn
+      // then keeps one block per part: a joined string could not be split again.
+      const interleaved = funcCalls.some((c) => c.position < blocks.length);
+      const content: AssistantMessage["content"] =
+        blocks.length === 0 ? null : interleaved ? blocks : geminiBlocksToContent(blocks);
       const openaiMsg: AssistantMessage = { role: "assistant", content };
 
-      const funcCalls = parts.filter((p: any) => p.functionCall);
       if (funcCalls.length > 0) {
-        openaiMsg.tool_calls = funcCalls.map((p: any): ToolCall => {
+        openaiMsg.tool_calls = funcCalls.map(({ p, position }): ToolCall => {
           const id = p.functionCall.id ?? `gemini_${p.functionCall.name}`;
           const pending = pendingCallIds.get(p.functionCall.name) ?? [];
           pending.push(id);
@@ -965,7 +1007,11 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
               // `args` is optional in the Gemini API; OpenAI requires an object.
               arguments: JSON.stringify(p.functionCall.args ?? {}),
             },
-          }, mergeGeminiExtras(geminiPartExtras(p), geminiCallExtras(p.functionCall, ["name", "args"])));
+          }, mergeGeminiExtras(
+            geminiPartExtras(p),
+            geminiCallExtras(p.functionCall, ["name", "args"]),
+            interleaved ? { position } : undefined,
+          ));
         });
       }
       result.push(openaiMsg);
@@ -978,6 +1024,14 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
 
 export function openAIToGemini(messages: OpenAIMessage[]): any[] {
   const result: any[] = [];
+
+  // A message geminiToOpenAI marked `sameTurn` goes back into the turn before it; anything
+  // else starts a new turn.
+  const pushUserParts = (msg: OpenAIMessage, parts: any[]) => {
+    const last = result[result.length - 1];
+    if (geminiExtras(msg).sameTurn && last?.role === "user") last.parts.push(...parts);
+    else result.push({ role: "user", parts });
+  };
 
   for (const msg of messages) {
     if (msg.role === "system") {
@@ -992,25 +1046,26 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
       // neighbours. Text-only turns keep collapsing to one joined part.
       const blocks = Array.isArray(msg.content) ? msg.content.filter(isGeminiBlock) : [];
       if (blocks.some((p) => p.type !== "text" || GEMINI_EXTRAS_KEY in p)) {
-        result.push({ role: "user", parts: blocks.map(geminiPartFromBlock) });
+        pushUserParts(msg, blocks.map(geminiPartFromBlock));
         continue;
       }
       const text = typeof msg.content === "string"
         ? msg.content
         : blocks.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n");
-      result.push({ role: "user", parts: [{ text }] });
+      pushUserParts(msg, [{ text }]);
       continue;
     }
 
     if (msg.role === "assistant") {
       const parts: any[] = [];
+      const positioned = msg.tool_calls?.some((tc) => geminiExtras(tc).position !== undefined) ?? false;
       if (typeof msg.content === "string") {
         if (msg.content) parts.push({ text: msg.content });
       } else if (Array.isArray(msg.content)) {
         const blocks = msg.content.filter(isGeminiBlock);
-        if (blocks.some((p) => p.type === "gemini_part" || GEMINI_EXTRAS_KEY in p)) {
-          // Keep each block its own part so a carried part, or a `thought` /
-          // `thoughtSignature` on one of them, is not merged into its neighbours.
+        if (positioned || blocks.some((p) => p.type === "gemini_part" || GEMINI_EXTRAS_KEY in p)) {
+          // Keep each block its own part so a carried part, a `thought` / `thoughtSignature`
+          // on one of them, or a functionCall that sat between them, keeps its neighbours.
           for (const p of blocks) parts.push(geminiPartFromBlock(p));
         } else {
           for (const g of groupAssistantParts(msg.content)) {
@@ -1020,6 +1075,9 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
         }
       }
       if (msg.tool_calls) {
+        // A call that carries `position`, the number of content parts that preceded it, goes
+        // back there; the others go last.
+        let inserted = 0;
         for (const tc of msg.tool_calls) {
           // `arguments` may be missing or malformed; a proxy round-trip drops
           // `undefined`. Keep whatever is there rather than discarding a tool
@@ -1027,7 +1085,9 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
           let args: any;
           try { args = JSON.parse(tc.function.arguments ?? "{}"); } catch { args = tc.function.arguments ?? {}; }
           const extras = geminiExtras(tc);
-          parts.push({ functionCall: { ...extras.call, name: tc.function.name, args }, ...extras.part });
+          const part = { functionCall: { ...extras.call, name: tc.function.name, args }, ...extras.part };
+          if (typeof extras.position === "number") parts.splice(extras.position + inserted++, 0, part);
+          else parts.push(part);
         }
       }
       result.push({ role: "model", parts });
@@ -1042,10 +1102,7 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
       const name = extras.call.name ?? msg.tool_call_id?.replace(/^gemini_/, "") ?? "unknown";
       // The response's id, multimodal parts, willContinue and scheduling come back from the
       // carried bag; a signed functionResponse keeps its `thoughtSignature` on the part.
-      result.push({
-        role: "user",
-        parts: [{ functionResponse: { ...extras.call, name, response }, ...extras.part }],
-      });
+      pushUserParts(msg, [{ functionResponse: { ...extras.call, name, response }, ...extras.part }]);
       continue;
     }
   }

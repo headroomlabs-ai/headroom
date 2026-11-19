@@ -2027,3 +2027,142 @@ describe("Gemini parts the converter does not translate survive the round trip",
     ]);
   });
 });
+
+describe("Gemini turns keep their part order through the round trip", () => {
+  // OpenAI splits one Gemini turn by part kind: content blocks, a separate tool_calls list,
+  // one tool message per functionResponse. The round trip has to put the turn back together
+  // as one turn, with every part where it was.
+  it("returns a functionResponse followed by a toolResponse in that order", () => {
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "a", response: {} } },
+          { toolResponse: { name: "b", response: {} } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("keeps a user turn that interleaves text, function responses and a carried part", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_a", name: "get_metrics", args: { region: "eu" } } },
+          { functionCall: { id: "call_c", name: "get_status", args: {} } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { text: "Results:" },
+          { functionResponse: { id: "call_a", name: "get_metrics", response: { p99: 310 } } },
+          { toolResponse: { name: "google_search", response: { results: [] } } },
+          { functionResponse: { id: "call_c", name: "get_status", response: { ok: true } } },
+          { text: "Go on." },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("keeps parallel function responses in the one turn that answers the calls", () => {
+    // The answer to parallel calls is one turn holding every functionResponse, in the order
+    // of the calls (Vertex AI thought-signature guide). One turn per response is a
+    // different request.
+    const contents = [
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "read", args: { p: "a" } } },
+          { functionCall: { id: "call_2", name: "read", args: { p: "b" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { id: "call_1", name: "read", response: { a: 1 } } },
+          { functionResponse: { id: "call_2", name: "read", response: { b: 2 } } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("returns a functionCall followed by a server-side toolCall in that order", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_1", name: "get_metrics", args: {} }, thoughtSignature: "sig-call-1" },
+          { toolCall: { name: "google_search", args: { query: "headroom" } } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("keeps a functionCall between two text parts where it was", () => {
+    const contents = [
+      {
+        role: "model",
+        parts: [
+          { text: "Checking the EU region." },
+          { functionCall: { id: "call_1", name: "get_metrics", args: { region: "eu" } } },
+          { text: "And the US one." },
+          { functionCall: { id: "call_2", name: "get_metrics", args: { region: "us" } } },
+          { executableCode: { language: "PYTHON", code: "print(1)" } },
+        ],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+
+  it("sends a mixed user turn as messages in source order, marked as one turn", () => {
+    // Wire-shape guard: the tool message comes first because the functionResponse did, and
+    // the message after it carries `sameTurn` so the reverse conversion rejoins the turn.
+    const openai = geminiToOpenAI([
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "a", response: {} } },
+          { toolResponse: { name: "b", response: {} } },
+        ],
+      },
+    ]);
+    expect(openai).toEqual([
+      { role: "tool", content: "{}", tool_call_id: "gemini_a", _headroomGemini: { call: { name: "a" } } },
+      {
+        role: "user",
+        content: [{ type: "gemini_part", part: { toolResponse: { name: "b", response: {} } } }],
+        _headroomGemini: { sameTurn: true },
+      },
+    ]);
+  });
+
+  it("leaves a model turn whose calls trail its text exactly as it was on the wire", () => {
+    // Guard: the common shape needs no position, so nothing is added to it.
+    const openai = geminiToOpenAI([
+      { role: "model", parts: [{ text: "Checking." }, { functionCall: { name: "f", args: {} } }] },
+    ]);
+    expect(openai).toEqual([
+      {
+        role: "assistant",
+        content: "Checking.",
+        tool_calls: [{ id: "gemini_f", type: "function", function: { name: "f", arguments: "{}" } }],
+      },
+    ]);
+  });
+
+  it("keeps two consecutive user turns apart", () => {
+    // Guard: only messages that came from one turn are rejoined.
+    const contents = [
+      { role: "user", parts: [{ text: "first" }] },
+      { role: "user", parts: [{ functionResponse: { name: "a", response: {} } }] },
+      { role: "user", parts: [{ text: "second" }] },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
+  });
+});

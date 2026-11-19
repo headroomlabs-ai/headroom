@@ -350,3 +350,47 @@ describe("Gemini withHeadroom keeps untranslated parts", () => {
     expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
   });
 });
+
+describe("Gemini withHeadroom keeps part order", () => {
+  it("hands a turn of parallel function responses and trailing parts back as one turn in order", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    // The proxy copies messages and their blocks; echo them after a JSON round trip.
+    mockFetch.mockImplementation(async (_url: string, opts: any) => ({
+      ok: true,
+      json: async () => ({
+        messages: JSON.parse(opts.body).messages,
+        tokens_before: 500,
+        tokens_after: 400,
+        tokens_saved: 100,
+        compression_ratio: 0.8,
+        transforms_applied: ["smart_crusher"],
+        ccr_hashes: [],
+      }),
+    }));
+    const contents = [
+      { role: "user", parts: [{ text: "Compare both regions." }] },
+      {
+        role: "model",
+        parts: [
+          { functionCall: { id: "call_a", name: "get_metrics", args: { region: "eu" } }, thoughtSignature: "sig-call-1" },
+          { toolCall: { name: "google_search", args: { query: "eu-west latency" } } },
+          { functionCall: { id: "call_b", name: "get_metrics", args: { region: "us" } } },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { id: "call_a", name: "get_metrics", response: { p99: 310 } } },
+          { toolResponse: { name: "google_search", response: { results: [] } } },
+          { functionResponse: { id: "call_b", name: "get_metrics", response: { p99: 280 } } },
+          { text: "Use the EU numbers as the baseline." },
+        ],
+      },
+    ];
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent({ contents });
+
+    expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
+  });
+});
