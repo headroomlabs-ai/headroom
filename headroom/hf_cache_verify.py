@@ -81,11 +81,16 @@ def check(
     for repo in (model, tokenizer_repo):
         if not repo:
             continue
-        # Prefer an exact pinned repo id over alias resolution: `get_tokenizer_name`
-        # matches family prefixes before the allowlist, so it maps
-        # "Qwen/Qwen2.5-7B" to "Qwen/Qwen-7B" — a different vocabulary. An
-        # operator naming a repo id means that repo id.
-        resolved = repo if repo in _TOKENIZER_REVISIONS else get_tokenizer_name(repo)
-        want(resolved, "tokenizer.json", _TOKENIZER_REVISIONS)
+        if "/" in repo:
+            # A Hub repo id ("owner/name") is taken literally. It must never be
+            # alias-resolved: `get_tokenizer_name` matches family prefixes
+            # before the allowlist, so "Qwen/Qwen2.5-7B" would silently become
+            # "Qwen/Qwen-7B" — a different vocabulary — and an id absent from
+            # the pin table would quietly check some other repo's snapshot
+            # instead of reporting that this build cannot pin it.
+            want(repo, "tokenizer.json", _TOKENIZER_REVISIONS)
+            continue
+        # A bare alias ("qwen2.5-7b") is what the resolver is for.
+        want(get_tokenizer_name(repo), "tokenizer.json", _TOKENIZER_REVISIONS)
 
     return missing
