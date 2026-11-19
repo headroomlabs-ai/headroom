@@ -30,6 +30,7 @@ logger = logging.getLogger("headroom.proxy")
 # Sentinel label value that models past MAX_DISTINCT_MODELS collapse into, so
 # client-supplied model cardinality stays bounded (see record_request).
 _OTHER_MODEL = "other"
+_MAX_MODEL_LENGTH = 128
 
 # Same idea for inbound request paths (see record_inbound_request). ``path`` is
 # client-controlled and effectively unbounded — ID-bearing passthrough routes
@@ -64,6 +65,12 @@ RATE_LIMIT_SOURCES = (RATE_LIMIT_SOURCE_HEADROOM, RATE_LIMIT_SOURCE_UPSTREAM)
 # Bucket for a failure with no attributed provider. Also seeded at zero so
 # headroom_requests_failed_total always exports at least one sample.
 _PROVIDER_UNKNOWN = "unknown"
+
+
+def _valid_model_key(model: str) -> bool:
+    return len(model) <= _MAX_MODEL_LENGTH and not any(
+        ord(char) < 32 or 127 <= ord(char) < 160 for char in model
+    )
 
 
 def _rate_limit_source(source: str | None) -> str:
@@ -967,8 +974,14 @@ class PrometheusMetrics:
             # (the sentinel docs/observability.md documents for `tier`), mirroring
             # the requests_by_stack cap. Membership test, never a defaultdict index:
             # indexing would materialize the key and defeat the cap.
-            if model in self.requests_by_model or len(self.requests_by_model) < MAX_DISTINCT_MODELS:
-                bounded_model = model
+            model_key = str(model)
+            if not _valid_model_key(model_key):
+                bounded_model = _OTHER_MODEL
+            elif (
+                model_key in self.requests_by_model
+                or len(self.requests_by_model) < MAX_DISTINCT_MODELS
+            ):
+                bounded_model = model_key
             else:
                 bounded_model = _OTHER_MODEL
                 if not self._model_cardinality_warned:

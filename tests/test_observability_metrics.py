@@ -531,6 +531,38 @@ async def test_prometheus_metrics_caps_model_cardinality() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prometheus_metrics_buckets_invalid_model_keys() -> None:
+    """A model key with control characters or past 128 chars counts under
+    "other", never as its own key, while legitimate names stay untouched."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str) -> None:
+        await metrics.record_request(
+            provider="openai",
+            model=model,
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+
+    await record("pasted terminal output\nsecond line\n" + "x" * 200)
+    await record("bad\tmodel")
+    await record("x" * 129)
+    await record("claude-opus-4-7[1m]")
+    await record("x" * 128)
+
+    assert metrics.requests_by_model["other"] == 3
+    assert metrics.requests_by_model["claude-opus-4-7[1m]"] == 1
+    assert metrics.requests_by_model["x" * 128] == 1
+    assert len(metrics.requests_by_model) == 3
+    assert metrics._cache_requests_by_model["other"] == 3
+    assert sum(metrics.requests_by_model.values()) == 5
+    assert 'headroom_requests_by_model{model="other"} 3' in await metrics.export()
+
+
+@pytest.mark.asyncio
 async def test_prometheus_metrics_model_cardinality_warns_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

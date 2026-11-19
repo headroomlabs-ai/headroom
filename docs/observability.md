@@ -254,7 +254,9 @@ Every label vocabulary is bounded by code, not customer input:
   It is bounded at record time by `MAX_DISTINCT_MODELS`
   (`headroom.telemetry.context`): once the cap is reached, further
   distinct models bucket into the `"other"` sentinel and a one-time
-  warning is logged, mirroring the `tier` discipline above. The
+  warning is logged, mirroring the `tier` discipline above. A name
+  containing control characters or longer than 128 characters never
+  becomes a key at all: it buckets straight into `"other"`. The
   in-memory dicts and the exported `headroom_requests_by_model` series
   can never exceed the cap plus `"other"`.
 
