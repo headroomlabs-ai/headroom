@@ -103,6 +103,25 @@ def test_claude_settings_path_honors_claude_config_dir(monkeypatch, tmp_path: Pa
     assert install_paths.claude_settings_path() == tmp_path / "home" / ".claude" / "settings.json"
 
 
+def test_claude_settings_path_keeps_dotdot_for_symlinked_config_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "link/..")
+
+    # ".." must survive so the filesystem resolves it after following the symlink.
+    assert install_paths.claude_settings_path() == tmp_path / "link" / ".." / "settings.json"
+
+    (tmp_path / "real" / "nested").mkdir(parents=True)
+    (tmp_path / "real" / "settings.json").write_text("real")
+    (tmp_path / "settings.json").write_text("cwd")
+    try:
+        (tmp_path / "link").symlink_to(tmp_path / "real" / "nested", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return  # symlinks unavailable here (for example Windows without privilege)
+    assert install_paths.claude_settings_path().read_text() == "real"
+
+
 def test_opencode_config_path_honors_opencode_home(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "unused")
     other_home = tmp_path / "custom-opencode-home"

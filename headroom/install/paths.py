@@ -204,7 +204,8 @@ def claude_settings_path() -> Path:
     base = Path(configured).expanduser() if configured else Path.home() / ".claude"
     # Absolute: the provider installer records this path for a later cleanup that may
     # run from another directory.
-    return Path(os.path.abspath(base)) / "settings.json"
+    # Path.absolute() keeps ".."; abspath() would fold it before a symlink is followed.
+    return base.absolute() / "settings.json"
 
 
 def codex_home_dir() -> Path:
