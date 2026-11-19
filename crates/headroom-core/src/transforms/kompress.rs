@@ -1103,12 +1103,18 @@ mod tests {
         std::env::set_var("HF_ENDPOINT", format!("http://127.0.0.1:{port}"));
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_in_server = Arc::clone(&seen);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_in_server = Arc::clone(&done);
         let server = std::thread::spawn(move || {
-            // Serve for a bounded window so a regression cannot hang the suite.
+            // Serve until the client side says it is finished, so the test takes
+            // as long as the load, not as long as this window. The deadline is
+            // only a safety net against a hang.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
+            while !done_in_server.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < deadline
+            {
                 let Ok((mut conn, _)) = listener.accept() else {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 };
                 let mut buf = [0u8; 8192];
@@ -1130,6 +1136,7 @@ mod tests {
         });
 
         let outcome = Kompress::from_pretrained(KompressConfig::default());
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
         let paths = seen.lock().unwrap().clone();
         let _ = server.join();
 
