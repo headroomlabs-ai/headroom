@@ -120,14 +120,14 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "^4.0.99",
-    "@ai-sdk/openai": "^4.0.111",
-    "@ai-sdk/provider": "^4.0.37",
-    "@anthropic-ai/sdk": "^1.6.0",
+    "@ai-sdk/anthropic": "^4.0.105",
+    "@ai-sdk/openai": "^4.0.118",
+    "@ai-sdk/provider": "^4.0.38",
+    "@anthropic-ai/sdk": "^1.8.0",
     "@types/node": "^26.6.6",
-    "ai": "^7.0.166",
+    "ai": "^7.0.173",
     "dotenv": "^18.0.10",
-    "openai": "^7.53.0",
+    "openai": "^7.57.0",
     "tsup": "^9.0.0",
     "typescript": "^6.0.3",
     "vitest": "^5.1.0"
