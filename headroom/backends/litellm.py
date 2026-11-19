@@ -692,6 +692,44 @@ def _convert_tool_choice(choice: Any) -> Any:
     return "auto"
 
 
+def _client_tools_only(tools: list[Any]) -> list[Any]:
+    """Drop Anthropic server-side tools, which only Anthropic can execute.
+
+    A typed entry (``tool_search_tool_regex_20251119``, ``web_search_20250305``,
+    ...) has no ``input_schema``; converted as-is it becomes a parameterless
+    function the target model can call but nobody can answer. Client tools carry
+    no ``type``, or ``"custom"``.
+    """
+    return [t for t in tools if not isinstance(t, dict) or t.get("type") in (None, "custom")]
+
+
+# Anthropic effort -> OpenAI ``reasoning_effort``. ``xhigh``/``max`` clamp to
+# ``high``: litellm refuses ``xhigh`` for the current GPT models before sending.
+_OPENAI_EFFORT = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
+
+
+def _openai_reasoning_effort(body: dict[str, Any]) -> str | None:
+    """The OpenAI ``reasoning_effort`` a Claude request asks for, if it asks.
+
+    An explicit ``output_config.effort`` wins. Otherwise a fixed thinking budget
+    is bucketed with the thresholds litellm uses for the reverse mapping
+    (1024/2048/4096). No thinking config, ``disabled`` and bare ``adaptive``
+    return None, so the target model's own default applies: ``none`` is not a
+    safe stand-in, because some models (gpt-6.1-sol) reject it.
+    """
+    output_config = body.get("output_config")
+    effort = output_config.get("effort") if isinstance(output_config, dict) else None
+    if effort in _OPENAI_EFFORT:
+        return _OPENAI_EFFORT[effort]
+    thinking = body.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+        return None
+    budget = thinking.get("budget_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool):
+        return None
+    return "low" if budget < 2048 else "medium" if budget < 4096 else "high"
+
+
 def _parse_tool_arguments(arguments: Any) -> Any:
     """Parse tool call arguments from string to dict.
 
@@ -1158,6 +1196,20 @@ class LiteLLMBackend(Backend):
 
         return converted
 
+    def _apply_openai_reasoning_effort(self, kwargs: dict[str, Any], body: dict[str, Any]) -> None:
+        """Carry a Claude request's thinking effort to an OpenAI target.
+
+        OpenAI only: it is the provider this mapping was verified against.
+        ``drop_params`` makes litellm drop the effort for a model that takes
+        none (gpt-4o) instead of refusing the whole request.
+        """
+        if self.provider != "openai":
+            return
+        effort = _openai_reasoning_effort(body)
+        if effort:
+            kwargs["reasoning_effort"] = effort
+            kwargs["drop_params"] = True
+
     def _system_field_to_message(self, system: Any) -> dict[str, Any]:
         """Convert Anthropic's top-level `system` field to an OpenAI-style message.
 
@@ -1302,10 +1354,13 @@ class LiteLLMBackend(Backend):
             # disabled for the turn. Never sent cross-vendor.
             if preserve_thinking and "thinking" in body:
                 kwargs["thinking"] = body["thinking"]
+            self._apply_openai_reasoning_effort(kwargs, body)
 
             # Tools (convert Anthropic format to OpenAI format)
             if "tools" in body:
                 tools_in = body["tools"]
+                if not preserve_thinking:
+                    tools_in = _client_tools_only(tools_in)
                 # Bedrock Converse API hard-rejects tool names over 64 chars.
                 # Claude Code injects every globally-added claude.ai MCP connector
                 # tool into every request, even disabled ones; a single oversized
@@ -1434,8 +1489,11 @@ class LiteLLMBackend(Backend):
             # (see send_message for why). Never sent cross-vendor.
             if preserve_thinking and "thinking" in body:
                 kwargs["thinking"] = body["thinking"]
+            self._apply_openai_reasoning_effort(kwargs, body)
             if "tools" in body:
                 tools_in = body["tools"]
+                if not preserve_thinking:
+                    tools_in = _client_tools_only(tools_in)
                 # Bedrock Converse API hard-rejects tool names over 64 chars.
                 # See send_message for the full rationale; same filter here.
                 if self.provider == "bedrock":
