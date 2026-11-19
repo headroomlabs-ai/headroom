@@ -1724,6 +1724,20 @@ def _is_managed_copilot_seeded_bearer(token: str) -> bool:
 
 
 _WEBSOCKET_SCHEME = {"https": "wss", "http": "ws"}
+_DEFAULT_PORTS = {"http": 80, "ws": 80, "https": 443, "wss": 443}
+
+
+def _origin_key(parsed: Any) -> tuple[str, str, int] | None:
+    """(scheme, hostname, effective port) of a parsed URL, None when it has none."""
+
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port or _DEFAULT_PORTS.get(scheme)
+    except ValueError:
+        return None
+    if not parsed.hostname or port is None:
+        return None
+    return scheme, parsed.hostname.lower(), port
 
 
 def _is_trusted_copilot_origin(url: str) -> bool:
@@ -1746,17 +1760,19 @@ def _is_trusted_copilot_origin(url: str) -> bool:
         os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip(),
         copilot_completions_base_url(),
     )
-    origins: set[tuple[str, str]] = set()
+    origins: set[tuple[str, str, int]] = set()
     for value in configured:
         if not value:
             continue
-        configured_url = urlparse(value)
-        configured_scheme = configured_url.scheme.lower()
-        origins.add((configured_scheme, configured_url.netloc.lower()))
+        key = _origin_key(urlparse(value))
+        if key is None:
+            continue
+        origins.add(key)
         # The WebSocket handler derives wss:// from https:// and ws:// from http://.
-        if configured_scheme in _WEBSOCKET_SCHEME:
-            origins.add((_WEBSOCKET_SCHEME[configured_scheme], configured_url.netloc.lower()))
-    if (scheme, parsed.netloc.lower()) in origins:
+        if key[0] in _WEBSOCKET_SCHEME:
+            origins.add((_WEBSOCKET_SCHEME[key[0]], key[1], key[2]))
+    # Compare by effective port: ``:80`` and no port are the same http origin.
+    if _origin_key(parsed) in origins:
         return True
     try:
         port = parsed.port

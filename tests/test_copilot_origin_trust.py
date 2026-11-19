@@ -109,3 +109,37 @@ def test_a_seeded_operator_token_is_not_forwarded_to_an_untrusted_origin(
     )
     assert "tid_operator_seed" not in str(headers)
     assert "copilot-session" not in str(headers)
+
+
+@pytest.mark.parametrize(
+    ("configured", "url"),
+    [
+        ("http://api.githubcopilot.com:80", "http://api.githubcopilot.com/v1/chat/completions"),
+        ("http://api.githubcopilot.com", "http://api.githubcopilot.com:80/v1/chat/completions"),
+        ("https://api.githubcopilot.com:443", "https://api.githubcopilot.com/v1/x"),
+        ("http://API.githubcopilot.com:80", "http://api.GITHUBCOPILOT.com/v1/x"),
+        ("http://api.githubcopilot.com:80", "ws://api.githubcopilot.com/responses"),
+    ],
+)
+def test_a_configured_origin_matches_by_effective_port(
+    monkeypatch: pytest.MonkeyPatch, configured: str, url: str
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", configured)
+    assert _apply(url)["Authorization"] == "Bearer copilot-session"
+
+
+@pytest.mark.parametrize(
+    ("configured", "url"),
+    [
+        ("http://api.githubcopilot.com:80", "http://api.githubcopilot.com:8080/v1/x"),
+        ("http://api.githubcopilot.com:80", "http://evil.example/v1/x"),
+        ("https://api.githubcopilot.com:443", "http://api.githubcopilot.com/v1/x"),
+    ],
+)
+def test_effective_port_matching_does_not_widen_the_configured_origin(
+    monkeypatch: pytest.MonkeyPatch, configured: str, url: str
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", configured)
+    headers = _apply(url)
+    assert "copilot-session" not in str(headers)
+    assert headers["authorization"] == "Bearer downstream"

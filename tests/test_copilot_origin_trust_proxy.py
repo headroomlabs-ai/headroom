@@ -144,3 +144,25 @@ def test_an_operator_configured_origin_keeps_its_credential(
     upstream = _through_proxy(proxy_client, "https://api.githubcopilot.com:8443")
 
     assert upstream.headers["authorization"] == f"Bearer {MINTED}"
+
+
+@pytest.mark.parametrize(
+    ("configured", "base_url"),
+    [
+        ("http://api.githubcopilot.com:80", "http://api.githubcopilot.com:80"),
+        ("http://api.githubcopilot.com:80", "http://api.githubcopilot.com"),
+        ("https://api.githubcopilot.com:443", "https://api.githubcopilot.com:443"),
+        ("https://api.githubcopilot.com:443", "https://api.githubcopilot.com"),
+    ],
+)
+def test_a_configured_default_port_matches_with_and_without_the_port(
+    proxy_client,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+    base_url: str,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", configured)
+    upstream = _through_proxy(proxy_client, base_url)
+
+    assert upstream.headers["authorization"] == f"Bearer {MINTED}"
+    assert "x-api-key" not in upstream.headers
