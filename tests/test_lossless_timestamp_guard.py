@@ -73,6 +73,10 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
             f"\x1b[2m15:{m:02d}:53\x1b[0m \x1b[32mINFO\x1b[0m worker heartbeat {m}"
             for m in range(60)
         ),
+        "\n".join(
+            f"\x1b[38:2:255:0:0m2026-11-17T22:45:{m:02d}Z\x1b[0m \x1b[31mERROR\x1b[0m timeout id={m}"
+            for m in range(40)
+        ),
     ],
     ids=[
         "iso-datetime",
@@ -87,6 +91,7 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
         "ruby-logger",
         "ansi-tracing-subscriber",
         "ansi-bare-clock",
+        "ansi-colon-truecolor",
     ],
 )
 def test_timestamped_logs_are_never_folded(sample: str) -> None:
@@ -120,6 +125,24 @@ def test_fatal_line_keeps_its_full_timestamp() -> None:
     out = compact_lossless(_multi_hour_log(), "search")
     fatal = [line for line in out.split("\n") if "FATAL" in line]
     assert fatal == ["2026-09-02 14:30:00 [FATAL] node evicted disk full"]
+
+
+def test_colon_form_truecolor_logs_detect_as_build_not_search() -> None:
+    """ITU-T T.416 colon-form SGR (``\\x1b[38:2:255:0:0m``) must not hide the
+    timestamp from detection or folding, matching the semicolon form."""
+    from headroom.transforms.content_detector import ContentType, detect_content_type
+
+    colon = "\n".join(
+        f"\x1b[38:2:255:0:0m2026-11-17T22:45:{i:02d}Z\x1b[0m \x1b[31mERROR\x1b[0m timeout id={i}"
+        for i in range(40)
+    )
+    semicolon = colon.replace("38:2:255:0:0", "38;2;255;0;0")
+
+    assert detect_content_type(colon).content_type == ContentType.BUILD_OUTPUT
+    assert detect_content_type(semicolon).content_type == ContentType.BUILD_OUTPUT
+    # Neither form is folded as grep rows; every full timestamp survives.
+    assert compact_lossless(colon, "search") == colon
+    assert compact_lossless(semicolon, "search") == semicolon
 
 
 def test_genuine_grep_output_still_folds() -> None:

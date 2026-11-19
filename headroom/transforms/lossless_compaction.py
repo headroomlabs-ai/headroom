@@ -40,7 +40,9 @@ logger = logging.getLogger(__name__)
 
 # ANSI CSI SGR (color/style) escape sequences: ESC [ ... m. Color is
 # non-semantic, so stripping it is a safe (one-way) lossless-of-meaning op.
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Parameters may use ';' (standard) or ':' (ITU-T T.416 sub-parameters, e.g.
+# true-color `\x1b[38:2:255:0:0m`), so both separators are accepted.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;:]*m")
 
 # syslog-style run-collapse marker. The count is captured for exact inversion.
 _RUN_MARKER_RE = re.compile(r"^\.\.\. \(repeated (\d+) times\)$")
@@ -75,7 +77,7 @@ _HEADING_ROW_RE = re.compile(r"^(?P<line>\d+):(?P<content>.*)$")
 _TIMESTAMP_ROW_RE = re.compile(
     # Leading ANSI SGR color codes (e.g. Rust tracing-subscriber's
     # `\x1b[2m2026-11-17T22:44:17Z\x1b[0m`) must not hide the timestamp.
-    r"^\s*(?:\x1b\[[0-9;]*m)*(?:\[(?:\x1b\[[0-9;]*m)*)?(?:"
+    r"^\s*(?:\x1b\[[0-9;:]*m)*(?:\[(?:\x1b\[[0-9;:]*m)*)?(?:"
     r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}"  # 2026-09-02 14:30 / ISO 8601 'T'
     r"|\d{4}/\d{2}/\d{2}[ T]\d{1,2}:\d{2}"  # Go log, nginx error log: 2026/09/02 14:30
     r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
