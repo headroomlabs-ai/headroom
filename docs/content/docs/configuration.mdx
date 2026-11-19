@@ -515,50 +515,50 @@ their tokenizer synchronously, blocking until both are on disk.
 
 ```bash
 # On a host with network access, into the directory you will carry across.
+# HEADROOM_OFFLINE=0 so the warm loads are allowed to fetch.
 HF_HUB_CACHE=/srv/hf-cache HEADROOM_OFFLINE=0 python - <<'PY'
+from headroom.tokenizers.huggingface import _load_tokenizer
 from headroom.transforms.kompress_compressor import warm_kompress_model
 
-# Loads chopratejas/kompress-v2-base (ONNX weights) + answerdotai/ModernBERT-base
-# (tokenizer) at their pins. Returns False rather than raising on failure, so
-# check it — a silent False leaves the cache incomplete.
+# 1. Kompress: chopratejas/kompress-v2-base (ONNX weights) + the
+#    answerdotai/ModernBERT-base tokenizer they were exported against.
+#    Returns False rather than raising, so check it.
 assert warm_kompress_model(device="cpu"), "Kompress warm failed; see the log"
-print("kompress weights + tokenizer cached")
+
+# 2. Counting: the tokenizer for the model this deployment serves. This is the
+#    other half of the upgrade — Kompress being cached says nothing about it.
+assert _load_tokenizer("Qwen/Qwen2.5-7B") is not None, "counting tokenizer warm failed"
+
+print("kompress weights + tokenizer, and the counting tokenizer, are cached")
 PY
 ```
 
 `compress()` is **not** a seeding tool: whether it reaches Kompress depends on the router,
 and a short or non-prose message may never invoke it at all, leaving the weights absent. Use
-the explicit loader above.
+the explicit loaders above.
 
-Then verify the exact files exist before copying the cache across:
+Then verify the exact files exist before copying the cache across. `headroom
+verify-hf-cache` derives the requirement from the loader's own candidate list, so it cannot
+drift from what the loader actually accepts:
 
 ```bash
-python - <<'PY'
-import sys
-from pathlib import Path
-
-from headroom.onnx_runtime import _PINNED_REVISIONS
-from headroom.transforms.kompress_compressor import HF_MODEL_ID, _MODERNBERT_TOKENIZER_REPO
-
-cache = Path("/srv/hf-cache")
-missing = []
-for repo, names in (
-    (HF_MODEL_ID, ["onnx/kompress-int8-wo.onnx", "onnx/kompress-fp32.onnx"]),
-    (_MODERNBERT_TOKENIZER_REPO, ["tokenizer.json"]),
-):
-    snap = cache / f"models--{repo.replace('/', '--')}" / "snapshots" / _PINNED_REVISIONS[repo]
-    for name in names:
-        if not (snap / name).is_file():
-            missing.append(str(snap / name))
-for path in missing:
-    print("MISSING", path)
-sys.exit(1 if missing else 0)
-PY
+# One supported ONNX candidate is enough; the command knows which ones count.
+headroom verify-hf-cache /srv/hf-cache --model Qwen/Qwen2.5-7B
 ```
 
-At least one `onnx/` file must be present — the loader tries the candidates in order and
-skips the ones that are absent. `models--…/snapshots/<pin>/` is the directory to look for;
-`refs/<pin>` is not written by Python and is not needed.
+It exits non-zero and prints `MISSING …` for every artifact the target host would lack. Two
+things it checks that are easy to miss:
+
+- **The Kompress pair.** At least one supported `onnx/` candidate in the pinned Kompress
+  snapshot, *and* `tokenizer.json` in the pinned ModernBERT snapshot. They are one artifact
+  pair: the export was produced against that tokenizer.
+- **The counting tokenizer for the model you actually serve** (`--model`). Seeding Kompress says
+  nothing about whether token counting for `Qwen/Qwen2.5-7B` can load *its* tokenizer — that is
+  the estimation fallback this whole section is about. `--model` accepts the repo id or the short
+  alias (`qwen2.5-7b`); pass `--no-kompress` on deployments that do not use Kompress.
+
+`models--…/snapshots/<pin>/` is the directory to look for; `refs/<pin>` is not written by Python
+and is not needed.
 
 To stay on the previously-cached bytes instead, set `HEADROOM_HF_PIN=off` on that host: it
 moves both the download and the cache lookup back to `main`, which is the deliberate escape

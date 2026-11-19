@@ -1302,14 +1302,15 @@ mod tests {
         assert_eq!(onnx_runtime_ready_with(true, || Ok(())), Ok(()));
     }
 
-    /// `from_pretrained` must refuse before `Api::new()` when the operator
-    /// air-gapped the box.
+    /// `from_pretrained` must refuse before a Hub client exists when the
+    /// operator air-gapped the box.
     ///
     /// The model id cannot exist, which is what makes this a real assertion
     /// rather than a tautology: without the guard the call reaches `hf-hub`,
-    /// dials `huggingface.co` and comes back `KompressError::Hub`. Only the
-    /// guard can produce `Offline`, and only by returning before the client is
-    /// built — so `Offline` *is* the "no socket was opened" assertion here.
+    /// dials `huggingface.co` and comes back a `Hub` error. Only the guard can
+    /// produce `Offline`, and only by returning before `hf_cache::hub_api`
+    /// builds the client — so `Offline` *is* the "no socket was opened"
+    /// assertion here.
     #[test]
     fn from_pretrained_refuses_while_offline() {
         let _guard = crate::test_support::env_lock();
