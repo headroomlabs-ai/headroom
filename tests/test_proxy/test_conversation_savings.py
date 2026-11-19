@@ -232,15 +232,34 @@ async def test_a_warm_replay_books_its_tokens_at_the_cache_read_price(
     _assert_the_warm_replay_was_booked(handler, ledger)
 
 
-@pytest.mark.asyncio
-async def test_a_warm_replay_over_websocket_is_booked_the_same(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, _ten_and_one_per_million: Any
-) -> None:
-    """The same two turns through the WebSocket handler: turn two's
-    ``response.create`` re-sends turn one's input, the compressor removes
-    1,024 tokens from each frame, and the upstream reports the same usage.
-    The handler measures each frame against the previous one, so the sinks
-    book what the HTTP path books."""
+_BIG, _SMALL = "log line " * 1_500, "3,000 log lines, compressed"
+
+
+def _message(role: str, text: str) -> dict[str, Any]:
+    kind = "output_text" if role == "assistant" else "input_text"
+    return {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
+
+
+def _create(items: list[dict[str, Any]], **fields: Any) -> str:
+    response = {"model": "warm-model", **fields, "input": items}
+    return json.dumps({"type": "response.create", "response": response})
+
+
+def _completed(n: int, cached: int, uncached: int) -> str:
+    usage = {
+        "input_tokens": cached + uncached,
+        "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0},
+        "output_tokens": 50,
+    }
+    response = {"id": f"resp_{n}", "model": "warm-model", "usage": usage}
+    return json.dumps({"type": "response.completed", "response": response})
+
+
+async def _run_ws_session(handler: Any, frames: list[str], events: list[str]) -> list[Any]:
+    """Run one session through ``handle_openai_responses_ws``. Like Codex,
+    each frame waits for the previous turn's terminal event; the upstream
+    answers frame n with ``events[n]``. The compressor cuts every ``_BIG``
+    text to ``_SMALL``, 1,024 tokens each. Returns the bodies sent upstream."""
     import asyncio
     import copy
     import sys
@@ -254,32 +273,9 @@ async def test_a_warm_replay_over_websocket_is_booked_the_same(
         _make_fake_websockets_module,
     )
 
-    big, small = "log line " * 1_500, "3,000 log lines, compressed"
-
-    def message(role: str, text: str) -> dict[str, Any]:
-        kind = "output_text" if role == "assistant" else "input_text"
-        return {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
-
-    turn_one = [message("user", big)]
-    turn_two = [*turn_one, message("assistant", "Mostly timeouts."), message("user", "Which?")]
-
-    def frame(items: list[dict[str, Any]]) -> str:
-        return json.dumps(
-            {"type": "response.create", "response": {"model": "warm-model", "input": items}}
-        )
-
-    def completed(n: int, cached: int, uncached: int) -> str:
-        usage = {
-            "input_tokens": cached + uncached,
-            "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0},
-            "output_tokens": 50,
-        }
-        response = {"id": f"resp_{n}", "model": "warm-model", "usage": usage}
-        return json.dumps({"type": "response.completed", "response": response})
+    assert isinstance(handler, _DummyOpenAIHandler)
 
     class _Client(_FakeWebSocket):
-        """Like Codex: the next response.create follows the last completion."""
-
         received = 0
 
         async def receive_text(self) -> str:
@@ -291,8 +287,6 @@ async def test_a_warm_replay_over_websocket_is_booked_the_same(
             raise _FakeWebSocketDisconnect("client closed")
 
     class _Upstream(_FakeUpstream):
-        """Completes each turn only once its frame was sent."""
-
         async def _iter(self):  # noqa: ANN202
             for n, event in enumerate(self._events, start=1):
                 while len(self.sent) < n:
@@ -302,27 +296,108 @@ async def test_a_warm_replay_over_websocket_is_booked_the_same(
 
     def compress(payload: dict[str, Any], **_kwargs: Any) -> tuple[Any, ...]:
         out = copy.deepcopy(payload)
-        for item in out["input"]:
-            for part in item["content"]:
-                if part["text"] == big:
-                    part["text"] = small
-        return out, True, 1_024, ["router:test"], "compressed", 1_000, 100, 4_096
+        parts = [
+            part
+            for item in out["input"]
+            for part in item.get("content") or []
+            if part.get("text") == _BIG
+        ]
+        for part in parts:
+            part["text"] = _SMALL
+        if not parts:
+            return payload, False, 0, [], None, 0, 0, 0
+        return out, True, 1_024 * len(parts), ["router:test"], "compressed", 1_000, 100, 4_096
 
-    handler = _DummyOpenAIHandler()
     handler.config.optimize = True
-    handler._compress_openai_responses_payload = compress  # type: ignore[method-assign]
-    ledger = _use_real_sinks(handler, monkeypatch, tmp_path)
-    upstream = _Upstream([completed(1, 0, 3_072), completed(2, 2_048, 1_024)])
-
+    handler._compress_openai_responses_payload = compress
+    upstream = _Upstream(events)
     with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
         await asyncio.wait_for(
-            handler.handle_openai_responses_ws(_Client(frames=[frame(turn_one), frame(turn_two)])),
-            timeout=10.0,
+            handler.handle_openai_responses_ws(_Client(frames=frames)), timeout=10.0
         )
+    return [json.loads(raw).get("response") or json.loads(raw) for raw in upstream.sent]
 
-    sent = [json.loads(raw).get("response") or json.loads(raw) for raw in upstream.sent]
-    assert [body["input"][0]["content"][0]["text"] for body in sent] == [small, small]
+
+@pytest.mark.asyncio
+async def test_a_warm_replay_over_websocket_is_booked_the_same(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, _ten_and_one_per_million: Any
+) -> None:
+    """The same two turns through the WebSocket handler: turn two's
+    ``response.create`` re-sends turn one's input, the compressor removes
+    1,024 tokens from each frame, and the upstream reports the same usage.
+    The handler measures each frame against the previous one, so the sinks
+    book what the HTTP path books."""
+    from tests.test_openai_codex_ws_lifecycle import _DummyOpenAIHandler
+
+    turn_one = [_message("user", _BIG)]
+    turn_two = [*turn_one, _message("assistant", "Mostly timeouts."), _message("user", "Which?")]
+    handler = _DummyOpenAIHandler()
+    ledger = _use_real_sinks(handler, monkeypatch, tmp_path)
+
+    sent = await _run_ws_session(
+        handler,
+        [_create(turn_one), _create(turn_two)],
+        [_completed(1, 0, 3_072), _completed(2, 2_048, 1_024)],
+    )
+
+    assert [body["input"][0]["content"][0]["text"] for body in sent] == [_SMALL, _SMALL]
     _assert_the_warm_replay_was_booked(handler, ledger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome_b",
+    [
+        {"type": "response.failed", "response": {"id": "resp_2", "status": "failed"}},
+        {"type": "response.incomplete", "response": {"id": "resp_2", "status": "incomplete"}},
+        {"type": "error", "error": {"type": "invalid_request_error", "code": "rejected"}},
+    ],
+    ids=["failed", "incomplete", "rejected"],
+)
+async def test_a_failed_websocket_turn_never_becomes_the_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    _ten_and_one_per_million: Any,
+    outcome_b: dict[str, Any],
+) -> None:
+    """Transcript A completes. A different transcript B fails without usage
+    (or ends incomplete, or is rejected with an ``error`` and no response).
+    A ``previous_response_id`` turn on A completes. Then B plus a new item
+    removes 1,024 tokens, with 2,048 cached and 1,024 uncached. A is still
+    the last successful transcript and shares no input item with B, so none
+    of the last turn's removals sat in a replayed prefix: it books at the
+    uncached rate and counts as new input. B's removals, deferred to the
+    incremental turn's record, count as new input too."""
+    from tests.test_openai_codex_ws_lifecycle import _DummyOpenAIHandler
+
+    transcript_a = [_message("user", "Why does the deploy fail?")]
+    transcript_b = [_message("user", _BIG)]
+    handler = _DummyOpenAIHandler()
+    ledger = _use_real_sinks(handler, monkeypatch, tmp_path)
+
+    await _run_ws_session(
+        handler,
+        [
+            _create(transcript_a),
+            _create(transcript_b),
+            _create([_message("user", "Go on.")], previous_response_id="resp_1"),
+            _create([*transcript_b, _message("user", "Which?")]),
+        ],
+        [
+            _completed(1, 0, 1_000),
+            json.dumps(outcome_b),
+            _completed(3, 1_000, 100),
+            _completed(4, 2_048, 1_024),
+        ],
+    )
+
+    events = [json.loads(line) for line in ledger.read_text().splitlines()]
+    last = events[-1]
+    assert (last["saved"], last.get("saved_prefix", 0)) == (1_024, 0)
+    assert last["cost_effective_usd"] == pytest.approx(1_024 * 10e-6, abs=1e-6)
+    m = handler.metrics
+    assert m.tokens_saved_total == 2_048
+    assert m.new_input_saved_tokens_total == 2_048
 
 
 def test_a_cold_replay_prices_like_the_live_zone(_ten_and_one_per_million: Any) -> None:

@@ -8535,26 +8535,30 @@ class OpenAIHandlerMixin:
             # path books.
 
             ws_conversation_key: str | None = None
-            # Frames measured against their conversation's previous request,
-            # as the HTTP path measures one, oldest first, until the record
-            # that books their savings takes them (_take_ws_savings_measure).
-            ws_pending_measures: list[ItemMeasure] = []
+            # One entry per response.create sent upstream whose response has
+            # not ended: the frame's measure against its conversation's
+            # previous request, as the HTTP path measures one, or None for a
+            # frame that is not measured.
+            ws_frame_measures: list[ItemMeasure | None] = []
+            # The measure of the turn that just completed with usage, for the
+            # record that books that turn (_take_ws_turn_measure).
+            ws_turn_measure: ItemMeasure | None = None
             # The client's own bytes, before hooks, memory, store=false,
             # compression or shaping rewrite them: the measure's ORIGINAL.
             first_client_raw = first_msg_raw
 
-            async def _measure_ws_frame(client_raw: str, sent: Any) -> None:
+            async def _measure_ws_frame(client_raw: str, sent: Any) -> ItemMeasure | None:
                 """Measure one forwarded frame. A frame on previous_response_id
                 carries only new items (the provider holds the rest), so it is
                 not measured: none of its removals sat in a replayed prefix."""
                 try:
                     original = json.loads(client_raw)
                     if not isinstance(original, dict) or not isinstance(sent, dict):
-                        return
+                        return None
                     original = _unwrap_response_create_body(original)
                     conversation = savings_conversation_key(original, session_id=f"ws:{session_id}")
                     if conversation is None:
-                        return
+                        return None
                     sent = _unwrap_response_create_body(sent)
                     model = str(sent.get("model") or original.get("model") or "")
 
@@ -8567,30 +8571,42 @@ class OpenAIHandlerMixin:
                             count=self.openai_provider.get_token_counter(model).count_text,
                         )
 
-                    ws_pending_measures.append(await asyncio.to_thread(_measure))
+                    return await asyncio.to_thread(_measure)
                 except Exception as exc:  # noqa: BLE001 - telemetry must never break a session
                     logger.warning(
                         "[%s] WS savings item measurement skipped: %s",
                         request_id,
                         describe_exception(exc),
                     )
-
-            def _take_ws_savings_measure() -> ItemMeasure | None:
-                """The pending measures as one, for the record that books their
-                savings. Frames whose turn never completed had their savings
-                deferred to this record, so their replayed share comes along;
-                they never become the baseline. The newest does, once the
-                funnel settles it."""
-                if not ws_pending_measures:
                     return None
-                *superseded, newest = ws_pending_measures
-                ws_pending_measures.clear()
-                for measure in superseded:
-                    get_item_ledger().settle(measure, succeeded=False)
-                return replace(
-                    newest,
-                    removed_old=newest.removed_old + sum(m.removed_old for m in superseded),
-                )
+
+            def _end_ws_response(*, completed: bool) -> None:
+                """A response ended (``completed``: with usage). A connection
+                runs one response at a time, so when exactly one frame is
+                outstanding the response is that frame's, and its measure goes
+                to the record that books the turn; the funnel settles it as
+                the baseline. Every other measure settles as failed and never
+                becomes the baseline: a frame whose response failed or carried
+                no usage, a frame that got no response (rejected, cancelled),
+                or frames that cannot be told apart. Savings deferred from a
+                failed turn still ride with the next booked record, without
+                its measure: that frame was never cached by the provider."""
+                nonlocal ws_turn_measure
+                stale = [ws_turn_measure]
+                ws_turn_measure = None
+                if completed and len(ws_frame_measures) == 1:
+                    ws_turn_measure = ws_frame_measures[0]
+                else:
+                    stale.extend(ws_frame_measures)
+                ws_frame_measures.clear()
+                for measure in stale:
+                    if measure is not None:
+                        get_item_ledger().settle(measure, succeeded=False)
+
+            def _take_ws_turn_measure() -> ItemMeasure | None:
+                nonlocal ws_turn_measure
+                measure, ws_turn_measure = ws_turn_measure, None
+                return measure
 
             try:
                 body = json.loads(first_msg_raw)
@@ -9440,7 +9456,10 @@ class OpenAIHandlerMixin:
                             await upstream.close()
                         return
                 async with upstream:
-                    await _measure_ws_frame(first_client_raw, _first_upstream_body)
+                    if first_frame_is_create:
+                        ws_frame_measures.append(
+                            await _measure_ws_frame(first_client_raw, _first_upstream_body)
+                        )
                     await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
 
                     # Unit 3: flag the upstream side flips on seeing
@@ -9946,7 +9965,9 @@ class OpenAIHandlerMixin:
                                     },
                                 )
                                 if ws_last_client_frame_type == "response.create":
-                                    await _measure_ws_frame(client_raw, _outbound_frame_body)
+                                    ws_frame_measures.append(
+                                        await _measure_ws_frame(client_raw, _outbound_frame_body)
+                                    )
                                 await upstream.send(_strip_codex_lite_metadata(msg))
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
@@ -10154,11 +10175,7 @@ class OpenAIHandlerMixin:
                                     else 0,
                                     tags=turn_tags,
                                     conversation_key=ws_conversation_key,
-                                    # Same gate as ``saved_delta``: a usage-less
-                                    # turn leaves its measure pending too.
-                                    savings_measure=_take_ws_savings_measure()
-                                    if input_delta > 0
-                                    else None,
+                                    savings_measure=_take_ws_turn_measure(),
                                     client=client,
                                     project=ws_turn_project_key,
                                 )
@@ -10302,6 +10319,15 @@ class OpenAIHandlerMixin:
                                     ws_cache_read_tokens_total += usage_cache_read_tokens
                                     ws_cache_write_tokens_total += usage_cache_write_tokens
                                     ws_uncached_input_tokens_total += usage_uncached_tokens
+                                if event_type in {
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.incomplete",
+                                }:
+                                    _end_ws_response(
+                                        completed=event_type == "response.completed"
+                                        and usage_input_tokens > 0
+                                    )
 
                                 if event_type in {"response.failed", "response.incomplete"}:
                                     for buffered_event in event_buffer:
@@ -10457,6 +10483,7 @@ class OpenAIHandlerMixin:
                                 }
                                 continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
                                 ws_memory_response_pending = True
+                                ws_frame_measures.append(None)  # Headroom's own frame
                                 await upstream.send(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
@@ -10778,12 +10805,8 @@ class OpenAIHandlerMixin:
                 # Rows no per-turn record claimed ride with the residual, under
                 # the same input-usage gate as ``residual_tokens_saved``.
                 ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
-            # Measures no per-turn record took, under the same gate. Without
-            # residual input their frames never completed: release them.
-            residual_measure = _take_ws_savings_measure()
-            if residual_measure is not None and residual_input_tokens <= 0:
-                get_item_ledger().settle(residual_measure, succeeded=False)
-                residual_measure = None
+            # Frames still outstanding never completed: release their measures.
+            _end_ws_response(completed=False)
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
@@ -10840,7 +10863,6 @@ class OpenAIHandlerMixin:
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
                         conversation_key=ws_conversation_key,
-                        savings_measure=residual_measure,
                         client=client,
                         project=ws_turn_project_key,
                         request_messages=ws_messages_for_log
