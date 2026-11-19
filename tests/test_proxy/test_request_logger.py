@@ -195,3 +195,15 @@ def test_get_recent_with_messages_can_skip_payloads_without_walking_them():
     assert slim[0]["tokens_saved"] == 60
     assert slim[0]["transforms_applied"] == ["kompress:user:0.4"]
     assert not {"request_messages", "compressed_messages", "response_content"} & slim[0].keys()
+
+
+def test_get_recent_non_positive_n_returns_nothing_not_the_whole_log():
+    logger = RequestLogger(log_file=None, log_full_messages=True)
+    for i in range(5):
+        logger.log(_entry(request_id=f"r{i}"))
+
+    assert len(logger.get_recent(2)) == 2
+    for n in (0, -1, -4):
+        assert logger.get_recent(n) == []
+        assert logger.get_recent_with_messages(n) == []
+        assert logger.get_recent_with_messages(n, include_messages=False) == []

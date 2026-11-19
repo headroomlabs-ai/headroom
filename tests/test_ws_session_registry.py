@@ -153,6 +153,34 @@ def test_deregister_releases_task_references():
     assert reg.active_relay_task_count() == 0
 
 
+def test_re_registering_the_same_handle_keeps_its_relay_tasks():
+    """``register`` is idempotent by ``session_id``; a second call with the same
+    handle must not drop the tasks already attached to it or mis-count the gauge."""
+    reg = WebSocketSessionRegistry()
+    handle = _make_handle()
+
+    class _Task:
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> bool:
+            return True
+
+        def get_name(self) -> str:
+            return "t"
+
+    task = _Task()
+    reg.register(handle)
+    reg.attach_tasks("sess-1", [task])
+    assert reg.active_relay_task_count() == 1
+
+    reg.register(handle)
+
+    assert handle.relay_tasks == [task]
+    assert reg.active_relay_task_count() == 1
+    assert reg.active_count() == 1
+
+
 def test_attach_tasks_on_missing_session_is_noop():
     reg = WebSocketSessionRegistry()
 
