@@ -78,6 +78,11 @@ pub const DEFAULT_TOKENIZER_REPO: &str = "answerdotai/ModernBERT-base";
 /// snapshots the cache-only loader reads. Keep each equal to its entry in
 /// `_PINNED_REVISIONS` (`headroom/onnx_runtime.py`), which is what the Python
 /// side downloads; `tests/test_kompress_rust_pins.py` enforces it.
+///
+/// The same two commits live in [`crate::hf_pins`], which every download and
+/// cache path resolves through; `hf_pins::tests::kompress_constants_agree_with
+/// _the_pin_table` keeps the two from drifting. They are literals here because
+/// the Python parity test reads this file's source text.
 pub const DEFAULT_MODEL_REVISION: &str = "b1563631b35bfdcee37587ad530147497d820d4c";
 pub const DEFAULT_TOKENIZER_REVISION: &str = "8949b909ec900327062f0ebf497f51aef5e6f0c8";
 /// Words per inference chunk. Coupled to the model's training window;
@@ -122,6 +127,12 @@ pub struct KompressConfig {
     pub chunk_words: usize,
     pub score_threshold: f32,
     pub min_words: usize,
+    /// Commit SHA to fetch `model_id` at. `None` uses the pinned revision from
+    /// [`crate::hf_pins`] (or the default branch for an unpinned/custom repo).
+    pub model_revision: Option<String>,
+    /// Commit SHA to fetch `tokenizer_repo` at, same rules as
+    /// [`Self::model_revision`].
+    pub tokenizer_revision: Option<String>,
 }
 
 impl Default for KompressConfig {
@@ -132,6 +143,8 @@ impl Default for KompressConfig {
             chunk_words: DEFAULT_CHUNK_WORDS,
             score_threshold: DEFAULT_SCORE_THRESHOLD,
             min_words: MIN_WORDS,
+            model_revision: None,
+            tokenizer_revision: None,
         }
     }
 }
@@ -264,8 +277,15 @@ impl Kompress {
     }
 
     /// Build by resolving artifacts from the HuggingFace Hub (cache-first,
-    /// downloading on miss). Blocking — call off the hot path. Tries the
+    /// downloading on miss). Blocking - call off the hot path. Tries the
     /// [`ONNX_CANDIDATES`] in order.
+    ///
+    /// Both the model repo and the tokenizer repo are fetched at their pinned
+    /// commit (`crate::hf_pins`), not `main`. The ONNX weights and the
+    /// tokenizer they were exported against are one artifact pair: floating
+    /// either changes compression output with no change here (GH #4939).
+    /// [`KompressConfig`] carries optional `model_revision`/`tokenizer_revision`
+    /// overrides for a caller with its own snapshot.
     pub fn from_pretrained(config: KompressConfig) -> Result<Self, KompressError> {
         // Air-gap chokepoint — the same guard `hf_cache::hub_api` runs for
         // the tokenizer and embedder, for the same reason. `HF_HUB_OFFLINE` only shortcuts the
@@ -283,13 +303,27 @@ impl Kompress {
         // has pre-seeded artifacts should use [`Self::from_files`], which is
         // network-free by construction and unaffected by this guard.
         crate::offline::guard_egress("Kompress model download", &config.model_id)?;
+        // Pinned commits, resolved before the client is built (GH #4939):
+        // `Api::model` hard-codes `main`, so every fetch below goes through a
+        // `Repo::with_revision` handle instead.
+        let model_revision =
+            crate::hf_pins::resolve(&config.model_id, config.model_revision.as_deref());
+        let tokenizer_revision =
+            crate::hf_pins::resolve(&config.tokenizer_repo, config.tokenizer_revision.as_deref());
         let api = hf_hub::api::sync::Api::new().map_err(|e| KompressError::Hub {
             repo: config.model_id.clone(),
             source: Box::new(e),
         })?;
 
-        let tok_path = api
-            .model(config.tokenizer_repo.clone())
+        let tokenizer_api = match tokenizer_revision {
+            Some(rev) => api.repo(hf_hub::Repo::with_revision(
+                config.tokenizer_repo.clone(),
+                hf_hub::RepoType::Model,
+                rev.to_string(),
+            )),
+            None => api.model(config.tokenizer_repo.clone()),
+        };
+        let tok_path = tokenizer_api
             .get("tokenizer.json")
             .map_err(|e| KompressError::Hub {
                 repo: config.tokenizer_repo.clone(),
@@ -297,7 +331,14 @@ impl Kompress {
             })?;
         let tokenizer = load_tokenizer(&tok_path, &config.tokenizer_repo)?;
 
-        let model_api = api.model(config.model_id.clone());
+        let model_api = match model_revision {
+            Some(rev) => api.repo(hf_hub::Repo::with_revision(
+                config.model_id.clone(),
+                hf_hub::RepoType::Model,
+                rev.to_string(),
+            )),
+            None => api.model(config.model_id.clone()),
+        };
         let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut tried: Vec<String> = Vec::new();
         for candidate in ONNX_CANDIDATES {
@@ -337,7 +378,11 @@ impl Kompress {
     /// plain text through untouched, exactly as Python does when Kompress is
     /// unavailable.
     pub fn from_cache(config: KompressConfig) -> Result<Option<Self>, KompressError> {
-        let Some(tok_path) = hf_cache_file(&config.tokenizer_repo, &["tokenizer.json"]) else {
+        let Some(tok_path) = hf_cache_file_at(
+            &config.tokenizer_repo,
+            &["tokenizer.json"],
+            config.tokenizer_revision.as_deref(),
+        ) else {
             // Diagnostic: a `None` here is the #1 cause of a silent
             // `kompress_ready=false`. Name the repo, the cache and the revision
             // looked in so operators don't have to guess between "not
@@ -363,7 +408,9 @@ impl Kompress {
         let mut found_onnx = false;
         for candidate in ONNX_CANDIDATES {
             let rel: Vec<&str> = candidate.split('/').collect();
-            let Some(onnx_path) = hf_cache_file(&config.model_id, &rel) else {
+            let Some(onnx_path) =
+                hf_cache_file_at(&config.model_id, &rel, config.model_revision.as_deref())
+            else {
                 continue;
             };
             found_onnx = true;
@@ -675,22 +722,29 @@ fn onnx_runtime_ready_with(
 /// parity harnesses that load one specific artifact through
 /// [`Kompress::from_files`], so they test the files production would load.
 pub fn cached_artifacts(config: &KompressConfig, onnx: &str) -> Option<(PathBuf, PathBuf)> {
-    let tokenizer = hf_cache_file(&config.tokenizer_repo, &["tokenizer.json"])?;
+    let tokenizer = hf_cache_file_at(
+        &config.tokenizer_repo,
+        &["tokenizer.json"],
+        config.tokenizer_revision.as_deref(),
+    )?;
     let rel: Vec<&str> = onnx.split('/').collect();
-    let model = hf_cache_file(&config.model_id, &rel)?;
+    let model = hf_cache_file_at(&config.model_id, &rel, config.model_revision.as_deref())?;
     Some((tokenizer, model))
 }
 
-/// The revision of `repo` to load from the cache: its pin when it is one of
-/// Kompress's default repos (see [`DEFAULT_MODEL_REVISION`]), otherwise
-/// `main`, which is also what Python's `_resolve_revision` gives an unpinned
-/// repo. `HEADROOM_HF_PIN=off` floats the pinned ones on `main` too.
+/// The revision of `repo` to load from the cache: its pin ([`crate::hf_pins`],
+/// the same table the Python side and the download path use), otherwise `main`,
+/// which is also what Python's `_resolve_revision` gives an unpinned repo.
+/// `HEADROOM_HF_PIN=off` floats the pinned ones on `main` too.
 fn cache_revision(repo: &str) -> &str {
-    match repo {
-        DEFAULT_MODEL_ID => crate::hf_cache::pinned_or_main(DEFAULT_MODEL_REVISION),
-        DEFAULT_TOKENIZER_REPO => crate::hf_cache::pinned_or_main(DEFAULT_TOKENIZER_REVISION),
-        _ => "main",
-    }
+    crate::hf_pins::revision(repo).unwrap_or("main")
+}
+
+/// [`cache_revision`] with a [`KompressConfig`] override honoured first, so a
+/// caller that pointed the download at its own snapshot reads that snapshot
+/// back instead of the default pin.
+fn cache_revision_or<'a>(repo: &str, explicit: Option<&'a str>) -> &'a str {
+    crate::hf_pins::resolve(repo, explicit).unwrap_or("main")
 }
 
 /// Resolve `rel` (e.g. `["tokenizer.json"]` or `["onnx", "kompress-int8-wo.onnx"]`)
@@ -707,13 +761,23 @@ fn cache_revision(repo: &str) -> &str {
 /// `HF_HUB_CACHE` names another directory, so neither does this. `is_file`
 /// follows the cache's symlinks, so a blob missing under a snapshot (or a
 /// symlink native Windows cannot follow over `\\wsl$`) is a miss.
-fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
+///
+/// `explicit` is a [`KompressConfig`] revision override; `None` uses the pin.
+fn hf_cache_file_at(repo: &str, rel: &[&str], explicit: Option<&str>) -> Option<PathBuf> {
     let cache = crate::hf_cache::hub_cache_dir()?;
-    let mut path = crate::hf_cache::snapshot_path(&cache, repo, cache_revision(repo));
+    let mut path = crate::hf_cache::snapshot_path(&cache, repo, cache_revision_or(repo, explicit));
     for part in rel {
         path.push(part);
     }
     path.is_file().then_some(path)
+}
+
+/// [`hf_cache_file_at`] with no revision override. Kept for the tests, which
+/// assert the pinned snapshot wins over a directory scan; production paths pass
+/// a [`KompressConfig`] override so a caller's own snapshot is read back.
+#[cfg_attr(not(test), allow(dead_code))]
+fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
+    hf_cache_file_at(repo, rel, None)
 }
 
 #[cfg(test)]
