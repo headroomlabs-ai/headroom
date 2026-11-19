@@ -34,12 +34,20 @@ def test_guide_does_not_tell_operators_to_seed_with_compress():
 
 
 def test_guide_checks_the_pinned_snapshot_layout():
-    """The verification snippet must key on snapshots/<pin>, not refs/<pin>."""
+    """The guide must verify via the real script, which keys on snapshots/<pin>.
+
+    The inline snippet it used to inline is gone: it hard-coded two ONNX
+    filenames as required, contradicting the guide's own "one candidate is
+    enough" and failing a valid cache. `tests/test_verify_hf_cache.py` covers
+    the script's behaviour; this checks the guide still points at it and still
+    names the pin table the script resolves through.
+    """
     text = DOCS.read_text(encoding="utf-8")
     section = text.split("#### Offline upgrade path", 1)[1].split("\n###", 1)[0]
+    assert "verify-hf-cache" in section, "the guide must use the verifier"
+    assert "scripts/verify_hf_cache.py" not in section
     assert "snapshots" in section
-    assert "_PINNED_REVISIONS" in section
-    # A pin the snippet resolves must actually exist in the table.
+    # A pin the guide's examples depend on must actually exist in the table.
     assert "chopratejas/kompress-v2-base" in _PINNED_REVISIONS
 
 
