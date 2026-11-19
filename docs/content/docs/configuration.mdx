@@ -489,9 +489,54 @@ is the thing being fixed.
 Air-gapped deployments are unaffected at the fetch level — `HEADROOM_OFFLINE=1` refuses these
 downloads before any socket opens, and `from_file` / `from_files` remain network-free. What
 you must pre-provision is the *pinned* snapshot: the native proxy's cache-only reader resolves
-the repo at its pin (a commit SHA names the snapshot directory directly), so seeding a
-different revision is a cache miss, not a silently different model. `HEADROOM_HF_PIN=off`
-moves both the download and the cache lookup back to `main`.
+the repo at its pin (a commit SHA names the snapshot directory directly, and the Rust tokenizer
+loader reads `snapshots/<sha>/` even when there is no `refs/<sha>` — which is how Python's own
+cache is laid out). Seeding a different revision is a cache miss, not a silently different
+model.
+
+#### Offline upgrade path — pre-seed the SHA before you upgrade
+
+This catches deployments that were already running before pinning existed. A cache filled
+from the default branch holds an *older* snapshot under `refs/main`; after upgrading, the pin
+names a commit the cache does not have, so:
+
+1. the cache-only attempt misses,
+2. `HEADROOM_OFFLINE=1` refuses the network fallback,
+3. the loader returns `None` and token counting degrades to character estimation.
+
+It does **not** silently keep using the old vocabulary — that would defeat the pin and quietly
+change every count, which is the failure this change exists to prevent. But the fallback is
+ugly if you did not plan for it: it is logged once per process, and because the result is
+cached (`lru_cache`), the process never retries that tokenizer.
+
+So, before upgrading an air-gapped host, warm the cache at the pins *it will use*. There is no
+dedicated preload command; the loaders fetch on first use, so run the feature once with network
+access and `HF_HUB_CACHE` pointed at the directory you will carry across:
+
+```bash
+# On a host with network access. Any use of the feature fetches at the pin —
+# e.g. a single compress() with the ML path enabled, or one proxy request:
+HF_HUB_CACHE=/srv/hf-cache python - <<'PY'
+import headroom
+headroom.compress([{"role": "user", "content": "hello"}], model="qwen2.5-7b")
+PY
+
+# Verify the exact snapshots landed, then copy /srv/hf-cache to the air-gapped
+# host and point its HF_HUB_CACHE at it. The layout to check for:
+#   .../models--Qwen--Qwen2.5-7B/snapshots/<pin>/tokenizer.json
+#   .../models--chopratejas--kompress-v2-base/snapshots/<pin>/onnx/...
+python - <<'PY'
+from headroom.onnx_runtime import _PINNED_REVISIONS
+from headroom.tokenizers.huggingface import _TOKENIZER_REVISIONS
+for table in (_PINNED_REVISIONS, _TOKENIZER_REVISIONS):
+    for repo, sha in table.items():
+        print(f"{repo} @ {sha}")
+PY
+```
+
+To stay on the previously-cached bytes instead, set `HEADROOM_HF_PIN=off` on that host: it
+moves both the download and the cache lookup back to `main`, which is the deliberate escape
+hatch for running an unpinned snapshot.
 
 ### Cold-prefix hook & reasoning compaction
 

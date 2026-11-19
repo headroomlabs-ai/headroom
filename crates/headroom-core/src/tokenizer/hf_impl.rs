@@ -149,6 +149,19 @@ impl HfTokenizer {
         repo: &str,
         revision: Option<&str>,
     ) -> Result<Self, HfTokenizerError> {
+        // Pinned commits (GH #4939): `Api::model` hard-codes `main`, so the
+        // revision is resolved first and every fetch below names it.
+        let pinned = crate::hf_pins::resolve(repo, revision);
+        // Warm-cache path, network-free. `hf-hub` resolves every revision
+        // through `refs/<revision>`, but Python's `huggingface_hub` writes
+        // `snapshots/<sha>/` with NO `refs/<sha>` (refs point at branches), so
+        // a cache Python seeded at a pin was a miss here and re-downloaded.
+        // Reading the snapshot directly first makes a Python-style warm cache a
+        // hit, which also lets an air-gapped host serve a pre-seeded pin without
+        // a socket — see the air-gap note below, which this now relaxes.
+        if let Some(path) = cached_tokenizer(repo, pinned) {
+            return Self::from_file(repo, path);
+        }
         // Air-gap chokepoint, matching `headroom/offline.py`'s `guard_egress`.
         // This is the Rust half of the same switch, so an operator who sets
         // HEADROOM_OFFLINE=1 gets the same refusal whichever runtime reaches
@@ -160,20 +173,16 @@ impl HfTokenizer {
         // HF_HUB_OFFLINE handling only covers the cache lookup — a cache miss
         // still dials out. So the air-gapped case never constructs a client.
         //
-        // The refusal is hard on purpose. Silently returning a cached or
-        // estimating tokenizer would leave token counts subtly wrong with no
-        // signal; the caller (`tokenizer::registry::try_register_hf`) already
-        // propagates the error so the operator sees which repo was wanted.
+        // The refusal is hard on purpose. Silently returning an estimating
+        // tokenizer would leave token counts subtly wrong with no signal; the
+        // caller (`tokenizer::registry::try_register_hf`) already propagates
+        // the error so the operator sees which repo was wanted.
         //
-        // Note it refuses even on a warm cache: `hf-hub` 0.5 exposes no
-        // cache-hit/cache-miss split at this layer, so "guard before the
-        // client exists" and "serve from the cache" cannot both hold here. An
-        // air-gapped deployment with pre-seeded artifacts should point at them
-        // with `from_file`, which is network-free by construction.
+        // It only refuses on a genuine cache miss: `cached_tokenizer` above
+        // already served a pre-seeded pin, which is the case an air-gapped
+        // deployment cares about. A miss still refuses rather than downloading.
         let api = hub_api(repo)?;
-        // Pinned commits (GH #4939): `Api::model` hard-codes `main`, so a
-        // resolved revision goes through a `Repo::with_revision` handle.
-        let handle = match crate::hf_pins::resolve(repo, revision) {
+        let handle = match pinned {
             Some(rev) => api.repo(hf_hub::Repo::with_revision(
                 repo.to_string(),
                 hf_hub::RepoType::Model,
@@ -197,6 +206,21 @@ impl HfTokenizer {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// The cached `tokenizer.json` for `repo` at `revision` (`None` = let the cache
+/// resolve the default branch), or `None` when it is not on disk.
+///
+/// `crate::hf_cache::snapshot_path` already resolves a commit SHA as the
+/// snapshot directory directly and a branch through `refs/<branch>`, which is
+/// exactly Python's layout. Read before the `hf-hub` client is built so a warm
+/// cache never opens a socket — and so a Python-seeded pin (which has no
+/// `refs/<sha>`) is a hit rather than a re-download.
+fn cached_tokenizer(repo: &str, revision: Option<&str>) -> Option<std::path::PathBuf> {
+    let cache = crate::hf_cache::hub_cache_dir()?;
+    let revision = revision?;
+    let path = crate::hf_cache::snapshot_path(&cache, repo, revision).join("tokenizer.json");
+    path.is_file().then_some(path)
 }
 
 /// The Hub client for [`HfTokenizer::from_pretrained`] fetching `repo`:
@@ -448,6 +472,42 @@ mod tests {
         cache_main_tokenizer(&t.path().join("hub"), "acme/tiny");
 
         let tokenizer = HfTokenizer::from_pretrained("acme/tiny").expect("served from the cache");
+        assert_eq!(tokenizer.count_text("hello world"), 2);
+    }
+
+    /// A cache seeded at a **commit SHA** with no `refs/<sha>` entry is a hit.
+    ///
+    /// Python's `huggingface_hub` writes `snapshots/<sha>/` and, for a branch,
+    /// a `refs/<branch>` pointer — it never writes `refs/<sha>`. `hf-hub`
+    /// resolves every revision through `refs/<revision>`, so a pinned download
+    /// would look up `refs/<the-pin>`, find nothing, and re-download a snapshot
+    /// that is already on disk. (#4939 review)
+    #[test]
+    fn from_pretrained_reads_a_python_style_sha_snapshot_without_a_ref() {
+        let _guard = crate::test_support::env_lock();
+        let _env = hub_env();
+        let t = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", t.path().join("home"));
+        std::env::set_var("USERPROFILE", t.path().join("home"));
+        std::env::set_var("HF_HUB_CACHE", t.path().join("hub"));
+        // A closed loopback port: if this is a cache miss the test fails with a
+        // connection error instead of silently reaching the real Hub.
+        std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:9");
+
+        let repo = "acme/tiny";
+        let sha = crate::hf_pins::revision(repo).unwrap_or("abc123");
+        let repo_dir = t
+            .path()
+            .join("hub")
+            .join(format!("models--{}", repo.replace('/', "--")));
+        let snapshot = repo_dir.join("snapshots").join(sha);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), TINY_TOKENIZER_JSON).unwrap();
+        // Deliberately NO refs/<sha>: that is what Python's cache looks like.
+        assert!(!repo_dir.join("refs").join(sha).exists());
+
+        let tokenizer =
+            HfTokenizer::from_pretrained_at(repo, Some(sha)).expect("served from the cache");
         assert_eq!(tokenizer.count_text("hello world"), 2);
     }
 
