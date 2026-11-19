@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import subprocess
-from pathlib import Path
+import sys
+import time
+from pathlib import Path, PureWindowsPath
 
 import pytest
 from click.testing import CliRunner
@@ -54,6 +56,21 @@ def test_redact_hides_home_and_windows_user_name():
 
 def test_redact_leaves_other_users_home_prefix_alone():
     assert sd.redact("/home/meg/x", HOME) == "/home/meg/x"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (r"C:\Users\Pouya\.serena\logs\mcp_1.txt", r"~\.serena\logs\mcp_1.txt"),
+        (
+            r"ERROR spawn failed in c:\users\pouya\proj",
+            r"ERROR spawn failed in c:\users\<user>\proj",
+        ),
+        (r"npm at D:\Users\Other\npm.cmd", r"npm at D:\Users\<user>\npm.cmd"),
+    ],
+)
+def test_redact_hides_native_windows_user_names(text: str, expected: str):
+    assert sd.redact(text, PureWindowsPath(r"C:\Users\Pouya")) == expected
 
 
 # --- toolchain resolution --------------------------------------------------
@@ -352,6 +369,57 @@ def test_probe_without_uvx_fails_cleanly():
     )
     assert finding.severity is sd.Severity.FAIL
     assert "uvx not found" in finding.summary
+
+
+def _running(pid: int) -> bool:
+    """Alive and not a zombie (an orphan's zombie can linger under a non-reaping PID 1)."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return False
+    return state != "Z"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_probe_timeout_kills_the_whole_process_tree(tmp_path: Path):
+    # Arrange: like uvx -> serena -> language server, the launcher's descendant
+    # outlives a timeout that only kills the direct child.
+    pid_file = tmp_path / "grandchild.pid"
+    argv = ["sh", "-c", f'sleep 60 & echo $! > "{pid_file}"; wait']
+
+    # Act
+    with pytest.raises(subprocess.TimeoutExpired):
+        sd._default_runner(argv, 1)
+
+    # Assert
+    grandchild = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while _running(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _running(grandchild)
+
+
+def test_interrupted_probe_tears_down_the_tree(monkeypatch):
+    class InterruptedProc:
+        pid = 4242
+
+        def communicate(self, timeout):
+            raise KeyboardInterrupt
+
+    proc = InterruptedProc()
+    killed: list[object] = []
+    monkeypatch.setattr(sd, "popen_text", lambda *a, **kw: proc)
+    monkeypatch.setattr(sd, "kill_process_tree", killed.append)
+
+    with pytest.raises(KeyboardInterrupt):
+        sd._default_runner(["uvx"], 5)
+
+    assert killed == [proc]
+
+
+def test_probe_runner_returns_output_of_a_finished_run():
+    completed = sd._default_runner([sys.executable, "-c", "print('✅ ok')"], 30)
+    assert (completed.returncode, completed.stdout.strip()) == (0, "✅ ok")
 
 
 # --- CLI -------------------------------------------------------------------

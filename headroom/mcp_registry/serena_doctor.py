@@ -24,12 +24,15 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePath
+from typing import Any
 
-from headroom._subprocess import run as run_text
+from headroom._subprocess import Popen as popen_text
+from headroom._subprocess import kill_process_tree
 
 from .base import ServerSpec
 
@@ -39,7 +42,10 @@ TOOLCHAIN = ("uvx", "node", "npm", "npx")
 _NODE_TOOLCHAIN = ("node", "npm")
 
 _WINDOWS_MOUNT = re.compile(r"^/mnt/[a-zA-Z]/")
-_WINDOWS_USER_DIR = re.compile(r"(/mnt/[a-zA-Z]/Users/)[^/\s]+", re.IGNORECASE)
+# A Windows profile dir as WSL (/mnt/c/Users/<name>) or Windows (C:\Users\<name>) spells it.
+_WINDOWS_USER_DIR = re.compile(
+    r"((?:/mnt/[a-zA-Z]/|\b[a-zA-Z]:[\\/])Users[\\/])[^\\/\s]+", re.IGNORECASE
+)
 
 # Non-interactive guards Ubuntu/Debian-style ~/.bashrc files open with.
 _CASE_GUARD_START = re.compile(r"^\s*case\s+[\"']?\$-[\"']?\s+in\b")
@@ -97,11 +103,12 @@ class ToolPath:
         return any(p is not None and _WINDOWS_MOUNT.match(p) for p in (self.found, self.real))
 
 
-def redact(text: str, home: Path) -> str:
+def redact(text: str, home: PurePath) -> str:
     """Hide the home directory and Windows user names in a path or log line."""
-    home_str = str(home).rstrip("/")
+    home_str = str(home).rstrip("/\\")
     if home_str:
-        text = text.replace(home_str + "/", "~/")
+        for sep in ("/", "\\"):  # native Windows paths use backslashes
+            text = text.replace(home_str + sep, "~" + sep)
     return _WINDOWS_USER_DIR.sub(r"\1<user>", text)
 
 
@@ -277,15 +284,33 @@ def health_check_command(spec: ServerSpec, project: Path) -> list[str]:
 
 
 def _default_runner(argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run the probe in its own process group and kill the whole tree on exit.
+
+    ``uvx`` runs Serena as a grandchild, and Serena starts language servers
+    under it; ``subprocess.run``'s timeout kills only ``uvx`` and would orphan
+    the rest. Ctrl+C no longer reaches a separate process group, so an
+    interrupt tears the tree down here too.
+    """
+    group: dict[str, Any] = {}
+    if sys.platform == "win32":
+        group["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        group["start_new_session"] = True
     # Shared wrapper: decodes Serena's emoji verdict as UTF-8 on Windows consoles too.
-    return run_text(  # noqa: S603 - argv is built from Headroom's own Serena spec
+    proc = popen_text(  # noqa: S603 - argv is built from Headroom's own Serena spec
         list(argv),
-        capture_output=True,
-        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
-        timeout=timeout,
-        check=False,
+        text=True,
+        **group,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except BaseException:  # TimeoutExpired, KeyboardInterrupt, anything: never leak the tree
+        kill_process_tree(proc)
+        raise
+    return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
 
 
 def run_health_check(
