@@ -42,6 +42,7 @@ from headroom.proxy.helpers import (
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.modes import is_cache_mode
+from headroom.proxy.output_savings_policy import _unwrap_response_create_body
 from headroom.proxy.provider_usage import (
     anthropic_cache_ttl_buckets,
     billed_input_for_provider,
@@ -74,6 +75,8 @@ from headroom.proxy.ws_session_registry import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from fastapi import Request, WebSocket
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -2086,6 +2089,23 @@ def _openai_responses_cache_split(
         _infer_openai_cache_write_tokens(input_tokens, cached),
         max(input_tokens - cached, 0),
         True,
+    )
+
+
+def _measure_responses_request(
+    original: dict[str, Any],
+    sent: dict[str, Any],
+    *,
+    conversation: str | None,
+    model: str,
+    count: Callable[[str], int],
+) -> ItemMeasure:
+    """Measure one Responses request's items against its conversation's
+    previous request (``headroom.proxy.savings``). ``original`` is the body the
+    client sent, ``sent`` the one forwarded. The outcome funnel settles it."""
+    items = responses_items(original)
+    return get_item_ledger().measure(
+        prefix_key(conversation, model, items), items, responses_items(sent), count
     )
 
 
@@ -7218,12 +7238,12 @@ class OpenAIHandlerMixin:
         if not (body.get("previous_response_id") or body.get("conversation")):
 
             def _measure_items() -> ItemMeasure:
-                original = responses_items(json.loads(original_body_bytes))
-                return get_item_ledger().measure(
-                    prefix_key(_pre_compression_conversation_key, model, original),
-                    original,
-                    responses_items(body),
-                    tokenizer.count_text,
+                return _measure_responses_request(
+                    json.loads(original_body_bytes),
+                    body,
+                    conversation=_pre_compression_conversation_key,
+                    model=model,
+                    count=tokenizer.count_text,
                 )
 
             try:
@@ -8515,6 +8535,63 @@ class OpenAIHandlerMixin:
             # path books.
 
             ws_conversation_key: str | None = None
+            # Frames measured against their conversation's previous request,
+            # as the HTTP path measures one, oldest first, until the record
+            # that books their savings takes them (_take_ws_savings_measure).
+            ws_pending_measures: list[ItemMeasure] = []
+            # The client's own bytes, before hooks, memory, store=false,
+            # compression or shaping rewrite them: the measure's ORIGINAL.
+            first_client_raw = first_msg_raw
+
+            async def _measure_ws_frame(client_raw: str, sent: Any) -> None:
+                """Measure one forwarded frame. A frame on previous_response_id
+                carries only new items (the provider holds the rest), so it is
+                not measured: none of its removals sat in a replayed prefix."""
+                try:
+                    original = json.loads(client_raw)
+                    if not isinstance(original, dict) or not isinstance(sent, dict):
+                        return
+                    original = _unwrap_response_create_body(original)
+                    conversation = savings_conversation_key(original, session_id=f"ws:{session_id}")
+                    if conversation is None:
+                        return
+                    sent = _unwrap_response_create_body(sent)
+                    model = str(sent.get("model") or original.get("model") or "")
+
+                    def _measure() -> ItemMeasure:
+                        return _measure_responses_request(
+                            original,
+                            sent,
+                            conversation=conversation,
+                            model=model,
+                            count=self.openai_provider.get_token_counter(model).count_text,
+                        )
+
+                    ws_pending_measures.append(await asyncio.to_thread(_measure))
+                except Exception as exc:  # noqa: BLE001 - telemetry must never break a session
+                    logger.warning(
+                        "[%s] WS savings item measurement skipped: %s",
+                        request_id,
+                        describe_exception(exc),
+                    )
+
+            def _take_ws_savings_measure() -> ItemMeasure | None:
+                """The pending measures as one, for the record that books their
+                savings. Frames whose turn never completed had their savings
+                deferred to this record, so their replayed share comes along;
+                they never become the baseline. The newest does, once the
+                funnel settles it."""
+                if not ws_pending_measures:
+                    return None
+                *superseded, newest = ws_pending_measures
+                ws_pending_measures.clear()
+                for measure in superseded:
+                    get_item_ledger().settle(measure, succeeded=False)
+                return replace(
+                    newest,
+                    removed_old=newest.removed_old + sum(m.removed_old for m in superseded),
+                )
+
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
@@ -9363,6 +9440,7 @@ class OpenAIHandlerMixin:
                             await upstream.close()
                         return
                 async with upstream:
+                    await _measure_ws_frame(first_client_raw, _first_upstream_body)
                     await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
 
                     # Unit 3: flag the upstream side flips on seeing
@@ -9704,6 +9782,7 @@ class OpenAIHandlerMixin:
                         try:
                             while True:
                                 msg = await websocket.receive_text()
+                                client_raw = msg
                                 client_frame_index += 1
                                 ws_client_frames_total += 1
                                 if session_handle is not None:
@@ -9866,6 +9945,8 @@ class OpenAIHandlerMixin:
                                         "transforms_applied": transforms_applied,
                                     },
                                 )
+                                if ws_last_client_frame_type == "response.create":
+                                    await _measure_ws_frame(client_raw, _outbound_frame_body)
                                 await upstream.send(_strip_codex_lite_metadata(msg))
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
@@ -10073,6 +10154,11 @@ class OpenAIHandlerMixin:
                                     else 0,
                                     tags=turn_tags,
                                     conversation_key=ws_conversation_key,
+                                    # Same gate as ``saved_delta``: a usage-less
+                                    # turn leaves its measure pending too.
+                                    savings_measure=_take_ws_savings_measure()
+                                    if input_delta > 0
+                                    else None,
                                     client=client,
                                     project=ws_turn_project_key,
                                 )
@@ -10692,6 +10778,12 @@ class OpenAIHandlerMixin:
                 # Rows no per-turn record claimed ride with the residual, under
                 # the same input-usage gate as ``residual_tokens_saved``.
                 ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
+            # Measures no per-turn record took, under the same gate. Without
+            # residual input their frames never completed: release them.
+            residual_measure = _take_ws_savings_measure()
+            if residual_measure is not None and residual_input_tokens <= 0:
+                get_item_ledger().settle(residual_measure, succeeded=False)
+                residual_measure = None
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
@@ -10748,6 +10840,7 @@ class OpenAIHandlerMixin:
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
                         conversation_key=ws_conversation_key,
+                        savings_measure=residual_measure,
                         client=client,
                         project=ws_turn_project_key,
                         request_messages=ws_messages_for_log

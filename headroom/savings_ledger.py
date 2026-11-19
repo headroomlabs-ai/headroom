@@ -704,6 +704,15 @@ def aggregate_savings(
                 deferred = max(int(event.get("deferred", 0) or 0), 0)
             except (TypeError, ValueError):
                 new_input = None
+            # Replayed-prefix removals a warm turn would have read from cache
+            # never entered new input either: leave them out of the numerator
+            # like deferral, capped at the event's reads as /stats caps them.
+            # An event without ``saved_prefix`` keeps the full figure.
+            cache = event.get("cache")
+            deferred += min(
+                _nonneg_int(event.get("saved_prefix", 0)),
+                _nonneg_int(cache.get("cr", 0) if isinstance(cache, dict) else 0),
+            )
 
         targets = [windowed]
         if ts >= today_cutoff:

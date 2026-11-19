@@ -123,6 +123,55 @@ def _ten_and_one_per_million(monkeypatch: pytest.MonkeyPatch) -> Any:
     resolve_rates.cache_clear()
 
 
+def _use_real_sinks(handler: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
+    """Give ``handler`` the production metrics, savings tracker, ledger and
+    cost tracker, writing under ``tmp_path``. Returns the ledger path."""
+    from headroom.proxy.cost import CostTracker
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.savings_tracker import SavingsTracker
+
+    ledger = tmp_path / "savings_events.jsonl"
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(ledger))
+    handler.cost_tracker = CostTracker()
+    handler.metrics = PrometheusMetrics(
+        savings_tracker=SavingsTracker(path=str(tmp_path / "proxy_savings.json")),
+        cost_tracker=handler.cost_tracker,
+    )
+    return ledger
+
+
+def _assert_the_warm_replay_was_booked(handler: Any, ledger: Any) -> None:
+    """Two turns removing 1,024 tokens each; turn two's removals all sat in
+    the replayed prefix, read from cache (2,048 cached + 1,024 uncached)."""
+    from headroom.savings_ledger import aggregate_savings
+
+    events = [json.loads(line) for line in ledger.read_text().splitlines()]
+    events = [e for e in events if e.get("saved")]
+    m = handler.metrics
+    lifetime = m.savings_tracker.snapshot()["lifetime"]
+    durable = m.savings_tracker.lifetime_response()
+    cost = handler.cost_tracker.stats()
+
+    # Token booking: both turns, every sink.
+    assert m.tokens_saved_total == 2_048
+    assert lifetime["tokens_saved"] == 2_048
+    assert durable["tokens"]["saved"] == 2_048
+    assert [e["saved"] for e in events] == [1_024, 1_024]
+    assert cost["total_compression_tokens_saved"] == 2_048
+    # Cache-aware valuation: turn two adds a cache read's worth.
+    expected = 1_024 * 10e-6 + 1_024 * 1e-6
+    assert lifetime["compression_savings_usd"] == pytest.approx(expected, abs=1e-6)
+    assert durable["cost"]["compression_savings_usd"] == pytest.approx(expected, abs=1e-6)
+    assert sum(e["cost_effective_usd"] for e in events) == pytest.approx(expected, abs=1e-6)
+    assert cost["cache_aware_savings_usd"] == round(expected, 4) == 0.0113
+    # New-input rate: turn two's removals were cache reads, not new input, so
+    # only turn one's 1,024 count, against 3,072 + 1,024 new tokens.
+    saved, new = m.new_input_saved_tokens_total, m.new_input_tokens_total
+    assert (saved, new) == (1_024, 4_096)
+    assert round(saved / (new + saved) * 100, 2) == 20.0  # /stats' formula
+    assert aggregate_savings(ledger).lifetime["new_input_savings_percent"] == 20.0
+
+
 @pytest.mark.asyncio
 async def test_a_warm_replay_books_its_tokens_at_the_cache_read_price(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any, _ten_and_one_per_million: Any
@@ -132,21 +181,12 @@ async def test_a_warm_replay_books_its_tokens_at_the_cache_read_price(
     provider reports 2,048 cached plus 1,024 uncached tokens. At $10/M
     uncached and $1/M cache reads, every sink books 1,024 + 1,024 tokens and
     $0.01024 + $0.001024: the replayed removal is worth a cache read, not the
-    live-zone rate that made the total $0.02048."""
-    from headroom.proxy.cost import CostTracker
-    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    live-zone rate that made the total $0.02048. The new-input rate is 20%,
+    not the 33.33% that counting the replayed removal as new input gives."""
     from headroom.proxy.savings import ItemMeasure
-    from headroom.proxy.savings_tracker import SavingsTracker
-
-    ledger = tmp_path / "savings_events.jsonl"
-    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(ledger))
 
     handler = _Handler()
-    handler.cost_tracker = CostTracker()
-    handler.metrics = PrometheusMetrics(
-        savings_tracker=SavingsTracker(path=str(tmp_path / "proxy_savings.json")),
-        cost_tracker=handler.cost_tracker,
-    )
+    ledger = _use_real_sinks(handler, monkeypatch, tmp_path)
     turn = {
         "model": "warm-model",
         "original_tokens": 4_096,
@@ -189,23 +229,100 @@ async def test_a_warm_replay_books_its_tokens_at_the_cache_read_price(
         ),
     )
 
-    events = [json.loads(line) for line in ledger.read_text().splitlines()]
-    lifetime = handler.metrics.savings_tracker.snapshot()["lifetime"]
-    durable = handler.metrics.savings_tracker.lifetime_response()
-    cost = handler.cost_tracker.stats()
+    _assert_the_warm_replay_was_booked(handler, ledger)
 
-    # Token booking: both turns, every sink.
-    assert handler.metrics.tokens_saved_total == 2_048
-    assert lifetime["tokens_saved"] == 2_048
-    assert durable["tokens"]["saved"] == 2_048
-    assert [e["saved"] for e in events] == [1_024, 1_024]
-    assert cost["total_compression_tokens_saved"] == 2_048
-    # Cache-aware valuation: turn two adds a cache read's worth.
-    expected = 1_024 * 10e-6 + 1_024 * 1e-6
-    assert lifetime["compression_savings_usd"] == pytest.approx(expected, abs=1e-6)
-    assert durable["cost"]["compression_savings_usd"] == pytest.approx(expected, abs=1e-6)
-    assert sum(e["cost_effective_usd"] for e in events) == pytest.approx(expected, abs=1e-6)
-    assert cost["cache_aware_savings_usd"] == round(expected, 4) == 0.0113
+
+@pytest.mark.asyncio
+async def test_a_warm_replay_over_websocket_is_booked_the_same(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, _ten_and_one_per_million: Any
+) -> None:
+    """The same two turns through the WebSocket handler: turn two's
+    ``response.create`` re-sends turn one's input, the compressor removes
+    1,024 tokens from each frame, and the upstream reports the same usage.
+    The handler measures each frame against the previous one, so the sinks
+    book what the HTTP path books."""
+    import asyncio
+    import copy
+    import sys
+    from unittest.mock import patch
+
+    from tests.test_openai_codex_ws_lifecycle import (
+        _DummyOpenAIHandler,
+        _FakeUpstream,
+        _FakeWebSocket,
+        _FakeWebSocketDisconnect,
+        _make_fake_websockets_module,
+    )
+
+    big, small = "log line " * 1_500, "3,000 log lines, compressed"
+
+    def message(role: str, text: str) -> dict[str, Any]:
+        kind = "output_text" if role == "assistant" else "input_text"
+        return {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
+
+    turn_one = [message("user", big)]
+    turn_two = [*turn_one, message("assistant", "Mostly timeouts."), message("user", "Which?")]
+
+    def frame(items: list[dict[str, Any]]) -> str:
+        return json.dumps(
+            {"type": "response.create", "response": {"model": "warm-model", "input": items}}
+        )
+
+    def completed(n: int, cached: int, uncached: int) -> str:
+        usage = {
+            "input_tokens": cached + uncached,
+            "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0},
+            "output_tokens": 50,
+        }
+        response = {"id": f"resp_{n}", "model": "warm-model", "usage": usage}
+        return json.dumps({"type": "response.completed", "response": response})
+
+    class _Client(_FakeWebSocket):
+        """Like Codex: the next response.create follows the last completion."""
+
+        received = 0
+
+        async def receive_text(self) -> str:
+            turn, self.received = self.received, self.received + 1
+            while len(self.sent_text) < turn:
+                await asyncio.sleep(0.001)
+            if self._frames:
+                return self._frames.pop(0)
+            raise _FakeWebSocketDisconnect("client closed")
+
+    class _Upstream(_FakeUpstream):
+        """Completes each turn only once its frame was sent."""
+
+        async def _iter(self):  # noqa: ANN202
+            for n, event in enumerate(self._events, start=1):
+                while len(self.sent) < n:
+                    await asyncio.sleep(0.001)
+                yield event
+            await asyncio.Event().wait()
+
+    def compress(payload: dict[str, Any], **_kwargs: Any) -> tuple[Any, ...]:
+        out = copy.deepcopy(payload)
+        for item in out["input"]:
+            for part in item["content"]:
+                if part["text"] == big:
+                    part["text"] = small
+        return out, True, 1_024, ["router:test"], "compressed", 1_000, 100, 4_096
+
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler._compress_openai_responses_payload = compress  # type: ignore[method-assign]
+    ledger = _use_real_sinks(handler, monkeypatch, tmp_path)
+    upstream = _Upstream([completed(1, 0, 3_072), completed(2, 2_048, 1_024)])
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(
+            handler.handle_openai_responses_ws(_Client(frames=[frame(turn_one), frame(turn_two)])),
+            timeout=10.0,
+        )
+
+    sent = [json.loads(raw).get("response") or json.loads(raw) for raw in upstream.sent]
+    assert [body["input"][0]["content"][0]["text"] for body in sent] == [small, small]
+    _assert_the_warm_replay_was_booked(handler, ledger)
 
 
 def test_a_cold_replay_prices_like_the_live_zone(_ten_and_one_per_million: Any) -> None:
@@ -224,6 +341,31 @@ def test_a_cold_replay_prices_like_the_live_zone(_ten_and_one_per_million: Any) 
         return float(priced["compression"])
 
     assert compression_usd(1_024) == pytest.approx(compression_usd(0)) == pytest.approx(0.01024)
+
+
+@pytest.mark.asyncio
+async def test_a_cold_replay_stays_in_the_new_input_numerator(
+    _ten_and_one_per_million: Any,
+) -> None:
+    """With nothing read from cache, the replayed prefix was billed as new
+    input, so its removal counts on the new-input basis like any other."""
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+
+    metrics = PrometheusMetrics(stateless=True)
+    common: dict[str, Any] = {
+        "provider": "openai",
+        "model": "warm-model",
+        "input_tokens": 3_072,
+        "output_tokens": 50,
+        "tokens_saved": 1_024,
+        "latency_ms": 1.0,
+        "prefix_tokens_saved": 1_024,
+    }
+    await metrics.record_request(**common, uncached_input_tokens=3_072)
+    await metrics.record_request(**common, cache_read_tokens=512, uncached_input_tokens=2_560)
+
+    # Cold: all 1,024 count. Half-warm: the 512 read from cache do not.
+    assert metrics.new_input_saved_tokens_total == 1_024 + 512
 
 
 @pytest.mark.asyncio

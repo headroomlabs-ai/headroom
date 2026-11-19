@@ -938,6 +938,13 @@ class PrometheusMetrics:
                 model,
             )
             tokens_saved = 0
+        # Replayed-prefix removals a warm turn would have read from cache never
+        # entered new input, so the new-input numerator leaves them out (the
+        # booked tokens and the dollars still count them). Capped at the
+        # reported reads, the share the pricer below fills reads with: a cold
+        # replay is billed as uncached or written input, which the denominator
+        # counts, so its removals belong in the numerator.
+        warm_prefix_saved = min(max(0, int(prefix_tokens_saved)), max(0, int(cache_read_tokens)))
         # Priced CACHE-AWARE: the full provider breakdown goes in, and each
         # layer is valued against the region of the request it actually came
         # out of — compression against the live zone, tool-schema deferral
@@ -1039,7 +1046,7 @@ class PrometheusMetrics:
             # New-input cohort, on the same predicate the ledger uses below.
             if uncached_input_tokens > 0 or cache_write_tokens > 0:
                 self.new_input_tokens_total += new_input_tokens
-                self.new_input_saved_tokens_total += max(0, int(tokens_saved))
+                self.new_input_saved_tokens_total += max(0, int(tokens_saved) - warm_prefix_saved)
 
             # Track provider-specific prefix cache metrics
             if cache_read_tokens > 0 or cache_write_tokens > 0:
