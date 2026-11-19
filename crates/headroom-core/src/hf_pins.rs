@@ -455,6 +455,10 @@ mod tests {
     /// this table is what every download and cache path resolves through. If a
     /// pin bump lands in one and not the other, the model download and the
     /// cache read would disagree about which snapshot is current.
+    ///
+    /// Kompress is `ml`-gated, so this is too — `cargo test -p headroom-core
+    /// --no-default-features --lib` must compile and pass.
+    #[cfg(feature = "ml")]
     #[test]
     fn kompress_constants_agree_with_the_pin_table() {
         use crate::transforms::kompress::{
