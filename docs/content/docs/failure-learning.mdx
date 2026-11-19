@@ -144,6 +144,26 @@ Options:
   --workers INT     Number of parallel workers
 ```
 
+## Enterprise MCP Config
+
+When `headroom learn` analyzes sessions through your Claude Code login instead
+of an API key, it starts `claude` with `--strict-mcp-config`, so no MCP server
+joins the analysis and text in your sessions cannot drive MCP tools. On a
+machine with an admin-managed (enterprise) MCP config, Claude Code refuses that
+flag, so `headroom learn` stops with an error and analyzes nothing.
+
+To run it anyway, opt in:
+
+```bash
+export HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP=1
+headroom learn
+```
+
+With the opt-in, `headroom learn` logs a warning and retries once without
+`--strict-mcp-config`. The admin's MCP servers connect to the analysis session,
+and `--disallowedTools "mcp__*"` denies their tools. To keep them out entirely,
+use an API key backend instead (`--model <litellm-model-name>`).
+
 ## Real-World Results
 
 <Callout type="warning" title="Figures removed">

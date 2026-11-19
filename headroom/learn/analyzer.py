@@ -14,6 +14,7 @@ users without raw API keys.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -116,6 +117,11 @@ _ENTERPRISE_MCP_OPT_IN_ENV = "HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP"
 
 class _EnterpriseMcpRefusal(RuntimeError):
     """claude-cli exited with the enterprise MCP refusal on its stderr."""
+
+
+def _pipe_closed(exc: OSError) -> bool:
+    """True when a stdin write failed because the child closed the pipe."""
+    return isinstance(exc, BrokenPipeError) or exc.errno == errno.EINVAL
 
 
 # Set of valid CLI model identifiers, derived from _CLI_BACKENDS.
@@ -956,13 +962,20 @@ def _call_claude_cli_streaming(
             ) from None
 
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    # A CLI can exit before reading its input (the enterprise MCP refusal does),
+    # so the pipe may close mid-write. Like subprocess.communicate(), ignore that
+    # (EPIPE, or EINVAL on Windows): its stderr and exit status below decide.
     try:
         proc.stdin.write(prompt)
+    except OSError as exc:
+        if not _pipe_closed(exc):
+            raise
     finally:
         try:
             proc.stdin.close()
-        except BrokenPipeError:  # pragma: no cover — defensive, claude exits before stdin drain
-            pass
+        except OSError as exc:
+            if not _pipe_closed(exc):
+                raise
 
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
 

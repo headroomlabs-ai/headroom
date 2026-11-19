@@ -240,8 +240,6 @@ headroom learn
 
 Without `HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1`, selecting `agy` (via `HEADROOM_LEARN_CLI` or `--model agy-cli`) fails before any analysis runs.
 
-On a machine with an admin-managed (enterprise) MCP config, Claude Code refuses the `--strict-mcp-config` flag that keeps MCP servers out of the analysis, so the `claude` backend stops with an error. To run it anyway with the admin's MCP servers connected (their tools denied with `--disallowedTools "mcp__*"`), set `HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP=1`, or use an API key instead.
-
 ## Real-World Results
 
 Tested on 67,583 tool calls across 23 projects:
