@@ -509,30 +509,56 @@ change every count, which is the failure this change exists to prevent. But the 
 ugly if you did not plan for it: it is logged once per process, and because the result is
 cached (`lru_cache`), the process never retries that tokenizer.
 
-So, before upgrading an air-gapped host, warm the cache at the pins *it will use*. There is no
-dedicated preload command; the loaders fetch on first use, so run the feature once with network
-access and `HF_HUB_CACHE` pointed at the directory you will carry across:
+So, before upgrading an air-gapped host, warm the cache at the pins *it will use*.
+`warm_kompress_model()` is the direct entry point: it loads the Kompress weights **and**
+their tokenizer synchronously, blocking until both are on disk.
 
 ```bash
-# On a host with network access. Any use of the feature fetches at the pin —
-# e.g. a single compress() with the ML path enabled, or one proxy request:
-HF_HUB_CACHE=/srv/hf-cache python - <<'PY'
-import headroom
-headroom.compress([{"role": "user", "content": "hello"}], model="qwen2.5-7b")
-PY
+# On a host with network access, into the directory you will carry across.
+HF_HUB_CACHE=/srv/hf-cache HEADROOM_OFFLINE=0 python - <<'PY'
+from headroom.transforms.kompress_compressor import warm_kompress_model
 
-# Verify the exact snapshots landed, then copy /srv/hf-cache to the air-gapped
-# host and point its HF_HUB_CACHE at it. The layout to check for:
-#   .../models--Qwen--Qwen2.5-7B/snapshots/<pin>/tokenizer.json
-#   .../models--chopratejas--kompress-v2-base/snapshots/<pin>/onnx/...
-python - <<'PY'
-from headroom.onnx_runtime import _PINNED_REVISIONS
-from headroom.tokenizers.huggingface import _TOKENIZER_REVISIONS
-for table in (_PINNED_REVISIONS, _TOKENIZER_REVISIONS):
-    for repo, sha in table.items():
-        print(f"{repo} @ {sha}")
+# Loads chopratejas/kompress-v2-base (ONNX weights) + answerdotai/ModernBERT-base
+# (tokenizer) at their pins. Returns False rather than raising on failure, so
+# check it — a silent False leaves the cache incomplete.
+assert warm_kompress_model(device="cpu"), "Kompress warm failed; see the log"
+print("kompress weights + tokenizer cached")
 PY
 ```
+
+`compress()` is **not** a seeding tool: whether it reaches Kompress depends on the router,
+and a short or non-prose message may never invoke it at all, leaving the weights absent. Use
+the explicit loader above.
+
+Then verify the exact files exist before copying the cache across:
+
+```bash
+python - <<'PY'
+import sys
+from pathlib import Path
+
+from headroom.onnx_runtime import _PINNED_REVISIONS
+from headroom.transforms.kompress_compressor import HF_MODEL_ID, _MODERNBERT_TOKENIZER_REPO
+
+cache = Path("/srv/hf-cache")
+missing = []
+for repo, names in (
+    (HF_MODEL_ID, ["onnx/kompress-int8-wo.onnx", "onnx/kompress-fp32.onnx"]),
+    (_MODERNBERT_TOKENIZER_REPO, ["tokenizer.json"]),
+):
+    snap = cache / f"models--{repo.replace('/', '--')}" / "snapshots" / _PINNED_REVISIONS[repo]
+    for name in names:
+        if not (snap / name).is_file():
+            missing.append(str(snap / name))
+for path in missing:
+    print("MISSING", path)
+sys.exit(1 if missing else 0)
+PY
+```
+
+At least one `onnx/` file must be present — the loader tries the candidates in order and
+skips the ones that are absent. `models--…/snapshots/<pin>/` is the directory to look for;
+`refs/<pin>` is not written by Python and is not needed.
 
 To stay on the previously-cached bytes instead, set `HEADROOM_HF_PIN=off` on that host: it
 moves both the download and the cache lookup back to `main`, which is the deliberate escape
