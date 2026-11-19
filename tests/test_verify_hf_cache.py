@@ -141,6 +141,68 @@ def test_an_exact_repo_id_is_not_alias_resolved(tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------
+# Misconfiguration paths: a repo the build ships with no pin at all.
+#
+# These say "this build is broken", not "your cache is incomplete" — a
+# deployment that floats on `main` cannot be told what to seed. They are the
+# paths an operator hits after a bad downgrade or a hand-edited table, so they
+# must report clearly rather than silently passing.
+# ---------------------------------------------------------------------------
+
+
+def test_a_shipped_repo_without_a_pin_is_reported(tmp_path, monkeypatch):
+    import headroom.onnx_runtime as onnx_runtime
+
+    monkeypatch.setattr(onnx_runtime, "_PINNED_REVISIONS", {}, raising=True)
+    missing = check(tmp_path)
+    assert any("no pinned revision" in entry for entry in missing), missing
+    assert any(_MODERNBERT_TOKENIZER_REPO in entry for entry in missing), missing
+
+
+def test_an_unpinned_kompress_model_is_reported(tmp_path, monkeypatch):
+    """The model repo's own pin check, not the tokenizer's."""
+    import headroom.onnx_runtime as onnx_runtime
+    from headroom.transforms.kompress_compressor import _MODERNBERT_TOKENIZER_REPO as tok_repo
+
+    # Keep the tokenizer pinned, drop only the model, so the failure is specific.
+    full = dict(onnx_runtime._PINNED_REVISIONS)
+    full.pop(HF_MODEL_ID, None)
+    assert tok_repo in full, "the tokenizer pin must survive for this test to be specific"
+    monkeypatch.setattr(onnx_runtime, "_PINNED_REVISIONS", full)
+
+    missing = check(tmp_path)
+    assert any(HF_MODEL_ID in entry and "no pinned revision" in entry for entry in missing), missing
+
+
+def test_an_unpinned_counting_tokenizer_repo_is_reported(tmp_path, monkeypatch):
+    """A repo admitted through --model but absent from the tokenizer pin table."""
+    import headroom.tokenizers.huggingface as hf_mod
+
+    _seed_kompress_minimal(tmp_path)
+    pin = _TOKENIZER_REVISIONS["Qwen/Qwen2.5-7B"]
+    _seed(tmp_path, "Qwen/Qwen2.5-7B", pin, "tokenizer.json")
+
+    without = dict(hf_mod._TOKENIZER_REVISIONS)
+    without.pop("Qwen/Qwen2.5-7B")
+    monkeypatch.setattr(hf_mod, "_TOKENIZER_REVISIONS", without)
+
+    missing = check(tmp_path, model="Qwen/Qwen2.5-7B")
+    assert any("no pinned revision" in entry for entry in missing), missing
+
+
+def test_the_command_defaults_to_huggingface_hubs_cache(tmp_path, monkeypatch):
+    """No path argument uses the cache the process would actually download into."""
+    import huggingface_hub.constants as constants
+
+    _seed_kompress_minimal(tmp_path)
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+
+    result = _invoke()
+    assert result.exit_code == 0, result.output
+    assert "OK" in result.output
+
+
 def test_no_kompress_checks_only_the_counting_tokenizer(tmp_path):
     pin = _TOKENIZER_REVISIONS["Qwen/Qwen2.5-7B"]
     _seed(tmp_path, "Qwen/Qwen2.5-7B", pin, "tokenizer.json")
