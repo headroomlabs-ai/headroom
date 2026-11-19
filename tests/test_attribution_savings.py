@@ -522,6 +522,33 @@ def test_a_replaced_resolver_is_not_overridden_by_the_legacy_field(tmp_path, mon
     assert "client" not in event["dims"]
 
 
+@pytest.mark.parametrize(
+    ("tenant_header", "expected"),
+    [("Authorization", None), ("X-Api-Key", None), ("X-Org-Id", "acme")],
+)
+def test_tenant_from_a_credential_header_never_reaches_the_ledger(
+    tmp_path, monkeypatch, tenant_header, expected
+):
+    from headroom.proxy.tenant_key import TENANT_KEY_HEADER_ENV_VAR
+
+    monkeypatch.setenv(TENANT_KEY_HEADER_ENV_VAR, tenant_header)
+    value = "acme" if expected else "synthetic-secret-marker"
+    captured = _capture_middleware_labels(monkeypatch)
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        client.get("/health", headers={tenant_header: value})
+        assert captured[-1].get("tenant") == expected
+
+        set_current_attribution(captured[-1])
+        _emit(client.app.state.proxy)
+        set_current_attribution(None)
+        by_dim = client.get("/stats").json()["savings"]["by_dimension"]
+        assert set(by_dim.get("tenant", {})) == ({expected} if expected else set())
+
+    ledger = (tmp_path / "events.jsonl").read_text()
+    assert "synthetic-secret-marker" not in ledger
+    assert json.loads(ledger.splitlines()[-1]).get("dims", {}).get("tenant") == expected
+
+
 def test_open_labels_book_a_builtin_dimension_that_is_not_selected(tmp_path, monkeypatch):
     from headroom.proxy import attribution
 

@@ -33,6 +33,7 @@ def resolve_client(request: AttributionRequest) -> str | None:
 def resolve_tenant(request: AttributionRequest) -> str | None:
     import os
 
+    from headroom.proxy.internal_header_policy import is_credential_header
     from headroom.proxy.tenant_key import (
         DEFAULT_TENANT_KEY_HEADER,
         TENANT_KEY_HEADER_ENV_VAR,
@@ -40,6 +41,9 @@ def resolve_tenant(request: AttributionRequest) -> str | None:
     )
 
     header = os.environ.get(TENANT_KEY_HEADER_ENV_VAR, "").strip() or DEFAULT_TENANT_KEY_HEADER
+    # A label is persisted, so a misconfigured header must not turn a secret into one.
+    if is_credential_header(header):
+        return None
     raw = request.header(header)
     if not raw:
         return None

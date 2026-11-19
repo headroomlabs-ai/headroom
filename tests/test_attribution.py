@@ -54,6 +54,25 @@ def test_resolves_builtins_from_headers():
     assert labels == {"project": "web app", "client": "claude-code", "tenant": "acme"}
 
 
+@pytest.mark.parametrize(
+    "header", ["Authorization", "X-Api-Key", "Cookie", "X-Headroom-Proxy-Token"]
+)
+def test_tenant_is_never_read_from_a_credential_header(monkeypatch, header):
+    from headroom.proxy.tenant_key import TENANT_KEY_HEADER_ENV_VAR
+
+    monkeypatch.setenv(TENANT_KEY_HEADER_ENV_VAR, header)
+    labels = resolve_attribution(_req({header: "synthetic-secret-marker", "User-Agent": CLI_UA}))
+    assert "tenant" not in labels
+    assert "synthetic-secret-marker" not in repr(labels)
+
+
+def test_tenant_reads_a_configured_non_credential_header(monkeypatch):
+    from headroom.proxy.tenant_key import TENANT_KEY_HEADER_ENV_VAR
+
+    monkeypatch.setenv(TENANT_KEY_HEADER_ENV_VAR, "X-Org-Id")
+    assert resolve_attribution(_req({"X-Org-Id": "acme"}))["tenant"] == "acme"
+
+
 def test_absent_signals_leave_dimensions_out_rather_than_placeholder():
     labels = resolve_attribution(_req({}, peer=None))
     assert "project" not in labels
