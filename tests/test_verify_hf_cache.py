@@ -159,6 +159,87 @@ def test_the_command_rejects_a_non_directory(tmp_path):
     assert "Not a cache directory" in result.output
 
 
+def _documented_verify_invocation() -> list[str]:
+    """The verify command exactly as the guide writes it, minus the cache path.
+
+    Parsed out of the docs rather than restated, so this test fails if the
+    guide's flags drift from what the command accepts (a stale ``--model``
+    spelling, a flag that was renamed, an argument that moved).
+    """
+    import re
+
+    text = DOCS.read_text(encoding="utf-8")
+    section = text.split("#### Offline upgrade path", 1)[1].split("\n###", 1)[0]
+    match = re.search(r"^headroom verify-hf-cache .+$", section, re.MULTILINE)
+    assert match, "the guide must show a `headroom verify-hf-cache` invocation"
+    argv = match.group(0).split()
+    # argv[0] is `headroom`; drop it and the placeholder cache path.
+    assert argv[1] == "verify-hf-cache", argv
+    rest = argv[2:]
+    assert rest and not rest[0].startswith("-"), (
+        f"expected the cache path right after the subcommand: {rest}"
+    )
+    return ["verify-hf-cache", *rest[1:]]
+
+
+def test_the_documented_command_runs_verbatim(tmp_path):
+    """Execute the guide's own command line against a correctly-seeded cache.
+
+    The reviewer's fixture, with the documented flags: either supported ONNX
+    candidate by itself plus the matching tokenizers. Copying the command by
+    hand into each test is how the earlier bug survived — this runs what the
+    guide actually says.
+    """
+    _seed_kompress_minimal(tmp_path)
+    pin = _TOKENIZER_REVISIONS["Qwen/Qwen2.5-7B"]
+    _seed(tmp_path, "Qwen/Qwen2.5-7B", pin, "tokenizer.json")
+
+    from headroom.cli.main import main
+
+    args = _documented_verify_invocation()
+    result = CliRunner().invoke(main, [args[0], str(tmp_path), *args[1:]])
+    assert result.exit_code == 0, f"{args} -> {result.output}"
+    assert "OK" in result.output
+
+
+@pytest.mark.parametrize("candidate", _DEFAULT_ONNX_FILENAMES)
+def test_either_candidate_alone_satisfies_the_documented_command(tmp_path, candidate):
+    """The reviewer's exact check: one supported ONNX file by itself, mirrored.
+
+    No `.onnx` sibling of any other name, no fp32 fallback — just the one file.
+    The counting tokenizer is seeded too, because the documented command passes
+    ``--model``.
+    """
+    cache = tmp_path / "hf-cache"
+    _seed(cache, HF_MODEL_ID, _PINNED_REVISIONS[HF_MODEL_ID], candidate)
+    _seed(
+        cache,
+        _MODERNBERT_TOKENIZER_REPO,
+        _PINNED_REVISIONS[_MODERNBERT_TOKENIZER_REPO],
+        "tokenizer.json",
+    )
+    _seed(cache, "Qwen/Qwen2.5-7B", _TOKENIZER_REVISIONS["Qwen/Qwen2.5-7B"], "tokenizer.json")
+    assert sorted(p.name for p in cache.rglob("*.onnx")) == [Path(candidate).name]
+
+    from headroom.cli.main import main
+
+    args = _documented_verify_invocation()
+    result = CliRunner().invoke(main, [args[0], str(cache), *args[1:]])
+    assert result.exit_code == 0, f"only {candidate}: {result.output}"
+
+
+def test_the_documented_command_fails_without_the_counting_tokenizer(tmp_path):
+    """The half that prevents the estimation fallback must actually be checked."""
+    _seed_kompress_minimal(tmp_path)
+
+    from headroom.cli.main import main
+
+    args = _documented_verify_invocation()
+    result = CliRunner().invoke(main, [args[0], str(tmp_path), *args[1:]])
+    assert result.exit_code == 1, result.output
+    assert "MISSING" in result.output
+
+
 def test_the_guide_points_at_the_real_command():
     """The docs must reference the command these tests cover, not an inline snippet."""
     section = DOCS.read_text(encoding="utf-8").split("#### Offline upgrade path", 1)[1]
