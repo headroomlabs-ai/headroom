@@ -812,6 +812,64 @@ def test_error_response_prefers_status_carried_by_exception(
     assert backend._error_response(_StatusError("rate limit", "429")).status_code == 429
 
 
+def _unified_openai_400() -> Exception:
+    """The exception the locked any-llm SDK raises with ANY_LLM_UNIFIED_EXCEPTIONS=1."""
+    httpx = pytest.importorskip("httpx")
+    openai = pytest.importorskip("openai")
+    handler = pytest.importorskip("any_llm.utils.exception_handler")
+    response = httpx.Response(400, request=httpx.Request("POST", "https://api.openai.com/v1"))
+    original = openai.BadRequestError(
+        "This model maximum context length is 8192 tokens",
+        response=response,
+        body={"code": "context_length_exceeded"},
+    )
+    converted = handler.convert_exception(original, "openai")
+    converted.__cause__ = original
+    return converted
+
+
+@pytest.mark.parametrize("openai_format", [True, False])
+def test_error_response_keeps_status_of_wrapped_provider_exception(
+    monkeypatch: pytest.MonkeyPatch, openai_format: bool
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    response = backend._error_response(_unified_openai_400(), openai_format=openai_format)
+
+    assert response.status_code == 400
+    assert response.body["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_send_openai_message_unified_400_stays_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend, instance = make_backend(monkeypatch)
+    instance.raise_error = _unified_openai_400()
+
+    result = await backend.send_openai_message(
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}, {}
+    )
+
+    assert result.status_code == 400
+    assert result.body["error"]["type"] == "invalid_request_error"
+
+
+def test_error_response_maps_sdk_rate_limit_error_without_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = pytest.importorskip("any_llm.utils.exception_handler")
+    backend, _instance = make_backend(monkeypatch)
+
+    converted = handler.convert_exception(
+        RuntimeError("Quota exceeded: token limit reached"), "test-provider"
+    )
+    assert type(converted).__name__ == "RateLimitError"
+
+    response = backend._error_response(converted)
+
+    assert response.status_code == 429
+    assert response.body["error"]["type"] == "rate_limit_error"
+
+
 @pytest.mark.asyncio
 async def test_close_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)

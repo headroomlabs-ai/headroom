@@ -35,6 +35,29 @@ except ImportError:
     AnyLLM = None  # type: ignore
 
 
+def _status_of(exc: BaseException) -> int | None:
+    """Return a structured 4xx status carried by ``exc``, if any."""
+    response = getattr(exc, "response", None)
+    for value in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "status", None),
+        getattr(response, "status_code", None),
+    ):
+        if isinstance(value, int) and not isinstance(value, bool) and 400 <= value <= 499:
+            return value
+    return None
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """``exc`` plus the provider exception any-llm wraps (original_exception/__cause__)."""
+    chain: list[BaseException] = []
+    nxt: BaseException | None = exc
+    while nxt is not None and nxt not in chain and len(chain) < 5:
+        chain.append(nxt)
+        nxt = getattr(nxt, "original_exception", None) or nxt.__cause__
+    return chain
+
+
 class AnyLLMBackend(Backend):
     """Backend using any-llm for multi-provider support."""
 
@@ -580,9 +603,11 @@ class AnyLLMBackend(Backend):
         # to the public vocabulary (see proxy/public_errors).
         error_message = client_message(e, format_exception_message(e))
         error_str = str(e).lower()
-        # A status carried by the exception wins over matching its text.
-        upstream = getattr(e, "status_code", None)
-        if isinstance(upstream, int) and not isinstance(upstream, bool) and 400 <= upstream <= 499:
+        # A status carried by the exception, or by the provider exception it
+        # wraps, wins over matching its text.
+        chain = _exception_chain(e)
+        upstream = next((s for s in map(_status_of, chain) if s is not None), None)
+        if upstream is not None:
             status_code = upstream
             error_type = {
                 401: "invalid_api_key" if openai_format else "authentication_error",
@@ -592,6 +617,10 @@ class AnyLLMBackend(Backend):
         elif "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
             error_type = "invalid_api_key" if openai_format else "authentication_error"
             status_code = 401
+        elif any(c.__name__ == "RateLimitError" for x in chain for c in type(x).__mro__):
+            # Typed throttling without a usable status (any-llm's RateLimitError).
+            error_type = "rate_limit_exceeded" if openai_format else "rate_limit_error"
+            status_code = 429
         elif _RATE_LIMIT_RE.search(error_str):
             error_type = "rate_limit_exceeded" if openai_format else "rate_limit_error"
             status_code = 429
