@@ -17,8 +17,12 @@ MIXED_FILE = "tests/test_realignment_live_multi_turn.py"
 OFFLINE_TEST = "test_classify_auth_mode_routes_payg_vs_oauth"
 
 
-def _collect(*args: str) -> str:
-    env = {**os.environ, "ANTHROPIC_API_KEY": "sk-ant-dummy-collect-only"}
+def _collect(*args: str, allow_empty: bool = False) -> str:
+    env = {
+        **os.environ,
+        "ANTHROPIC_API_KEY": "sk-ant-dummy-collect-only",
+        "OPENAI_API_KEY": "sk-dummy-collect-only",
+    }
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", *args],
         cwd=ROOT,
@@ -28,7 +32,10 @@ def _collect(*args: str) -> str:
         timeout=300,
     )
     # A failed collection prints no test names, which would let the "not in" checks pass.
-    assert result.returncode == 0, result.stdout + result.stderr
+    # pytest exits 5 when every test is deselected; that is the expected result for a
+    # directory whose tests are all live.
+    ok = (0, 5) if allow_empty else (0,)
+    assert result.returncode in ok, result.stdout + result.stderr
     return result.stdout
 
 
@@ -47,3 +54,23 @@ def test_dash_m_live_selects_live_tests_again() -> None:
     assert "test_exact_replay_is_accepted" in out
     assert "test_anthropic_cache_hit_across_two_turns" in out
     assert OFFLINE_TEST not in out
+
+
+LIVE_DIR = "tests/test_live"
+LIVE_DIR_TESTS = (
+    "test_api_accepts_stale_marker_shape",
+    "test_model_reads_grouped_format",
+    "test_held_read_is_cached_and_not_rewritten",
+)
+
+
+def test_default_run_deselects_the_whole_test_live_directory() -> None:
+    out = _collect(LIVE_DIR, allow_empty=True)
+    for name in LIVE_DIR_TESTS:
+        assert name not in out
+
+
+def test_dash_m_live_selects_the_test_live_directory_again() -> None:
+    out = _collect("-m", "live", LIVE_DIR)
+    for name in LIVE_DIR_TESTS:
+        assert name in out
