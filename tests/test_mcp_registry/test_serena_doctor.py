@@ -325,6 +325,31 @@ def test_probe_pass_proves_health_by_output():
     )
 
 
+def test_probe_exit_zero_without_passing_verdict_is_not_health():
+    # A clean exit alone proves nothing: only Serena's own verdict does.
+    finding = sd.run_health_check(
+        build_serena_spec("claude-code"),
+        Path("/repo"),
+        HOME,
+        run=lambda argv, t: _completed(0, "Starting language server...\n"),
+    )
+    assert finding.severity is sd.Severity.FAIL
+    assert finding.summary == (
+        "health check could not verify Serena's health: exit 0 without a passing verdict"
+    )
+    assert "Starting language server..." in (finding.hint or "")
+
+
+def test_probe_failed_verdict_wins_over_exit_zero():
+    finding = sd.run_health_check(
+        build_serena_spec("claude-code"),
+        Path("/repo"),
+        HOME,
+        run=lambda argv, t: _completed(0, "❌ Health check failed: no symbols\n"),
+    )
+    assert finding.severity is sd.Severity.FAIL
+
+
 def test_probe_failure_relays_serena_reason():
     stdout = "❌ Health check failed: npm is not installed or isn't in PATH.\n"
     finding = sd.run_health_check(
@@ -479,3 +504,19 @@ def test_cli_probe_runs_health_check_on_project(monkeypatch, tmp_path: Path):
     assert result.exit_code == 0, result.output
     assert calls == [(sd.health_check_command(build_serena_spec("claude-code"), tmp_path), 7)]
     assert "✓ health check passed" in result.output
+
+
+def test_cli_probe_without_serena_verdict_reports_unverified_and_fails(monkeypatch, tmp_path: Path):
+    # Arrange: native toolchain, and a probe that exits 0 but prints no verdict.
+    _cli_env(monkeypatch, tmp_path, LINUX_TOOLS)
+    monkeypatch.setattr(
+        sd, "_default_runner", lambda argv, timeout: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+
+    # Act
+    result = CliRunner().invoke(main, ["mcp", "doctor", "--probe", "--project", str(tmp_path)])
+
+    # Assert
+    assert result.exit_code == 2, result.output
+    assert "✗ health check could not verify Serena's health" in result.output
+    assert "answered real symbol requests" not in result.output

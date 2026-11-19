@@ -335,19 +335,29 @@ def run_health_check(
             "request. Fix the findings above, then retry.",
         )
     output = redact((completed.stdout or "") + (completed.stderr or ""), home)
+    lines = output.splitlines()
+    verdicts = {match.group(1) for line in lines if (match := _PROBE_VERDICT.search(line))}
     relevant = [
         line.strip()
-        for line in output.splitlines()
+        for line in lines
         if _PROBE_VERDICT.search(line) or line.startswith("Log saved to")
     ]
     detail = "\n".join(relevant[-_MAX_PROBE_LINES:]) or None
-    if completed.returncode == 0:
+    # Health is proven only by Serena's own passing verdict; a clean exit alone
+    # (e.g. a Serena release that words its verdict differently) proves nothing.
+    if completed.returncode == 0 and verdicts == {"passed"}:
         return Finding(
             Severity.OK, "health check passed: Serena answered real symbol requests", detail
         )
     if detail is None:
-        tail = [line for line in output.splitlines() if line.strip()][-_MAX_PROBE_LINES:]
-        detail = "\n".join(line[:_MAX_LINE_CHARS] for line in tail) or None
+        tail = [line for line in lines if line.strip()][-_MAX_PROBE_LINES:]
+        detail = "\n".join(line[:_MAX_LINE_CHARS] for line in tail) or "(no output)"
+    if completed.returncode == 0 and "failed" not in verdicts:
+        return Finding(
+            Severity.FAIL,
+            "health check could not verify Serena's health: exit 0 without a passing verdict",
+            detail,
+        )
     return Finding(Severity.FAIL, f"health check failed (exit {completed.returncode})", detail)
 
 
