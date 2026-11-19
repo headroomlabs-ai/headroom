@@ -533,7 +533,9 @@ async def test_prometheus_metrics_caps_model_cardinality() -> None:
 @pytest.mark.asyncio
 async def test_prometheus_metrics_buckets_invalid_model_keys() -> None:
     """A model key with control characters or past 128 chars counts under
-    "other", never as its own key, while legitimate names stay untouched."""
+    "other", never as its own key, while legitimate names stay untouched.
+    Invalid writes are also excluded from per-model cache-bust attribution,
+    so they never warm _cache_requests_by_model."""
     metrics = PrometheusMetrics(stateless=True)
 
     async def record(model: str) -> None:
@@ -557,9 +559,41 @@ async def test_prometheus_metrics_buckets_invalid_model_keys() -> None:
     assert metrics.requests_by_model["claude-opus-4-7[1m]"] == 1
     assert metrics.requests_by_model["x" * 128] == 1
     assert len(metrics.requests_by_model) == 3
-    assert metrics._cache_requests_by_model["other"] == 3
+    # The three invalid writes never warm the cache-bust dict; only the two
+    # valid models are tracked there.
+    assert "other" not in metrics._cache_requests_by_model
+    assert len(metrics._cache_requests_by_model) == 2
     assert sum(metrics.requests_by_model.values()) == 5
     assert 'headroom_requests_by_model{model="other"} 3' in await metrics.export()
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_write_does_not_bust_valid_other_model() -> None:
+    """An invalid model's cache write must not warm the "other" entry used
+    for cache-bust attribution, or a genuine "other" model's first write
+    would be misread as a bust (issue #4942 review). Both requests still
+    count under "other" in requests_by_model."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_write_tokens=100,
+            cache_read_tokens=0,
+        )
+
+    await record("x" * 129)
+    await record("other")
+
+    assert metrics.requests_by_model["other"] == 2
+    assert metrics._cache_requests_by_model["other"] == 1
+    assert metrics.cache_by_provider["anthropic"]["bust_count"] == 0
+    assert 'headroom_provider_cache_bust_total{provider="anthropic"} 0' in (await metrics.export())
 
 
 @pytest.mark.asyncio

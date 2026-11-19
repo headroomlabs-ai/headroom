@@ -975,7 +975,8 @@ class PrometheusMetrics:
             # the requests_by_stack cap. Membership test, never a defaultdict index:
             # indexing would materialize the key and defeat the cap.
             model_key = str(model)
-            if not _valid_model_key(model_key):
+            model_key_valid = _valid_model_key(model_key)
+            if not model_key_valid:
                 bounded_model = _OTHER_MODEL
             elif (
                 model_key in self.requests_by_model
@@ -1067,18 +1068,21 @@ class PrometheusMetrics:
                 # is always a cold start (100% write, 0% read) — not a bust.
                 # Only flag as bust when a previously-warm model suddenly has
                 # high write ratio, indicating prefix invalidation.
-                # bounded_model can be "other" once the cardinality cap trips, which
-                # mixes distinct models in this bust heuristic. That is acceptable:
-                # it only happens past MAX_DISTINCT_MODELS distinct models on cached
-                # anthropic traffic, the worst case is a mis-attributed bust stat,
-                # and it keeps _cache_requests_by_model bounded.
-                model_req_num = self._cache_requests_by_model[bounded_model]
-                self._cache_requests_by_model[bounded_model] += 1
-                if provider == "anthropic" and model_req_num > 0:
-                    total_cached = cache_read_tokens + cache_write_tokens
-                    if total_cached > 0 and cache_write_tokens > total_cached * 0.5:
-                        pc["bust_count"] += 1
-                        pc["bust_write_tokens"] += cache_write_tokens
+                # An invalid model key never warms _cache_requests_by_model:
+                # it counts under "other" in requests_by_model only. Warming
+                # the shared "other" entry would make a later genuine "other"
+                # model's first write look like a bust. Only valid names past
+                # the cardinality cap still attribute to "other" here; that
+                # mixing is confined to past-MAX_DISTINCT_MODELS traffic and
+                # keeps _cache_requests_by_model bounded.
+                if model_key_valid:
+                    model_req_num = self._cache_requests_by_model[bounded_model]
+                    self._cache_requests_by_model[bounded_model] += 1
+                    if provider == "anthropic" and model_req_num > 0:
+                        total_cached = cache_read_tokens + cache_write_tokens
+                        if total_cached > 0 and cache_write_tokens > total_cached * 0.5:
+                            pc["bust_count"] += 1
+                            pc["bust_write_tokens"] += cache_write_tokens
 
             self.latency_sum_ms += latency_ms
             self.latency_min_ms = min(self.latency_min_ms, latency_ms)
