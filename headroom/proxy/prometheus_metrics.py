@@ -13,6 +13,7 @@ import asyncio
 import logging
 import threading
 from collections import defaultdict
+from collections.abc import Hashable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -367,8 +368,10 @@ class PrometheusMetrics:
                 "bust_write_tokens": 0,
             }
         )
-        # Track per-model cache request count to distinguish cold starts from busts
-        self._cache_requests_by_model: dict[str, int] = defaultdict(int)
+        # Track per-model cache request count to distinguish cold starts from busts.
+        # Keys are the caller's model values, not the display-coerced strings,
+        # so int 123 and str "123" keep separate histories.
+        self._cache_requests_by_model: dict[Any, int] = defaultdict(int)
 
         # New-input basis. The cohort is every request that newly BILLED input
         # (uncached or cache-write tokens), which is not the same set as the
@@ -1075,9 +1078,17 @@ class PrometheusMetrics:
                 # the cardinality cap still attribute to "other" here; that
                 # mixing is confined to past-MAX_DISTINCT_MODELS traffic and
                 # keeps _cache_requests_by_model bounded.
+                # Cache-history identity is the caller's model value, not the
+                # display-coerced string: int 123 and str "123" are distinct
+                # models (as on main) and must not share one cache entry.
+                # Unhashable values fall back to the display key.
                 if model_key_valid:
-                    model_req_num = self._cache_requests_by_model[bounded_model]
-                    self._cache_requests_by_model[bounded_model] += 1
+                    if bounded_model == model_key and isinstance(model, Hashable):
+                        cache_model = model
+                    else:
+                        cache_model = bounded_model
+                    model_req_num = self._cache_requests_by_model[cache_model]
+                    self._cache_requests_by_model[cache_model] += 1
                     if provider == "anthropic" and model_req_num > 0:
                         total_cached = cache_read_tokens + cache_write_tokens
                         if total_cached > 0 and cache_write_tokens > total_cached * 0.5:

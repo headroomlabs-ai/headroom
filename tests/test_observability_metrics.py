@@ -597,6 +597,37 @@ async def test_invalid_model_write_does_not_bust_valid_other_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mixed_type_model_keys_do_not_share_cache_history() -> None:
+    """A numeric model and its string form are distinct cache histories:
+    int 123 then str "123" are both first-time writes, so neither is a
+    bust (issue #4942 review). Both still count under the "123" display
+    bucket in requests_by_model, keeping numeric input exporter-compatible."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str | int) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,  # type: ignore[arg-type]
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_write_tokens=100,
+            cache_read_tokens=0,
+        )
+
+    await record(123)
+    await record("123")
+
+    assert metrics.requests_by_model["123"] == 2
+    assert metrics._cache_requests_by_model[123] == 1
+    assert metrics._cache_requests_by_model["123"] == 1
+    assert len(metrics._cache_requests_by_model) == 2
+    assert metrics.cache_by_provider["anthropic"]["bust_count"] == 0
+    assert 'headroom_provider_cache_bust_total{provider="anthropic"} 0' in (await metrics.export())
+
+
+@pytest.mark.asyncio
 async def test_prometheus_metrics_model_cardinality_warns_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

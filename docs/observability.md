@@ -259,7 +259,9 @@ Every label vocabulary is bounded by code, not customer input:
   becomes a key at all: it buckets straight into `"other"`. Such writes
   are also excluded from the per-model cache-bust attribution, so a junk
   write cannot make a later genuine `"other"` model's first write look
-  like a bust. The
+  like a bust. Cache-bust attribution keys on the caller's model value
+  rather than the display string, so a numeric model (123) and its string
+  form ("123") keep separate histories. The
   in-memory dicts and the exported `headroom_requests_by_model` series
   can never exceed the cap plus `"other"`.
 
