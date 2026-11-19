@@ -78,19 +78,20 @@ def check(
                 missing.append(f"{HF_MODEL_ID} @ {model_pin}: needs one of {candidates}")
         want(_MODERNBERT_TOKENIZER_REPO, "tokenizer.json", _PINNED_REVISIONS)
 
-    for repo in (model, tokenizer_repo):
-        if not repo:
-            continue
-        if "/" in repo:
-            # A Hub repo id ("owner/name") is taken literally. It must never be
-            # alias-resolved: `get_tokenizer_name` matches family prefixes
-            # before the allowlist, so "Qwen/Qwen2.5-7B" would silently become
-            # "Qwen/Qwen-7B" — a different vocabulary — and an id absent from
-            # the pin table would quietly check some other repo's snapshot
-            # instead of reporting that this build cannot pin it.
-            want(repo, "tokenizer.json", _TOKENIZER_REVISIONS)
-            continue
-        # A bare alias ("qwen2.5-7b") is what the resolver is for.
-        want(get_tokenizer_name(repo), "tokenizer.json", _TOKENIZER_REVISIONS)
+    # Mirror what the runtime will actually fetch, which is not the same
+    # question as "is this repo pinned".
+    #
+    # A served model goes through `HuggingFaceTokenizer` -> `get_tokenizer_name`,
+    # so a *bare alias* ("qwen2.5-7b") and a raw repo id ("Qwen/Qwen2.5-7B") can
+    # resolve to different repositories — the latter matches a family prefix
+    # first and lands on "Qwen/Qwen-7B", a different vocabulary. Verifying the
+    # literal id would pass while the runtime asks for a snapshot this guide
+    # never seeded, and falls back to estimation. So `model` resolves exactly as
+    # the runtime does.
+    if model:
+        want(get_tokenizer_name(model), "tokenizer.json", _TOKENIZER_REVISIONS)
+    if tokenizer_repo:
+        # This one names a repository outright, so it is taken literally.
+        want(tokenizer_repo, "tokenizer.json", _TOKENIZER_REVISIONS)
 
     return missing

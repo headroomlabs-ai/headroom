@@ -51,6 +51,16 @@ def verify_hf_cache(
     """
     from ..hf_cache_verify import check
 
+    if require_kompress and not model and not tokenizer_repo:
+        # `--no-kompress` with no target asks for nothing, which would print OK
+        # over an empty directory — a green check that verified no files.
+        click.echo(
+            "verify-hf-cache: --no-kompress requires --model or --tokenizer-repo "
+            "(otherwise there is nothing to check).",
+            err=True,
+        )
+        raise SystemExit(2)
+
     if cache is None:
         # Default to the cache this process would actually download into, so an
         # operator on the seeding host need not restate HF_HUB_CACHE.
