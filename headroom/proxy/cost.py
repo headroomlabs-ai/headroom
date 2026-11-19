@@ -1372,21 +1372,13 @@ class CostTracker:
             self._api_cache_write_1h_by_model.get(key, 0) + write_1h_eff
         )
         self._api_uncached_by_model[key] = self._api_uncached_by_model.get(key, 0) + uncached_tokens
-        if key == OTHER_MODEL and model != OTHER_MODEL:
-            self._book_folded_usd(
-                model,
-                long_context=long_context,
-                tokens_saved=tokens_saved,
-                tokens_sent=tokens_sent,
-                cache_read=cache_read_tokens,
-                write=write_eff,
-                write_5m=write_5m_eff,
-                write_1h=write_1h_eff,
-                uncached=uncached_tokens,
-                output=output_tokens,
-                tool_schema_saved=tool_schema_saved,
-            )
-
+        # Resolve the selected price BEFORE folded accounting, so the ledger
+        # entry and a folded ``other`` label book the same dollars once.
+        # Previously the folded path ran first and re-resolved the catalog,
+        # so an override-priced request booked $20.20 in the ledger but
+        # $0.51 on the card, and an unknown model's cache reads booked $1.50
+        # in the ledger but $0.00 in totals() (#3825).
+        #
         # Populate _costs so check_budget() has real data to enforce against.
         # When the call site had no API usage breakdown (all cache/uncached
         # fields are 0), fall back to tokens_sent so input cost isn't
@@ -1487,6 +1479,26 @@ class CostTracker:
             self._costs.append(entry)
             self._record_budget_cost(entry)
             self._prune_old_costs()
+
+        if key == OTHER_MODEL and model != OTHER_MODEL:
+            self._book_folded_usd(
+                model,
+                long_context=long_context,
+                tokens_saved=tokens_saved,
+                tokens_sent=tokens_sent,
+                cache_read=cache_read_tokens,
+                write=write_eff,
+                write_5m=write_5m_eff,
+                write_1h=write_1h_eff,
+                uncached=uncached_tokens,
+                output=output_tokens,
+                tool_schema_saved=tool_schema_saved,
+                selected_pricing=fixed_pricing,
+            )
+
+        # The selected price and ledger entry are resolved above, before
+        # folded accounting, so a folded label books the same dollars the
+        # ledger just booked instead of re-resolving the catalog (#3825).
 
         # Capture spend at request time so catalog/override changes cannot
         # reprice historical traffic. Keyed by the BOUNDED label (``key``),
@@ -1803,9 +1815,28 @@ class CostTracker:
         uncached: int,
         output: int,
         tool_schema_saved: int,
+        selected_pricing: tuple[float, float] | None = None,
     ) -> None:
-        """Price one request whose label was folded, with the read-time formulas."""
-        prices = self._get_cache_prices(model)
+        """Price one request whose label was folded, with the read-time formulas.
+
+        ``selected_pricing`` is the per-1M (input, output) price the ledger
+        just booked for this request (operator override or unknown-model
+        fallback). When set, the folded dollars use it -- the provider's 50%
+        cache-read convention, writes at list -- instead of re-resolving the
+        catalog, so the card and the ledger cannot disagree about a folded
+        label (#3825). When None the request priced from the catalog and the
+        existing catalog lookups below still apply.
+        """
+        prices: tuple[float, float, float, float] | None
+        out_price: float | None
+        if selected_pricing is not None:
+            input_per_1m, output_per_1m = selected_pricing
+            input_price = input_per_1m / 1_000_000
+            prices = (0.5 * input_price, input_price, input_price, input_price)
+            out_price = output_per_1m / 1_000_000
+        else:
+            prices = self._get_cache_prices(model)
+            out_price = self._get_output_price(model, long_context=long_context)
         if prices:
             cr_price, w5_price, w1h_price, uncached_price = prices
             if cache_read + write + uncached > 0:
@@ -1819,7 +1850,6 @@ class CostTracker:
             else:
                 self._folded_input_usd += tokens_sent * uncached_price
             self._folded_savings_usd += tokens_saved * uncached_price
-        out_price = self._get_output_price(model, long_context=long_context)
         if out_price:
             self._folded_output_usd += max(0, output) * out_price
         # Cache-aware compression and tool-schema savings: same buckets and
@@ -1834,7 +1864,11 @@ class CostTracker:
                 uncached_tokens=uncached,
                 region="live_zone",
             )
-            ca = self._get_cache_prices(model, long_context=long_context, for_billing=False)
+            ca = (
+                prices
+                if selected_pricing is not None
+                else self._get_cache_prices(model, long_context=long_context, for_billing=False)
+            )
             if ca:
                 self._folded_cache_aware_savings_usd += c5 * ca[1] + c1 * ca[2] + cl * ca[3]
         if tool_schema_saved > 0:
@@ -1847,7 +1881,11 @@ class CostTracker:
                 uncached_tokens=uncached,
                 region="prefix",
             )
-            tp = self._get_cache_prices(model, for_billing=False)
+            tp = (
+                prices
+                if selected_pricing is not None
+                else self._get_cache_prices(model, for_billing=False)
+            )
             if tp:
                 self._folded_tool_savings_usd += rd * tp[0] + t5 * tp[1] + t1 * tp[2] + tl * tp[3]
 

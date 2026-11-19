@@ -40,6 +40,12 @@ _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 _PRICING_FALLBACK_WARNINGS: set[str] = set()
 # Models that fell through every price source to the unknown-model default
 # (issue #3732). A cost computed from one of these is a guess, not a lookup.
+# Capped: model names come from clients, so an unbounded dedup set grows
+# with every distinct unknown name. Past the cap a new name still gets its
+# one warning -- it just is not retained -- so warning behaviour is unchanged
+# and memory stays bounded. Same 200-name bound as the tracker's per-model
+# maps (``MAX_TRACKED_MODELS``).
+_MAX_WARNED_UNKNOWN_PRICING_MODELS = 200
 _UNKNOWN_PRICING_MODELS: set[str] = set()
 
 TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
@@ -840,17 +846,22 @@ class OpenAIProvider(Provider):
         mechanism. Pricing provenance is derived per lookup by
         :meth:`_resolve_pricing`, never from this set, so a model that later
         resolves (explicit override, catalog update) stops being flagged.
+        The set is capped at ``_MAX_WARNED_UNKNOWN_PRICING_MODELS`` names:
+        past the cap a new name still warns once, it just is not retained.
+        The logged name is sanitized with :func:`safe_id` -- it comes from
+        clients, so a raw ``%s`` could forge log lines or flood the log.
         """
         if model in _UNKNOWN_PRICING_MODELS:
             return
-        _UNKNOWN_PRICING_MODELS.add(model)
+        if len(_UNKNOWN_PRICING_MODELS) < _MAX_WARNED_UNKNOWN_PRICING_MODELS:
+            _UNKNOWN_PRICING_MODELS.add(model)
         in_price, out_price = cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
         logger.warning(
-            "No pricing found for model '%s' in explicit config, LiteLLM, or the "
+            "No pricing found for model %s in explicit config, LiteLLM, or the "
             "built-in table -- using the shared unknown-model fallback ($%.2f/$%.2f per 1M "
             "tokens). This cost is a GUESS. To price it explicitly, set the "
             "HEADROOM_MODEL_LIMITS env var or add it to ~/.headroom/models.json.",
-            model,
+            safe_id(model),
             in_price,
             out_price,
         )

@@ -171,6 +171,52 @@ def test_unknown_model_warns_once_and_is_flagged_estimated(
     assert provider.pricing_is_estimated("no-such-model-warns-once") is True
 
 
+def test_unknown_pricing_warning_registry_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unknown-pricing warning registry cannot grow without bound (#3825).
+
+    Model names come from clients: 250 distinct unknown names must not
+    create 250 retained entries. Past the cap a new name still warns once;
+    it just is not retained.
+    """
+    import headroom.providers.openai as openai_mod
+
+    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+
+    provider = OpenAIProvider()
+    for i in range(250):
+        provider._warn_unknown_pricing(f"bound-probe-{i}")
+
+    assert len(openai_mod._UNKNOWN_PRICING_MODELS) <= (
+        openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS
+    )
+
+
+def test_unknown_pricing_warning_sanitizes_model_id(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A client-supplied model id cannot forge log lines (#3825)."""
+    import logging
+
+    import headroom.providers.openai as openai_mod
+
+    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+
+    provider = OpenAIProvider()
+    nasty = "evil-model\nFORGED log line"
+    with caplog.at_level(logging.WARNING, logger="headroom.providers.openai"):
+        provider._warn_unknown_pricing(nasty)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # One log line: the newline is escaped, not emitted raw.
+    assert "\n" not in message
+    assert nasty not in message
+    assert "evil-model\\nFORGED log line" in message
+
+
 def test_resolved_prices_are_not_flagged_estimated(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

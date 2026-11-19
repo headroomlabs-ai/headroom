@@ -159,6 +159,72 @@ def test_overflow_keeps_cache_aware_savings_for_reviewer_probe():
     assert tracker.stats()["tool_savings_usd"] == 0.0
 
 
+def test_overflow_override_pricing_keeps_selected_dollars():
+    """A folded override-priced request books the selected price, not the catalog.
+
+    JerrettDavis review 2026-11-19 (#3825): with the model map saturated,
+    gpt-4o at $100/$200 per 1M booked $20.20 in the ledger but stats()
+    showed $0.51 -- the folded path re-resolved the catalog instead of
+    using the selected override price. Fails before the fix (stats $0.51,
+    totals $0.50).
+    """
+    kwargs = {
+        "tokens_saved": 0,
+        "tokens_sent": 200_000,
+        "uncached_tokens": 200_000,
+        "output_tokens": 1_000,
+        "pricing": (100.0, 200.0),
+        "pricing_override": True,
+    }
+    control = CostTracker()
+    control.record_tokens("gpt-4o", **kwargs)
+    tracker = CostTracker()
+    _saturate_with_unpriced_names(tracker)
+    tracker.record_tokens("gpt-4o", **kwargs)
+
+    assert tracker.period_cost_breakdown()["total_usd"] == 20.20
+    assert tracker.stats()["total_cost_usd"] == 20.20
+    assert tracker.stats()["total_input_cost_usd"] == 20.0
+    assert tracker.stats()["output_cost_usd"] == 0.2
+    assert tracker.totals() == (200_000, 20.0)
+    want, got = control.stats(), tracker.stats()
+    for field in (
+        "total_input_cost_usd",
+        "output_cost_usd",
+        "total_cost_usd",
+    ):
+        assert got[field] == want[field], field
+    assert tracker.totals() == control.totals()
+
+
+def test_overflow_unknown_cache_reads_keep_fallback_dollars():
+    """A folded unknown model's cache reads book the shared fallback.
+
+    JerrettDavis review 2026-11-19 (#3825): with the model map saturated,
+    one million unknown-model cache reads booked $1.50 in the ledger while
+    totals() showed $0.00 -- the folded path found no catalog price and
+    booked nothing. Fails before the fix (totals $0.00).
+    """
+    kwargs = {
+        "tokens_saved": 0,
+        "tokens_sent": 1_000_000,
+        "cache_read_tokens": 1_000_000,
+        "uncached_tokens": 0,
+        "output_tokens": 0,
+    }
+    control = CostTracker()
+    control.record_tokens("made-up-model-zzz", **kwargs)
+    tracker = CostTracker()
+    _saturate_with_unpriced_names(tracker)
+    tracker.record_tokens("made-up-model-zzz", **kwargs)
+
+    assert tracker.period_cost_breakdown()["total_usd"] == 1.50
+    assert tracker.totals() == (1_000_000, 1.5)
+    assert tracker.stats()["total_input_cost_usd"] == 1.5
+    assert tracker.totals() == control.totals()
+    assert tracker.stats()["total_cost_usd"] == control.stats()["total_cost_usd"]
+
+
 def test_overflowing_passthrough_names_add_no_dollars():
     tracker = CostTracker()
     for i in range(MAX_TRACKED_MODELS):
