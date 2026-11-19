@@ -198,7 +198,10 @@ class RequestOutcome:
     # savings_measure: the request's per-item original/sent counts against the
     #     conversation's previous request (``headroom.proxy.savings``), from
     #     which the per-request savings record is priced. None on paths that
-    #     do not measure items yet.
+    #     do not measure items yet. Its ``removed_old`` (removals in items the
+    #     previous request already carried) is the share of ``tokens_saved``
+    #     the funnel prices against the cached prefix: see
+    #     ``emit_request_outcome``.
     savings_measure: ItemMeasure | None = None
     transforms_applied: tuple[str, ...] = ()
     waste_signals: dict[str, int] | None = None
@@ -690,6 +693,19 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if not input_provider_reported and billed_input_tokens > 0:
         _warn_estimated_input(outcome.provider, outcome.model)
 
+    # Every removed token is booked, re-sent ones included. Their dollars are
+    # not all alike: a removal inside items the previous request already
+    # carried sat in the prefix that request cached, so a warm turn would have
+    # read it at the cache-read rate. That share is priced against the prefix,
+    # the rest against the live zone.
+    # shortcut: the prefix region stops at the reads this request reported, so a
+    # replayed removal larger than them prices the excess at the live-zone mix;
+    # the savings record's warm ratio (#4236) replaces this when #4238 wires it.
+    measure = outcome.savings_measure
+    prefix_tokens_saved = (
+        min(max(0, measure.removed_old), max(0, outcome.tokens_saved)) if measure else 0
+    )
+
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
         provider=outcome.provider,
@@ -723,6 +739,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         # OpenAI never charges.
         cache_inferred=outcome.cache_inferred,
         input_provider_reported=input_provider_reported,
+        prefix_tokens_saved=prefix_tokens_saved,
     )
 
     # 2. Cost tracker (optional).
@@ -744,6 +761,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # compression only while its own headline counted both layers.
             tool_schema_saved=tool_search_saved,
             provider_reported=input_provider_reported,
+            prefix_tokens_saved=prefix_tokens_saved,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

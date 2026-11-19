@@ -13,6 +13,7 @@ extensions and for the per-request savings record's previous-request lookup.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -93,6 +94,136 @@ async def test_a_re_sent_removal_is_booked_the_same_on_both_providers() -> None:
         await emit_request_outcome(handler, _anthropic_outcome())
         await emit_request_outcome(handler, _responses_outcome(tokens_saved=10_000))
     assert _booked(handler) == [458, 10_000] * 3
+
+
+@pytest.fixture
+def _ten_and_one_per_million(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """``warm-model`` at $10/M uncached input and $1/M cache reads."""
+    from types import SimpleNamespace
+
+    from headroom.pricing.counterfactual import resolve_rates
+
+    resolve_rates.cache_clear()
+    monkeypatch.setattr(
+        "headroom.pricing.counterfactual._litellm",
+        lambda: SimpleNamespace(
+            model_cost={
+                "warm-model": {
+                    "input_cost_per_token": 10e-6,
+                    "cache_read_input_token_cost": 1e-6,
+                    "litellm_provider": "openai",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "headroom.pricing.litellm_pricing.resolve_litellm_model", lambda model: model
+    )
+    yield
+    resolve_rates.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_a_warm_replay_books_its_tokens_at_the_cache_read_price(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, _ten_and_one_per_million: Any
+) -> None:
+    """Two turns of one conversation, each removing 1,024 tokens. Turn two
+    re-sends turn one, every removal sits in that replayed prefix, and the
+    provider reports 2,048 cached plus 1,024 uncached tokens. At $10/M
+    uncached and $1/M cache reads, every sink books 1,024 + 1,024 tokens and
+    $0.01024 + $0.001024: the replayed removal is worth a cache read, not the
+    live-zone rate that made the total $0.02048."""
+    from headroom.proxy.cost import CostTracker
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.savings import ItemMeasure
+    from headroom.proxy.savings_tracker import SavingsTracker
+
+    ledger = tmp_path / "savings_events.jsonl"
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(ledger))
+
+    handler = _Handler()
+    handler.cost_tracker = CostTracker()
+    handler.metrics = PrometheusMetrics(
+        savings_tracker=SavingsTracker(path=str(tmp_path / "proxy_savings.json")),
+        cost_tracker=handler.cost_tracker,
+    )
+    turn = {
+        "model": "warm-model",
+        "original_tokens": 4_096,
+        "optimized_tokens": 3_072,
+        "output_tokens": 50,
+        "tokens_saved": 1_024,
+        "attempted_input_tokens": 4_096,
+    }
+    await emit_request_outcome(
+        handler,
+        _responses_outcome(
+            **turn,
+            cache_read_tokens=0,
+            uncached_input_tokens=3_072,
+            provider_input_tokens=3_072,
+            savings_measure=ItemMeasure(
+                sent_tokens=3_072,
+                removed_old=0,
+                removed_new=1_024,
+                sent_shared_prefix=0,
+                bust=0,
+            ),
+        ),
+    )
+    await emit_request_outcome(
+        handler,
+        _responses_outcome(
+            **turn,
+            request_id="req-2",
+            cache_read_tokens=2_048,
+            uncached_input_tokens=1_024,
+            provider_input_tokens=3_072,
+            savings_measure=ItemMeasure(
+                sent_tokens=3_072,
+                removed_old=1_024,
+                removed_new=0,
+                sent_shared_prefix=2_048,
+                bust=0,
+            ),
+        ),
+    )
+
+    events = [json.loads(line) for line in ledger.read_text().splitlines()]
+    lifetime = handler.metrics.savings_tracker.snapshot()["lifetime"]
+    durable = handler.metrics.savings_tracker.lifetime_response()
+    cost = handler.cost_tracker.stats()
+
+    # Token booking: both turns, every sink.
+    assert handler.metrics.tokens_saved_total == 2_048
+    assert lifetime["tokens_saved"] == 2_048
+    assert durable["tokens"]["saved"] == 2_048
+    assert [e["saved"] for e in events] == [1_024, 1_024]
+    assert cost["total_compression_tokens_saved"] == 2_048
+    # Cache-aware valuation: turn two adds a cache read's worth.
+    expected = 1_024 * 10e-6 + 1_024 * 1e-6
+    assert lifetime["compression_savings_usd"] == pytest.approx(expected, abs=1e-6)
+    assert durable["cost"]["compression_savings_usd"] == pytest.approx(expected, abs=1e-6)
+    assert sum(e["cost_effective_usd"] for e in events) == pytest.approx(expected, abs=1e-6)
+    assert cost["cache_aware_savings_usd"] == round(expected, 4) == 0.0113
+
+
+def test_a_cold_replay_prices_like_the_live_zone(_ten_and_one_per_million: Any) -> None:
+    """With nothing read from cache (an expired prefix), a replayed removal
+    is a miss, priced like any other removal."""
+    from headroom.proxy.savings_tracker import estimate_request_savings_usd
+
+    def compression_usd(prefix: int) -> float:
+        priced = estimate_request_savings_usd(
+            "warm-model",
+            compression_tokens_saved=1_024,
+            compression_prefix_tokens_saved=prefix,
+            uncached_input_tokens=3_072,
+            provider="openai",
+        )
+        return float(priced["compression"])
+
+    assert compression_usd(1_024) == pytest.approx(compression_usd(0)) == pytest.approx(0.01024)
 
 
 @pytest.mark.asyncio

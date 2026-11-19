@@ -310,6 +310,9 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # Whether the positional tokens_sent is the provider's billed count.
         # This outcome carries no provider_input_tokens, so it is an estimate.
         "provider_reported": False,
+        # The share of tokens_saved removed from a re-sent prefix, priced as
+        # one. Zero without an item measure, which this outcome lacks.
+        "prefix_tokens_saved": 0,
     }
 
 

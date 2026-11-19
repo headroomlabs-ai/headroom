@@ -11,8 +11,10 @@ turn's ``tokens_saved`` includes removals from earlier turns, booked again.
 Anthropic does the same: the frozen cached prefix is re-sent with its
 removals, and a ``router:noop`` turn books the session's removals again. Both
 paths count a token every time it is removed from a request that reaches the
-provider. The cache-aware price of re-sent removals is the savings record's
-job (#4238), the same for both providers.
+provider. Their dollars differ: removals in items the conversation's
+previous request already carried (``ItemMeasure.removed_old``) sat in the
+prefix that request cached, so the outcome funnel prices them against the
+cached prefix (reads first) and only the rest against the live zone.
 """
 
 from __future__ import annotations

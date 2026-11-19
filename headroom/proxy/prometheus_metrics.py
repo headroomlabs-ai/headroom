@@ -902,6 +902,11 @@ class PrometheusMetrics:
         # when it is Headroom's local estimate. None (callers predating the
         # split) records nothing in either bucket.
         input_provider_reported: bool | None = None,
+        # The share of ``tokens_saved`` removed from items the conversation's
+        # previous request already carried, which a warm turn reads from the
+        # provider's cache. Booked as tokens like the rest; only its price
+        # differs (prefix region, not live zone).
+        prefix_tokens_saved: int = 0,
     ):
         """Record metrics for a request.
 
@@ -943,6 +948,7 @@ class PrometheusMetrics:
         savings_usd = estimate_request_savings_usd(
             model,
             compression_tokens_saved=tokens_saved,
+            compression_prefix_tokens_saved=prefix_tokens_saved,
             tool_schema_tokens_saved=tool_search_saved,
             output_tokens_saved=output_tokens_saved,
             output_tokens=output_tokens,
@@ -1114,6 +1120,7 @@ class PrometheusMetrics:
                 output_tokens=output_tokens,
                 attempted_input_tokens=attempted_input_tokens,
                 tokens_saved=tokens_saved,
+                compression_prefix_tokens_saved=prefix_tokens_saved,
                 cached=cached,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
@@ -1212,6 +1219,7 @@ class PrometheusMetrics:
                 # their sum can never be re-priced correctly — which is exactly
                 # why the pre-v2 ledger could not be corrected in place.
                 saved_compression=tokens_saved,
+                saved_compression_prefix=prefix_tokens_saved,
                 saved_tool_schema=deferral_saved,
                 # The observed cache mix. Storing the MIX rather than only the
                 # dollar it produced is the point of ledger v2: a stored dollar
