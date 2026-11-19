@@ -14,6 +14,7 @@ extensions and for the per-request savings record's previous-request lookup.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -446,6 +447,8 @@ def _ended(n: int, kind: str) -> str:
     [
         # The review's case: the standalone error retires B, C becomes the baseline.
         pytest.param("A B:rejected C", "A", 0, id="rejected-then-completed"),
+        # A rejected re-send of A defers its 1,024 to C's record, never as prefix.
+        pytest.param("A A:rejected C", "A", 0, id="deferred-rejection"),
         pytest.param("A! B!:rejected C!", "A", 0, id="rejected-then-completed-unnamed"),
         pytest.param("A B:rejected B:rejected C", "A", 0, id="two-rejections"),
         # An error after response.created fails that response; C still completes.
@@ -472,7 +475,8 @@ async def test_each_websocket_response_settles_its_own_frame(
     re-sends one transcript plus a new item: 1,024 removals, 2,048 cached +
     1,024 uncached. Its prefix share is 1,024 only if that transcript's own
     frame was the last to complete with usage. A step is ``<transcript>``
-    (completes; ``!`` without ``response.created``) or ``<transcript>:<how>``."""
+    (completes; ``!`` without ``response.created``) or ``<transcript>:<how>``.
+    Whatever the ordering, the session books every frame's removals once."""
     from tests.test_openai_codex_ws_lifecycle import _DummyOpenAIHandler
 
     frames: list[str] = []
@@ -515,73 +519,185 @@ async def test_each_websocket_response_settles_its_own_frame(
     assert (last["saved"], last.get("saved_prefix", 0)) == (1_024, replayed)
     rate = 1e-6 if replayed else 10e-6
     assert last["cost_effective_usd"] == pytest.approx(1_024 * rate, abs=1e-6)
+    removed = 1_024 * sum(raw.count(_BIG) for raw in frames)
+    assert sum(event.get("saved", 0) for event in booked) == removed
+    assert handler.metrics.tokens_saved_total == removed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", [True, False], ids=["created", "no-created"])
+async def test_a_pipelined_replay_books_its_own_removals(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    _ten_and_one_per_million: Any,
+    named: bool,
+) -> None:
+    """The review's case: A completes, then a cold C and a replay of A go out
+    back to back, before C's response. C removes nothing; the replay removes
+    1,024 tokens that sat in A's prefix, read from cache. Each ledger row
+    books its own frame: C books 0, the replay books 1,024 as prefix."""
+    from tests.test_openai_codex_ws_lifecycle import _DummyOpenAIHandler
+
+    handler = _DummyOpenAIHandler()
+    ledger = _use_real_sinks(handler, monkeypatch, tmp_path)
+
+    def done(n: int, cached: int, uncached: int) -> list[str]:
+        return ([_created(n)] if named else []) + [_completed(n, cached, uncached)]
+
+    await _run_ws_session(
+        handler,
+        [
+            _create(_TRANSCRIPTS["A"]),
+            _create(_TRANSCRIPTS["C"]),
+            _create([*_TRANSCRIPTS["A"], _message("user", "Which?")]),
+        ],
+        [done(1, 0, 3_072), done(2, 0, 1_000), done(3, 2_048, 1_024)],
+        pipelined=frozenset({2}),
+    )
+
+    rows = [
+        (e.get("saved", 0), e.get("saved_prefix", 0), round(e.get("cost_effective_usd", 0), 6))
+        for e in (json.loads(line) for line in ledger.read_text().splitlines())
+    ]
+    assert rows == [(1_024, 0, 0.01024), (0, 0, 0.0), (1_024, 1_024, 0.001024)]
+    assert handler.metrics.tokens_saved_total == 2_048
+
+
+@dataclass
+class _Measure:
+    """Stands in for an ItemMeasure: a name and a replayed share."""
+
+    name: str
+    removed_old: int = 10**6
 
 
 @pytest.mark.parametrize(
-    ("ops", "completed", "released"),
+    ("ops", "booked", "released", "unbooked"),
     [
         # Headroom's memory continuation (an unmeasured frame) is rejected.
         pytest.param(
-            "sent:a created:r1 ended:r1 sent:- errored sent:b created:r2 ended:r2",
-            "ab",
+            "sent:a/100 created:r1 ended:r1 sent:- errored sent:b/50 created:r2 ended:r2",
+            "a:100 b:50",
             "",
+            0,
             id="continuation-rejected",
         ),
         # A client frame is rejected after a continuation completed.
         pytest.param(
-            "sent:a created:r1 ended:r1 sent:- created:r2 ended:r2 sent:b errored",
-            "a-",
+            "sent:a/100 created:r1 ended:r1 sent:- created:r2 ended:r2 sent:b/50 errored",
+            "a:100 -:0",
             "b",
+            50,
             id="rejected-after-continuation",
         ),
         # Disconnect with one frame bound to a response and one not.
-        pytest.param("sent:a created:r1 sent:b close", "", "ab", id="disconnect-bound-and-unbound"),
-        # A completed measure nothing booked is released at close.
         pytest.param(
-            "sent:a created:r1 ended:r1/held close", "", "a", id="unbooked-completion-at-close"
+            "sent:a/100 created:r1 sent:b/50", "", "ab", 150, id="disconnect-bound-and-unbound"
         ),
-        # An error naming its response fails that frame, not the newer one.
+        # A completion nothing booked is released at close.
         pytest.param(
-            "sent:a created:r1 sent:b errored:r1 ended:r1/failed created:r2 ended:r2",
-            "b",
+            "sent:a/100 created:r1 ended:r1/held", "", "a", 100, id="unbooked-completion-at-close"
+        ),
+        # An error naming its response fails that frame, not the newer one,
+        # and its savings ride with the next completion.
+        pytest.param(
+            "sent:a/100 created:r1 sent:b/50 errored:r1 ended:r1/failed created:r2 ended:r2",
+            "none b:150",
             "a",
+            0,
             id="error-naming-its-response",
         ),
         # Once responses are named, an unknown id ends nothing.
-        pytest.param("sent:a created:r1 ended:r9 ended:r1", "-a", "", id="unknown-id-once-named"),
+        pytest.param(
+            "sent:a/100 created:r1 ended:r9 ended:r1",
+            "none a:100",
+            "",
+            0,
+            id="unknown-id-once-named",
+        ),
         # Fallback, no response.created: responses end frames in send order.
-        pytest.param("sent:a sent:b ended:x ended:y/failed", "a", "b", id="fallback-send-order"),
-        # A completion without usage is not a success.
-        pytest.param("sent:a created:r1 ended:r1/no-usage", "", "a", id="completed-without-usage"),
+        pytest.param(
+            "sent:a/100 sent:b/50 ended:x ended:y/failed",
+            "a:100 none",
+            "b",
+            50,
+            id="fallback-send-order",
+        ),
+        # A completion without usage defers its frame to the next completion.
+        pytest.param(
+            "sent:a/100 created:r1 ended:r1/no-usage sent:b/50 created:r2 ended:r2",
+            "none b:150",
+            "a",
+            0,
+            id="completed-without-usage",
+        ),
+        # The review's case: C and the replay D are in flight together.
+        pytest.param(
+            "sent:a/100 created:r1 ended:r1 sent:c/0 sent:d/80 created:r2 created:r3"
+            " ended:r2 ended:r3",
+            "a:100 c:0 d:80",
+            "",
+            0,
+            id="pipelined",
+        ),
     ],
 )
 def test_websocket_responses_pair_with_their_own_frames(
-    ops: str, completed: str, released: str
+    ops: str, booked: str, released: str, unbooked: int
 ) -> None:
-    """``_WsTurnMeasures`` on its own: which frame's measure each completion
-    hands to its record (``completed``, ``-`` for an unmeasured frame), and
-    which measures are released and can never become the baseline."""
-    from headroom.proxy.handlers.openai import _WsTurnMeasures
+    """``_WsTurnMeasures`` on its own, then a disconnect: what each completion's
+    record books (``measure:saved``, ``-`` for an unmeasured frame, ``none``
+    for a response that did not complete with usage), which measures are
+    released and can never become the baseline, and what is left for the
+    session's residual record. Every frame's savings are booked exactly once."""
+    from headroom.proxy.handlers.openai import _WsFrame, _WsTurnMeasures
 
     gone: list[Any] = []
     taken: list[str] = []
-    pairs = _WsTurnMeasures(release=gone.append)
+    sent = 0
+    turns = _WsTurnMeasures(release=gone.append)
     for op in ops.split():
         verb, _, arg = op.partition(":")
         arg, _, how = arg.partition("/")
         if verb == "sent":
-            pairs.sent(None if arg == "-" else arg)  # type: ignore[arg-type]
+            saved = int(how or 0)
+            sent += saved
+            measure = None if arg == "-" else _Measure(arg)
+            turns.sent(_WsFrame(measure, saved=saved))  # type: ignore[arg-type]
         elif verb == "created":
-            pairs.created(arg)
+            turns.created(arg)
         elif verb == "ended":
-            pairs.ended(arg, completed=how in {"", "held"})
-            if how == "":
-                taken.append(pairs.take_completed() or "-")  # type: ignore[arg-type]
-        elif verb == "errored":
-            pairs.errored(arg or None)
+            turns.ended(arg, completed=how in {"", "held"})
+            if how != "held":
+                booking = turns.take_completed()
+                name = "none" if booking is None else getattr(booking.measure, "name", "-")
+                taken.append(f"{name}:{booking.saved}" if booking else name)
         else:
-            pairs.close()
-    assert ("".join(taken), "".join(gone)) == (completed, released)
+            turns.errored(arg or None)
+    left = turns.close()
+    assert (" ".join(taken), "".join(m.name for m in gone), left.saved) == (
+        booked,
+        released,
+        unbooked,
+    )
+    total = sum(int(t.rsplit(":", 1)[1]) for t in taken if ":" in t)
+    assert total + left.saved == sent
+
+
+def test_deferred_savings_never_count_as_a_replayed_prefix() -> None:
+    """A failed frame's savings ride with the next completion, but the
+    completed frame's replayed share stays capped at its own savings."""
+    from headroom.proxy.handlers.openai import _WsFrame, _WsTurnMeasures
+
+    turns = _WsTurnMeasures(release=lambda _measure: None)
+    turns.sent(_WsFrame(_Measure("a"), saved=100))  # type: ignore[arg-type]
+    turns.errored(None)
+    turns.sent(_WsFrame(_Measure("b", removed_old=80), saved=50))  # type: ignore[arg-type]
+    turns.created("r2")
+    turns.ended("r2", completed=True)
+    booking = turns.take_completed()
+    assert booking is not None and booking.saved == 150
+    assert booking.measure.removed_old == 50  # type: ignore[union-attr]
 
 
 def test_a_cold_replay_prices_like_the_live_zone(_ten_and_one_per_million: Any) -> None:

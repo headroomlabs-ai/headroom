@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -2111,16 +2111,29 @@ def _measure_responses_request(
 
 @dataclass
 class _WsFrame:
-    """A ``response.create`` sent upstream, until its response ends."""
+    """A ``response.create`` sent upstream, until its response ends, with what
+    its turn's record books: its measure and what compression found in it."""
 
     measure: ItemMeasure | None
+    saved: int = 0
+    attempted: int = 0
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    conversation_key: str | None = None
     response_id: str | None = None
+
+    def absorb(self, other: _WsFrame) -> None:
+        """Take ``other``'s savings (never its measure)."""
+        self.saved += other.saved
+        self.attempted += other.attempted
+        accumulate_savings(self.rows, other.rows)
+        other.saved, other.attempted, other.rows = 0, 0, []
 
 
 class _WsTurnMeasures:
     """Pairs each ``response.create`` a WebSocket session sends upstream with
-    its own response, so a frame's measure becomes the baseline only when that
-    frame's response completes with usage.
+    its own response, so a turn's record books that frame's savings and its
+    measure becomes the baseline only when that frame's response completes
+    with usage.
 
     ``response.created`` binds the oldest frame without a response to the
     response id; a terminal event ends the frame bound to its id, whatever
@@ -2131,23 +2144,27 @@ class _WsTurnMeasures:
     frame bound, it fails the oldest response in progress, whose terminal
     event may still follow.
 
-    A measure that does not complete is released (``settle(succeeded=False)``):
-    its pending slot is freed and the baseline stays as it was. Dropping it
-    instead would hold the slot until eviction, which marks the
-    conversation's baseline lost.
+    A frame that does not complete with usage is deferred: its savings ride
+    with the next completion with usage on the connection, and its measure is
+    released (``settle(succeeded=False)``): its pending slot is freed and the
+    baseline stays as it was. Dropping the measure instead would hold the slot
+    until eviction, which marks the conversation's baseline lost.
     """
 
     def __init__(self, release: Callable[[ItemMeasure], None] | None = None) -> None:
         self._frames: list[_WsFrame] = []
-        self._completed: ItemMeasure | None = None
+        self._completed: _WsFrame | None = None
+        self._deferred = _WsFrame(None)
         self._named = False
         self._release_measure = release or (
             lambda measure: get_item_ledger().settle(measure, succeeded=False)
         )
 
-    def _release(self, measure: ItemMeasure | None) -> None:
-        if measure is not None:
-            self._release_measure(measure)
+    def _defer(self, frame: _WsFrame) -> None:
+        if frame.measure is not None:
+            self._release_measure(frame.measure)
+            frame.measure = None
+        self._deferred.absorb(frame)
 
     def _bound(self, response_id: str | None) -> _WsFrame | None:
         return next((f for f in self._frames if response_id and f.response_id == response_id), None)
@@ -2155,9 +2172,9 @@ class _WsTurnMeasures:
     def _oldest_unbound(self) -> _WsFrame | None:
         return next((f for f in self._frames if f.response_id is None), None)
 
-    def sent(self, measure: ItemMeasure | None) -> None:
-        """A ``response.create`` went upstream (``None``: not measured)."""
-        self._frames.append(_WsFrame(measure))
+    def sent(self, frame: _WsFrame) -> None:
+        """A ``response.create`` went upstream."""
+        self._frames.append(frame)
 
     def created(self, response_id: str | None) -> None:
         frame = self._oldest_unbound()
@@ -2175,11 +2192,12 @@ class _WsTurnMeasures:
         if frame is None:
             return
         self._frames.remove(frame)
-        if completed:
-            self._release(self._completed)
-            self._completed = frame.measure
-        else:
-            self._release(frame.measure)
+        if not completed:
+            self._defer(frame)
+            return
+        if self._completed is not None:  # a completion no record took
+            self._defer(self._completed)
+        self._completed = frame
 
     def errored(self, response_id: str | None) -> None:
         frame = self._bound(response_id)
@@ -2190,20 +2208,33 @@ class _WsTurnMeasures:
             elif self._frames:
                 frame = self._frames[0]
         if frame is not None:
-            self._release(frame.measure)
-            frame.measure = None
+            self._defer(frame)
 
-    def take_completed(self) -> ItemMeasure | None:
-        """The completed frame's measure, for the record that books its turn."""
-        measure, self._completed = self._completed, None
-        return measure
+    def take_completed(self) -> _WsFrame | None:
+        """What the record of the completion just ended books: the completed
+        frame's measure and savings plus every deferred frame's savings.
+        ``None`` when that response did not complete with usage."""
+        frame, self._completed = self._completed, None
+        if frame is None:
+            return None
+        if frame.measure is not None:
+            # Deferred savings are never a replayed prefix of this frame.
+            frame.measure = replace(
+                frame.measure, removed_old=min(frame.measure.removed_old, frame.saved)
+            )
+        frame.absorb(self._deferred)
+        return frame
 
-    def close(self) -> None:
-        """Session end: nothing outstanding completed."""
-        for frame in self._frames:
-            self._release(frame.measure)
+    def close(self) -> _WsFrame:
+        """Session end: release every measure and return the savings no
+        record booked, for the session's residual record."""
+        leftover = _WsFrame(None)
+        for frame in [*self._frames, *filter(None, [self._completed])]:
+            self._defer(frame)
         self._frames.clear()
-        self._release(self.take_completed())
+        self._completed = None
+        leftover.absorb(self._deferred)
+        return leftover
 
 
 def _deferrable_savings_delta(input_delta: int, saved_delta: int) -> int:
@@ -8106,11 +8137,12 @@ class OpenAIHandlerMixin:
         # handshake. Returns `{}` when no tags are present.
         _extract_ws_tags = getattr(self, "_extract_tags", None)
         ws_tags = _extract_ws_tags(ws_headers) if callable(_extract_ws_tags) else {}
-        # Savings attribution rows (turn hooks, tool-search deferral) from frames
-        # that were rewritten and sent, waiting for the next turn's outcome. Each
-        # frame compresses into its own dict: a timed-out compression thread
-        # keeps running and must not book rows for a frame sent uncompressed.
-        # Coalesced per source by ``accumulate_savings``, so it stays small.
+        # Savings attribution rows (turn hooks, tool-search deferral) of the frame
+        # being rewritten, until ``_ws_frame`` moves them onto its ``_WsFrame``
+        # to book with that frame's response. Each frame compresses into its
+        # own dict: a timed-out compression thread keeps running and must not
+        # book rows for a frame sent uncompressed. Coalesced per source by
+        # ``accumulate_savings``, so it stays small.
         ws_turn_savings: list[dict[str, Any]] = []
 
         # Extract subprotocol from client — this is an application-level negotiation
@@ -8633,10 +8665,27 @@ class OpenAIHandlerMixin:
 
             ws_conversation_key: str | None = None
             # Each response.create sent upstream, with its measure against its
-            # conversation's previous request (as the HTTP path measures one),
-            # paired with its own response; the turn's record takes the
-            # measure of the frame that completed.
+            # conversation's previous request (as the HTTP path measures one)
+            # and its savings, paired with its own response: a turn's record
+            # books the frame that completed.
             ws_measures = _WsTurnMeasures()
+
+            def _ws_frame(measure: ItemMeasure | None) -> _WsFrame:
+                """The client frame about to go upstream: its measure and what
+                compression found in it since the previous client frame."""
+                nonlocal ws_framed_tokens_saved_total, ws_framed_attempted_input_tokens_total
+                frame = _WsFrame(
+                    measure,
+                    saved=tokens_saved - ws_framed_tokens_saved_total,
+                    attempted=attempted_input_tokens_total - ws_framed_attempted_input_tokens_total,
+                    rows=list(ws_turn_savings),
+                    conversation_key=ws_conversation_key,
+                )
+                ws_framed_tokens_saved_total = tokens_saved
+                ws_framed_attempted_input_tokens_total = attempted_input_tokens_total
+                ws_turn_savings.clear()
+                return frame
+
             # The client's own bytes, before hooks, memory, store=false,
             # compression or shaping rewrite them: the measure's ORIGINAL.
             first_client_raw = first_msg_raw
@@ -8717,8 +8766,9 @@ class OpenAIHandlerMixin:
             ws_recorded_cache_read_tokens_total = 0
             ws_recorded_cache_write_tokens_total = 0
             ws_recorded_uncached_input_tokens_total = 0
-            ws_recorded_tokens_saved_total = 0
-            ws_recorded_attempted_input_tokens_total = 0
+            # Compression savings already attached to a sent frame (_ws_frame).
+            ws_framed_tokens_saved_total = 0
+            ws_framed_attempted_input_tokens_total = 0
             ws_response_create_frames = 1
             # Per-connection traffic-learner dedup: tool-call ids already
             # observed on this WS, so a replayed transcript (each turn resends
@@ -9524,7 +9574,9 @@ class OpenAIHandlerMixin:
                 async with upstream:
                     if first_frame_is_create:
                         ws_measures.sent(
-                            await _measure_ws_frame(first_client_raw, _first_upstream_body)
+                            _ws_frame(
+                                await _measure_ws_frame(first_client_raw, _first_upstream_body)
+                            )
                         )
                     await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
 
@@ -10032,7 +10084,11 @@ class OpenAIHandlerMixin:
                                 )
                                 if ws_last_client_frame_type == "response.create":
                                     ws_measures.sent(
-                                        await _measure_ws_frame(client_raw, _outbound_frame_body)
+                                        _ws_frame(
+                                            await _measure_ws_frame(
+                                                client_raw, _outbound_frame_body
+                                            )
+                                        )
                                     )
                                 await upstream.send(_strip_codex_lite_metadata(msg))
                         except asyncio.CancelledError:
@@ -10094,7 +10150,6 @@ class OpenAIHandlerMixin:
                         nonlocal ws_recorded_cache_read_tokens_total
                         nonlocal ws_recorded_cache_write_tokens_total
                         nonlocal ws_recorded_uncached_input_tokens_total
-                        nonlocal ws_recorded_tokens_saved_total
                         nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
                         nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
                         nonlocal ws_ttfb_ms
@@ -10131,8 +10186,6 @@ class OpenAIHandlerMixin:
                             nonlocal ws_recorded_cache_read_tokens_total
                             nonlocal ws_recorded_cache_write_tokens_total
                             nonlocal ws_recorded_uncached_input_tokens_total
-                            nonlocal ws_recorded_tokens_saved_total
-                            nonlocal ws_recorded_attempted_input_tokens_total
                             nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
 
                             input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
@@ -10147,20 +10200,13 @@ class OpenAIHandlerMixin:
                                 ws_uncached_input_tokens_total
                                 - ws_recorded_uncached_input_tokens_total
                             )
-                            # Usage-less turn (cancelled/failed before
-                            # response.completed): defer its savings — see
-                            # _deferrable_savings_delta. The recorded total
-                            # advances by the recorded delta below, so
-                            # deferred savings stay pending and land with the
-                            # next usage-carrying turn.
-                            saved_delta = _deferrable_savings_delta(
-                                input_delta,
-                                tokens_saved - ws_recorded_tokens_saved_total,
-                            )
-                            attempted_delta = (
-                                attempted_input_tokens_total
-                                - ws_recorded_attempted_input_tokens_total
-                            )
+                            # The frame whose response just completed with
+                            # usage, plus the savings of every frame deferred
+                            # before it (_WsTurnMeasures). A response without
+                            # usage books none: its frame was deferred.
+                            booking = ws_measures.take_completed()
+                            saved_delta = booking.saved if booking else 0
+                            attempted_delta = booking.attempted if booking else 0
                             (
                                 overhead_delta_ms,
                                 ttfb_for_record_ms,
@@ -10200,15 +10246,9 @@ class OpenAIHandlerMixin:
                             # at the WS upgrade) so dashboards can
                             # slice WS turns by tag — same surface
                             # as HTTP turns.
-                            # Same gate as ``saved_delta``: a usage-less turn
-                            # leaves its rows pending for a usage-carrying one.
                             turn_tags = ws_tags
-                            if ws_turn_savings and input_delta > 0:
-                                turn_tags = {
-                                    **ws_tags,
-                                    SAVINGS_ATTRIBUTION_TAG: list(ws_turn_savings),
-                                }
-                                ws_turn_savings.clear()
+                            if booking and booking.rows:
+                                turn_tags = {**ws_tags, SAVINGS_ATTRIBUTION_TAG: booking.rows}
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -10240,8 +10280,10 @@ class OpenAIHandlerMixin:
                                     if isinstance(body, dict)
                                     else 0,
                                     tags=turn_tags,
-                                    conversation_key=ws_conversation_key,
-                                    savings_measure=ws_measures.take_completed(),
+                                    conversation_key=booking.conversation_key
+                                    if booking
+                                    else ws_conversation_key,
+                                    savings_measure=booking.measure if booking else None,
                                     client=client,
                                     project=ws_turn_project_key,
                                 )
@@ -10257,14 +10299,6 @@ class OpenAIHandlerMixin:
                             ws_recorded_cache_read_tokens_total = ws_cache_read_tokens_total
                             ws_recorded_cache_write_tokens_total = ws_cache_write_tokens_total
                             ws_recorded_uncached_input_tokens_total = ws_uncached_input_tokens_total
-                            # Advance by the recorded delta, not to the live
-                            # total: when the usage-less guard above zeroed
-                            # saved_delta, the un-recorded savings must stay
-                            # pending for the next usage-carrying turn.
-                            # Equivalent to `= tokens_saved` whenever the
-                            # delta was recorded as computed.
-                            ws_recorded_tokens_saved_total += saved_delta
-                            ws_recorded_attempted_input_tokens_total = attempted_input_tokens_total
                             ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
                             ws_recorded_compression_timing_totals.update(
                                 ws_compression_timing_totals
@@ -10559,7 +10593,9 @@ class OpenAIHandlerMixin:
                                 }
                                 continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
                                 ws_memory_response_pending = True
-                                ws_measures.sent(None)  # Headroom's own frame
+                                ws_measures.sent(  # Headroom's own frame
+                                    _WsFrame(None, conversation_key=ws_conversation_key)
+                                )
                                 await upstream.send(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
@@ -10838,19 +10874,18 @@ class OpenAIHandlerMixin:
                 0,
                 ws_uncached_input_tokens_total - ws_recorded_uncached_input_tokens_total,
             )
-            # Savings deferred from usage-less turns (per-turn guard in
-            # _record_ws_response_metrics) land here when the session closes
-            # before another usage frame arrives. With no residual input there
-            # is no spend to pair them with — drop them rather than write the
-            # savings-with-zero-spend checkpoint the per-turn guard prevents.
+            # Savings no per-turn record booked: frames still outstanding,
+            # frames deferred after the last completion with usage, and
+            # compression of a frame never sent. Every measure is released.
+            # With no residual input there is no spend to pair the savings
+            # with: drop them rather than write a savings-with-zero-spend
+            # checkpoint.
+            unbooked = ws_measures.close()
+            unbooked.absorb(_ws_frame(None))
             residual_tokens_saved = _deferrable_savings_delta(
-                residual_input_tokens,
-                max(0, tokens_saved - ws_recorded_tokens_saved_total),
+                residual_input_tokens, max(0, unbooked.saved)
             )
-            residual_attempted_input_tokens = max(
-                0,
-                attempted_input_tokens_total - ws_recorded_attempted_input_tokens_total,
-            )
+            residual_attempted_input_tokens = max(0, unbooked.attempted)
             (
                 final_overhead_delta_ms,
                 final_ttfb_ms,
@@ -10877,12 +10912,9 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
-            if ws_turn_savings and residual_input_tokens > 0:
-                # Rows no per-turn record claimed ride with the residual, under
-                # the same input-usage gate as ``residual_tokens_saved``.
-                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
-            # Frames still outstanding never completed: release their measures.
-            ws_measures.close()
+            if unbooked.rows and residual_input_tokens > 0:
+                # Under the same input-usage gate as ``residual_tokens_saved``.
+                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = unbooked.rows
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
