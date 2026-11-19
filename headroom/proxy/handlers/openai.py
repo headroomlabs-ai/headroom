@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -2107,6 +2107,103 @@ def _measure_responses_request(
     return get_item_ledger().measure(
         prefix_key(conversation, model, items), items, responses_items(sent), count
     )
+
+
+@dataclass
+class _WsFrame:
+    """A ``response.create`` sent upstream, until its response ends."""
+
+    measure: ItemMeasure | None
+    response_id: str | None = None
+
+
+class _WsTurnMeasures:
+    """Pairs each ``response.create`` a WebSocket session sends upstream with
+    its own response, so a frame's measure becomes the baseline only when that
+    frame's response completes with usage.
+
+    ``response.created`` binds the oldest frame without a response to the
+    response id; a terminal event ends the frame bound to its id, whatever
+    else is outstanding. Until an upstream has sent ``response.created`` it
+    is taken not to (fallback): terminal events end the oldest frame, in send
+    order. A standalone ``error`` rejects the oldest frame without a response,
+    which no later event will name, so it is retired; with every outstanding
+    frame bound, it fails the oldest response in progress, whose terminal
+    event may still follow.
+
+    A measure that does not complete is released (``settle(succeeded=False)``):
+    its pending slot is freed and the baseline stays as it was. Dropping it
+    instead would hold the slot until eviction, which marks the
+    conversation's baseline lost.
+    """
+
+    def __init__(self, release: Callable[[ItemMeasure], None] | None = None) -> None:
+        self._frames: list[_WsFrame] = []
+        self._completed: ItemMeasure | None = None
+        self._named = False
+        self._release_measure = release or (
+            lambda measure: get_item_ledger().settle(measure, succeeded=False)
+        )
+
+    def _release(self, measure: ItemMeasure | None) -> None:
+        if measure is not None:
+            self._release_measure(measure)
+
+    def _bound(self, response_id: str | None) -> _WsFrame | None:
+        return next((f for f in self._frames if response_id and f.response_id == response_id), None)
+
+    def _oldest_unbound(self) -> _WsFrame | None:
+        return next((f for f in self._frames if f.response_id is None), None)
+
+    def sent(self, measure: ItemMeasure | None) -> None:
+        """A ``response.create`` went upstream (``None``: not measured)."""
+        self._frames.append(_WsFrame(measure))
+
+    def created(self, response_id: str | None) -> None:
+        frame = self._oldest_unbound()
+        if frame is not None and response_id:
+            frame.response_id = response_id
+            self._named = True
+
+    def ended(self, response_id: str | None, *, completed: bool) -> None:
+        """``response.completed`` (``completed``: with usage), ``.failed`` or
+        ``.incomplete``. An id no frame is bound to ends nothing, except in
+        the fallback, where it ends the oldest frame."""
+        frame = self._bound(response_id)
+        if frame is None and not self._named:
+            frame = self._oldest_unbound()
+        if frame is None:
+            return
+        self._frames.remove(frame)
+        if completed:
+            self._release(self._completed)
+            self._completed = frame.measure
+        else:
+            self._release(frame.measure)
+
+    def errored(self, response_id: str | None) -> None:
+        frame = self._bound(response_id)
+        if frame is None:
+            frame = self._oldest_unbound()
+            if frame is not None:
+                self._frames.remove(frame)
+            elif self._frames:
+                frame = self._frames[0]
+        if frame is not None:
+            self._release(frame.measure)
+            frame.measure = None
+
+    def take_completed(self) -> ItemMeasure | None:
+        """The completed frame's measure, for the record that books its turn."""
+        measure, self._completed = self._completed, None
+        return measure
+
+    def close(self) -> None:
+        """Session end: nothing outstanding completed."""
+        for frame in self._frames:
+            self._release(frame.measure)
+        self._frames.clear()
+        self._release(self.take_completed())
 
 
 def _deferrable_savings_delta(input_delta: int, saved_delta: int) -> int:
@@ -8535,14 +8632,11 @@ class OpenAIHandlerMixin:
             # path books.
 
             ws_conversation_key: str | None = None
-            # One entry per response.create sent upstream whose response has
-            # not ended: the frame's measure against its conversation's
-            # previous request, as the HTTP path measures one, or None for a
-            # frame that is not measured.
-            ws_frame_measures: list[ItemMeasure | None] = []
-            # The measure of the turn that just completed with usage, for the
-            # record that books that turn (_take_ws_turn_measure).
-            ws_turn_measure: ItemMeasure | None = None
+            # Each response.create sent upstream, with its measure against its
+            # conversation's previous request (as the HTTP path measures one),
+            # paired with its own response; the turn's record takes the
+            # measure of the frame that completed.
+            ws_measures = _WsTurnMeasures()
             # The client's own bytes, before hooks, memory, store=false,
             # compression or shaping rewrite them: the measure's ORIGINAL.
             first_client_raw = first_msg_raw
@@ -8579,34 +8673,6 @@ class OpenAIHandlerMixin:
                         describe_exception(exc),
                     )
                     return None
-
-            def _end_ws_response(*, completed: bool) -> None:
-                """A response ended (``completed``: with usage). A connection
-                runs one response at a time, so when exactly one frame is
-                outstanding the response is that frame's, and its measure goes
-                to the record that books the turn; the funnel settles it as
-                the baseline. Every other measure settles as failed and never
-                becomes the baseline: a frame whose response failed or carried
-                no usage, a frame that got no response (rejected, cancelled),
-                or frames that cannot be told apart. Savings deferred from a
-                failed turn still ride with the next booked record, without
-                its measure: that frame was never cached by the provider."""
-                nonlocal ws_turn_measure
-                stale = [ws_turn_measure]
-                ws_turn_measure = None
-                if completed and len(ws_frame_measures) == 1:
-                    ws_turn_measure = ws_frame_measures[0]
-                else:
-                    stale.extend(ws_frame_measures)
-                ws_frame_measures.clear()
-                for measure in stale:
-                    if measure is not None:
-                        get_item_ledger().settle(measure, succeeded=False)
-
-            def _take_ws_turn_measure() -> ItemMeasure | None:
-                nonlocal ws_turn_measure
-                measure, ws_turn_measure = ws_turn_measure, None
-                return measure
 
             try:
                 body = json.loads(first_msg_raw)
@@ -9457,7 +9523,7 @@ class OpenAIHandlerMixin:
                         return
                 async with upstream:
                     if first_frame_is_create:
-                        ws_frame_measures.append(
+                        ws_measures.sent(
                             await _measure_ws_frame(first_client_raw, _first_upstream_body)
                         )
                     await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
@@ -9965,7 +10031,7 @@ class OpenAIHandlerMixin:
                                     },
                                 )
                                 if ws_last_client_frame_type == "response.create":
-                                    ws_frame_measures.append(
+                                    ws_measures.sent(
                                         await _measure_ws_frame(client_raw, _outbound_frame_body)
                                     )
                                 await upstream.send(_strip_codex_lite_metadata(msg))
@@ -10175,7 +10241,7 @@ class OpenAIHandlerMixin:
                                     else 0,
                                     tags=turn_tags,
                                     conversation_key=ws_conversation_key,
-                                    savings_measure=_take_ws_turn_measure(),
+                                    savings_measure=ws_measures.take_completed(),
                                     client=client,
                                     project=ws_turn_project_key,
                                 )
@@ -10319,15 +10385,25 @@ class OpenAIHandlerMixin:
                                     ws_cache_read_tokens_total += usage_cache_read_tokens
                                     ws_cache_write_tokens_total += usage_cache_write_tokens
                                     ws_uncached_input_tokens_total += usage_uncached_tokens
-                                if event_type in {
+                                response_id = (
+                                    str(response.get("id") or "") or None
+                                    if isinstance(response, dict)
+                                    else None
+                                )
+                                if event_type == "response.created":
+                                    ws_measures.created(response_id)
+                                elif event_type in {
                                     "response.completed",
                                     "response.failed",
                                     "response.incomplete",
                                 }:
-                                    _end_ws_response(
+                                    ws_measures.ended(
+                                        response_id,
                                         completed=event_type == "response.completed"
-                                        and usage_input_tokens > 0
+                                        and usage_input_tokens > 0,
                                     )
+                                elif event_type == "error":
+                                    ws_measures.errored(response_id)
 
                                 if event_type in {"response.failed", "response.incomplete"}:
                                     for buffered_event in event_buffer:
@@ -10483,7 +10559,7 @@ class OpenAIHandlerMixin:
                                 }
                                 continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
                                 ws_memory_response_pending = True
-                                ws_frame_measures.append(None)  # Headroom's own frame
+                                ws_measures.sent(None)  # Headroom's own frame
                                 await upstream.send(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
@@ -10806,7 +10882,7 @@ class OpenAIHandlerMixin:
                 # the same input-usage gate as ``residual_tokens_saved``.
                 ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
             # Frames still outstanding never completed: release their measures.
-            _end_ws_response(completed=False)
+            ws_measures.close()
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0

@@ -255,11 +255,19 @@ def _completed(n: int, cached: int, uncached: int) -> str:
     return json.dumps({"type": "response.completed", "response": response})
 
 
-async def _run_ws_session(handler: Any, frames: list[str], events: list[str]) -> list[Any]:
+async def _run_ws_session(
+    handler: Any,
+    frames: list[str],
+    events: list[str | list[str]],
+    *,
+    pipelined: frozenset[int] = frozenset(),
+) -> list[Any]:
     """Run one session through ``handle_openai_responses_ws``. Like Codex,
-    each frame waits for the previous turn's terminal event; the upstream
-    answers frame n with ``events[n]``. The compressor cuts every ``_BIG``
-    text to ``_SMALL``, 1,024 tokens each. Returns the bodies sent upstream."""
+    each frame waits for the previous frame's events, except a frame whose
+    index is in ``pipelined``, sent right after the one before it. The
+    upstream answers frame n with ``events[n]`` (one event or a list), once
+    it has received n frames. The compressor cuts every ``_BIG`` text to
+    ``_SMALL``, 1,024 tokens each. Returns the bodies sent upstream."""
     import asyncio
     import copy
     import sys
@@ -275,12 +283,22 @@ async def _run_ws_session(handler: Any, frames: list[str], events: list[str]) ->
 
     assert isinstance(handler, _DummyOpenAIHandler)
 
+    groups = [[e] if isinstance(e, str) else e for e in events]
+    # Events the client has seen before it sends frame i (the last entry:
+    # before it hangs up). A pipelined frame goes out with the one before it.
+    waits = [sum(len(g) for g in groups[:i]) for i in range(len(groups) + 1)]
+    for i in sorted(pipelined):
+        waits[i] = waits[i - 1]
+    # The upstream answers frame i once the client has sent every frame it
+    # sends before seeing that answer, so pipelined frames are both in flight.
+    needs = [sum(w <= waits[i] for w in waits[:-1]) for i in range(len(groups))]
+
     class _Client(_FakeWebSocket):
         received = 0
 
         async def receive_text(self) -> str:
             turn, self.received = self.received, self.received + 1
-            while len(self.sent_text) < turn:
+            while len(self.sent_text) < waits[min(turn, len(waits) - 1)]:
                 await asyncio.sleep(0.001)
             if self._frames:
                 return self._frames.pop(0)
@@ -288,10 +306,11 @@ async def _run_ws_session(handler: Any, frames: list[str], events: list[str]) ->
 
     class _Upstream(_FakeUpstream):
         async def _iter(self):  # noqa: ANN202
-            for n, event in enumerate(self._events, start=1):
-                while len(self.sent) < n:
+            for need, group in zip(needs, groups, strict=True):
+                while len(self.sent) < need:
                     await asyncio.sleep(0.001)
-                yield event
+                for event in group:
+                    yield event
             await asyncio.Event().wait()
 
     def compress(payload: dict[str, Any], **_kwargs: Any) -> tuple[Any, ...]:
@@ -310,7 +329,7 @@ async def _run_ws_session(handler: Any, frames: list[str], events: list[str]) ->
 
     handler.config.optimize = True
     handler._compress_openai_responses_payload = compress
-    upstream = _Upstream(events)
+    upstream = _Upstream([e for g in groups for e in g])
     with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
         await asyncio.wait_for(
             handler.handle_openai_responses_ws(_Client(frames=frames)), timeout=10.0
@@ -398,6 +417,171 @@ async def test_a_failed_websocket_turn_never_becomes_the_baseline(
     m = handler.metrics
     assert m.tokens_saved_total == 2_048
     assert m.new_input_saved_tokens_total == 2_048
+
+
+# Full transcripts for the ordering cases. Only A and D carry ``_BIG``, so a
+# re-send of either removes 1,024 tokens; no two share an input item.
+_TRANSCRIPTS = {
+    "A": [_message("user", _BIG)],
+    "B": [_message("user", "Summarize the deploy log.")],
+    "C": [_message("user", "List the failing routes.")],
+    "D": [_message("user", "Group the errors by route."), _message("user", _BIG)],
+}
+_REJECTED = json.dumps(
+    {"type": "error", "error": {"type": "invalid_request_error", "message": "rejected"}}
+)
+
+
+def _created(n: int) -> str:
+    return json.dumps({"type": "response.created", "response": {"id": f"resp_{n}"}})
+
+
+def _ended(n: int, kind: str) -> str:
+    return json.dumps({"type": f"response.{kind}", "response": {"id": f"resp_{n}"}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("steps", "probe", "replayed"),
+    [
+        # The review's case: the standalone error retires B, C becomes the baseline.
+        pytest.param("A B:rejected C", "A", 0, id="rejected-then-completed"),
+        pytest.param("A! B!:rejected C!", "A", 0, id="rejected-then-completed-unnamed"),
+        pytest.param("A B:rejected B:rejected C", "A", 0, id="two-rejections"),
+        # An error after response.created fails that response; C still completes.
+        pytest.param("A B:mid-error C", "A", 0, id="error-mid-response"),
+        pytest.param("A B:mid-error-failed C", "A", 0, id="error-mid-response-then-failed"),
+        # An incremental turn is not measured: A stays the baseline.
+        pytest.param("A B:rejected A:incremental", "A", 1_024, id="rejected-then-incremental"),
+        pytest.param("A C:no-usage", "A", 1_024, id="completed-without-usage"),
+        # D is sent before C's response ends; each response settles its own frame.
+        pytest.param("A C D:pipelined", "D", 1_024, id="pipelined"),
+        # B is rejected while D's response runs, then D completes.
+        pytest.param("A D:created B:rejected-while-D-runs", "D", 1_024, id="rejected-mid-flight"),
+    ],
+)
+async def test_each_websocket_response_settles_its_own_frame(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    _ten_and_one_per_million: Any,
+    steps: str,
+    probe: str,
+    replayed: int,
+) -> None:
+    """Orderings of full transcripts on one connection, then a probe that
+    re-sends one transcript plus a new item: 1,024 removals, 2,048 cached +
+    1,024 uncached. Its prefix share is 1,024 only if that transcript's own
+    frame was the last to complete with usage. A step is ``<transcript>``
+    (completes; ``!`` without ``response.created``) or ``<transcript>:<how>``."""
+    from tests.test_openai_codex_ws_lifecycle import _DummyOpenAIHandler
+
+    frames: list[str] = []
+    events: list[str | list[str]] = []
+    pipelined: set[int] = set()
+    named = "!" not in steps  # the upstream sends response.created
+    for n, step in enumerate(steps.split(), start=1):
+        name, _, how = step.partition(":")
+        items = _TRANSCRIPTS[name.rstrip("!")]
+        done = ([_created(n)] if named else []) + [_completed(n, 0, 1_000)]
+        if how == "incremental":
+            frames.append(_create([_message("user", "Go on.")], previous_response_id="resp_1"))
+        else:
+            frames.append(_create(items))
+        events.append(
+            {
+                "": done,
+                "rejected": [_REJECTED],
+                "mid-error": [_created(n), _REJECTED],
+                "mid-error-failed": [_created(n), _REJECTED, _ended(n, "failed")],
+                "incremental": done,
+                "no-usage": [_created(n), _ended(n, "completed")],
+                "pipelined": done,
+                "created": [_created(n)],
+                "rejected-while-D-runs": [_REJECTED, _completed(n - 1, 0, 1_000)],
+            }[how]
+        )
+        if how in {"pipelined", "rejected-while-D-runs"}:
+            pipelined.add(n - 1)
+    frames.append(_create([*_TRANSCRIPTS[probe], _message("user", "Which?")]))
+    n = len(frames)
+    events.append(([_created(n)] if named else []) + [_completed(n, 2_048, 1_024)])
+    handler = _DummyOpenAIHandler()
+    ledger = _use_real_sinks(handler, monkeypatch, tmp_path)
+
+    await _run_ws_session(handler, frames, events, pipelined=frozenset(pipelined))
+
+    booked = [json.loads(line) for line in ledger.read_text().splitlines()]
+    last = [event for event in booked if event.get("saved")][-1]
+    assert (last["saved"], last.get("saved_prefix", 0)) == (1_024, replayed)
+    rate = 1e-6 if replayed else 10e-6
+    assert last["cost_effective_usd"] == pytest.approx(1_024 * rate, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("ops", "completed", "released"),
+    [
+        # Headroom's memory continuation (an unmeasured frame) is rejected.
+        pytest.param(
+            "sent:a created:r1 ended:r1 sent:- errored sent:b created:r2 ended:r2",
+            "ab",
+            "",
+            id="continuation-rejected",
+        ),
+        # A client frame is rejected after a continuation completed.
+        pytest.param(
+            "sent:a created:r1 ended:r1 sent:- created:r2 ended:r2 sent:b errored",
+            "a-",
+            "b",
+            id="rejected-after-continuation",
+        ),
+        # Disconnect with one frame bound to a response and one not.
+        pytest.param("sent:a created:r1 sent:b close", "", "ab", id="disconnect-bound-and-unbound"),
+        # A completed measure nothing booked is released at close.
+        pytest.param(
+            "sent:a created:r1 ended:r1/held close", "", "a", id="unbooked-completion-at-close"
+        ),
+        # An error naming its response fails that frame, not the newer one.
+        pytest.param(
+            "sent:a created:r1 sent:b errored:r1 ended:r1/failed created:r2 ended:r2",
+            "b",
+            "a",
+            id="error-naming-its-response",
+        ),
+        # Once responses are named, an unknown id ends nothing.
+        pytest.param("sent:a created:r1 ended:r9 ended:r1", "-a", "", id="unknown-id-once-named"),
+        # Fallback, no response.created: responses end frames in send order.
+        pytest.param("sent:a sent:b ended:x ended:y/failed", "a", "b", id="fallback-send-order"),
+        # A completion without usage is not a success.
+        pytest.param("sent:a created:r1 ended:r1/no-usage", "", "a", id="completed-without-usage"),
+    ],
+)
+def test_websocket_responses_pair_with_their_own_frames(
+    ops: str, completed: str, released: str
+) -> None:
+    """``_WsTurnMeasures`` on its own: which frame's measure each completion
+    hands to its record (``completed``, ``-`` for an unmeasured frame), and
+    which measures are released and can never become the baseline."""
+    from headroom.proxy.handlers.openai import _WsTurnMeasures
+
+    gone: list[Any] = []
+    taken: list[str] = []
+    pairs = _WsTurnMeasures(release=gone.append)
+    for op in ops.split():
+        verb, _, arg = op.partition(":")
+        arg, _, how = arg.partition("/")
+        if verb == "sent":
+            pairs.sent(None if arg == "-" else arg)  # type: ignore[arg-type]
+        elif verb == "created":
+            pairs.created(arg)
+        elif verb == "ended":
+            pairs.ended(arg, completed=how in {"", "held"})
+            if how == "":
+                taken.append(pairs.take_completed() or "-")  # type: ignore[arg-type]
+        elif verb == "errored":
+            pairs.errored(arg or None)
+        else:
+            pairs.close()
+    assert ("".join(taken), "".join(gone)) == (completed, released)
 
 
 def test_a_cold_replay_prices_like_the_live_zone(_ten_and_one_per_million: Any) -> None:
