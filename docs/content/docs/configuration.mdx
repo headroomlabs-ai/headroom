@@ -465,6 +465,34 @@ headroom proxy --learn --min-evidence 3
 
 For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
 
+### HuggingFace revision pinning
+
+Headroom downloads tokenizer and ONNX artifacts from the HuggingFace Hub for the optional
+ML paths (token counting, Kompress, the image encoder, relevance embeddings). Every
+repository it ships against is pinned to an **immutable commit SHA**, both in the Python
+package and in the Rust core, so a repo whose `main` branch moves cannot silently change
+the bytes behind your token counts or compression behaviour.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `HEADROOM_HF_PIN` | Set to `off`, `0`, `false`, or `no` to float every repository on its default branch again — for evaluating a newer upstream revision before adopting it. Any other value (including a typo) keeps pinning. | unset (pinned) |
+| `HEADROOM_HF_TOKENIZER_REVISIONS` | `repo=sha,repo=sha` pins for repositories added through `HEADROOM_HF_TOKENIZER_ALLOWLIST`. We can't choose a pin for an id we only learn about from the environment, so operator-added repos float unless named here. | unset |
+| `HEADROOM_HF_TOKENIZER_ALLOWLIST` | Comma-separated extra tokenizer repo ids that `_load_tokenizer` may fetch at all. | unset |
+
+Upgrade path: bump the SHA in `headroom/tokenizers/huggingface.py` (`_TOKENIZER_REVISIONS`)
+and `headroom/onnx_runtime.py` (`_PINNED_REVISIONS`), plus `crates/headroom-core/src/hf_pins.rs`
+for the Rust paths, then run the tests — `tests/test_hf_revision_pinning.py` and the
+`hf_pins` unit tests both fail if the three tables disagree or if a pin is not a full
+40-character SHA. There is no runtime "latest" resolution by design: a floating revision
+is the thing being fixed.
+
+Air-gapped deployments are unaffected at the fetch level — `HEADROOM_OFFLINE=1` refuses these
+downloads before any socket opens, and `from_file` / `from_files` remain network-free. What
+you must pre-provision is the *pinned* snapshot: the native proxy's cache-only reader resolves
+the repo at its pin (a commit SHA names the snapshot directory directly), so seeding a
+different revision is a cache miss, not a silently different model. `HEADROOM_HF_PIN=off`
+moves both the download and the cache lookup back to `main`.
+
 ### Cold-prefix hook & reasoning compaction
 
 Two related optimizations target tokens that agent harnesses re-send every turn:

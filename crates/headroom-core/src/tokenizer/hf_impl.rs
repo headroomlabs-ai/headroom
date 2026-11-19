@@ -112,7 +112,14 @@ impl HfTokenizer {
     /// HuggingFace Hub and load it. `repo` is the canonical Hub identifier,
     /// e.g. `"CohereForAI/c4ai-command-r-v01"` or `"meta-llama/Meta-Llama-3-8B"`.
     ///
-    /// Uses the `main` revision. Blocking — calls into `ureq` synchronously.
+    /// Fetches at the repo's pinned commit ([`crate::hf_pins`]), not `main`:
+    /// tokenizer bytes decide every token count the proxy reports, so a floating
+    /// revision means the same model can be counted differently after an
+    /// upstream push with no change here (GH #4939). Use
+    /// [`Self::from_pretrained_at`] to name a revision explicitly, and
+    /// `HEADROOM_HF_PIN=off` to float deliberately.
+    ///
+    /// Blocking — calls into `ureq` synchronously.
     /// The file lands in the hub cache directory Python's `huggingface_hub`
     /// would use ([`crate::hf_cache::hub_cache_dir`]: `HF_HUB_CACHE`, then
     /// `HUGGINGFACE_HUB_CACHE`, `HF_HOME/hub`, `XDG_CACHE_HOME/huggingface/hub`,
@@ -129,6 +136,19 @@ impl HfTokenizer {
     /// - [`HfTokenizerError::Load`] if the downloaded bytes don't parse as
     ///   a valid `tokenizer.json`. Should not happen for healthy HF repos.
     pub fn from_pretrained(repo: &str) -> Result<Self, HfTokenizerError> {
+        Self::from_pretrained_at(repo, None)
+    }
+
+    /// [`Self::from_pretrained`] with an explicit revision.
+    ///
+    /// `revision: None` means "the pin for `repo`, or the default branch for a
+    /// repo we do not ship". Anything else is used verbatim — a commit SHA, a
+    /// tag, or a branch — so a caller with its own vendored snapshot (or a
+    /// mirror) can point at it without editing the shared table.
+    pub fn from_pretrained_at(
+        repo: &str,
+        revision: Option<&str>,
+    ) -> Result<Self, HfTokenizerError> {
         // Air-gap chokepoint, matching `headroom/offline.py`'s `guard_egress`.
         // This is the Rust half of the same switch, so an operator who sets
         // HEADROOM_OFFLINE=1 gets the same refusal whichever runtime reaches
@@ -151,8 +171,17 @@ impl HfTokenizer {
         // air-gapped deployment with pre-seeded artifacts should point at them
         // with `from_file`, which is network-free by construction.
         let api = hub_api(repo)?;
-        let path = api
-            .model(repo.to_string())
+        // Pinned commits (GH #4939): `Api::model` hard-codes `main`, so a
+        // resolved revision goes through a `Repo::with_revision` handle.
+        let handle = match crate::hf_pins::resolve(repo, revision) {
+            Some(rev) => api.repo(hf_hub::Repo::with_revision(
+                repo.to_string(),
+                hf_hub::RepoType::Model,
+                rev.to_string(),
+            )),
+            None => api.model(repo.to_string()),
+        };
+        let path = handle
             .get("tokenizer.json")
             .map_err(|e| HfTokenizerError::Hub {
                 repo: repo.to_string(),
@@ -525,5 +554,71 @@ mod tests {
             matches!(r, Err(HfTokenizerError::Hub { .. })),
             "expected HfTokenizerError::Hub, got {r:?}"
         );
+    }
+
+    /// GH #4939: the download must name an immutable revision for a shipped
+    /// repo, and an explicit override must reach the handle unchanged.
+    ///
+    /// What is asserted is the *resolution*, not the fetch: `from_pretrained`
+    /// opens a socket, and a unit test must not. The `Repo` built from each
+    /// resolution is checked for the revision it would put in the URL.
+    #[test]
+    fn shipped_tokenizer_repos_resolve_to_their_pin() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::hf_pins::PIN_ENV);
+        for repo in [
+            "meta-llama/Meta-Llama-3-8B",
+            "Qwen/Qwen2.5-7B",
+            "mistralai/Mistral-7B-v0.1",
+        ] {
+            let rev = crate::hf_pins::resolve(repo, None)
+                .unwrap_or_else(|| panic!("{repo} is shipped but unpinned"));
+            let handle = hf_hub::Repo::with_revision(
+                repo.to_string(),
+                hf_hub::RepoType::Model,
+                rev.to_string(),
+            );
+            assert_eq!(handle.revision(), rev);
+            // `url_revision` is what hf-hub splices into the fetch URL, so this
+            // is the closest a unit test gets to "the GET carries the commit".
+            assert_eq!(handle.url_revision(), rev);
+            assert_ne!(handle.url_revision(), "main");
+            assert_eq!(
+                handle.folder_name(),
+                format!("models--{}", repo.replace('/', "--"))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_revision_beats_the_pin_at_the_entry_point() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::hf_pins::PIN_ENV);
+        assert_eq!(
+            crate::hf_pins::resolve("meta-llama/Meta-Llama-3-8B", Some("abc123")),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn unpinned_repo_keeps_the_default_branch() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::hf_pins::PIN_ENV);
+        assert_eq!(crate::hf_pins::resolve("gpt2", None), None);
+    }
+
+    /// The pin must not change which cache directory is used, or every warm
+    /// deployment would re-download the tokenizer once. `hf-hub` keys the
+    /// snapshot dir on the commit and `refs/main` on the branch, so resolving a
+    /// pin adds a `refs/<sha>` entry; it does not relocate the repo dir.
+    #[test]
+    fn pinning_does_not_relocate_the_cache_repo_dir() {
+        let main = hf_hub::Repo::new("gpt2".to_string(), hf_hub::RepoType::Model);
+        let pinned = hf_hub::Repo::with_revision(
+            "gpt2".to_string(),
+            hf_hub::RepoType::Model,
+            "abc123".to_string(),
+        );
+        assert_eq!(main.folder_name(), pinned.folder_name());
     }
 }
