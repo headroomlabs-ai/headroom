@@ -300,47 +300,68 @@ impl Kompress {
         // `refs/<sha>`, so a Python-seeded pin was a miss here and re-downloaded.
         // Reading the snapshot directly first makes that a hit — and lets an
         // air-gapped host serve a pre-seeded pin instead of refusing.
-        if let Some(kompress) = Self::from_cached_pair(&config, tokenizer_revision, model_revision)
-        {
+        //
+        // The tokenizer is resolved separately from the weights and carried
+        // into the fallback: when it is cached but the weights are not, asking
+        // `hf-hub` for the tokenizer again would turn a cache hit into a
+        // download request, and a failing tokenizer endpoint would abort before
+        // the weights were ever requested. A cached tokenizer is reused as-is.
+        let cached = Self::cached_tokenizer(&config);
+        if let Some(kompress) = Self::from_cached_pair(&config, cached.as_ref(), model_revision) {
             return Ok(kompress);
         }
 
-        // Air-gap chokepoint — the same guard `hf_cache::hub_api` runs for
-        // the tokenizer and embedder, for the same reason. `HF_HUB_OFFLINE` only shortcuts the
-        // cache *lookup*; on a cache miss `hf-hub` still dials huggingface.co,
-        // so the Kompress model download is a live egress path under
-        // `HEADROOM_OFFLINE=1` and was not covered.
+        // Air-gap chokepoint, shared with the tokenizer and embedder:
+        // `hf_cache::hub_api` runs the guard before it builds the client (the
+        // `ureq` agent and endpoint resolution happen in that constructor), and
+        // it reads `HF_ENDPOINT`, `HF_TOKEN` and the one Hub cache directory
+        // Python uses. Plain `Api::new()` honours none of those, so it would
+        // write into `~/.cache` while the cache-first read above looks
+        // elsewhere — and ignore a mirror or a gated-repo token.
         //
-        // It sits before `Api::new()` because that already resolves the Hub
-        // endpoint and builds the `ureq` agent, so guarding at the `get` call
-        // would leak the setup packets the switch promises not to send.
-        //
-        // It only refuses on a genuine cache miss: `from_cached_pair` above
-        // already served a pre-seeded pin, which is the air-gapped case. A miss
-        // still refuses rather than downloading; a caller that has the files
-        // outside the Hub cache should use [`Self::from_files`], which is
-        // network-free by construction.
-        crate::offline::guard_egress("Kompress model download", &config.model_id)?;
-        let api = hf_hub::api::sync::Api::new().map_err(|e| KompressError::Hub {
-            repo: config.model_id.clone(),
-            source: Box::new(e),
-        })?;
-
-        let tokenizer_api = match tokenizer_revision {
-            Some(rev) => api.repo(hf_hub::Repo::with_revision(
-                config.tokenizer_repo.clone(),
-                hf_hub::RepoType::Model,
-                rev.to_string(),
-            )),
-            None => api.model(config.tokenizer_repo.clone()),
+        // A caller that has the files outside the Hub cache should use
+        // [`Self::from_files`], which is network-free by construction.
+        let Some(cache) = crate::hf_cache::hub_cache_dir() else {
+            // Offline still wins: the caller treats `Offline` as final, and a
+            // missing cache directory is no reason to report a Hub failure.
+            crate::offline::guard_egress("Kompress model download", &config.model_id)?;
+            return Err(KompressError::Hub {
+                repo: config.model_id.clone(),
+                source: "no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)".into(),
+            });
         };
-        let tok_path = tokenizer_api
-            .get("tokenizer.json")
-            .map_err(|e| KompressError::Hub {
-                repo: config.tokenizer_repo.clone(),
-                source: Box::new(e),
+        let api = crate::hf_cache::hub_api(&cache, "Kompress model download", &config.model_id)
+            .map_err(|e| match e {
+                crate::hf_cache::HubApiError::Offline(blocked) => KompressError::Offline(blocked),
+                crate::hf_cache::HubApiError::Build(source) => KompressError::Hub {
+                    repo: config.model_id.clone(),
+                    source: Box::new(source),
+                },
             })?;
-        let tokenizer = load_tokenizer(&tok_path, &config.tokenizer_repo)?;
+
+        // Only when nothing usable came from the cache: a `hf-hub` fetch here
+        // would re-download the tokenizer we already have on disk.
+        let tokenizer = match cached {
+            Some(tokenizer) => tokenizer,
+            None => {
+                let tokenizer_api = match tokenizer_revision {
+                    Some(rev) => api.repo(hf_hub::Repo::with_revision(
+                        config.tokenizer_repo.clone(),
+                        hf_hub::RepoType::Model,
+                        rev.to_string(),
+                    )),
+                    None => api.model(config.tokenizer_repo.clone()),
+                };
+                let tok_path =
+                    tokenizer_api
+                        .get("tokenizer.json")
+                        .map_err(|e| KompressError::Hub {
+                            repo: config.tokenizer_repo.clone(),
+                            source: Box::new(e),
+                        })?;
+                load_tokenizer(&tok_path, &config.tokenizer_repo)?
+            }
+        };
 
         let model_api = match model_revision {
             Some(rev) => api.repo(hf_hub::Repo::with_revision(
@@ -386,27 +407,38 @@ impl Kompress {
     /// Exactly one snapshot per repo — [`hf_cache_file_at`] — so a candidate
     /// that exists only under a different cached revision is a miss, and the
     /// tokenizer and weights always come from the same commit.
+    ///
+    /// `cached_tokenizer` is the tokenizer already loaded from that snapshot,
+    /// loaded here so the caller can reuse it when the weights still have to be
+    /// fetched.
     fn from_cached_pair(
         config: &KompressConfig,
-        tokenizer_revision: Option<&str>,
+        cached_tokenizer: Option<&Tokenizer>,
         model_revision: Option<&str>,
     ) -> Option<Self> {
-        let tok_path = hf_cache_file_at(
-            &config.tokenizer_repo,
-            &["tokenizer.json"],
-            tokenizer_revision,
-        )?;
-        let tokenizer = load_tokenizer(&tok_path, &config.tokenizer_repo).ok()?;
+        let tokenizer = cached_tokenizer?;
         for candidate in ONNX_CANDIDATES {
             let rel: Vec<&str> = candidate.split('/').collect();
             let Some(onnx_path) = hf_cache_file_at(&config.model_id, &rel, model_revision) else {
                 continue;
             };
             if let Ok(session) = build_session(&onnx_path) {
-                return Some(Self::assemble(config.clone(), tokenizer, session));
+                return Some(Self::assemble(config.clone(), tokenizer.clone(), session));
             }
         }
         None
+    }
+
+    /// The tokenizer for `config` from the Hub cache at its pin, if present.
+    ///
+    /// Loaded before the pair check so the fallback can reuse it: a cached
+    /// tokenizer must never be re-fetched just because the weights were not
+    /// cached, or a hit becomes a request that can fail first.
+    fn cached_tokenizer(config: &KompressConfig) -> Option<Tokenizer> {
+        let revision =
+            crate::hf_pins::resolve(&config.tokenizer_repo, config.tokenizer_revision.as_deref());
+        let path = hf_cache_file_at(&config.tokenizer_repo, &["tokenizer.json"], revision)?;
+        load_tokenizer(&path, &config.tokenizer_repo).ok()
     }
     /// Cache-only construction: resolve the tokenizer + ONNX artifact from
     /// the local HuggingFace cache **without ever hitting the network**, and
@@ -826,6 +858,25 @@ mod tests {
     use super::*;
     use crate::hf_cache::tests::CacheEnv;
 
+    /// Minimal valid `tokenizer.json`: WordLevel model, Whitespace
+    /// pre-tokenizer, three-token vocabulary. Enough for `load_tokenizer` to
+    /// produce a real `Tokenizer` without a multi-MB fixture.
+    const TINY_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": {"hello": 0, "world": 1, "[UNK]": 2},
+            "unk_token": "[UNK]"
+        }
+    }"#;
+
     /// Lay out `rel` under `repo`'s snapshot `commit` in the hub cache `cache`.
     fn cached_file(cache: &Path, repo: &str, commit: &str, rel: &str) -> PathBuf {
         let path = cache
@@ -835,6 +886,19 @@ mod tests {
             .join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, commit).unwrap();
+        path
+    }
+
+    /// [`cached_file`] with real `tokenizer.json` bytes, for a test that has to
+    /// actually load the tokenizer rather than just resolve its path.
+    fn cached_tokenizer_json(cache: &Path, repo: &str, commit: &str) -> PathBuf {
+        let path = cache
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join(commit)
+            .join("tokenizer.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, TINY_TOKENIZER_JSON).unwrap();
         path
     }
 
@@ -942,7 +1006,6 @@ mod tests {
         )
         .expect("a Python-style pinned snapshot is a cache hit");
         assert!(tok.ends_with(Path::new(DEFAULT_TOKENIZER_REVISION).join("tokenizer.json")));
-
         let rel: Vec<&str> = ONNX_CANDIDATES[1].split('/').collect();
         let onnx = hf_cache_file_at(&config.model_id, &rel, model_revision)
             .expect("the weights at the pin are a cache hit");
@@ -987,6 +1050,100 @@ mod tests {
             hf_cache_file_at(&config.model_id, &rel, model_revision),
             None,
             "weights at another revision must not satisfy the pair"
+        );
+    }
+
+    /// Cached tokenizer + absent weights, downloads enabled: the fallback must
+    /// **reuse** the cached tokenizer instead of asking the Hub for it.
+    ///
+    /// This is the case the review flagged. Seeding only the tokenizer makes
+    /// `from_cached_pair` decline (no weights), so the loader takes the network
+    /// path for the weights. If that path re-fetched the tokenizer, a Hub that
+    /// cannot serve `tokenizer.json` would abort the load *before* the weights
+    /// were ever requested — turning a partial cache into a hard failure.
+    ///
+    /// The stand-in endpoint answers tokenizer requests with 500 and records
+    /// every path it is asked for. The assertions are about which paths were
+    /// requested. Building the session needs the real 261 MB artifact, so the
+    /// load is expected to fail — after the weight request, which is the
+    /// ordering under test.
+    #[test]
+    fn cached_tokenizer_is_reused_when_only_the_weights_need_fetching() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let _guard = crate::test_support::env_lock();
+        let _env = CacheEnv::cleared_with(
+            [
+                "HEADROOM_HF_PIN",
+                "HF_TOKEN",
+                "HUGGING_FACE_HUB_TOKEN",
+                "HF_TOKEN_PATH",
+                "HF_ENDPOINT",
+            ]
+            .map(String::from),
+        );
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("HF_HUB_CACHE", cache.path());
+        std::env::set_var("HOME", cache.path().join("home"));
+        std::env::set_var("USERPROFILE", cache.path().join("home"));
+
+        // Only the tokenizer is cached, at its pin, in Python's layout (no refs).
+        cached_tokenizer_json(
+            cache.path(),
+            DEFAULT_TOKENIZER_REPO,
+            DEFAULT_TOKENIZER_REVISION,
+        );
+
+        // Stand-in Hub: refuse tokenizer paths, 404 everything else, and record
+        // every path asked for.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::env::set_var("HF_ENDPOINT", format!("http://127.0.0.1:{port}"));
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_server = Arc::clone(&seen);
+        let server = std::thread::spawn(move || {
+            // Serve for a bounded window so a regression cannot hang the suite.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                };
+                let mut buf = [0u8; 8192];
+                let Ok(n) = conn.read(&mut buf) else { continue };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen_in_server.lock().unwrap().push(path.clone());
+                let status = if path.contains("tokenizer.json") {
+                    // A Hub that cannot serve the tokenizer must not be asked.
+                    "500 Internal Server Error"
+                } else {
+                    "404 Not Found"
+                };
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+            }
+        });
+
+        let outcome = Kompress::from_pretrained(KompressConfig::default());
+        let paths = seen.lock().unwrap().clone();
+        let _ = server.join();
+
+        assert!(
+            !paths.iter().any(|p| p.contains("tokenizer.json")),
+            "the cached tokenizer was re-fetched instead of reused: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("kompress")),
+            "the weight request never happened: {paths:?}"
+        );
+        assert!(
+            outcome.is_err(),
+            "no ONNX artifact is on disk, so the load must report an error"
         );
     }
 
