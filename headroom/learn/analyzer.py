@@ -14,6 +14,7 @@ users without raw API keys.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -103,6 +104,25 @@ _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
 # tools under the user's permissions. It is never auto-detected and only runs
 # when the user sets this env var to "1".
 _AGY_UNSAFE_OPT_IN_ENV = "HEADROOM_LEARN_ALLOW_UNSAFE_AGY"
+
+# Claude Code prints this to stderr and exits when an admin-managed (enterprise)
+# MCP config is present. Without --strict-mcp-config the admin's MCP servers join
+# the analysis session, so claude-cli stops there unless the user sets this env
+# var to "1".
+_ENTERPRISE_MCP_REFUSAL = (
+    "You cannot use --strict-mcp-config when an enterprise MCP config is present"
+)
+_ENTERPRISE_MCP_OPT_IN_ENV = "HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP"
+
+
+class _EnterpriseMcpRefusal(RuntimeError):
+    """claude-cli exited with the enterprise MCP refusal on its stderr."""
+
+
+def _pipe_closed(exc: OSError) -> bool:
+    """True when a stdin write failed because the child closed the pipe."""
+    return isinstance(exc, BrokenPipeError) or exc.errno == errno.EINVAL
+
 
 # Set of valid CLI model identifiers, derived from _CLI_BACKENDS.
 _CLI_MODEL_IDS: set[str] = {model for _, model, _ in _CLI_BACKENDS}
@@ -784,7 +804,8 @@ def _call_cli_llm(
     Raises:
         ValueError: If *model* is not a known CLI backend, or is ``agy-cli``
             without the unsafe opt-in.
-        RuntimeError: If the CLI is not installed, exits non-zero, or times out.
+        RuntimeError: If the CLI is not installed, exits non-zero, or times out,
+            or claude-cli meets an enterprise MCP config without its opt-in.
     """
     cmd: list[str] | None = None
     for _name, model_name, cmd_parts in _CLI_BACKENDS:
@@ -806,9 +827,31 @@ def _call_cli_llm(
 
     if model == "claude-cli":
         idle_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", _CLI_IDLE_TIMEOUT)
-        return _call_claude_cli_streaming(
-            cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
-        )
+        try:
+            return _call_claude_cli_streaming(
+                cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
+            )
+        except _EnterpriseMcpRefusal:
+            if os.environ.get(_ENTERPRISE_MCP_OPT_IN_ENV) != "1":
+                raise RuntimeError(
+                    "Claude Code refuses --strict-mcp-config because an admin-managed "
+                    "(enterprise) MCP config is present, so the analysis cannot run "
+                    "without those MCP servers, and session text could make their "
+                    f"tools act under your credentials. Set {_ENTERPRISE_MCP_OPT_IN_ENV}=1 "
+                    "to accept this risk and run anyway, or use an API key backend "
+                    "with --model <litellm-model-name>."
+                ) from None
+            logger.warning(
+                "claude-cli runs without --strict-mcp-config under an enterprise MCP "
+                "config; the admin's MCP servers connect to the analysis session"
+            )
+            # Defense in depth: a CLI deny rule keeps every MCP tool out of the
+            # session's tool list (verified with a user-level --mcp-config).
+            cmd = [part for part in cmd if part != "--strict-mcp-config"]
+            cmd += ["--disallowedTools", "mcp__*"]
+            return _call_claude_cli_streaming(
+                cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
+            )
 
     stdin = prompt
     if model == "agy-cli":
@@ -919,13 +962,20 @@ def _call_claude_cli_streaming(
             ) from None
 
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    # A CLI can exit before reading its input (the enterprise MCP refusal does),
+    # so the pipe may close mid-write. Like subprocess.communicate(), ignore that
+    # (EPIPE, or EINVAL on Windows): its stderr and exit status below decide.
     try:
         proc.stdin.write(prompt)
+    except OSError as exc:
+        if not _pipe_closed(exc):
+            raise
     finally:
         try:
             proc.stdin.close()
-        except BrokenPipeError:  # pragma: no cover — defensive, claude exits before stdin drain
-            pass
+        except OSError as exc:
+            if not _pipe_closed(exc):
+                raise
 
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
 
@@ -1013,17 +1063,19 @@ def _call_claude_cli_streaming(
 
     proc.wait()
 
+    stderr_blob = "".join(stderr_lines)
     if proc.returncode != 0:
         # `final_result` is preferred over the raw stdout tail: claude emits a
         # final `result` event even when the run fails, and its `result` field is
         # the human-readable reason ("API Error: ...", "Not logged in", usage
         # limits).
         detail = _failure_detail(
-            "".join(stderr_lines), "".join(stdout_lines), result_text=final_result, prompt=prompt
+            stderr_blob, "".join(stdout_lines), result_text=final_result, prompt=prompt
         )
-        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{detail}")
+        # stderr only: stdout and the result text can echo session text.
+        error = _EnterpriseMcpRefusal if _ENTERPRISE_MCP_REFUSAL in stderr_blob else RuntimeError
+        raise error(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{detail}")
 
-    stderr_blob = "".join(stderr_lines)
     if stderr_blob.strip():
         logger.debug("CLI stderr (exit 0): %s", stderr_blob[:_MAX_SNIPPET_LEN])
 
