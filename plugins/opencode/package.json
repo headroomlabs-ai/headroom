@@ -7,7 +7,6 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "hook-shim",
     "README.md"
   ],
   "scripts": {

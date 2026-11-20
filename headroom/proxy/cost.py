@@ -998,6 +998,7 @@ class CostTracker:
         self._api_cache_write_5m_by_model: dict[str, int] = {}
         self._api_cache_write_1h_by_model: dict[str, int] = {}
         self._api_uncached_by_model: dict[str, int] = {}
+        self._pricing_surface_by_model: dict[str, str] = {}
         # Priced dollars of requests whose model label was folded into ``other``:
         # the read-time pass prices by label, and ``other`` has no price, so
         # those dollars are priced once here, at record time.
@@ -1035,6 +1036,7 @@ class CostTracker:
         self._api_cache_write_5m_by_model.clear()
         self._api_cache_write_1h_by_model.clear()
         self._api_uncached_by_model.clear()
+        self._pricing_surface_by_model.clear()
         self._folded_input_usd = 0.0
         self._folded_output_usd = 0.0
         self._folded_savings_usd = 0.0
@@ -1048,6 +1050,7 @@ class CostTracker:
         output_tokens: int,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        cache_write_inferred: bool = False,
     ) -> float | None:
         """Estimate cost in USD using LiteLLM's pricing database.
 
@@ -1083,7 +1086,7 @@ class CostTracker:
                 prompt_tokens=input_tokens,
                 completion_tokens=output_tokens,
                 cache_read_input_tokens=cache_read_tokens,
-                cache_creation_input_tokens=cache_write_tokens,
+                cache_creation_input_tokens=0 if cache_write_inferred else cache_write_tokens,
             )
 
             total_cost = input_cost + output_cost
@@ -1124,6 +1127,7 @@ class CostTracker:
         uncached_tokens: int = 0,
         output_tokens: int = 0,
         cache_inferred: bool = False,
+        pricing_surface: str | None = None,
         tool_schema_saved: int = 0,
         provider_reported: bool = False,
     ):
@@ -1291,6 +1295,8 @@ class CostTracker:
                 output=output_tokens,
                 tool_schema_saved=tool_schema_saved,
             )
+        if pricing_surface:
+            self._pricing_surface_by_model[model] = pricing_surface
 
         # Populate _costs so check_budget() has real data to enforce against.
         # When the call site had no API usage breakdown (all cache/uncached
@@ -1332,6 +1338,7 @@ class CostTracker:
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=effective_cache_write,
+            cache_write_inferred=cache_inferred,
         )
         if cost is not None:
             entry = CostEntry(datetime.now(), cost, basis)
@@ -1516,6 +1523,51 @@ class CostTracker:
             _warn_pricing_once("output_price", "Failed to get output price", model, e)
             return None
 
+    def _get_reference_cache_prices(
+        self,
+        model: str,
+        pricing_surface: str | None = None,
+    ) -> tuple[float, float, float, float] | None:
+        """Return display-only OpenCode reference prices for unknown models.
+
+        Shaped like :meth:`_get_cache_prices` — (cache read, 5m write, 1h
+        write, uncached input). Reference pricing carries a single write rate,
+        so it fills both TTL buckets.
+        """
+        from headroom.pricing.opencode_prices import get_opencode_reference_pricing
+
+        surface = pricing_surface or self._pricing_surface_by_model.get(model)
+        pricing = get_opencode_reference_pricing(model, surface)
+        if pricing is None:
+            return None
+        uncached = pricing.input_cost_per_token
+        cache_read = pricing.cache_read_input_token_cost
+        cache_write = pricing.cache_write_input_token_cost
+        write = cache_write if cache_write is not None else uncached
+        return (
+            cache_read if cache_read is not None else uncached,
+            write,
+            write,
+            uncached,
+        )
+
+    def _get_display_cache_prices(self, model: str) -> tuple[float, float, float, float] | None:
+        return self._get_cache_prices(model) or self._get_reference_cache_prices(model)
+
+    def _pricing_metadata_for_model(self, model: str) -> dict[str, object] | None:
+        from headroom.pricing.opencode_prices import (
+            get_opencode_reference_pricing,
+            reference_pricing_metadata,
+        )
+
+        surface = self._pricing_surface_by_model.get(model)
+        if not surface:
+            return None
+        pricing = get_opencode_reference_pricing(model, surface)
+        if pricing is None:
+            return None
+        return reference_pricing_metadata(model, surface, pricing)
+
     def _write_cost_usd(self, model: str, w5m_price: float, w1h_price: float) -> float:
         """Dollar cost of ``model``'s cache writes, split by the TTL they used.
 
@@ -1660,7 +1712,7 @@ class CostTracker:
             uncached = self._api_uncached_by_model.get(model, 0)
             total_input_tokens += sent
 
-            prices = self._get_cache_prices(model)
+            prices = self._get_display_cache_prices(model)
             if prices:
                 cr_price, cw5_price, cw1h_price, uncached_price = prices
                 if cr + cw + uncached > 0:
@@ -1697,7 +1749,7 @@ class CostTracker:
             total_saved += saved
             total_compression_saved += compression_saved
             total_tool_saved += tool_saved
-            per_model[model] = {
+            model_stats: dict[str, Any] = {
                 "requests": reqs,
                 "tokens_saved": saved,
                 "compression_tokens_saved": compression_saved,
@@ -1711,6 +1763,10 @@ class CostTracker:
                 if (saved + sent) > 0
                 else 0,
             }
+            pricing_metadata = self._pricing_metadata_for_model(model)
+            if pricing_metadata:
+                model_stats["pricing"] = pricing_metadata
+            per_model[model] = model_stats
 
         # Compute actual input cost using API-reported cache breakdown and
         # LiteLLM's per-category pricing (cache reads discounted, writes at
@@ -1729,7 +1785,7 @@ class CostTracker:
             uncached = self._api_uncached_by_model.get(model, 0)
             total_input_tokens += sent
 
-            prices = self._get_cache_prices(model)
+            prices = self._get_display_cache_prices(model)
             if prices:
                 cr_price, cw5_price, cw1h_price, uncached_price = prices
                 if cr + cw + uncached > 0:
@@ -1761,11 +1817,16 @@ class CostTracker:
             saved = self._tokens_saved_by_model[model]
             if saved <= 0:
                 continue
-            prices = self._get_cache_prices(model)
+            prices = self._get_display_cache_prices(model)
             if prices:
                 _cr_price, _cw5_price, _cw1h_price, uncached_price = prices
                 savings_usd += saved * uncached_price
 
+        reference_models = {
+            model: metadata
+            for model in self._tokens_saved_by_model
+            if (metadata := self._pricing_metadata_for_model(model)) is not None
+        }
         # Completion spend. The input-only figure above is what a budget and the
         # per-model table want; a card that says "$X spent" has to include the
         # tokens the model emitted, or the spend it shows isn't the bill.
@@ -1882,6 +1943,15 @@ class CostTracker:
             # What the session actually cost, input + output.
             "total_cost_usd": round(cost_with_headroom + output_cost_usd, 4),
             "savings_usd": round(savings_usd, 4),
+            "pricing_reference": {
+                "has_reference_prices": bool(reference_models),
+                "models": reference_models,
+                "note": (
+                    "Reference-only prices are used for display when OpenCode Zen/Go "
+                    "models are missing from LiteLLM. They are not used for budget "
+                    "enforcement and OpenCode Go may be billed differently."
+                ),
+            },
             "cache_aware_savings_usd": round(cache_aware_savings_usd, 4),
             "tool_savings_usd": round(tool_savings_usd, 4),
             # Budget config passthrough — surfaces in /stats["cost"] so

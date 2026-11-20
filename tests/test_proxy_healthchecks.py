@@ -41,6 +41,17 @@ def test_livez_reports_process_health(client):
     assert data["uptime_seconds"] >= 0
 
 
+def test_healthz_reports_process_health(client):
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["service"] == "headroom-proxy"
+    assert data["status"] == "healthy"
+    assert data["alive"] is True
+    assert data["uptime_seconds"] >= 0
+
+
 def test_readyz_reports_core_subsystem_checks(client):
     response = client.get("/readyz")
 
@@ -54,6 +65,10 @@ def test_readyz_reports_core_subsystem_checks(client):
     assert data["checks"]["cache"]["status"] == "disabled"
     assert data["checks"]["rate_limiter"]["status"] == "disabled"
     assert data["checks"]["memory"]["status"] == "disabled"
+    assert data["checks"]["upstream"]["provider"] == "anthropic"
+    assert data["checks"]["upstream"]["scope"] == "configured_provider_target"
+    assert data["checks"]["upstream"]["dynamic_request_base_url_header"] == ("x-headroom-base-url")
+    assert data["checks"]["upstream"]["dynamic_request_base_urls_probed"] is False
     runtime = data["runtime"]
     assert runtime["anthropic_pre_upstream"]["resolved_concurrency"] == max(
         2, min(8, os.cpu_count() or 4)
@@ -83,6 +98,8 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     assert config["memory"] is False
     assert config["learn"] is False
     assert config["code_graph"] is False
+    assert config["provider_api_targets"]["anthropic"] == "https://api.anthropic.com"
+    assert config["provider_api_targets"]["openai"] == "https://api.openai.com"
     assert config["savings_profile"] is None
     assert config["target_ratio"] is None
     assert config["max_items_after_crush"] == 50
@@ -126,6 +143,28 @@ def test_health_reports_agent_savings_config():
     assert reported["max_items_after_crush"] == 8
     assert reported["smart_crusher_with_compaction"] is False
     assert reported["accuracy_guard"] == "strict"
+
+
+def test_health_reports_resolved_provider_api_targets(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        openai_api_url="https://opencode.ai/zen/go/v1",
+        anthropic_api_url="https://anthropic.example/v1",
+    )
+    app = create_app(config)
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["config"]["openai_api_url"] == "https://opencode.ai/zen/go/v1"
+    assert payload["config"]["provider_api_targets"]["openai"] == "https://opencode.ai/zen/go"
+    assert payload["config"]["provider_api_targets"]["anthropic"] == "https://anthropic.example"
 
 
 def test_health_includes_deployment_metadata_when_present(monkeypatch):
@@ -277,6 +316,8 @@ def test_readyz_upstream_check_disabled_by_env_var(monkeypatch):
     # When the check is skipped the component is reported as "disabled"
     assert data["checks"]["upstream"]["enabled"] is False
     assert data["checks"]["upstream"]["ready"] is True
+    assert data["checks"]["upstream"]["provider"] == "anthropic"
+    assert data["checks"]["upstream"]["dynamic_request_base_urls_probed"] is False
 
 
 def test_readyz_upstream_check_failure_returns_503(monkeypatch):
@@ -309,6 +350,8 @@ def test_readyz_upstream_check_failure_returns_503(monkeypatch):
     data = response.json()
     assert data["ready"] is False
     assert data["checks"]["upstream"]["ready"] is False
+    assert data["checks"]["upstream"]["provider"] == "anthropic"
+    assert data["checks"]["upstream"]["scope"] == "configured_provider_target"
     assert "connection refused" in data["checks"]["upstream"]["error"]
 
 

@@ -169,3 +169,29 @@ def test_budget_input_cost_counted_without_usage_breakdown():
 
     # 500k input tokens at Sonnet list price is ~$1.50 — must be > output-only
     assert ct.get_period_cost() > 0.5
+
+
+def test_opencode_go_reference_prices_are_display_only(monkeypatch):
+    """OpenCode Go can surface Zen reference prices without budget enforcement."""
+    import headroom.pricing.opencode_prices as opencode_prices
+    from headroom.proxy.server import CostTracker
+
+    opencode_prices._SCRAPE_CACHE.clear()
+    monkeypatch.setattr(opencode_prices, "_fetch_docs_pricing", lambda surface: {})
+    ct = CostTracker()
+    monkeypatch.setattr(ct, "_get_cache_prices", lambda model, **kw: None)
+    ct.record_tokens(
+        "glm-5.2",
+        tokens_saved=100_000,
+        tokens_sent=200_000,
+        uncached_tokens=200_000,
+        pricing_surface="opencode-go",
+    )
+
+    stats = ct.stats()
+    assert stats["total_input_cost_usd"] == 0.28
+    assert stats["savings_usd"] == 0.14
+    assert stats["pricing_reference"]["has_reference_prices"] is True
+    assert stats["per_model"]["glm-5.2"]["pricing"]["reference_only"] is True
+    assert stats["per_model"]["glm-5.2"]["pricing"]["surface"] == "opencode-go"
+    assert ct.get_period_cost() == 0.0

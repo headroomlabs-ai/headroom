@@ -741,13 +741,16 @@ def test_release_yml_does_not_install_openssl_or_perl_for_wheels() -> None:
         )
 
 
-def test_build_wheels_matrix_includes_intel_macos_with_dynamic_ort() -> None:
-    """Intel macOS wheels use `ort-load-dynamic` because `ort-sys 2.0.0-rc.12`
+def test_build_wheels_matrix_excludes_intel_macos() -> None:
+    """`ort-sys 2.0.0-rc.12` (transitive via the ML compression backend)
     has no prebuilt ONNX Runtime binaries for `x86_64-apple-darwin`.
+    Building ORT from source would add CMake + ~5 minutes per build.
+    Apple Silicon macOS is fully covered; Intel-mac users install from
+    the platform-independent sdist this matrix also produces.
 
     We assert against the actual matrix entry shape (`target: <triple>`
-    on a non-comment line) so explanatory comments mentioning other
-    triples don't false-positive.
+    on a non-comment line) so explanatory comments mentioning the
+    excluded triple don't false-positive.
     """
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
@@ -768,10 +771,14 @@ def test_build_wheels_matrix_includes_intel_macos_with_dynamic_ort() -> None:
     assert "aarch64-apple-darwin" in matrix_targets, "Apple Silicon must stay in the matrix"
     assert "x86_64-unknown-linux-gnu" in matrix_targets
     assert "aarch64-unknown-linux-gnu" in matrix_targets
-    assert "x86_64-apple-darwin" in matrix_targets, (
-        f"x86_64-apple-darwin must be a wheel-matrix target; got {matrix_targets}"
+
+    # Intel macOS must NOT be a matrix entry — re-add only after switching
+    # off ort-sys (e.g., to ort-tract) or adding a CMake-from-source step.
+    assert "x86_64-apple-darwin" not in matrix_targets, (
+        f"x86_64-apple-darwin must not be a wheel-matrix target; got {matrix_targets}"
     )
 
+    # The runner OS itself shouldn't appear as a configured `os:` either.
     matrix_os: list[str] = []
     for raw in body.splitlines():
         stripped = raw.lstrip()
@@ -779,27 +786,7 @@ def test_build_wheels_matrix_includes_intel_macos_with_dynamic_ort() -> None:
             continue
         if stripped.startswith("os:"):
             matrix_os.append(stripped.split(":", 1)[1].strip())
-        elif stripped.startswith("- os:"):
-            matrix_os.append(stripped.split(":", 1)[1].strip())
-    assert "macos-15-intel" in matrix_os
-
-
-def test_smoke_import_macos_selects_wheel_arch_from_target() -> None:
-    """The macOS smoke-import step must pick the wheel tag from the matrix
-    target (arm64 for Apple Silicon, x86_64 for Intel) instead of
-    hardcoding `_arm64` for every macOS row."""
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-
-    step_start = content.index("- name: Smoke-import wheel on macOS host")
-    step_end = content.index("- name: Smoke-import wheel on Windows host", step_start)
-    macos_block = content[step_start:step_end]
-
-    assert "WHEEL_TARGET: ${{ matrix.wheel_target }}" in macos_block
-    assert "aarch64-apple-darwin) mac_arch=arm64" in macos_block
-    assert "x86_64-apple-darwin) mac_arch=x86_64" in macos_block
-    assert "macosx_*_${mac_arch}.whl" in macos_block
-    assert "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" not in macos_block
-    assert "headroom_ai-*-abi3-macosx_*_arm64.whl" not in macos_block
+    assert "macos-15-intel" not in matrix_os
 
 
 def test_aarch64_wheel_uses_native_arm64_runner() -> None:

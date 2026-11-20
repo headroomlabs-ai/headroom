@@ -203,6 +203,23 @@ def test_query_string_is_preserved_for_reconstructed_upstream_paths() -> None:
         _assert_path(captured, expected_path)
 
 
+def test_opencode_go_original_path_prefix_is_preserved() -> None:
+    body = {"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}]}
+    headers = {
+        "Authorization": "Bearer sk-test",
+        "x-headroom-base-url": "https://opencode.ai",
+        "x-headroom-original-path": "/zen/go/v1/chat/completions",
+    }
+
+    client, captured = _build_openai_client()
+    response = client.post(_OPENAI_CHAT_PATH, headers=headers, json=body)
+    assert response.status_code == 200, response.text
+
+    assert captured["method"] == "POST"
+    _assert_origin(captured, "https://opencode.ai")
+    _assert_path(captured, "/zen/go/v1/chat/completions")
+
+
 def test_opencode_zen_reconstructed_chat_path_records_zen_provider() -> None:
     headers = {
         "Authorization": "Bearer sk-test",

@@ -77,6 +77,13 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# Except the pre-built OpenCode plugin bundle shipped inside the Python
+# package itself (headroom/providers/opencode/_plugin_dist/dist/) — this is
+# not a build artifact directory to ignore, it's checked-in plugin runtime
+# code that must ship with headroom-ai so `headroom wrap opencode` always
+# works without an npm publish or a local `npm run build`.
+!headroom/providers/opencode/_plugin_dist/dist/
+!headroom/providers/opencode/_plugin_dist/dist/**
 downloads/
 eggs/
 .eggs/

@@ -80,6 +80,14 @@ from headroom.proxy.upstream_guard import is_safe_upstream_url_async
 logger = logging.getLogger("headroom.proxy.routes")
 
 
+def _select_openai_base_url(proxy: Any, headers: dict[str, str]) -> str:
+    custom_base = headers.get("x-headroom-base-url", "")
+    if custom_base:
+        normalized = custom_base.rstrip("/")
+        return normalized[:-3] if normalized.endswith("/v1") else normalized
+    return _api_target(proxy, "openai")
+
+
 async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Response | None:
     upstream_headers = dict(request.headers.items())
     drop_header(upstream_headers, "host")
@@ -224,10 +232,14 @@ def _register_openai_responses_subpath_route(
         if chatgpt_response is not None:
             return chatgpt_response
 
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
         return await handle_openai_responses_subpath(
             proxy.http_client,
             request,
-            _api_target(proxy, "openai"),
+            _select_openai_base_url(proxy, dict(request.headers)),
             sub_path,
         )
 
@@ -290,10 +302,14 @@ def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
 
 def _register_openai_image_route(app: FastAPI, proxy: Any, endpoint: OpenAIImageEndpoint) -> None:
     async def openai_image_endpoint(request: Request):
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
         return await handle_openai_image_endpoint(
             proxy,
             request,
-            openai_api_base_url=_api_target(proxy, "openai"),
+            openai_api_base_url=_select_openai_base_url(proxy, dict(request.headers)),
             endpoint=endpoint,
         )
 

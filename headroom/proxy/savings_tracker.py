@@ -291,6 +291,13 @@ def _normalize_agent(value: Any) -> str:
 
 MODEL_UNKNOWN = "unknown"
 
+_RAW_BREAKDOWN_FIELDS = (
+    "total_cache_read_tokens",
+    "total_cache_write_tokens",
+    "total_uncached_input_tokens",
+    "total_inferred_cache_write_tokens",
+)
+
 
 def _empty_cache_delta() -> dict[str, Any]:
     """Zeroed cache fields for a rollup bucket or one of its breakdowns.
@@ -316,6 +323,36 @@ def _normalize_model(value: Any) -> str:
         return MODEL_UNKNOWN
     cleaned = value.strip()
     return cleaned or MODEL_UNKNOWN
+
+
+def _merge_raw_breakdown_totals(
+    target: dict[str, Any],
+    *,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    uncached_input_tokens: int = 0,
+    inferred_cache_write_tokens: int = 0,
+) -> None:
+    deltas = {
+        "total_cache_read_tokens": _coerce_int(cache_read_tokens),
+        "total_cache_write_tokens": _coerce_int(cache_write_tokens),
+        "total_uncached_input_tokens": _coerce_int(uncached_input_tokens),
+        "total_inferred_cache_write_tokens": _coerce_int(inferred_cache_write_tokens),
+    }
+    for key, delta in deltas.items():
+        if delta > 0:
+            target[key] = _coerce_int(target.get(key)) + delta
+
+
+def _raw_breakdown_totals(entry: Any) -> dict[str, int]:
+    if not isinstance(entry, dict):
+        return {}
+    totals: dict[str, int] = {}
+    for key in _RAW_BREAKDOWN_FIELDS:
+        value = _coerce_int(entry.get(key))
+        if value > 0:
+            totals[key] = value
+    return totals
 
 
 # `_resolve_litellm_model` is called on every savings-tracking update (i.e.
@@ -423,33 +460,42 @@ def _log_unpriced_model_once(model: str, field: str) -> None:
         )
 
 
-def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
+def _estimate_compression_savings_usd(
+    model: str,
+    tokens_saved: int,
+    pricing_surface: str | None = None,
+) -> float:
     """Estimate compression savings in USD from saved input tokens."""
     litellm = _get_litellm_module()
     if tokens_saved <= 0:
         return 0.0
-    if litellm is None:
-        return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
-    try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
-        input_cost_per_token = info.get("input_cost_per_token")
-        # Distinguish "price unknown" (missing key → fall back) from a model that
-        # is legitimately free (input_cost_per_token == 0.0). `if not ...` treated
-        # a real 0.0 as unavailable and billed the $3/M fallback — phantom savings
-        # for a model that costs nothing.
-        if input_cost_per_token is None:
+    if litellm is not None:
+        try:
+            resolved = _resolve_litellm_model(model)
+            info = litellm.model_cost.get(resolved, {})
+            input_cost_per_token = info.get("input_cost_per_token")
+            # Distinguish "price unknown" (missing key → fall back) from a
+            # model that is legitimately free (input_cost_per_token == 0.0).
+            # `if not ...` treated a real 0.0 as unavailable and billed the
+            # $3/M fallback — phantom savings for a model that costs nothing.
+            if input_cost_per_token is not None:
+                return float(tokens_saved) * float(input_cost_per_token)
             _log_unpriced_model_once(model, "input_cost_per_token")
-            return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
-        return float(tokens_saved) * float(input_cost_per_token)
-    except Exception as exc:
-        logger.debug(
-            "Compression savings priced at the fallback rate for model=%s: %s",
-            safe_id(model),
-            describe_exception(exc),
-        )
-        return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        except Exception as exc:
+            logger.debug(
+                "Compression savings priced at the fallback rate for model=%s: %s",
+                safe_id(model),
+                describe_exception(exc),
+            )
+
+    from headroom.pricing.opencode_prices import get_opencode_reference_pricing
+
+    reference_pricing = get_opencode_reference_pricing(model, pricing_surface)
+    if reference_pricing is not None:
+        return float(tokens_saved) * float(reference_pricing.input_cost_per_token)
+
+    return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
 def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
@@ -668,6 +714,8 @@ def _estimate_input_cost_usd(
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     uncached_input_tokens: int = 0,
+    cache_write_inferred: bool = False,
+    pricing_surface: str | None = None,
 ) -> float:
     """Estimate input spend in USD for a request.
 
@@ -678,56 +726,67 @@ def _estimate_input_cost_usd(
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
+    billed_cache_write = 0 if cache_write_inferred else cache_write
 
-    # Prefer the breakdown when callers supply segmented token counts.
-    # Never add `input_tokens` on top of the breakdown to avoid double-counting.
+    # Prefer the breakdown when callers supply segmented token counts. Use the
+    # raw (non-billed) cache_write to detect breakdown presence — an inferred
+    # cache write still means "this request had cache activity", even though
+    # it isn't separately billed. Never add `input_tokens` on top of the
+    # breakdown to avoid double-counting.
     use_breakdown = (cache_read + cache_write + uncached) > 0
     chargeable_tokens = (
-        (cache_read + cache_write + uncached) if use_breakdown else total_input_tokens
+        (cache_read + billed_cache_write + uncached) if use_breakdown else total_input_tokens
     )
-    if chargeable_tokens <= 0:
+    if total_input_tokens + cache_read + cache_write + uncached <= 0:
         return 0.0
 
     litellm = _get_litellm_module()
     # Keep exact provider pricing authoritative when available.
-    # `litellm` can be present but lack an entry for the resolved model,
-    # in which case we fall back to a blended rate instead of zeroing usage.
-    if litellm is None:
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+    # `litellm` can be present but lack an entry for the resolved model, in
+    # which case we fall back to Headroom's opencode reference pricing table
+    # (when applicable) and finally to a blended rate instead of zeroing usage.
+    if litellm is not None:
+        try:
+            resolved = _resolve_litellm_model(model)
+            info = litellm.model_cost.get(resolved, {})
+            input_cost_per_token = info.get("input_cost_per_token")
+            if input_cost_per_token is not None:
+                if use_breakdown:
+                    cache_read_cost = info.get(
+                        "cache_read_input_token_cost",
+                        input_cost_per_token,
+                    )
+                    cache_write_cost = info.get(
+                        "cache_creation_input_token_cost",
+                        input_cost_per_token,
+                    )
+                    return (
+                        float(cache_read) * float(cache_read_cost)
+                        + float(billed_cache_write) * float(cache_write_cost)
+                        + float(uncached) * float(input_cost_per_token)
+                    )
 
-    try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
-        input_cost_per_token = info.get("input_cost_per_token")
-        # A missing key means the model is unknown → fall back to a blended rate.
-        # A present 0.0 means the model is free and must cost $0, not the fallback.
-        if input_cost_per_token is None:
+                return float(total_input_tokens) * float(input_cost_per_token)
             _log_unpriced_model_once(model, "input_cost_per_token")
-            return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        except Exception:
+            pass
 
+    from headroom.pricing.opencode_prices import get_opencode_reference_pricing
+
+    reference_pricing = get_opencode_reference_pricing(model, pricing_surface)
+    if reference_pricing is not None:
+        input_cost_per_token = reference_pricing.input_cost_per_token
         if use_breakdown:
-            cache_read_cost = info.get(
-                "cache_read_input_token_cost",
-                input_cost_per_token,
-            )
-            cache_write_cost = info.get(
-                "cache_creation_input_token_cost",
-                input_cost_per_token,
-            )
+            cache_read_cost = reference_pricing.cache_read_input_token_cost
+            cache_write_cost = reference_pricing.cache_write_input_token_cost
             return (
-                float(cache_read) * float(cache_read_cost)
-                + float(cache_write) * float(cache_write_cost)
+                float(cache_read) * float(cache_read_cost or input_cost_per_token)
+                + float(billed_cache_write) * float(cache_write_cost or input_cost_per_token)
                 + float(uncached) * float(input_cost_per_token)
             )
-
         return float(total_input_tokens) * float(input_cost_per_token)
-    except Exception as exc:
-        logger.debug(
-            "Input cost priced at the fallback rate for model=%s: %s",
-            safe_id(model),
-            describe_exception(exc),
-        )
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+
+    return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
@@ -784,7 +843,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     if timestamp is None:
         return None
 
-    return {
+    normalized = {
         "timestamp": _to_utc_iso(timestamp),
         "provider": provider,
         "model": model,
@@ -802,6 +861,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "tool_schema_savings_usd": round(tool_schema_savings_usd, 6),
         "total_output_cost_usd": round(total_output_cost_usd, 6),
     }
+    normalized.update(_raw_breakdown_totals(entry))
+    return normalized
 
 
 def _empty_display_session() -> dict[str, Any]:
@@ -871,6 +932,7 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["total_input_cost_usd"] = round(
             _coerce_float(entry.get("total_input_cost_usd")), 6
         )
+        normalized.update(_raw_breakdown_totals(entry))
         last_activity = _parse_timestamp(entry.get("last_activity_at"))
         normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
         projects[cleaned_name] = normalized
@@ -943,7 +1005,7 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         savings_list_usd = _coerce_signed_float(entry.get("compression_savings_list_usd"))
         savings_basis = str(entry.get("savings_basis") or BASIS_UNKNOWN)
 
-    return {
+    normalized = {
         "requests": _coerce_int(entry.get("requests")),
         "tokens_saved": tokens_saved,
         "compression_savings_usd": round(savings_usd, 6),
@@ -968,6 +1030,8 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         "started_at": _to_utc_iso(started_at),
         "last_activity_at": _to_utc_iso(last_activity_at),
     }
+    normalized.update(_raw_breakdown_totals(entry))
+    return normalized
 
 
 class SavingsTracker:
@@ -1077,6 +1141,7 @@ class SavingsTracker:
         model: str,
         tokens_saved: int,
         provider: str | None = None,
+        pricing_surface: str | None = None,
         agent: str | None = None,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
@@ -1097,7 +1162,14 @@ class SavingsTracker:
         if timestamp_dt is None:
             timestamp_dt = _utc_now()
 
-        delta_usd = _estimate_compression_savings_usd(model, delta_tokens)
+        if pricing_surface is None:
+            delta_usd = _estimate_compression_savings_usd(model, delta_tokens)
+        else:
+            delta_usd = _estimate_compression_savings_usd(
+                model,
+                delta_tokens,
+                pricing_surface=pricing_surface,
+            )
 
         with self._lock:
             lifetime = self._state["lifetime"]
@@ -1136,6 +1208,7 @@ class SavingsTracker:
                     "compression_savings_usd": lifetime["compression_savings_usd"],
                     "total_input_tokens": lifetime["total_input_tokens"],
                     "total_input_cost_usd": lifetime["total_input_cost_usd"],
+                    **_raw_breakdown_totals(lifetime),
                 }
             )
             self._trim_history_locked(reference_time=timestamp_dt)
@@ -1166,9 +1239,11 @@ class SavingsTracker:
         provider: str | None = None,
         agent: str | None = None,
         project: str | None = None,
+        pricing_surface: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        cache_write_inferred: bool = False,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
         # Mixed value types: per-layer dollars plus the string `basis` label
@@ -1191,6 +1266,11 @@ class SavingsTracker:
         delta_tokens_saved = _coerce_int(tokens_saved)
         delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
+        delta_savings_usd = _estimate_compression_savings_usd(
+            model,
+            delta_tokens_saved,
+            pricing_surface=pricing_surface,
+        )
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
         delta_output_tokens_saved_high = (
             delta_output_tokens_saved
@@ -1297,6 +1377,8 @@ class SavingsTracker:
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             uncached_input_tokens=uncached_input_tokens,
+            cache_write_inferred=cache_write_inferred,
+            pricing_surface=pricing_surface,
         )
 
         with self._lock:
@@ -1349,6 +1431,13 @@ class SavingsTracker:
             )
             lifetime["total_input_tokens"] = next_total_input_tokens
             lifetime["total_input_cost_usd"] = next_total_input_cost_usd
+            _merge_raw_breakdown_totals(
+                lifetime,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+                inferred_cache_write_tokens=cache_write_tokens if cache_write_inferred else 0,
+            )
             lifetime["output_tokens_saved"] = (
                 lifetime.get("output_tokens_saved", 0) + delta_output_tokens_saved
             )
@@ -1416,6 +1505,13 @@ class SavingsTracker:
                 session["total_input_cost_usd"] + session_input_cost_delta,
                 6,
             )
+            _merge_raw_breakdown_totals(
+                session,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+                inferred_cache_write_tokens=cache_write_tokens if cache_write_inferred else 0,
+            )
             total_before = session["tokens_saved"] + session["total_input_tokens"]
             session["savings_percent"] = round(
                 (session["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
@@ -1443,6 +1539,10 @@ class SavingsTracker:
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
+                cache_read_tokens_delta=cache_read_tokens,
+                cache_write_tokens_delta=cache_write_tokens,
+                uncached_input_tokens_delta=uncached_input_tokens,
+                inferred_cache_write_tokens_delta=cache_write_tokens if cache_write_inferred else 0,
             )
 
             # In --mode cache, headroom's own compression (tokens_saved) is
@@ -1463,26 +1563,26 @@ class SavingsTracker:
                 or delta_tool_tokens_saved > 0
                 or delta_output_tokens > 0
             ):
-                self._state["history"].append(
-                    {
-                        "timestamp": _to_utc_iso(timestamp_dt),
-                        "provider": _normalize_provider(provider),
-                        "agent": _normalize_agent(agent),
-                        "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
-                        "total_tokens_saved": lifetime["tokens_saved"],
-                        "compression_savings_usd": lifetime["compression_savings_usd"],
-                        "cache_read_tokens": lifetime["cache_read_tokens"],
-                        "cache_savings_usd": lifetime["cache_savings_usd"],
-                        "total_input_tokens": lifetime["total_input_tokens"],
-                        "total_input_cost_usd": lifetime["total_input_cost_usd"],
-                        "output_tokens_saved": lifetime.get("output_tokens_saved", 0),
-                        "output_tokens": lifetime.get("output_tokens", 0),
-                        "output_savings_usd": lifetime.get("output_savings_usd", 0.0),
-                        "tool_tokens_saved": lifetime["tool_tokens_saved"],
-                        "tool_schema_savings_usd": lifetime["tool_schema_savings_usd"],
-                        "total_output_cost_usd": lifetime.get("total_output_cost_usd", 0.0),
-                    }
-                )
+                history_entry = {
+                    "timestamp": _to_utc_iso(timestamp_dt),
+                    "provider": _normalize_provider(provider),
+                    "agent": _normalize_agent(agent),
+                    "model": _normalize_model(model)[:MAX_LABEL_LENGTH],
+                    "total_tokens_saved": lifetime["tokens_saved"],
+                    "compression_savings_usd": lifetime["compression_savings_usd"],
+                    "cache_read_tokens": lifetime["cache_read_tokens"],
+                    "cache_savings_usd": lifetime["cache_savings_usd"],
+                    "total_input_tokens": lifetime["total_input_tokens"],
+                    "total_input_cost_usd": lifetime["total_input_cost_usd"],
+                    "output_tokens_saved": lifetime.get("output_tokens_saved", 0),
+                    "output_tokens": lifetime.get("output_tokens", 0),
+                    "output_savings_usd": lifetime.get("output_savings_usd", 0.0),
+                    "tool_tokens_saved": lifetime["tool_tokens_saved"],
+                    "tool_schema_savings_usd": lifetime["tool_schema_savings_usd"],
+                    "total_output_cost_usd": lifetime.get("total_output_cost_usd", 0.0),
+                }
+                history_entry.update(_raw_breakdown_totals(lifetime))
+                self._state["history"].append(history_entry)
                 self._trim_history_locked(reference_time=timestamp_dt)
 
             self._maybe_save_locked()
@@ -1598,6 +1698,10 @@ class SavingsTracker:
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
+        cache_read_tokens_delta: int = 0,
+        cache_write_tokens_delta: int = 0,
+        uncached_input_tokens_delta: int = 0,
+        inferred_cache_write_tokens_delta: int = 0,
     ) -> None:
         """Accumulate per-project savings. Caller must hold ``self._lock``.
 
@@ -1618,6 +1722,13 @@ class SavingsTracker:
         entry["total_input_tokens"] += max(input_tokens_delta, 0)
         entry["total_input_cost_usd"] = round(
             entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
+        )
+        _merge_raw_breakdown_totals(
+            entry,
+            cache_read_tokens=cache_read_tokens_delta,
+            cache_write_tokens=cache_write_tokens_delta,
+            uncached_input_tokens=uncached_input_tokens_delta,
+            inferred_cache_write_tokens=inferred_cache_write_tokens_delta,
         )
         entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
         if len(projects) > DEFAULT_MAX_PROJECTS:
@@ -2059,7 +2170,7 @@ class SavingsTracker:
                 migrated_at = _to_utc_iso(_utc_now())
                 self._needs_schema_save = True
 
-        state = {
+        state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "lifetime": {
                 "requests": lifetime_requests,
@@ -2092,6 +2203,9 @@ class SavingsTracker:
             "projects": _normalize_projects(raw.get("projects")),
             "by_model": _normalize_by_model(raw.get("by_model")),
         }
+        state["lifetime"].update(_raw_breakdown_totals(lifetime_raw))
+        if normalized_history:
+            state["lifetime"].update(_raw_breakdown_totals(normalized_history[-1]))
         raw_lifetime_metrics = raw.get("lifetime_metrics")
         if isinstance(raw_lifetime_metrics, dict):
             state["lifetime_metrics"] = raw_lifetime_metrics
