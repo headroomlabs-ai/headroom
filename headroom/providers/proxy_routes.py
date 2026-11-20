@@ -11,7 +11,10 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import Response
 
 from headroom.log_safety import redact_url
-from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
+from headroom.providers.cloudcode import (
+    AGY_DISPATCH_SCOPE_KEY,
+    normalize_cloudcode_passthrough_path,
+)
 from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.live import (
@@ -41,6 +44,9 @@ from headroom.providers.openai_responses import (
 )
 from headroom.providers.proxy_targets import (
     api_target as _api_target,
+)
+from headroom.providers.proxy_targets import (
+    cloudcode_host_base as _cloudcode_host_base,
 )
 from headroom.providers.proxy_targets import (
     openai_compatible_base_url as _openai_compatible_base_url,
@@ -336,17 +342,28 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         normalized_cloudcode_path = normalize_cloudcode_passthrough_path(path)
         if normalized_cloudcode_path is not None:
             normalize_request_path(request, normalized_cloudcode_path)
+            host = request.headers.get("host", "")
+            cloudcode_base = (
+                _cloudcode_host_base(host)
+                if request.scope.get(AGY_DISPATCH_SCOPE_KEY) is True
+                else None
+            ) or _api_target(proxy, "cloudcode")
 
             return await proxy.handle_passthrough(
                 request,
-                _api_target(proxy, "cloudcode"),
+                cloudcode_base,
             )
 
         return await proxy.handle_passthrough(
             request,
             # The path matters here: this is where unrouted paths land, and
             # Copilot's inline completions are one of them (#3076).
-            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
+            _select_passthrough_base_url(
+                proxy,
+                dict(request.headers),
+                request.url.path,
+                allow_cloudcode_host=request.scope.get(AGY_DISPATCH_SCOPE_KEY) is True,
+            ),
         )
 
     async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
@@ -687,7 +704,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
         return await proxy.handle_passthrough(
             request,
-            _select_passthrough_base_url(proxy, dict(request.headers)),
+            _select_passthrough_base_url(
+                proxy,
+                dict(request.headers),
+                allow_cloudcode_host=request.scope.get(AGY_DISPATCH_SCOPE_KEY) is True,
+            ),
         )
 
     _register_openai_image_routes(app, proxy)
