@@ -403,6 +403,7 @@ def test_wrap_claude_project_settings_flag_writes_and_restores(tmp_path: Path) -
             "old",
             foundry_mode=False,
             vertex_mode=False,
+            bedrock_mode=False,
             settings_path=write_kwargs["settings_path"],
         )
 

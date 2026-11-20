@@ -880,6 +880,7 @@ def _start_proxy(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    bedrock_sign: bool = False,
     factory_api_url: str | None = None,
     proxy_extensions: list[str] | None = None,
 ) -> subprocess.Popen:
@@ -933,6 +934,10 @@ def _start_proxy(
     _region = region or os.environ.get("HEADROOM_REGION")
     if _region:
         cmd.extend(["--region", _region])
+
+    # Direct-to-AWS Bedrock SigV4 re-signing (CLAUDE_CODE_USE_BEDROCK turnkey).
+    if bedrock_sign:
+        cmd.append("--bedrock-sign")
 
     if openai_api_url:
         cmd.extend(["--openai-api-url", openai_api_url])
@@ -1555,9 +1560,13 @@ def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
     return vertex_url
 
 
-def _claude_wrap_base_url_env_key(*, foundry_mode: bool = False, vertex_mode: bool = False) -> str:
+def _claude_wrap_base_url_env_key(
+    *, foundry_mode: bool = False, vertex_mode: bool = False, bedrock_mode: bool = False
+) -> str:
     if vertex_mode:
         return "ANTHROPIC_VERTEX_BASE_URL"
+    if bedrock_mode:
+        return "ANTHROPIC_BEDROCK_BASE_URL"
     if foundry_mode:
         return "ANTHROPIC_FOUNDRY_BASE_URL"
     return "ANTHROPIC_BASE_URL"
@@ -2040,6 +2049,7 @@ def _selfheal_dead_wrap_base_url() -> None:
             _claude_wrap_base_url_env_key(),
             _claude_wrap_base_url_env_key(foundry_mode=True),
             _claude_wrap_base_url_env_key(vertex_mode=True),
+            _claude_wrap_base_url_env_key(bedrock_mode=True),
         ):
             _check_and_clear_dead_wrap_marker(settings_path, key=key)
         # The prior value a clear restores may itself be None, so detect the
@@ -2186,6 +2196,7 @@ def _write_claude_wrap_base_url(
     *,
     foundry_mode: bool = False,
     vertex_mode: bool = False,
+    bedrock_mode: bool = False,
     settings_path: Path | None = None,
     port: int | None = None,
 ) -> str | None:
@@ -2205,7 +2216,9 @@ def _write_claude_wrap_base_url(
     detected and self-healed (issue #1768).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
+    key = _claude_wrap_base_url_env_key(
+        foundry_mode=foundry_mode, vertex_mode=vertex_mode, bedrock_mode=bedrock_mode
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     with _wrap_settings_lock(path):
         payload = _read_settings_for_write(path)
@@ -2260,6 +2273,7 @@ def _restore_claude_wrap_base_url(
     *,
     foundry_mode: bool = False,
     vertex_mode: bool = False,
+    bedrock_mode: bool = False,
     settings_path: Path | None = None,
     _key_override: str | None = None,
     force: bool = False,
@@ -2284,7 +2298,7 @@ def _restore_claude_wrap_base_url(
 
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
-        foundry_mode=foundry_mode, vertex_mode=vertex_mode
+        foundry_mode=foundry_mode, vertex_mode=vertex_mode, bedrock_mode=bedrock_mode
     )
     with nullcontext() if _lock_held else _wrap_settings_lock(path):
         # Another live wrap session in this project may still be using the key.
@@ -5115,6 +5129,7 @@ def _ensure_proxy_unlocked(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    bedrock_sign: bool = False,
     factory_api_url: str | None = None,
 ) -> tuple[subprocess.Popen | None, int]:
     """Start or verify proxy. Returns (process_handle, actual_port).
@@ -5591,6 +5606,7 @@ def _ensure_proxy_unlocked(
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
+                    bedrock_sign=bedrock_sign,
                     factory_api_url=factory_api_url,
                     proxy_extensions=proxy_extensions,
                 ),
@@ -6432,6 +6448,7 @@ def claude(
     _wrote_project_settings: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
+    _settings_bedrock: list[bool] = [False]
     # Bind before the try so the finally can always reference it. It is otherwise
     # only assigned inside the try (after _ensure_proxy, which can raise), so an
     # early proxy-start failure would make the finally raise UnboundLocalError,
@@ -6737,11 +6754,18 @@ def claude(
         # are disabled. The marker records the prior value to restore; without
         # one, default wraps leave project settings untouched (#1599).
         _settings_vertex[0] = bool(use_vertex)
-        _settings_foundry[0] = bool(foundry_upstream) and not _settings_vertex[0]
+        _settings_bedrock[0] = bool(use_bedrock) and not _settings_vertex[0]
+        _settings_foundry[0] = (
+            bool(foundry_upstream) and not _settings_vertex[0] and not _settings_bedrock[0]
+        )
+        # _wrap_settings_path is bound before the try (above) so the finally is
+        # always safe; the value is unchanged here.
         _check_and_clear_stale_wrap_marker(
             _wrap_settings_path,
             key=_claude_wrap_base_url_env_key(
-                foundry_mode=_settings_foundry[0], vertex_mode=_settings_vertex[0]
+                foundry_mode=_settings_foundry[0],
+                vertex_mode=_settings_vertex[0],
+                bedrock_mode=_settings_bedrock[0],
             ),
         )
         if use_bedrock and _claude_project_settings_enabled(project_settings):
@@ -6762,6 +6786,7 @@ def claude(
                 ),
                 foundry_mode=_settings_foundry[0],
                 vertex_mode=_settings_vertex[0],
+                bedrock_mode=_settings_bedrock[0],
                 settings_path=_wrap_settings_path,
                 port=actual_port,
             )
@@ -6856,6 +6881,7 @@ def claude(
                 _saved_base_url[0],
                 foundry_mode=_settings_foundry[0],
                 vertex_mode=_settings_vertex[0],
+                bedrock_mode=_settings_bedrock[0],
                 settings_path=_wrap_settings_path,
             )
         cleanup()
@@ -6953,8 +6979,15 @@ def unwrap_claude(
     _unwrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
     if _remove_claude_wrap_selfheal_hook(_unwrap_settings_path):
         click.echo("  Removed Headroom wrap self-heal SessionStart hook (issue #2221).")
-    for _foundry, _vertex in ((False, False), (True, False), (False, True)):
-        _key = _claude_wrap_base_url_env_key(foundry_mode=_foundry, vertex_mode=_vertex)
+    for _foundry, _vertex, _bedrock in (
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ):
+        _key = _claude_wrap_base_url_env_key(
+            foundry_mode=_foundry, vertex_mode=_vertex, bedrock_mode=_bedrock
+        )
         _marker = _read_wrap_marker(_unwrap_settings_path)
         _prior = (
             _marker.get("previous") if _marker is not None and _marker.get("key") == _key else None
@@ -6963,6 +6996,7 @@ def unwrap_claude(
             _prior,
             foundry_mode=_foundry,
             vertex_mode=_vertex,
+            bedrock_mode=_bedrock,
             settings_path=_unwrap_settings_path,
             # unwrap is the user asking for their settings back, so it drops
             # every wrap session's claim rather than deferring to a live
