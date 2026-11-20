@@ -144,10 +144,10 @@ def test_openai_responses_path(inline_resolve):
 
     assert resp.status_code == 200, resp.text
     text = resp.json()["output"][0]["content"][0]["text"]
-    if inline_resolve:
-        assert text == f"here it is: {ORIGINAL}"
-    else:
-        assert text == f"here it is: {marker}"
+    # Explicit inline resolution returns the original. The unconditional
+    # client-bound invariant uses a bounded prose placeholder instead.
+    expected = ORIGINAL if inline_resolve else "[compressed content: string,23.6KB]"
+    assert text == f"here it is: {expected}"
 
 
 @pytest.mark.parametrize("inline_resolve", [True, False])
@@ -167,7 +167,5 @@ def test_anthropic_messages_path(inline_resolve):
 
     assert resp.status_code == 200, resp.text
     text = resp.json()["content"][0]["text"]
-    if inline_resolve:
-        assert text == f"here it is: {ORIGINAL}"
-    else:
-        assert text == f"here it is: {marker}"
+    expected = ORIGINAL if inline_resolve else "[compressed content: string,23.6KB]"
+    assert text == f"here it is: {expected}"

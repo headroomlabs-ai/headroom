@@ -49,6 +49,7 @@ def _config() -> ProxyConfig:
         memory_enabled=False,
         ccr_inject_tool=True,
         ccr_handle_responses=True,
+        ccr_event_streaming=False,
         ccr_context_tracking=False,
         image_optimize=False,
         # Commit immediately, so a failure is exercised on the committed path

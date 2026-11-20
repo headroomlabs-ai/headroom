@@ -115,7 +115,7 @@ def test_anthropic_ccr_exception_reraises_not_swallowed():
 
 
 @pytest.mark.parametrize("status", [401, 429, 500])
-def test_anthropic_ccr_non_2xx_continuation_keeps_original_response(status: int):
+def test_anthropic_ccr_non_2xx_continuation_does_not_leak_private_call(status: int):
     """A failed CCR continuation must not become a synthetic HTTP 200 error."""
     config = _make_config()
     hash_key = get_compression_store().store(
@@ -168,6 +168,7 @@ def test_anthropic_ccr_non_2xx_continuation_keeps_original_response(status: int)
             )
 
     assert len(continuation_client.post_calls) == 1
-    assert response.status_code == 200
-    assert response.json() == initial_response
-    assert response.content == initial_bytes
+    assert response.status_code == 502
+    assert "headroom_retrieve" not in response.text
+    assert "toolu_bad" not in response.text
+    assert "content" not in response.json()
