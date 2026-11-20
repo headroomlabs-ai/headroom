@@ -254,6 +254,20 @@ def test_dictionary_cells_still_decode_edge_values() -> None:
     ]
 
 
+@pytest.mark.parametrize(("rows", "wrapped"), [(3, False), (5, True)])
+def test_factoring_keeps_block_when_serialized_dictionary_costs_more(rows: int, wrapped: bool):
+    block = f"[{rows}]{{v:string}}\n" + "abcdef\n" * rows
+    text = json.dumps(block) if wrapped else block
+    assert factor_values(text) == text
+
+
+def test_factoring_counts_multibyte_values_in_bytes() -> None:
+    block = "[4]{v:string}\n" + "ééabcd\n" * 4
+    factored = factor_values(block)
+    assert len(factored.encode()) < len(block.encode())
+    assert expand_compacted(factored) == expand_compacted(block)
+
+
 def test_container_shaped_string_cells_round_trip() -> None:
     # A string whose text is a JSON container (`"[]"`, `"{}"`, `"[1,2]"`) must come back as
     # that string, not as the value it spells. #4053 fixed the scalar-looking case; containers
