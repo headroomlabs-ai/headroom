@@ -1669,6 +1669,13 @@ class CostTracker:
                         + self._write_cost_usd(model, cw5_price, cw1h_price)
                         + uncached * uncached_price
                     )
+                    # Requests that reported no API usage breakdown still added
+                    # their tokens to ``sent`` but none of the breakdown buckets;
+                    # price that uncovered remainder at the list (uncached) rate
+                    # so their input cost is not silently dropped.
+                    breakdown_tokens = cr + cw + uncached
+                    if breakdown_tokens < sent:
+                        cost_with_headroom += (sent - breakdown_tokens) * uncached_price
                 else:
                     cost_with_headroom += sent * uncached_price
         return total_input_tokens, round(cost_with_headroom + self._folded_input_usd, 4)
@@ -1741,6 +1748,13 @@ class CostTracker:
                         + uncached * uncached_price
                     )
                     billed_tokens = cr + cw + uncached
+                    # Requests without an API usage breakdown still added their
+                    # tokens to ``sent`` but none of the breakdown buckets; price
+                    # the uncovered remainder at the list rate so their input
+                    # cost is not silently dropped (the budget path already does
+                    # this fallback in ``record_tokens``).
+                    if billed_tokens < sent:
+                        model_cost += (sent - billed_tokens) * uncached_price
                 else:
                     # No cache data from API — fall back to list price
                     model_cost = sent * uncached_price
