@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _KNOWN_WRAP_AGENTS = frozenset(
     {
         "claude",
+        "codebuddy",
         "copilot",
         "codex",
         "aider",

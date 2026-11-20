@@ -1,6 +1,6 @@
 # MCP Server — Context Engineering Toolkit
 
-Headroom's MCP server exposes **compression, retrieval, and observability** as tools that any MCP-compatible AI coding tool can use — Claude Code, Cursor, Codex, and more.
+Headroom's MCP server exposes **compression, retrieval, and observability** as tools that any MCP-compatible AI coding tool can use — Claude Code, CodeBuddy, Cursor, Codex, and more.
 
 ## Quick Start
 
@@ -115,7 +115,7 @@ reads across all of them.
 
 ```
 ┌─────────────────────────────────────────────┐
-│  Claude Code / Cursor / Codex               │
+│  Claude Code / CodeBuddy / Cursor / Codex    │
 │                                              │
 │  LLM calls headroom_compress on demand       │
 │  ↓                                           │
@@ -195,6 +195,7 @@ The MCP server works with any MCP-compatible host:
 | Tool | MCP Support | Setup |
 |------|-------------|-------|
 | Claude Code | Native | `headroom mcp install` |
+| CodeBuddy | Native | `headroom mcp install` |
 | Cursor | Supported | Add to Cursor MCP settings |
 | Codex | If supported | Configure MCP server |
 | Any MCP host | Yes | Point to `headroom mcp serve` |
