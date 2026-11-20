@@ -1078,3 +1078,41 @@ class TestContentRouterIntegration:
         assert result == [{"role": "user", "content": "Hello"}]
         assert metrics["tokens_saved"] == 0
         fake.close.assert_called_once()
+
+
+class TestOnnxSessionReuse:
+    """The ONNX path must reuse one router across requests (no per-request churn)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        from headroom.models.ml_models import MLModelRegistry
+
+        MLModelRegistry.reset()
+        yield
+        MLModelRegistry.reset()
+
+    def test_two_compress_calls_build_router_once(self, openai_messages_with_image):
+        """Two consecutive ONNX-path compress() build the router a single time."""
+        import headroom.image.onnx_router as onnx_router_mod
+        from headroom.models.ml_models import MLModelRegistry
+
+        instances: list[object] = []
+
+        class _CountingRouter:
+            def __init__(self, use_siglip: bool = True):
+                self.use_siglip = use_siglip
+                instances.append(self)
+
+            def classify(self, image_data, query):
+                return SimpleNamespace(technique=Technique.PRESERVE, confidence=1.0)
+
+        compressor = ImageCompressor()
+        with patch.object(onnx_router_mod, "OnnxTechniqueRouter", _CountingRouter):
+            compressor.compress(openai_messages_with_image, provider="openai")
+            compressor.compress(openai_messages_with_image, provider="openai")
+
+        assert len(instances) == 1
+        assert (
+            MLModelRegistry.get_onnx_technique_router(use_siglip=compressor.use_siglip)
+            is instances[0]
+        )
