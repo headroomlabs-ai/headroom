@@ -38,6 +38,7 @@ if TYPE_CHECKING:
         create_groq_provider,
         create_lmstudio_provider,
         create_ollama_provider,
+        create_runcrate_provider,
         create_together_provider,
         create_vllm_provider,
     )
@@ -59,6 +60,7 @@ __all__ = [
     # Factory functions
     "create_ollama_provider",
     "create_together_provider",
+    "create_runcrate_provider",
     "create_groq_provider",
     "create_fireworks_provider",
     "create_anyscale_provider",
@@ -89,6 +91,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "create_together_provider": (
         "headroom.providers.openai_compatible",
         "create_together_provider",
+    ),
+    "create_runcrate_provider": (
+        "headroom.providers.openai_compatible",
+        "create_runcrate_provider",
     ),
     "create_groq_provider": ("headroom.providers.openai_compatible", "create_groq_provider"),
     "create_fireworks_provider": (
