@@ -321,7 +321,7 @@ async fn e2e_anthropic_streaming() {
     assert!(
         has_start && has_delta && has_stop,
         "stream missing expected events (start={has_start} delta={has_delta} stop={has_stop}). buf:\n{}",
-        &buf.chars().take(2000).collect::<String>()
+        buf.chars().take(2000).collect::<String>()
     );
     assert!(
         chunks >= 1,
