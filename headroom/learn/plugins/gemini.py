@@ -200,7 +200,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
     def _parse_messages(self, session_id: str, messages: list) -> SessionData | None:
         """Parse Gemini API format messages into normalized SessionData."""
-        tool_calls_pending: dict[str, tuple[str, dict, int]] = {}
+        tool_calls_pending: dict[str, list[tuple[str | None, str, dict, int]]] = {}
         tool_calls: list[ToolCall] = []
         events: list[SessionEvent] = []
         msg_index = 0
@@ -254,7 +254,9 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                             args = {}
                         normalized_name = normalize_tool_name(name)
                         if name:
-                            tool_calls_pending[name] = (normalized_name, args, msg_index)
+                            tool_calls_pending.setdefault(name, []).append(
+                                (fc.get("id"), normalized_name, args, msg_index)
+                            )
 
                 if "functionResponse" in part:
                     fr = part["functionResponse"]
@@ -271,8 +273,28 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                         else:
                             result_content = str(response)
 
-                        if name in tool_calls_pending:
-                            normalized_name, args, call_idx = tool_calls_pending.pop(name)
+                        pending = tool_calls_pending.get(name, [])
+                        response_id = fr.get("id")
+                        # Prefer an exact ID match; use FIFO only when either side lacks an ID.
+                        match_idx = next(
+                            (
+                                i
+                                for i, (call_id, *_) in enumerate(pending)
+                                if response_id is not None and call_id == response_id
+                            ),
+                            None,
+                        )
+                        if match_idx is None:
+                            match_idx = next(
+                                (
+                                    i
+                                    for i, (call_id, *_) in enumerate(pending)
+                                    if response_id is None or call_id is None
+                                ),
+                                None,
+                            )
+                        if match_idx is not None:
+                            _, normalized_name, args, call_idx = pending.pop(match_idx)
                         else:
                             normalized_name = normalize_tool_name(name)
                             args = {}

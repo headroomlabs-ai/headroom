@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from headroom.learn.models import ProjectInfo, Recommendation, RecommendationTarget
 from headroom.learn.scanner import GeminiScanner
 from headroom.learn.writer import GeminiWriter
@@ -130,6 +132,53 @@ class TestProjectDiscovery:
 
 
 class TestJsonSessionParsing:
+    @pytest.mark.parametrize(
+        "call_ids,response_ids,response_order",
+        [
+            (("a", "b"), ("a", "b"), ("a", "b")),
+            (("a", "b"), ("b", "a"), ("b", "a")),
+            ((None, None), (None, None), ("a", "b")),
+            (("a", "b"), (None, None), ("a", "b")),
+            ((None, None), ("a", "b"), ("a", "b")),
+        ],
+    )
+    def test_parallel_same_name_calls(self, tmp_path, call_ids, response_ids, response_order):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        messages = [
+            {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "name": "read_file",
+                            "args": {"path": path},
+                            **({"id": call_id} if call_id is not None else {}),
+                        }
+                    }
+                    for path, call_id in zip(("a", "b"), call_ids)
+                ],
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "name": "read_file",
+                            "response": {"output": output},
+                            **({"id": response_id} if response_id is not None else {}),
+                        }
+                    }
+                    for output, response_id in zip(response_order, response_ids)
+                ],
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [
+            ({"path": path}, path) for path in response_order
+        ]
+
     def test_basic_tool_call(self, tmp_path):
         gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
         session = _make_gemini_session(
