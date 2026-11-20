@@ -339,6 +339,8 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
     compress_user_messages = getattr(config, "compress_user_messages", None)
     if compress_user_messages is not None:
         kwargs["compress_user_messages"] = bool(compress_user_messages)
+    if os.environ.get("HEADROOM_COMPRESS_USER_MESSAGES") == "0":
+        kwargs["compress_user_messages"] = False
 
     compress_system_messages = getattr(config, "compress_system_messages", None)
     if compress_system_messages is not None:

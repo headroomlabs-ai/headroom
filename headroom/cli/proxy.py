@@ -1566,6 +1566,7 @@ def proxy(
         omlx_target_api_url=resolve_omlx_target_api_url(omlx_api_url, os.environ),
         mode=effective_mode,
         optimize=not no_optimize,
+        image_optimize=_get_env_bool("HEADROOM_IMAGE_OPTIMIZE", True),
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,

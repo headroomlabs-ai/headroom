@@ -13,6 +13,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
+from headroom.ccr.retrieval_content import is_retrieval_result
+
 from .content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -61,6 +63,7 @@ class CompressionUnit:
 UNIT_REASON_CATEGORIES = {
     None: "applied",
     "protected_user_message": "protected_role",
+    "protected_retrieval_result": "protected_role",
     "protected_system_message": "protected_role",
     "protected_assistant_message": "protected_role",
     "immutable": "immutable",
@@ -220,6 +223,8 @@ def _compress_marker_free_text(
 
 def check_unit_protection(unit: CompressionUnit) -> str | None:
     """Return the early refusal reason if a unit is protected, else None."""
+    if is_retrieval_result(unit.text):
+        return "protected_retrieval_result"
     if not unit.mutable:
         return "immutable"
     if unit.role == "user" and unit.metadata.get("compress_user") != "true":
