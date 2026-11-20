@@ -317,6 +317,67 @@ def _url_host(value: str) -> str:
     return (parsed.hostname or netloc_or_path.split("/", 1)[0]).lower()
 
 
+def _parse_copilot_origin(value: str) -> tuple[str, str, int | None] | None:
+    """Return ``(scheme, hostname, effective_port)`` for *value*, or ``None``.
+
+    ``scheme`` is ``""`` for bare ``host[:port][/path]`` inputs without ``://``.
+    """
+
+    raw = value.strip()
+    if not raw:
+        return None
+    has_scheme = "://" in raw
+    parsed = urlparse(raw if has_scheme else f"https://{raw}")
+    if not has_scheme and (parsed.username is not None or parsed.password is not None):
+        return None
+    try:
+        explicit_port = parsed.port
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return None
+    scheme = parsed.scheme.lower() if has_scheme else ""
+    if explicit_port is not None:
+        effective_port: int | None = explicit_port
+    elif scheme in ("https", "wss", ""):
+        effective_port = 443
+    elif scheme in ("http", "ws"):
+        effective_port = 80
+    else:
+        effective_port = None
+    return scheme, hostname, effective_port
+
+
+def _is_secure_copilot_origin(scheme: str, port: int | None) -> bool:
+    """Return True only for HTTPS/WSS (or scheme-less bare hosts) on port 443."""
+
+    return scheme in ("https", "wss", "") and port == 443
+
+
+def _schemes_match_for_configured_origin(cand_scheme: str, cfg_scheme: str) -> bool:
+    if not cand_scheme:
+        return cfg_scheme in ("https", "wss")
+    if cand_scheme == cfg_scheme:
+        return True
+    return {cand_scheme, cfg_scheme} <= {"https", "wss"} or {cand_scheme, cfg_scheme} <= {
+        "http",
+        "ws",
+    }
+
+
+def _origin_matches_configured(candidate: tuple[str, str, int | None], configured_url: str) -> bool:
+    cfg = _parse_copilot_origin(configured_url)
+    if cfg is None:
+        return False
+    cfg_scheme, cfg_host, cfg_port = cfg
+    effective_cfg_scheme = cfg_scheme or "https"
+    cand_scheme, cand_host, cand_port = candidate
+    if cand_host != cfg_host or cand_port != cfg_port:
+        return False
+    return _schemes_match_for_configured_origin(cand_scheme, effective_cfg_scheme)
+
+
 def is_copilot_completions_host(url: str | None) -> bool:
     """Return True when *url* already points at a Copilot inline-completions host.
 
@@ -328,17 +389,18 @@ def is_copilot_completions_host(url: str | None) -> bool:
 
     if not url:
         return False
-    # Compare hosts, never whole strings: this is asked both about a bare base
-    # URL (routing) and about a fully-built URL with the path appended (auth).
-    # A string compare answers True for the first and False for the second, so
-    # an operator override would route correctly and then be forwarded with no
-    # credentials at all.
-    host = _url_host(url)
-    if not host:
+    # Compare origins (scheme, host, effective port), never whole strings: this
+    # is asked both about a bare base URL (routing) and about a fully-built URL
+    # with the path appended (auth).
+    origin = _parse_copilot_origin(url)
+    if origin is None:
         return False
     override = os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip()
-    if override and host == _url_host(override):
+    if override and _origin_matches_configured(origin, override):
         return True
+    scheme, host, port = origin
+    if not _is_secure_copilot_origin(scheme, port):
+        return False
     if host == "copilot-proxy.githubusercontent.com":
         return True
     # Per-SKU hosts GitHub hands out via `endpoints.proxy`, e.g.
@@ -1312,12 +1374,15 @@ def is_copilot_api_url(url: str | None) -> bool:
 
     if not url:
         return False
-    parsed = urlparse(url)
-    host = parsed.netloc.lower() or parsed.path.lower()
-    configured_host = urlparse(_configured_api_url()).netloc.lower()
-    if configured_host and host == configured_host:
+    origin = _parse_copilot_origin(url)
+    if origin is None:
+        return False
+    configured_override = _configured_api_url_override()
+    if configured_override and _origin_matches_configured(origin, configured_override):
         return True
-    hostname = (parsed.hostname or host.split("/", 1)[0]).lower()
+    scheme, hostname, port = origin
+    if not _is_secure_copilot_origin(scheme, port):
+        return False
     return is_public_copilot_api_host(hostname) or _is_ghe_copilot_api_host(hostname)
 
 
