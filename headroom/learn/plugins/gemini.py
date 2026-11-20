@@ -24,6 +24,12 @@ from ._paths import path_exists
 logger = logging.getLogger(__name__)
 
 
+def _optional_id(part: dict) -> str | None:
+    """Return a call/response ID, treating malformed (non-string) IDs as missing."""
+    value = part.get("id")
+    return value if isinstance(value, str) else None
+
+
 class GeminiPlugin(LearnPlugin, ConversationScanner):
     """Reads Google Gemini CLI session logs from ~/.gemini/tmp/<project>/chats/.
 
@@ -238,11 +244,11 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
             # Calls answered by ID somewhere in this message are reserved for that
             # exact match, so an earlier ID-less response can't take them by FIFO.
             reserved_ids = {
-                (part["functionResponse"].get("name", ""), part["functionResponse"].get("id"))
+                (part["functionResponse"].get("name", ""), _optional_id(part["functionResponse"]))
                 for part in parts
                 if isinstance(part, dict)
                 and isinstance(part.get("functionResponse"), dict)
-                and part["functionResponse"].get("id") is not None
+                and _optional_id(part["functionResponse"]) is not None
             }
 
             for part in parts:
@@ -273,7 +279,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                             call_ordinals[(msg_index, name)] = ordinal + 1
                             last_call_msg[name] = msg_index
                             tool_calls_pending.setdefault(name, []).append(
-                                (fc.get("id"), normalized_name, args, msg_index, ordinal)
+                                (_optional_id(fc), normalized_name, args, msg_index, ordinal)
                             )
 
                 if "functionResponse" in part:
@@ -292,7 +298,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                             result_content = str(response)
 
                         pending = tool_calls_pending.get(name, [])
-                        response_id = fr.get("id")
+                        response_id = _optional_id(fr)
                         # Prefer an exact ID match; use FIFO only when either side lacks an ID.
                         match_idx = next(
                             (

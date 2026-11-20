@@ -248,6 +248,53 @@ class TestJsonSessionParsing:
             ({"path": "a.py"}, "a"),
         ]
 
+    def test_malformed_ids_treated_as_missing(self, tmp_path):
+        gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
+        session = _make_gemini_session(
+            [
+                {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "read_file", "args": {"path": "a.py"}}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "read_file",
+                                "id": [],
+                                "response": {"output": "a"},
+                            }
+                        },
+                    ],
+                },
+                {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "read_file", "id": {}, "args": {"path": "b.py"}}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {"functionResponse": {"name": "read_file", "response": {"output": "b"}}},
+                    ],
+                },
+            ]
+        )
+        _write_json_session(chats_dir, session)
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        sessions = scanner.scan_project(scanner.discover_projects()[0])
+
+        assert len(sessions) == 1
+        assert [(tc.input_data, tc.output) for tc in sessions[0].tool_calls] == [
+            ({"path": "a.py"}, "a"),
+            ({"path": "b.py"}, "b"),
+        ]
+
     def test_basic_tool_call(self, tmp_path):
         gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
         session = _make_gemini_session(
