@@ -3704,6 +3704,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         start_hard_watchdog()
 
+        # Complement, not duplicate: the hard watchdog only fires when native
+        # code seizes the GIL, so it stays silent when the loop thread is parked
+        # inside a GIL-*releasing* call -- every asyncio timeout is then dead
+        # too, and the proxy freezes with no log line at all (#4967). This one
+        # watches the loop's own heartbeat and dumps the stacks that name the
+        # culprit, without ever exiting.
+        from headroom.proxy.loop_watchdog import start_loop_watchdog
+
+        start_loop_watchdog()
+
         # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
         # traffic if the Rust extension is missing unless the operator
         # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
@@ -3817,6 +3827,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         timeout,
                         exc,
                     )
+
+            from headroom.proxy.loop_watchdog import stop_loop_watchdog
+
+            stop_loop_watchdog()
 
             periodic_toin_stats_task = app.state.periodic_toin_stats_task
             if periodic_toin_stats_task is not None:
@@ -4143,7 +4157,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "active_sessions": ws_active_sessions,
                 "active_relay_tasks": ws_active_relay_tasks,
             },
+            # A wedged loop and a wedged compression worker look identical from
+            # the client's side (both freeze a request past every timeout) and
+            # nothing distinguishes them in the log while the loop is stalled.
+            # These counters make the difference observable after the fact
+            # (#4967): a non-zero ``current_stall_seconds`` means the loop is
+            # blocked *now*, so no asyncio deadline in the proxy can fire.
+            "event_loop_watchdog": _loop_watchdog_snapshot(),
         }
+
+    def _loop_watchdog_snapshot() -> dict[str, Any]:
+        """Read the event-loop watchdog counters without ever failing /health."""
+        try:
+            from headroom.proxy.loop_watchdog import snapshot as _loop_snapshot
+
+            return _loop_snapshot()
+        except Exception:  # pragma: no cover - diagnostics must not break /health
+            logger.debug("event-loop watchdog snapshot failed", exc_info=True)
+            return {"enabled": False}
 
     def _loop_callback_payload() -> LoopHealthState:
         return {
