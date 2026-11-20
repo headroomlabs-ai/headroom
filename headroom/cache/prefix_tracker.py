@@ -662,9 +662,25 @@ def restore_frozen_prefix(
     frozen = min(frozen_message_count, len(original_messages))
     restored = list(candidate_messages)
 
-    # Defensive: if a transform dropped prefix messages, restore them.
-    if len(restored) < frozen:
-        return list(original_messages[:frozen]) + restored, frozen
+    # A transform that dropped messages makes the candidate shorter than the
+    # original. When the drop lands inside the frozen prefix, the surviving live
+    # messages shift up into the frozen slots and the positional loop below would
+    # silently overwrite one of them. Rebuild instead: emit the frozen prefix
+    # verbatim, then every candidate message that is not a surviving frozen
+    # original (matched canonically, in order, so a drop that lands after an
+    # already-frozen message does not duplicate it).
+    if len(restored) < len(original_messages):
+        frozen_originals = original_messages[:frozen]
+        live: list[dict[str, Any]] = []
+        frozen_idx = 0
+        for message in restored:
+            if frozen_idx < frozen and _canonicalize_for_prefix_compare(
+                message
+            ) == _canonicalize_for_prefix_compare(frozen_originals[frozen_idx]):
+                frozen_idx += 1
+                continue
+            live.append(message)
+        return list(frozen_originals) + live, frozen
 
     changed = 0
     for idx in range(frozen):

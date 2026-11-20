@@ -297,6 +297,46 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     assert changed == 1
 
 
+def test_restore_frozen_prefix_keeps_live_messages_when_a_frozen_message_is_dropped() -> None:
+    """A transform that drops a frozen message must not delete the live message
+    that shifted into the now-empty frozen slot (regression for a positional
+    overwrite that silently dropped a message from the forwarded request).
+    """
+    frozen_a = {"role": "user", "content": "frozen A"}
+    live_b = {"role": "user", "content": "live B"}
+    live_c = {"role": "assistant", "content": "live C"}
+    original = [frozen_a, live_b, live_c]
+
+    # The transform dropped the single frozen message; B and C are live.
+    restored, changed = OpenAIHandlerMixin._restore_frozen_prefix(
+        original,
+        [live_b, live_c],
+        frozen_message_count=1,
+    )
+    assert restored == original
+    assert changed == 1
+
+
+def test_restore_frozen_prefix_mid_prefix_drop_does_not_duplicate() -> None:
+    """A drop inside a longer frozen prefix must restore the dropped message
+    without duplicating the frozen messages that survived ahead of it.
+    """
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ]
+    # The transform dropped messages[1] (frozen); 0, 2, 3 survive.
+    restored, changed = OpenAIHandlerMixin._restore_frozen_prefix(
+        messages,
+        [messages[0], messages[2], messages[3]],
+        frozen_message_count=2,
+    )
+    assert restored == messages
+    assert changed == 2
+
+
 def test_relocate_system_messages_moves_stray_system_into_top_level() -> None:
     # Issue #765: compression relocated the harness system block into
     # messages[0] as a role="system" entry, which Anthropic rejects with a 400.
