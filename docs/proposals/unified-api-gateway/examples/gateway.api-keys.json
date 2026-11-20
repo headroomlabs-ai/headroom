@@ -1,0 +1,339 @@
+{
+  "version": 1,
+  "runtime": {
+    "profile": "gateway",
+    "engine": "python",
+    "bind": "127.0.0.1",
+    "port": 8787,
+    "workers": 1,
+    "remote_enabled": false,
+    "stateless": false
+  },
+  "transforms": {
+    "mode": "off"
+  },
+  "privacy": {
+    "beacon": false,
+    "payload_logging": false,
+    "metrics": "local"
+  },
+  "client_auth": {
+    "required": true,
+    "principals": [
+      {
+        "id": "local-app",
+        "secret_ref": "env:HEADROOM_GATEWAY_CLIENT_TOKEN",
+        "scopes": [
+          "inference",
+          "models"
+        ],
+        "routes": [
+          "openai-native",
+          "anthropic-native",
+          "gemini-native"
+        ]
+      }
+    ]
+  },
+  "credentials": [
+    {
+      "id": "openai-api",
+      "provider": "openai",
+      "source": {
+        "kind": "env",
+        "ref": "OPENAI_API_KEY"
+      },
+      "refresh_owner": "none",
+      "allowed_origins": [
+        "https://api.openai.com:443"
+      ],
+      "allowed_path_prefixes": [
+        "/v1/"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "anthropic-api",
+      "provider": "anthropic",
+      "source": {
+        "kind": "env",
+        "ref": "ANTHROPIC_API_KEY"
+      },
+      "refresh_owner": "none",
+      "allowed_origins": [
+        "https://api.anthropic.com:443"
+      ],
+      "allowed_path_prefixes": [
+        "/v1/"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "gemini-api",
+      "provider": "gemini",
+      "source": {
+        "kind": "env",
+        "ref": "GEMINI_API_KEY"
+      },
+      "refresh_owner": "none",
+      "allowed_origins": [
+        "https://generativelanguage.googleapis.com:443"
+      ],
+      "allowed_path_prefixes": [
+        "/v1beta/"
+      ],
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "openai-native",
+      "public_model": "REPLACE_WITH_ENABLED_OPENAI_MODEL",
+      "upstream_model": "REPLACE_WITH_ENABLED_OPENAI_MODEL",
+      "provider": "openai",
+      "upstream_origin": "https://api.openai.com:443",
+      "upstream_path_prefix": "/v1/",
+      "credentials": [
+        "openai-api"
+      ],
+      "ingress_protocols": [
+        "openai-chat",
+        "openai-responses"
+      ],
+      "native_protocols": [
+        "openai-chat",
+        "openai-responses"
+      ],
+      "translation": "disabled",
+      "body_contract": "strict-native",
+      "private_network": false,
+      "retry": {
+        "max_attempts": 1,
+        "ambiguous_commit": "never",
+        "after_output": "never"
+      },
+      "billing": {
+        "allow_paid_fallback": false
+      },
+      "enabled": true,
+      "catalog": {
+        "source": "configured",
+        "entitlements": {
+          "openai-api": "allowed"
+        }
+      },
+      "capabilities": {
+        "openai-chat": {
+          "http-json": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          },
+          "http-stream": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          }
+        },
+        "openai-responses": {
+          "http-json": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          },
+          "http-stream": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          },
+          "websocket": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "anthropic-native",
+      "public_model": "REPLACE_WITH_ENABLED_ANTHROPIC_MODEL",
+      "upstream_model": "REPLACE_WITH_ENABLED_ANTHROPIC_MODEL",
+      "provider": "anthropic",
+      "upstream_origin": "https://api.anthropic.com:443",
+      "upstream_path_prefix": "/v1/",
+      "credentials": [
+        "anthropic-api"
+      ],
+      "ingress_protocols": [
+        "anthropic-messages"
+      ],
+      "native_protocols": [
+        "anthropic-messages"
+      ],
+      "translation": "disabled",
+      "body_contract": "strict-native",
+      "private_network": false,
+      "retry": {
+        "max_attempts": 1,
+        "ambiguous_commit": "never",
+        "after_output": "never"
+      },
+      "billing": {
+        "allow_paid_fallback": false
+      },
+      "enabled": true,
+      "catalog": {
+        "source": "configured",
+        "entitlements": {
+          "anthropic-api": "allowed"
+        }
+      },
+      "capabilities": {
+        "anthropic-messages": {
+          "http-json": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          },
+          "http-stream": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-native",
+      "public_model": "REPLACE_WITH_ENABLED_GEMINI_MODEL",
+      "upstream_model": "REPLACE_WITH_ENABLED_GEMINI_MODEL",
+      "provider": "gemini",
+      "upstream_origin": "https://generativelanguage.googleapis.com:443",
+      "upstream_path_prefix": "/v1beta/",
+      "credentials": [
+        "gemini-api"
+      ],
+      "ingress_protocols": [
+        "gemini-generate"
+      ],
+      "native_protocols": [
+        "gemini-generate"
+      ],
+      "translation": "disabled",
+      "body_contract": "strict-native",
+      "private_network": false,
+      "retry": {
+        "max_attempts": 1,
+        "ambiguous_commit": "never",
+        "after_output": "never"
+      },
+      "billing": {
+        "allow_paid_fallback": false
+      },
+      "enabled": true,
+      "catalog": {
+        "source": "configured",
+        "entitlements": {
+          "gemini-api": "allowed"
+        }
+      },
+      "capabilities": {
+        "gemini-generate": {
+          "http-json": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          },
+          "http-stream": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "admission": {
+    "max_concurrency": 128,
+    "queue_limit": 128,
+    "queue_timeout_seconds": 0,
+    "budget_usd": null,
+    "budget_period": "process",
+    "unknown_cost_policy": "allow"
+  },
+  "limits": {
+    "request_deadline_seconds": 120
+  }
+}
