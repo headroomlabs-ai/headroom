@@ -79,6 +79,9 @@ from headroom.proxy.ccr_marker_policy import (
     has_new_ccr_markers as _has_new_ccr_markers,
 )
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
+from headroom.proxy.ccr_session_tracker import (
+    SessionExpansionDedupTracker as _SessionExpansionDedupTracker,
+)
 from headroom.proxy.internal_header_policy import (
     STRIP_INTERNAL_HEADERS_ENV,
     StripInternalHeadersMode,
@@ -994,6 +997,80 @@ def log_memory_injection(
     )
 
 
+def latest_user_chat_message_index(messages: list[dict[str, Any]]) -> int:
+    """Index ``append_text_to_latest_user_chat_message`` will mutate, or -1.
+
+    OpenAI chat histories routinely end on a non-user message (``assistant``
+    prefill, trailing ``role="tool"`` results), so the append target is the
+    latest USER message — not necessarily the tail. Injection guards must ask
+    about that exact index, so the finder lives here and the append helper
+    uses it too; the two can then never disagree.
+    """
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            return idx
+    return -1
+
+
+def latest_non_frozen_user_turn_index(
+    messages: list[dict[str, Any]],
+    *,
+    frozen_message_count: int,
+) -> int:
+    """Index Anthropic's ``_append_context_to_latest_non_frozen_user_turn``
+    will mutate, or -1.
+
+    Only the live-zone tail is eligible: the final message, and only when it
+    is a user turn outside the frozen prefix. An assistant prefill or a
+    tool_result tail therefore has no target at all (-1), which is also why
+    the guard must not assume ``messages[-1]`` is what gets mutated.
+    """
+    index = len(messages) - 1
+    if index < 0 or index < frozen_message_count:
+        return -1
+    msg = messages[index]
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return -1
+    return index
+
+
+def injection_target_already_forwarded(
+    messages: list[dict[str, Any]],
+    *,
+    prefix_tracker: Any,
+    target_index: int,
+) -> bool:
+    """True when appending to ``messages[target_index]`` would double-inject.
+
+    Shared guard for CCR proactive-expansion and memory-context injection on
+    both the Anthropic and OpenAI paths. Each appends through a
+    provider-specific "append to latest user turn" helper whose target is NOT
+    always the tail message, so callers pass the exact index that helper will
+    mutate (``latest_non_frozen_user_turn_index`` /
+    ``latest_user_chat_message_index``). ``target_index < 0`` means the helper
+    would not mutate anything, so the guard is a no-op.
+
+    Every caller runs after ``overlay_cached_prefix``, which replays last
+    turn's forwarded bytes into the leading positions it proved stable —
+    including whatever was injected into them last turn. Appending into such
+    a position adds a second copy and changes bytes the provider already
+    hashed, busting the cache from that point on (#2186). See
+    ``headroom.cache.prefix_tracker.position_already_forwarded``.
+    """
+    from headroom.cache.prefix_tracker import position_already_forwarded
+
+    if target_index < 0:
+        return False
+    return position_already_forwarded(
+        messages,
+        target_index,
+        prefix_tracker.get_last_forwarded_messages(),
+    )
+
+
 def append_text_to_latest_user_chat_message(
     messages: list[dict[str, Any]],
     context_text: str,
@@ -1015,43 +1092,36 @@ def append_text_to_latest_user_chat_message(
     if not messages or not context_text:
         return messages, 0
 
-    new_messages = list(messages)
-    for idx in range(len(new_messages) - 1, -1, -1):
-        msg = new_messages[idx]
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
-            continue
-
-        content = msg.get("content")
-        if isinstance(content, str):
-            updated_msg = {**msg, "content": content + "\n\n" + context_text}
-            new_messages[idx] = updated_msg
-            return new_messages, len(context_text)
-
-        if isinstance(content, list) and content:
-            new_content: list[dict[str, Any]] = []
-            appended = False
-            for part in content:
-                if (
-                    not appended
-                    and isinstance(part, dict)
-                    and part.get("type") in ("text", "input_text")
-                ):
-                    existing_text = part.get("text", "")
-                    new_part = {**part, "text": existing_text + "\n\n" + context_text}
-                    new_content.append(new_part)
-                    appended = True
-                else:
-                    new_content.append(part)
-            if appended:
-                updated_msg = {**msg, "content": new_content}
-                new_messages[idx] = updated_msg
-                return new_messages, len(context_text)
-
-        # User message but no eligible text block — leave untouched and stop.
+    idx = latest_user_chat_message_index(messages)
+    if idx < 0:
         return messages, 0
 
+    new_messages = list(messages)
+    msg = new_messages[idx]
+    content = msg.get("content")
+    if isinstance(content, str):
+        new_messages[idx] = {**msg, "content": content + "\n\n" + context_text}
+        return new_messages, len(context_text)
+
+    if isinstance(content, list) and content:
+        new_content: list[dict[str, Any]] = []
+        appended = False
+        for part in content:
+            if (
+                not appended
+                and isinstance(part, dict)
+                and part.get("type") in ("text", "input_text")
+            ):
+                existing_text = part.get("text", "")
+                new_content.append({**part, "text": existing_text + "\n\n" + context_text})
+                appended = True
+            else:
+                new_content.append(part)
+        if appended:
+            new_messages[idx] = {**msg, "content": new_content}
+            return new_messages, len(context_text)
+
+    # User message but no eligible text block — leave untouched.
     return messages, 0
 
 
@@ -2893,6 +2963,29 @@ def _reset_session_ccr_tracker_for_test() -> None:
     global _session_ccr_tracker
     with _session_ccr_tracker_lock:
         _session_ccr_tracker = None
+
+
+# Process-wide singleton for per-session CCR proactive-expansion dedup (#2186).
+_session_expansion_dedup_tracker_lock = threading.Lock()
+_session_expansion_dedup_tracker: _SessionExpansionDedupTracker | None = None
+
+
+def get_session_expansion_dedup_tracker() -> _SessionExpansionDedupTracker:
+    """Return the process-wide :class:`SessionExpansionDedupTracker` singleton."""
+    global _session_expansion_dedup_tracker
+    with _session_expansion_dedup_tracker_lock:
+        if _session_expansion_dedup_tracker is None:
+            _session_expansion_dedup_tracker = _SessionExpansionDedupTracker(
+                max_sessions=get_tool_tracker_max_sessions()
+            )
+        return _session_expansion_dedup_tracker
+
+
+def _reset_session_expansion_dedup_tracker_for_test() -> None:
+    """Clear the process-wide expansion-dedup tracker (test-only)."""
+    global _session_expansion_dedup_tracker
+    with _session_expansion_dedup_tracker_lock:
+        _session_expansion_dedup_tracker = None
 
 
 def has_new_ccr_markers(

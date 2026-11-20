@@ -369,7 +369,7 @@ class TestRelevanceCalculation:
         tracker.track_compression(
             hash_key="exact_match",
             turn_number=1,
-            tool_name=None,
+            tool_name="Glob",
             original_count=100,
             compressed_count=10,
             sample_content="authentication_middleware.py, auth_handler.py",
@@ -1046,3 +1046,77 @@ class TestConversationScoping:
         )
 
         assert [r.hash_key for r in recommendations] == ["any_hash"]
+
+
+# Tool-provenance gate on proactive expansion
+#
+# Proactive expansion restores tool ground truth. Entries with no tool
+# provenance are compressed instruction/system text (agent rules, injected
+# reminders) — the model already holds them compressed alongside a retrieval
+# marker, and expansion appends the full original *in addition to* the
+# compressed copy, so re-injecting them costs more than never compressing
+# them. These tests pin that they are never recommended.
+# ============================================================================
+
+
+class TestToolProvenanceGate:
+    """Only tool-derived contexts are eligible for proactive expansion."""
+
+    @staticmethod
+    def _track(tracker, hash_key, tool_name):
+        tracker.track_compression(
+            hash_key=hash_key,
+            turn_number=1,
+            tool_name=tool_name,
+            original_count=1663,
+            compressed_count=1230,
+            sample_content="authentication_middleware.py, auth_handler.py",
+            workspace_key="ws-gate",
+        )
+
+    def test_non_tool_context_is_never_recommended(self):
+        """Instruction text (tool_name=None) must not surface, however relevant."""
+        tracker = ContextTracker()
+        self._track(tracker, "instruction_block", None)
+
+        recommendations = tracker.analyze_query(
+            query="authentication middleware", current_turn=2, workspace_key="ws-gate"
+        )
+
+        assert recommendations == []
+
+    def test_tool_context_still_recommended(self):
+        """The gate must not regress the case proactive expansion exists for."""
+        tracker = ContextTracker()
+        self._track(tracker, "bash_output", "Bash")
+
+        recommendations = tracker.analyze_query(
+            query="authentication middleware", current_turn=2, workspace_key="ws-gate"
+        )
+
+        assert [r.hash_key for r in recommendations] == ["bash_output"]
+
+    def test_mixed_pool_yields_only_tool_contexts(self):
+        """A non-tool entry must not consume a max_proactive_expansions slot."""
+        tracker = ContextTracker()
+        self._track(tracker, "instruction_block", None)
+        self._track(tracker, "bash_output", "Bash")
+        self._track(tracker, "glob_output", "Glob")
+
+        recommendations = tracker.analyze_query(
+            query="authentication middleware", current_turn=2, workspace_key="ws-gate"
+        )
+
+        assert "instruction_block" not in {r.hash_key for r in recommendations}
+        assert {r.hash_key for r in recommendations} == {"bash_output", "glob_output"}
+
+    def test_gate_does_not_purge_the_entry(self):
+        """Filtering happens on read — the entry stays retrievable on demand."""
+        tracker = ContextTracker()
+        self._track(tracker, "instruction_block", None)
+
+        tracker.analyze_query(
+            query="authentication middleware", current_turn=2, workspace_key="ws-gate"
+        )
+
+        assert "instruction_block" in tracker.get_tracked_hashes()
