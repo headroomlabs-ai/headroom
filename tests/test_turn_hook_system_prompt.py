@@ -279,7 +279,7 @@ def test_an_accounting_failure_keeps_its_input_out_of_debug_logs(monkeypatch, si
     import logging
 
     from headroom.log_safety import CONTENT_OPT_IN_ENV
-    from headroom.proxy.gateway_turn import _safe_call
+    from headroom.proxy.gateway_turn import accounting_call
     from headroom.proxy.turn_hooks import count_system_tokens
 
     monkeypatch.delenv(CONTENT_OPT_IN_ENV, raising=False)
@@ -294,7 +294,7 @@ def test_an_accounting_failure_keeps_its_input_out_of_debug_logs(monkeypatch, si
         if site == "system_count":
             assert count_system_tokens(_leaky_counter, f"system {CANARY}") is None
         else:
-            assert _safe_call(_leaky_counter, [{"name": CANARY}]) is None
+            assert accounting_call(_leaky_counter, [{"name": CANARY}]) is None
     finally:
         logger.removeHandler(handler)
         logger.setLevel(old_level)

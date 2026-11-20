@@ -741,6 +741,63 @@ def test_undeferring_a_client_deferred_tool_is_charged_on_responses(schema_words
     assert (headline == 0) == (schema_words == 400)
 
 
+def test_a_fold_larger_than_the_undeferred_schema_books_the_difference_on_responses() -> None:
+    from headroom.proxy.handlers.openai import _json_debug_dumps
+
+    def payload() -> dict[str, Any]:
+        return {
+            "model": "gpt-5.5",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "data " * 300}],
+            "tools": [
+                {"type": "tool_search"},
+                {**_function_tool("later", 5), "defer_loading": True},
+            ],
+        }
+
+    def fold(ctx: Any) -> None:
+        ctx.messages[0]["output"] = "folded"
+
+    def fold_and_undefer(ctx: Any) -> None:
+        fold(ctx)
+        for tool in ctx.tools:
+            tool.pop("defer_loading", None)
+
+    fold_only, _, _ = _responses_headline(fold, payload())
+    headline, ledger, _ = _responses_headline(fold_and_undefer, payload())
+    count = _StubProvider().get_token_counter("gpt-5.5").count_text
+    search = {"type": "tool_search"}
+    growth = count(_json_debug_dumps([search, _function_tool("later", 5)])) - count(
+        _json_debug_dumps([search])
+    )
+    assert growth > 0
+    assert headline == ledger == fold_only - growth
+
+
+def test_a_failing_tool_count_leaves_the_tool_delta_uncounted(monkeypatch) -> None:
+    # The tool counter tokenizes client schemas; if it raises, the request still
+    # goes out with the hook's edits and only the tool delta goes unbooked.
+    import headroom.proxy.handlers.openai as openai_handler
+
+    def broken(*_args: Any) -> tuple[int, int]:
+        raise ValueError("tokenizer failed")
+
+    monkeypatch.setattr(openai_handler, "hook_tool_counts", broken)
+
+    def fold(ctx: Any) -> None:
+        ctx.messages[0]["output"] = "folded"
+
+    headline, ledger, working = _responses_headline(
+        fold,
+        {
+            "model": "gpt-5.5",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "data " * 300}],
+            "tools": [_function_tool("lookup", 5)],
+        },
+    )
+    assert working["input"][0]["output"] == "folded"
+    assert headline > 0
+
+
 def test_undeferring_a_tool_nested_in_a_namespace_is_charged() -> None:
     # Codex ships MCP servers as namespace groups; the deferred tool is nested.
     def fold_and_undefer_nested(ctx: Any) -> None:

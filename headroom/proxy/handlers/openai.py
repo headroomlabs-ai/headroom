@@ -3399,6 +3399,7 @@ class OpenAIHandlerMixin:
         # the outbound tools before we send — the extensible counterpart to the
         # built-in deferral above. Gated on the registry so it is a no-op (no copy,
         # no context construction) when no hook is registered.
+        from headroom.proxy.gateway_turn import accounting_call
         from headroom.proxy.turn_hooks import (
             TurnContext,
             registered_turn_hooks,
@@ -3436,8 +3437,8 @@ class OpenAIHandlerMixin:
 
             # Loading is unreadable on OpenAI: a tool a hook un-defers is charged
             # as growth (hook_tool_counts), as the hook ledger does.
-            _tools_snapshot = tools_before_hook(
-                working.get("tools"), None, _count_responses_tools, savings_tags
+            _tools_snapshot = accounting_call(
+                tools_before_hook, working.get("tools"), None, _count_responses_tools, savings_tags
             )
             # The Responses system prompt: `instructions`, or a leading system or
             # developer input item. On a continuation that item is a turn-level
@@ -3542,9 +3543,18 @@ class OpenAIHandlerMixin:
                         )
                     elif _sys_after > _sys_before:
                         _hook_growth += _sys_after - _sys_before
-            _tools_was, _tools_now = hook_tool_counts(
-                _tools_snapshot, working.get("tools"), None, _count_responses_tools
+            _tool_counts = (
+                accounting_call(
+                    hook_tool_counts,
+                    _tools_snapshot,
+                    working.get("tools"),
+                    None,
+                    _count_responses_tools,
+                )
+                if _tools_snapshot is not None
+                else None
             )
+            _tools_was, _tools_now = _tool_counts or (0, 0)
             _hook_growth += max(0, _tools_now - _tools_was)
             _hook_tool_saved = max(0, _tools_was - _tools_now)
             if _hook_tool_saved and savings_tags is not None:
@@ -5238,6 +5248,7 @@ class OpenAIHandlerMixin:
         # buffered runs all of them. Gated on the registry so it's a no-op when
         # none are registered; the net tool-schema token delta is recorded as a
         # saving.
+        from headroom.proxy.gateway_turn import accounting_call
         from headroom.proxy.turn_hooks import (
             TurnContext,
             registered_turn_hooks,
@@ -5257,7 +5268,9 @@ class OpenAIHandlerMixin:
 
             # Loading is unreadable here: a tool a hook un-defers is charged
             # (hook_tool_counts), as the hook ledger does.
-            _th_tools_snapshot = tools_before_hook(_th_tools_before, None, _th_count_tools, tags)
+            _th_tools_snapshot = accounting_call(
+                tools_before_hook, _th_tools_before, None, _th_count_tools, tags
+            )
             _th_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
@@ -5277,9 +5290,14 @@ class OpenAIHandlerMixin:
             except Exception:
                 _th_msg_before = None
             run_request_hooks(_th_ctx, stream_safe_only=stream)
-            _th_tok_before, _th_tok_after = hook_tool_counts(
-                _th_tools_snapshot, _th_ctx.tools, None, _th_count_tools
+            _th_tool_counts = (
+                accounting_call(
+                    hook_tool_counts, _th_tools_snapshot, _th_ctx.tools, None, _th_count_tools
+                )
+                if _th_tools_snapshot is not None
+                else None
             )
+            _th_tok_before, _th_tok_after = _th_tool_counts or (0, 0)
             # A hook may either replace ctx.messages/ctx.tools or mutate them in
             # place (the contract allows both). Use object identity only to decide
             # whether body needs reassignment; measure the saving from the FINAL

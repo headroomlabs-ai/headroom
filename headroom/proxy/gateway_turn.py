@@ -1050,7 +1050,7 @@ class RequestTransformer:
             msg_before = _safe_count(count_messages, messages)
             system_before = count_system_tokens(count_messages, self.system)
             tools_snapshot = (
-                _safe_call(
+                accounting_call(
                     tools_before_hook,
                     tools,
                     loading_history(self.provider, messages),
@@ -1089,7 +1089,7 @@ class RequestTransformer:
                 transforms.append("turn_hook")
                 messages_rewritten = True
             counts = (
-                _safe_call(
+                accounting_call(
                     hook_tool_counts,
                     tools_snapshot,
                     tools,
@@ -1140,14 +1140,18 @@ class RequestTransformer:
         return messages
 
 
-def _safe_call(fn: Callable[..., Any], *args: Any) -> Any:
-    """``fn(*args)``, or ``None`` when it raises: accounting never fails a turn."""
+def accounting_call(fn: Callable[..., Any], *args: Any) -> Any:
+    """``fn(*args)``, or ``None`` when it raises: accounting never fails a turn.
+
+    Shared with the OpenAI handlers' turn-hook tool counts, whose counters
+    tokenize client schemas and can raise whatever their tokenizer raises.
+    """
     try:
         return fn(*args)
     except Exception as exc:
         # The arguments are prompts and tool schemas: never their text in a log.
         logger.debug(
-            "gateway turn: %s failed; savings uncounted: %s",
+            "turn-hook accounting: %s failed; savings uncounted: %s",
             fn.__name__,
             describe_exception(exc),
         )

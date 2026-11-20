@@ -189,12 +189,14 @@ def tools_before_hook(
         chargeable: frozenset[str] = frozenset()
     else:
         # Where loading is unreadable (``messages`` is None, OpenAI tool
-        # search) a deferred tool the hook un-defers may have been unloaded:
-        # it is charged as if it were, which under-books at worst. (Condensing
-        # or removing one there is still booked as if billed, as before.)
+        # search) a deferred tool is taken as unloaded: un-deferring it is
+        # charged as growth, and condensing or removing it books nothing (see
+        # hook_tool_counts). Either way that under-books at worst.
         # With a deferral credit, every deferred tool is left to
-        # reconcile_deferred_tokens: the proxy's deferrers stand down when the
-        # client already defers, so the credit's tools are all of them.
+        # reconcile_deferred_tokens. The credit's tools are all of them: core
+        # and tool-search defer only when request_already_defers_tools() is
+        # False (no ``defer_loading`` anywhere, namespace members included),
+        # and they flag top-level tools only.
         chargeable = unbilled if messages is not None else _tool_ids(tools, deferred_only=True)
         if isinstance(tags, dict) and "tool_search_deferred_tokens" in tags:
             chargeable -= _tool_ids(tools, deferred_only=True)
@@ -231,8 +233,11 @@ def hook_tool_counts(
     billed_after = _tool_ids(tools) - unbilled_after
     excluded = frozenset((before.unbilled | unbilled_after) - billed_before - billed_after)
     if messages is None:
-        # Unreadable loading: only un-deferring is seen to bill a tool.
+        # Unreadable loading: a deferred tool is taken as unloaded, so only
+        # un-deferring is seen to bill it. A chargeable tool the hook leaves
+        # deferred, condenses or removes was billed on neither side.
         billed_after -= _tool_ids(tools, deferred_only=True)
+        excluded |= before.chargeable - billed_after
     newly_billed = before.chargeable & billed_after
     if before.count is not None:
         before_count = before.count

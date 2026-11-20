@@ -388,11 +388,12 @@ def test_condensing_a_loaded_deferred_tool_books_its_delta(server_side: bool) ->
     assert entry["tokens"] == pytest.approx(_condensed_delta("resident", "loaded"), abs=1)
 
 
-def test_deferred_tools_still_count_on_other_providers() -> None:
+def test_condensing_a_deferred_tool_where_loading_is_unreadable_books_nothing() -> None:
     # OpenAI tool search loads tools outside an Anthropic history, which this
-    # accounting cannot read: every deferred tool is measured as before.
+    # accounting cannot read: a deferred tool is taken as unloaded, as when a
+    # hook un-defers it, so condensing it is not booked as a saving.
     register_turn_hook(_CondenseAll())
-    tools = [{**_tool("a"), "defer_loading": True}]
+    tools = [_tool("resident"), {**_tool("a"), "defer_loading": True}]
     ctx = TurnContext(
         provider="openai",
         model="gpt-5",
@@ -403,7 +404,7 @@ def test_deferred_tools_still_count_on_other_providers() -> None:
     )
     run_request_hooks(ctx)
     (entry,) = from_tags(ctx.tags)
-    assert entry["tokens"] == _condensed_delta("a")
+    assert entry["tokens"] == _condensed_delta("resident")
 
 
 class _DropDeferred:
@@ -414,10 +415,13 @@ class _DropDeferred:
         ctx.tools = [t for t in ctx.tools if not t.get("defer_loading")]
 
 
-def test_removing_an_unloaded_deferred_tool_books_nothing() -> None:
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_removing_an_unloaded_deferred_tool_books_nothing(provider: str) -> None:
+    # OpenAI: loading is unreadable, so the tool is taken as unloaded and its
+    # removal was never on the bill.
     register_turn_hook(_DropDeferred())
     ctx = TurnContext(
-        provider="anthropic",
+        provider=provider,
         model="claude-sonnet-4-6",
         messages=[{"role": "user", "content": "hi"}],
         tools=[_tool("a"), {**_tool("b"), "defer_loading": True}],
