@@ -1,0 +1,304 @@
+{
+ "version": 1,
+ "generated_by": "tests/fixtures/compression_ratio_golden/_generate.py",
+ "metric_notes": {
+  "byte_ratio": "1 - bytes_after/bytes_before (UTF-8)",
+  "token_ratio": "1 - tokens_after/tokens_before (EstimatingTokenCounter)"
+ },
+ "tolerances": {
+  "smart_crusher": 0.02,
+  "text_crusher": 0.02,
+  "log": 0.02,
+  "search": 0.02,
+  "diff": 0.02,
+  "tabular": 0.02,
+  "config": 0.02,
+  "code_aware": 0.05,
+  "html": 0.1,
+  "kompress": 0.1
+ },
+ "cases": {
+  "smart_crusher/dict_array_200": {
+   "bytes_before": 21095,
+   "bytes_after": 9565,
+   "tokens_before": 6592,
+   "tokens_after": 2391,
+   "byte_ratio": 0.546575,
+   "token_ratio": 0.637288,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "smart_crusher/duplicate_rows_60": {
+   "bytes_before": 2160,
+   "bytes_after": 990,
+   "tokens_before": 675,
+   "tokens_after": 248,
+   "byte_ratio": 0.541667,
+   "token_ratio": 0.632593,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "smart_crusher/nested_events_30": {
+   "bytes_before": 1878,
+   "bytes_after": 899,
+   "tokens_before": 587,
+   "tokens_after": 281,
+   "byte_ratio": 0.521299,
+   "token_ratio": 0.521295,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "smart_crusher/small_object_passthrough": {
+   "bytes_before": 19,
+   "bytes_after": 19,
+   "tokens_before": 6,
+   "tokens_after": 6,
+   "byte_ratio": 0.0,
+   "token_ratio": 0.0,
+   "modified": false,
+   "tolerance": 0.02
+  },
+  "log/pytest_output": {
+   "bytes_before": 2329,
+   "bytes_after": 729,
+   "tokens_before": 582,
+   "tokens_after": 182,
+   "byte_ratio": 0.68699,
+   "token_ratio": 0.687285,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "log/cargo_build": {
+   "bytes_before": 9290,
+   "bytes_after": 985,
+   "tokens_before": 2654,
+   "tokens_after": 281,
+   "byte_ratio": 0.893972,
+   "token_ratio": 0.894122,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "log/repetitive_app_log": {
+   "bytes_before": 4455,
+   "bytes_after": 552,
+   "tokens_before": 1114,
+   "tokens_after": 138,
+   "byte_ratio": 0.876094,
+   "token_ratio": 0.876122,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "log/short_log_passthrough": {
+   "bytes_before": 24,
+   "bytes_after": 24,
+   "tokens_before": 6,
+   "tokens_after": 6,
+   "byte_ratio": 0.0,
+   "token_ratio": 0.0,
+   "modified": false,
+   "tolerance": 0.02
+  },
+  "search/grep_multifile_48": {
+   "bytes_before": 2616,
+   "bytes_after": 891,
+   "tokens_before": 747,
+   "tokens_after": 255,
+   "byte_ratio": 0.659404,
+   "token_ratio": 0.658635,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "search/ripgrep_context_20": {
+   "bytes_before": 1870,
+   "bytes_after": 345,
+   "tokens_before": 468,
+   "tokens_after": 86,
+   "byte_ratio": 0.815508,
+   "token_ratio": 0.816239,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "search/small_search_passthrough": {
+   "bytes_before": 27,
+   "bytes_after": 26,
+   "tokens_before": 8,
+   "tokens_after": 7,
+   "byte_ratio": 0.037037,
+   "token_ratio": 0.125,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "diff/multi_file_diff_5": {
+   "bytes_before": 3225,
+   "bytes_after": 1777,
+   "tokens_before": 806,
+   "tokens_after": 444,
+   "byte_ratio": 0.448992,
+   "token_ratio": 0.449132,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "diff/single_hunk_small": {
+   "bytes_before": 108,
+   "bytes_after": 108,
+   "tokens_before": 27,
+   "tokens_after": 27,
+   "byte_ratio": 0.0,
+   "token_ratio": 0.0,
+   "modified": false,
+   "tolerance": 0.02
+  },
+  "tabular/csv_80_rows": {
+   "bytes_before": 5507,
+   "bytes_after": 5507,
+   "tokens_before": 1377,
+   "tokens_after": 1377,
+   "byte_ratio": 0.0,
+   "token_ratio": 0.0,
+   "modified": false,
+   "tolerance": 0.02
+  },
+  "tabular/markdown_table_40": {
+   "bytes_before": 843,
+   "bytes_after": 565,
+   "tokens_before": 211,
+   "tokens_after": 141,
+   "byte_ratio": 0.329775,
+   "token_ratio": 0.331754,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "tabular/tiny_csv_passthrough": {
+   "bytes_before": 8,
+   "bytes_after": 8,
+   "tokens_before": 2,
+   "tokens_after": 2,
+   "byte_ratio": 0.0,
+   "token_ratio": 0.0,
+   "modified": false,
+   "tolerance": 0.02
+  },
+  "config/yaml_service_config": {
+   "bytes_before": 994,
+   "bytes_after": 646,
+   "tokens_before": 248,
+   "tokens_after": 162,
+   "byte_ratio": 0.350101,
+   "token_ratio": 0.346774,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "config/toml_lockfile_packages": {
+   "bytes_before": 1705,
+   "bytes_after": 1183,
+   "tokens_before": 486,
+   "tokens_after": 356,
+   "byte_ratio": 0.306158,
+   "token_ratio": 0.26749,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "config/ini_sections": {
+   "bytes_before": 750,
+   "bytes_after": 601,
+   "tokens_before": 188,
+   "tokens_after": 150,
+   "byte_ratio": 0.198667,
+   "token_ratio": 0.202128,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "text_crusher/prose_redundant_20": {
+   "bytes_before": 1077,
+   "bytes_after": 498,
+   "tokens_before": 269,
+   "tokens_after": 125,
+   "byte_ratio": 0.537604,
+   "token_ratio": 0.535316,
+   "modified": true,
+   "tolerance": 0.02
+  },
+  "text_crusher/short_prose_passthrough": {
+   "bytes_before": 40,
+   "bytes_after": 40,
+   "tokens_before": 10,
+   "tokens_after": 10,
+   "byte_ratio": 0.0,
+   "token_ratio": 0.0,
+   "modified": false,
+   "tolerance": 0.02
+  },
+  "code_aware/python_module": {
+   "bytes_before": 3607,
+   "bytes_after": 3607,
+   "tokens_before": 1031,
+   "tokens_after": 1031,
+   "byte_ratio": 0.0,
+   "token_ratio": 0.0,
+   "modified": false,
+   "tolerance": 0.05
+  },
+  "code_aware/typescript_module": {
+   "bytes_before": 1568,
+   "bytes_after": 1217,
+   "tokens_before": 448,
+   "tokens_after": 348,
+   "byte_ratio": 0.223852,
+   "token_ratio": 0.223214,
+   "modified": true,
+   "tolerance": 0.05
+  },
+  "html/article_page": {
+   "bytes_before": 2635,
+   "bytes_after": 2071,
+   "tokens_before": 659,
+   "tokens_after": 518,
+   "byte_ratio": 0.214042,
+   "token_ratio": 0.213961,
+   "modified": true,
+   "tolerance": 0.1
+  },
+  "html/docs_page": {
+   "bytes_before": 1766,
+   "bytes_after": 1338,
+   "tokens_before": 442,
+   "tokens_after": 335,
+   "byte_ratio": 0.242356,
+   "token_ratio": 0.242081,
+   "modified": true,
+   "tolerance": 0.1
+  },
+  "kompress/prose_pipeline_doc": {
+   "bytes_before": 2300,
+   "bytes_after": 2164,
+   "tokens_before": 575,
+   "tokens_after": 541,
+   "byte_ratio": 0.05913,
+   "token_ratio": 0.05913,
+   "modified": true,
+   "tolerance": 0.1
+  },
+  "kompress/meeting_notes": {
+   "bytes_before": 1599,
+   "bytes_after": 1448,
+   "tokens_before": 457,
+   "tokens_after": 414,
+   "byte_ratio": 0.094434,
+   "token_ratio": 0.094092,
+   "modified": true,
+   "tolerance": 0.1
+  }
+ },
+ "aggregates": {
+  "code_aware": 0.111926,
+  "config": 0.284975,
+  "diff": 0.224496,
+  "html": 0.228199,
+  "kompress": 0.076782,
+  "log": 0.614264,
+  "search": 0.503983,
+  "smart_crusher": 0.402385,
+  "tabular": 0.109925,
+  "text_crusher": 0.268802
+ }
+}
