@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from headroom.memory.adapters.graph import InMemoryGraphStore
-from headroom.memory.adapters.hnsw import HNSWVectorIndex
+from headroom.memory.adapters.hnsw import HNSWVectorIndex, _check_hnswlib_available
 from headroom.memory.adapters.sqlite import SQLiteMemoryStore
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 from headroom.memory.config import MemoryConfig
@@ -16,6 +16,10 @@ from headroom.memory.models import Memory
 from headroom.memory.ports import MemoryFilter
 from headroom.memory.sync import sync, sync_export, sync_import
 from headroom.memory.sync_adapters.codex_agent import CodexAdapter
+
+# HierarchicalMemory requires hnswlib. The probe runs hnswlib in a subprocess and
+# can fail on some CI CPUs or under timeout, so skip instead of erroring at setup.
+pytestmark = pytest.mark.skipif(not _check_hnswlib_available(), reason="hnswlib not available")
 
 
 @pytest.fixture
