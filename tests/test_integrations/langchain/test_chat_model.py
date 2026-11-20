@@ -229,6 +229,30 @@ class TestHeadroomChatModel:
             assert len(model._metrics_history) == 1
             assert model._metrics_history[0].tokens_saved == 20
 
+    def test_generate_allows_compression_of_user_context(self, mock_chat_model, sample_messages):
+        """The wrapper must allow long HumanMessage context into the router."""
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        model = HeadroomChatModel(mock_chat_model)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline
+
+        with patch.object(model._pipeline, "apply") as mock_apply:
+            mock_result = MagicMock()
+            mock_result.messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Long context"},
+            ]
+            mock_result.tokens_before = 100
+            mock_result.tokens_after = 80
+            mock_result.transforms_applied = ["kompress"]
+            mock_apply.return_value = mock_result
+
+            model._generate(sample_messages)
+
+        assert mock_apply.call_args.kwargs["compress_user_messages"] is True
+
     def test_metrics_history_limited(self, mock_chat_model, sample_messages):
         """Metrics history is limited to 100 entries."""
         from headroom.integrations import HeadroomChatModel
