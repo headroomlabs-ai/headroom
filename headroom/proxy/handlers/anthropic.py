@@ -82,7 +82,7 @@ from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.model_router import estimate_input_tokens, request_max_tokens
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
-from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.outcome import RequestOutcome, set_pending_proactive_retrieval
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
 from headroom.proxy.provider_usage import anthropic_cache_ttl_buckets, usage_int
 from headroom.proxy.rate_limit_identity import rate_limit_identity
@@ -992,6 +992,38 @@ class AnthropicHandlerMixin:
                 return updated
 
         return messages
+
+    def _record_proactive_retrieval_drawback(self, count: int, payload: int) -> None:
+        """Record a proxy proactive-expansion re-injection as retrieval drawback.
+
+        Proactive expansion re-injects compressed originals into the billed
+        request body without the model calling ``headroom_retrieve``. Feed it
+        through the same two channels ``cost.py`` aggregates so net savings
+        reflect it: the live handler counters (payload tokens only -- ``cost.py``
+        adds the per-retrieval overhead once, from the count) and the durable
+        savings ledger (payload + ``count`` * overhead, matching the reactive
+        ``_record_retrieval_savings`` split). Best-effort; never raises.
+        """
+        if count <= 0 and payload <= 0:
+            return
+        handler = getattr(self, "ccr_response_handler", None)
+        if handler is not None:
+            handler.record_proactive_retrievals(count, payload)
+        try:
+            from headroom import savings_ledger
+            from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
+
+            savings_ledger.record_savings_event(
+                tokens_before=0,
+                tokens_after=0,
+                kind="retrieve",
+                tokens_retrieved=payload + count * CCR_RETRIEVAL_OVERHEAD_TOKENS,
+                model=None,
+                client="proxy",
+                source="proxy",
+            )
+        except Exception:
+            logger.debug("durable proactive retrieval recording failed", exc_info=True)
 
     @staticmethod
     def _is_proactive_expansion_block(block: Any) -> bool:
@@ -3333,12 +3365,29 @@ class AnthropicHandlerMixin:
                                 # cached prefix (Claude Code's trailing system
                                 # marker sits after it). Mutating it makes the
                                 # next overlay/restart rewrite the conversation.
-                                optimized_messages = (
+                                new_optimized = (
                                     self._append_proactive_expansion_after_cached_prefix(
                                         optimized_messages,
                                         expansion_text,
                                     )
                                 )
+                                # Only a real re-injection is billed. The helper
+                                # returns the SAME list object unchanged when the
+                                # latest turn is frozen or has no eligible text
+                                # block -- in that case nothing was appended, so
+                                # there is no retrieval drawback to record.
+                                if new_optimized is not optimized_messages:
+                                    optimized_messages = new_optimized
+                                    # Defer recording: bind the drawback to this
+                                    # request. The outcome funnel books it only
+                                    # after the upstream forward succeeds, so a
+                                    # failed request never inflates net savings.
+                                    set_pending_proactive_retrieval(
+                                        (
+                                            len(expansions),
+                                            sum(int(e.get("tokens", 0) or 0) for e in expansions),
+                                        )
+                                    )
 
             # Traffic Learner: Extract patterns from inbound tool results
             if self.traffic_learner and not (

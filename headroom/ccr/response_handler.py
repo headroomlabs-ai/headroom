@@ -77,6 +77,9 @@ class CCRToolResult:
     success: bool
     items_retrieved: int = 0
     tool_name: str | None = None
+    # Keep new optional fields after the established positional constructor
+    # parameters. Some integrations still pass ``tool_name`` positionally.
+    tokens_retrieved: int = 0
 
 
 @dataclass
@@ -130,6 +133,9 @@ class CCRResponseHandler:
     def __init__(self, config: ResponseHandlerConfig | None = None):
         self.config = config or ResponseHandlerConfig()
         self._retrieval_count = 0
+        self._retrieved_tokens = 0
+        self._ccr_overhead_input_tokens = 0
+        self._ccr_overhead_output_tokens = 0
         self._retrieval_count_lock = __import__("threading").Lock()
 
     def serve_withheld_retrievals(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -266,6 +272,9 @@ class CCRResponseHandler:
                     content=content,
                     success=True,
                     items_retrieved=entry.original_item_count,
+                    tokens_retrieved=(
+                        getattr(entry, "original_tokens", 0) or len(entry.original_content) // 4
+                    ),
                     tool_name=ccr_call.tool_name,
                 )
 
@@ -501,6 +510,19 @@ class CCRResponseHandler:
         current_response = response
         current_messages = list(messages)  # Copy to avoid mutation
         rounds = 0
+        # Per-call sum of the dropped rounds' usage, split into the cost buckets
+        # the outcome funnel prices (uncached input / cache_read / cache_write /
+        # output). Kept in locals (NOT the shared instance counters at 542-543)
+        # so concurrent requests on one handler can't mix their overhead; the
+        # instance counters stay for the /stats ccr_overhead attribution view.
+        # Cache-split (not just gross input) matters: OpenAI prompt_tokens and
+        # Anthropic input_tokens have different cache semantics, and pricing
+        # cached tokens at the discounted/premium rate vs full-list uncached is
+        # the difference between an accurate fold and an over-count.
+        call_overhead_uncached_in = 0
+        call_overhead_cache_read = 0
+        call_overhead_cache_write = 0
+        call_overhead_output = 0
 
         while rounds < self.config.max_retrieval_rounds:
             # Check for CCR tool calls
@@ -547,9 +569,6 @@ class CCRResponseHandler:
                 current_response = trimmed
 
             rounds += 1
-            with self._retrieval_count_lock:
-                self._retrieval_count += len(ccr_calls)
-
             logger.info(f"CCR: Handling {len(ccr_calls)} retrieval(s) in round {rounds}")
 
             # Execute all CCR retrievals
@@ -586,9 +605,15 @@ class CCRResponseHandler:
             else:
                 current_messages.append(tool_result_msg)
 
+            # Capture the usage of the response we are about to drop. Only
+            # account the retrieved payload after the continuation succeeds; if
+            # that upstream call fails, the payload was never re-injected into a
+            # billed request.
+            _in_tok, _out_tok = self._extract_usage_tokens(current_response)
+
             # Make continuation API call
             try:
-                current_response = await api_call_fn(current_messages, tools)
+                next_response = await api_call_fn(current_messages, tools)
             except Exception as e:
                 # Log the type and repr, not just str(e): many exceptions
                 # (httpx.TimeoutException(''), a bare Exception(), a connect
@@ -604,23 +629,182 @@ class CCRResponseHandler:
                     current_response = mixed_turn
                 break
 
+            # Account this round atomically so get_stats sees a consistent
+            # snapshot: retrieval count, the retrieved payload, and the usage of
+            # the dropped tool_use response.
+            with self._retrieval_count_lock:
+                self._retrieval_count += len(ccr_calls)
+                self._retrieved_tokens += sum(r.tokens_retrieved for r in results)
+                self._ccr_overhead_input_tokens += _in_tok
+                self._ccr_overhead_output_tokens += _out_tok
+                _uin, _cr, _cw, _uout = self._extract_round_cost_usage(current_response, provider)
+                call_overhead_uncached_in += _uin
+                call_overhead_cache_read += _cr
+                call_overhead_cache_write += _cw
+                call_overhead_output += _uout
+
+            # Durable ledger: record this round's proxy-side retrieval so
+            # `headroom savings` reflects net (not just gross) for proxy
+            # deployments -- the proxy CCR handler never routes through the MCP
+            # tool path that writes the ledger. Best-effort, blended-rate priced.
+            self._record_retrieval_savings(results)
+            current_response = next_response
+
         if rounds >= self.config.max_retrieval_rounds:
             logger.warning(
                 f"CCR: Hit max retrieval rounds ({self.config.max_retrieval_rounds}), "
                 f"returning response with possible unhandled CCR calls"
             )
 
+        # Publish this call's dropped-round usage (cache-split) to the outcome
+        # funnel (per-asyncio-task ContextVar). The funnel folds each bucket
+        # into the matching cost field so cost_with_headroom prices continuation
+        # cache at the right rate. Guarded so a no-continuation call (rounds ==
+        # 0) publishes nothing.
+        if (
+            call_overhead_uncached_in
+            or call_overhead_cache_read
+            or call_overhead_cache_write
+            or call_overhead_output
+        ):
+            from headroom.proxy.outcome import set_pending_ccr_continuation_usage
+
+            set_pending_ccr_continuation_usage(
+                (
+                    call_overhead_uncached_in,
+                    call_overhead_cache_read,
+                    call_overhead_cache_write,
+                    call_overhead_output,
+                )
+            )
+
         return current_response
+
+    def _record_retrieval_savings(self, results: list[CCRToolResult]) -> None:
+        """Append a durable retrieve event for a proxy CCR round (best-effort).
+
+        The proxy's in-process handler never routes through the MCP tool path
+        that writes the ledger, so without this `headroom savings` would show
+        gross (not net) for proxy deployments. Priced at the blended rate
+        (the handler has no request-model context). Never raises.
+        """
+        try:
+            successes = [r for r in results if r.success and r.tokens_retrieved > 0]
+            payload = sum(r.tokens_retrieved for r in successes)
+            if payload <= 0:
+                return
+            from headroom import savings_ledger
+            from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
+
+            savings_ledger.record_savings_event(
+                tokens_before=0,
+                tokens_after=0,
+                kind="retrieve",
+                tokens_retrieved=payload + len(successes) * CCR_RETRIEVAL_OVERHEAD_TOKENS,
+                model=None,
+                client="proxy",
+                source="proxy",
+            )
+        except Exception:
+            logger.debug("durable proxy retrieval recording failed", exc_info=True)
+
+    def record_proactive_retrievals(self, count: int, tokens: int) -> None:
+        """Fold proxy proactive-expansion re-injections into live retrieval stats.
+
+        Payload tokens only (overhead is added once by cost.py from the count),
+        mirroring the reactive path so cost.py aggregation stays consistent.
+        """
+        if count <= 0 and tokens <= 0:
+            return
+        with self._retrieval_count_lock:
+            self._retrieval_count += max(count, 0)
+            self._retrieved_tokens += max(tokens, 0)
+
+    @staticmethod
+    def _extract_usage_tokens(resp: Any) -> tuple[int, int]:
+        """Return (input_tokens, output_tokens) from a provider response.
+
+        Tolerates Anthropic (input_tokens/output_tokens) and OpenAI
+        (prompt_tokens/completion_tokens) shapes; (0, 0) when absent.
+        """
+        if not isinstance(resp, dict):
+            return 0, 0
+        usage = resp.get("usage") or {}
+        if not isinstance(usage, dict):
+            return 0, 0
+        inp = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+        out = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+        try:
+            return int(inp), int(out)
+        except (TypeError, ValueError):
+            return 0, 0
+
+    @staticmethod
+    def _extract_round_cost_usage(resp: Any, provider: str) -> tuple[int, int, int, int]:
+        """Return (uncached_input, cache_read, cache_write, output) for one
+        continuation round, split into the cost buckets the outcome funnel
+        prices.
+
+        Provider-aware so cached tokens land in cache_read / cache_write
+        (priced discounted / premium by cost_with_headroom) instead of being
+        collapsed into uncached input at full list price. Mirrors the per-handler
+        usage parsing (handlers/anthropic.py, handlers/openai.py) for the dropped
+        continuation rounds, which those handlers only parse for the final round.
+
+        OpenAI cache_write *inference* (_infer_openai_cache_write_tokens) is
+        deliberately NOT replicated here: it is a heuristic, and for the cost
+        fold we only credit cache_write that the provider reported explicitly
+        (cache_creation_input_tokens). Cached-token reads prefer the
+        Anthropic/Bedrock top-level keys when present (authoritative), then fall
+        back to the OpenAI prompt_tokens_details / input_tokens_details shapes.
+        """
+        if not isinstance(resp, dict):
+            return 0, 0, 0, 0
+        usage = resp.get("usage") or {}
+        if not isinstance(usage, dict):
+            return 0, 0, 0, 0
+
+        def _i(value: Any, default: int = 0) -> int:
+            try:
+                return max(int(value), 0)
+            except (TypeError, ValueError):
+                return default
+
+        if provider in ("openai", "openai_responses"):
+            gross = _i(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
+            out = _i(usage.get("completion_tokens", usage.get("output_tokens", 0)))
+            cr = _i(usage.get("cache_read_input_tokens", 0))
+            cw = _i(usage.get("cache_creation_input_tokens", 0))
+            if cr == 0:
+                details = (
+                    usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+                )
+                if isinstance(details, dict):
+                    cr = _i(details.get("cached_tokens", 0))
+            uncached = max(0, gross - cr - cw)
+            return uncached, cr, cw, out
+
+        # anthropic (and default): input_tokens is already the uncached portion.
+        return (
+            _i(usage.get("input_tokens", 0)),
+            _i(usage.get("cache_read_input_tokens", 0)),
+            _i(usage.get("cache_creation_input_tokens", 0)),
+            _i(usage.get("output_tokens", 0)),
+        )
 
     def get_stats(self) -> dict[str, Any]:
         """Get handler statistics."""
-        return {
-            "total_retrievals": self._retrieval_count,
-            "config": {
-                "enabled": self.config.enabled,
-                "max_rounds": self.config.max_retrieval_rounds,
-            },
-        }
+        with self._retrieval_count_lock:
+            return {
+                "total_retrievals": self._retrieval_count,
+                "tokens_retrieved": self._retrieved_tokens,
+                "ccr_overhead_input_tokens": self._ccr_overhead_input_tokens,
+                "ccr_overhead_output_tokens": self._ccr_overhead_output_tokens,
+                "config": {
+                    "enabled": self.config.enabled,
+                    "max_rounds": self.config.max_retrieval_rounds,
+                },
+            }
 
 
 @dataclass

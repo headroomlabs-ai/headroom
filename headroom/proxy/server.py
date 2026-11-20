@@ -2740,7 +2740,10 @@ class HeadroomProxy(
         See ``docs/superpowers/specs/P0-proxy-pipeline-audit.md`` for the
         divergence catalog this funnel collapses.
         """
-        from headroom.proxy.outcome import emit_request_outcome
+        from headroom.proxy.outcome import (
+            clear_pending_outcome_side_channels,
+            emit_request_outcome,
+        )
 
         # Shielded because four call sites are `finally:` blocks inside streaming
         # async generators (streaming.py:1611, :1859, :2069, openai.py:8614). A
@@ -2753,7 +2756,14 @@ class HeadroomProxy(
         # The shield does not swallow the cancellation — the await below still
         # raises CancelledError, so generator teardown propagates exactly as
         # before. It only keeps the bookkeeping from being torn in half.
-        await asyncio.shield(emit_request_outcome(self, outcome))
+        try:
+            await asyncio.shield(emit_request_outcome(self, outcome))
+        finally:
+            # The shielded funnel runs in a child task, which holds a COPY of this
+            # context: its consume_* cleared the copy, not ours. Clear here as well,
+            # or a second outcome emitted from this same context would re-book the
+            # same CCR continuation usage / proactive drawback.
+            clear_pending_outcome_side_channels()
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
@@ -5498,6 +5508,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         tool_schema_usd = float(_cost_tracker_stats.get("tool_savings_usd", 0.0) or 0.0)
         total_tokens_all_layers = all_layers_tokens_saved
         persistent_savings = m.savings_tracker.stats_preview()
+        # Durable CCR retrieval figures (survive proxy restart). The session
+        # CCR card only reflects the current process's in-memory handler counts,
+        # so retrievals recorded by prior proxy processes vanish after a restart.
+        # Surface the ledger's lifetime totals next to lifetime cache reads. Copy
+        # the lifetime dict before augmenting so the tracker snapshot is untouched.
+        # Best-effort -- never break /stats on a ledger read.
+        try:
+            from headroom.savings_ledger import aggregate_savings
+
+            _ledger_lifetime = aggregate_savings().lifetime
+            _ps_lifetime = dict(persistent_savings.get("lifetime") or {})
+            _ps_lifetime["retrievals"] = int(_ledger_lifetime.get("retrievals", 0) or 0)
+            _ps_lifetime["tokens_retrieved"] = int(_ledger_lifetime.get("tokens_retrieved", 0) or 0)
+            _ps_lifetime["net_tokens_saved"] = int(_ledger_lifetime.get("net_tokens_saved", 0) or 0)
+            persistent_savings["lifetime"] = _ps_lifetime
+        except Exception:  # noqa: BLE001 -- never break /stats on a ledger read
+            pass
         display_session = persistent_savings.get("display_session", {})
         recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
         recent_request_payload = _build_recent_request_payload()
@@ -5878,6 +5905,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "original_tokens_cached": compression_stats.get("total_original_tokens", 0),
                 "compressed_tokens_cached": compression_stats.get("total_compressed_tokens", 0),
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
+                # CCR retrieval drawback -> net savings. Mirrored from the session
+                # summary (single source of the net computation) so external
+                # dashboards can read net without descending into `summary`.
+                "tokens_retrieved": summary["compression"].get("tokens_retrieved", 0),
+                "retrievals_total": summary["compression"].get("retrievals_total", 0),
+                "net_tokens_saved": summary["compression"].get("net_tokens_saved", 0),
+                "retrieval_cost_usd": summary["cost"].get("retrieval_cost_usd", 0.0),
                 # "this_replica" with a shared store: the token and retrieval
                 # counts are this process's since it started, not the store's.
                 "totals_scope": compression_stats.get("totals_scope", "store"),
@@ -5915,6 +5949,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     for p in feedback_stats.get("tool_patterns", {}).values()
                     if p.get("retrieval_rate", 0) > 0.3
                 ),
+                # Over-compression signal: tools the model keeps re-expanding.
+                # Surfaced as a ranked list (top 5) for the dashboard CCR card.
+                "high_retrieval_tools": sorted(
+                    (
+                        {
+                            "tool": name,
+                            "retrieval_rate": round(p.get("retrieval_rate", 0), 4),
+                            "retrievals": p.get("retrievals", 0),
+                            "compressions": p.get("compressions", 0),
+                        }
+                        for name, p in feedback_stats.get("tool_patterns", {}).items()
+                        if p.get("retrieval_rate", 0) > 0.3
+                    ),
+                    key=lambda r: r["retrieval_rate"],
+                    reverse=True,
+                )[:5],
             },
             "toin": get_toin().get_stats(),
             # Auto-learning progress. `pending_patterns` counts sub-threshold

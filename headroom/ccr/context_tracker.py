@@ -533,6 +533,8 @@ class ContextTracker:
                             "content": entry.original_content,
                             "item_count": entry.original_item_count,
                             "reason": rec.reason,
+                            "tokens": getattr(entry, "original_tokens", 0)
+                            or (len(entry.original_content) // 4),
                         }
                     )
                     logger.info(

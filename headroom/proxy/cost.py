@@ -632,7 +632,7 @@ def _aggregate_mcp_events() -> dict[str, int]:
     compress events), ``retrievals`` (count of headroom_retrieve
     calls — the load-bearing over-compression signal).
     """
-    zero = {"compressions": 0, "tokens_removed": 0, "retrievals": 0}
+    zero = {"compressions": 0, "tokens_removed": 0, "retrievals": 0, "tokens_retrieved": 0}
     try:
         from headroom.ccr.mcp_server import _read_shared_events
     except ImportError:
@@ -646,6 +646,7 @@ def _aggregate_mcp_events() -> dict[str, int]:
     compressions = 0
     tokens_removed = 0
     retrievals = 0
+    tokens_retrieved = 0
     for evt in events:
         kind = evt.get("type")
         if kind == "compress":
@@ -655,10 +656,12 @@ def _aggregate_mcp_events() -> dict[str, int]:
             tokens_removed += max(0, in_tok - out_tok)
         elif kind == "retrieve":
             retrievals += 1
+            tokens_retrieved += int(evt.get("tokens", 0) or 0)
     return {
         "compressions": compressions,
         "tokens_removed": tokens_removed,
         "retrievals": retrievals,
+        "tokens_retrieved": tokens_retrieved,
     }
 
 
@@ -869,6 +872,63 @@ def build_session_summary(
     # (if it grows linearly with turn count, our lossy compressors are
     # dropping info the model actually needs).
     summary["mcp"] = _aggregate_mcp_events()
+
+    # ---- CCR retrieval drawback -> net savings ----
+    # Retrievals re-inject original content plus tool wrappers: real billed
+    # tokens that offset gross compression savings. Sum the three retrieval
+    # channels -- the MCP shared log (out-of-process `headroom mcp serve`), the
+    # in-process proxy CCR reactive handler, and proxy proactive expansion
+    # (folded into the same handler counters) -- which handle disjoint
+    # retrievals, so this does not double-count. Imported lazily to avoid an
+    # import cycle (matches _aggregate_mcp_events' deferred import above).
+    from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
+    from headroom.savings_ledger import estimate_cost_usd
+
+    _mcp_stats = summary["mcp"]
+    _handler_stats: dict[str, Any] = {}
+    _handler = getattr(proxy, "ccr_response_handler", None)
+    if _handler is not None:
+        try:
+            _handler_stats = _handler.get_stats()
+        except Exception:  # noqa: BLE001 -- never break /stats on a handler read
+            _handler_stats = {}
+    retrievals_total = int(_mcp_stats.get("retrievals", 0) or 0) + int(
+        _handler_stats.get("total_retrievals", 0) or 0
+    )
+    tokens_retrieved = int(_mcp_stats.get("tokens_retrieved", 0) or 0) + int(
+        _handler_stats.get("tokens_retrieved", 0) or 0
+    )
+    overhead_tokens = retrievals_total * CCR_RETRIEVAL_OVERHEAD_TOKENS
+    # Honest net: never clamped, goes negative when retrievals outweigh savings.
+    net_tokens_saved = int(metrics.tokens_saved_total or 0) - tokens_retrieved - overhead_tokens
+
+    summary["compression"]["tokens_retrieved"] = tokens_retrieved
+    summary["compression"]["retrievals_total"] = retrievals_total
+    summary["compression"]["net_tokens_saved"] = net_tokens_saved
+
+    # Attribution view only. The dropped CCR continuation rounds' usage is now
+    # folded into the cost view at the outcome funnel
+    # (set_pending_ccr_continuation_usage -> the cost_tracker.record_tokens
+    # cache_read / cache_write / uncached args that cost_with_headroom prices,
+    # plus output_tokens for the budget). So the dropped rounds ARE inside
+    # cost_with_headroom (their input side). This block surfaces them again
+    # purely as a token breakdown; do NOT add ccr_overhead into a second cost
+    # total, that double-counts. (The earlier "already inside cost_with_headroom"
+    # claim was inaccurate: handle_response returns only the final round, so
+    # without the funnel fold the dropped rounds were never costed at all.)
+    # Note the funnel deliberately leaves metrics / SavingsTracker / RequestLog
+    # on the final round's numbers — continuation cache reads must not be
+    # credited as cache savings.
+    summary["cost"]["retrieval_cost_usd"] = round(
+        estimate_cost_usd(primary_model, tokens_retrieved + overhead_tokens), 6
+    )
+    summary["cost"]["ccr_overhead"] = {
+        "retrievals": retrievals_total,
+        "overhead_tokens_per_retrieval": CCR_RETRIEVAL_OVERHEAD_TOKENS,
+        "overhead_tokens_total": overhead_tokens,
+        "input_tokens": int(_handler_stats.get("ccr_overhead_input_tokens", 0) or 0),
+        "output_tokens": int(_handler_stats.get("ccr_overhead_output_tokens", 0) or 0),
+    }
 
     # Codex WS sessions compress per-unit on the long-lived /responses socket,
     # but turn-level records (which feed tokens_saved_total above) only land

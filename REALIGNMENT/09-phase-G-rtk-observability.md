@@ -114,6 +114,11 @@ None.
 
 `git revert`. `tokens_saved_rtk` returns to silent zero.
 
+### Notes
+
+- If the savings ledger/tracker is ever reimplemented in Rust, it must preserve the JSONL event schema's `kind` field (`"compress"` | `"retrieve"`) and `tokens_retrieved` field, deriving net savings at read time rather than encoding a negative `saved` value, so existing ledgers keep loading.
+  - The proxy debits **three** retrieval sources into that net figure — the `headroom_retrieve` MCP tool, the in-process reactive handler, and **proactive expansion** (proxy re-injecting compressed content before the model asks). A Rust port must record proactive expansion as a `retrieve` event too, or net savings will silently under-count re-injected tokens.
+
 ---
 
 ## PR-G3 — Per-invocation RTK metrics + observability gaps

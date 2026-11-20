@@ -440,6 +440,37 @@ class TestExpansionExecution:
         # Should handle gracefully, no results
         assert len(results) == 0
 
+    def test_execute_full_expansion_reports_original_tokens(self):
+        """Result carries the entry's original_tokens for retrieval-cost sizing."""
+        store = get_compression_store()
+        original = json.dumps([{"id": i} for i in range(100)])
+        hash_key = store.store(
+            original=original,
+            compressed="[]",
+            original_item_count=100,
+            original_tokens=1234,
+        )
+        tracker = ContextTracker()
+        results = tracker.execute_expansions(
+            [ExpansionRecommendation(hash_key=hash_key, reason="relevant", relevance_score=0.8)]
+        )
+        assert results[0]["tokens"] == 1234
+
+    def test_execute_full_expansion_tokens_fallback(self):
+        """When original_tokens is 0, fall back to len(content) // 4."""
+        store = get_compression_store()
+        original = "x" * 400
+        hash_key = store.store(
+            original=original,
+            compressed="[]",
+            original_item_count=1,
+        )
+        tracker = ContextTracker()
+        results = tracker.execute_expansions(
+            [ExpansionRecommendation(hash_key=hash_key, reason="relevant", relevance_score=0.8)]
+        )
+        assert results[0]["tokens"] == len(original) // 4 == 100
+
 
 class TestExpansionFormatting:
     """Test formatting of expansions for context."""

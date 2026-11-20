@@ -625,6 +625,7 @@ class CompressionStore:
             "tool_signature_hash": entry.tool_signature_hash,
             "original_tokens": entry.original_tokens,
             "compressed_tokens": entry.compressed_tokens,
+            "tokens": entry.original_tokens,
             "original_item_count": entry.original_item_count,
             "compressed_item_count": entry.compressed_item_count,
             **_payload_for_retrieval_log(payload),

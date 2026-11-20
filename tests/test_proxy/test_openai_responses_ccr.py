@@ -198,6 +198,63 @@ def test_ccr_intercept_exception_is_reraised_not_swallowed():
     assert "function_call" not in json.dumps(body)
 
 
+def test_ccr_outcome_reads_final_round_usage_and_folds_dropped_round_into_cost():
+    """The Responses path captures usage before CCR runs, so it must re-derive it
+    from the final body: provider_input_tokens carries the final round (60 in / 5
+    out), not the initial one (50 / 10), while optimized_tokens stays on the local
+    tokenizer scale. The dropped initial round reaches the cost view via the
+    continuation fold, and only the cost view."""
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=True,
+    )
+    app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    captured: dict = {}
+    cost_calls: list = []
+
+    with TestClient(app) as client:
+        server = app.state.proxy
+        calls = _install_two_call_retry(app)
+
+        emit = server._record_request_outcome
+
+        async def capture_outcome(outcome):
+            captured["outcome"] = outcome
+            await emit(outcome)
+
+        server._record_request_outcome = capture_outcome
+        server.cost_tracker.record_tokens = lambda *a, **kw: cost_calls.append(kw)
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5-codex",
+                "input": "please look this up",
+                "tools": [_RETRIEVE_TOOL],
+                "stream": False,
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    # Initial round + one real continuation round through the live CCR handler.
+    assert len(calls) == 2
+
+    outcome = captured["outcome"]
+    assert outcome.output_tokens == 5
+    assert outcome.optimized_tokens == outcome.original_tokens
+    assert outcome.provider_input_tokens == 60
+    assert outcome.uncached_input_tokens == 60
+
+    # Cost view carries the dropped initial round on top of the final one.
+    assert cost_calls[0]["uncached_tokens"] == 60 + 50
+    assert cost_calls[0]["output_tokens"] == 5 + 10
+
+
 def test_streaming_request_with_retrieve_tool_buffers_upstream_and_streams_final_result():
     """stream:true + headroom_retrieve in tools -> forced buffered stream:false upstream."""
     app = _make_app()
