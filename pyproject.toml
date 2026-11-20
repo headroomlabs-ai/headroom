@@ -194,6 +194,14 @@ memory-stack = [
     "qdrant-client>=1.9.0,<2.0",
     "neo4j>=5.20.0,<7.0",
 ]
+# cognee knowledge-graph memory backend (CogneeBackend). Heavy dependency
+# tree (LLM + graph + vector stack), so intentionally excluded from [all];
+# opt in with `pip install headroom-ai[cognee]`. Not co-installable with [ml]:
+# every cognee release pins huggingface-hub<1 while [ml] needs >=1.5.0 —
+# see [tool.uv].conflicts.
+cognee = [
+    "cognee>=1.5.3,<2.0.0",
+]
 # Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
 # HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
 pytorch-mps = [
@@ -475,6 +483,61 @@ constraint-dependencies = [
     "aiohttp>=3.14.4",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
+]
+
+# Mutually exclusive extras: cognee pins huggingface-hub<1 in every release
+# while [ml] requires huggingface-hub>=1.5.0 (transformers 5.x). Declaring the
+# conflict lets `uv lock` produce a solution for each extra; `pip install
+# headroom-ai[cognee,ml]` remains unsatisfiable upstream of this project.
+conflicts = [
+    [
+        { extra = "cognee" },
+        { extra = "ml" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "proxy" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "proxy-prod" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "memory" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "pytorch-mps" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "voice" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "voice-train" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "evals" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "dev" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "all" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "lean" },
+    ],
+    [
+        { extra = "cognee" },
+        { extra = "sandbox" },
+    ],
 ]
 
 # Pin the project's package index to public PyPI. Without this, `uv lock`
