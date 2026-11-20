@@ -123,7 +123,7 @@ def test_create_proxy_backend_uses_injected_backend_types() -> None:
         anyllm_provider="ignored",
         bedrock_region="us-east-1",
         logger=logger,
-        litellm_backend_cls=lambda provider, region, profile_name=None: {
+        litellm_backend_cls=lambda provider, region, **_: {
             "kind": "litellm",
             "provider": provider,
             "region": region,
