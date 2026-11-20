@@ -19,6 +19,7 @@ from ..config import (
     TransformResult,
     WasteSignals,
 )
+from ..ignore import IgnorePolicy
 from ..observability import get_headroom_tracer, get_otel_metrics
 from ..tokenizer import Tokenizer
 from ..utils import deep_copy_messages
@@ -178,6 +179,15 @@ class TransformPipeline:
         # - Logs -> LogCompressor
         # - Search results -> SearchCompressor
         # - HTML -> HTMLExtractor
+        #
+        # Wire HeadroomConfig.ignore (+ any .headroomignore at cwd) into Read
+        # lifecycle replacement and age-based tool-result compression, which
+        # can identify a real path from a Read tool call (issue #1150).
+        # Root is the process cwd: TransformPipeline has no separate notion
+        # of "project root" today, matching the convention used by
+        # `headroom doctor` / the code-graph watcher.
+        from pathlib import Path as _Path
+
         # observer: the proxy passes PrometheusMetrics; this bare pipeline is
         # used by the library/adapter paths, which would otherwise report
         # tokens.saved with an empty by_strategy. Imported here rather than at
@@ -189,8 +199,10 @@ class TransformPipeline:
         # carried by the Rust config but never read there, so the router gate
         # enforces it. Copied so the router's lazy build can't write back into
         # the caller's config.
+        ignore_policy = IgnorePolicy.load(_Path.cwd(), getattr(self.config, "ignore", None))
         smart_crusher = self.config.smart_crusher
         router_config = ContentRouterConfig(
+            ignore_policy=ignore_policy,
             enable_smart_crusher=smart_crusher.enabled,
             smart_crusher=copy.deepcopy(smart_crusher),
         )

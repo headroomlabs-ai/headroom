@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -429,6 +430,45 @@ def test_stats_endpoint_reports_langfuse_configuration(monkeypatch: pytest.Monke
     assert langfuse["enabled"] is True
     assert langfuse["service_name"] == "headroom-proxy"
     assert langfuse["endpoint"] == "https://cloud.langfuse.com/api/public/otel/v1/traces"
+
+
+def test_proxy_wires_ignore_policy_into_router_and_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    from headroom.config import IgnoreConfig
+    from headroom.proxy.server import HeadroomProxy, ProxyConfig
+
+    captured: dict[str, object] = {}
+
+    class FakeWatcher:
+        def __init__(self, project_dir, ignore_config=None) -> None:
+            captured["project_dir"] = project_dir
+            captured["ignore_config"] = ignore_config
+
+        def start(self) -> bool:
+            return False
+
+    monkeypatch.setattr("headroom.graph.watcher.CodeGraphWatcher", FakeWatcher)
+
+    proxy = HeadroomProxy(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            code_graph_watcher=True,
+            ignore=IgnoreConfig(compress=["CLAUDE.md"], memory=["AGENTS.md"]),
+        )
+    )
+
+    router = proxy.anthropic_pipeline.transforms[-1]
+    assert router.config.ignore_policy.is_ignored("CLAUDE.md", "compress")
+    assert not router.config.ignore_policy.is_ignored("AGENTS.md", "compress")
+    assert captured["project_dir"] == Path.cwd()
+    assert isinstance(captured["ignore_config"], IgnoreConfig)
+    assert captured["ignore_config"].memory == ["AGENTS.md"]
 
 
 # --- Cache-miss attribution (#1313) ---

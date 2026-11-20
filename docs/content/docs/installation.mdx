@@ -99,8 +99,8 @@ pip install "headroom-ai[all]"
 | `proxy-prod` | `proxy` plus gunicorn on Unix production hosts | `pip install "headroom-ai[proxy,proxy-prod]"` |
 | `ml` | PyTorch/Hugging Face Kompress backend and model tooling; opt-in, not in `[all]` | `pip install "headroom-ai[ml]"` |
 | `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
-| `memory` | Persistent memory (sqlite-vec, sentence-transformers); opt-in, not in `[all]` | `pip install "headroom-ai[memory]"` |
-| `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
+| `memory` | Persistent memory (sqlite-vec, sentence-transformers); opt-in, not in `[all]` — pure-Python default backend, no compiler | `pip install "headroom-ai[memory]"` |
+| `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain and, on distro Python, development headers; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
 | `memory-stack` | Optional Qdrant + Neo4j memory backend helpers; **not in `[all]`**. Headroom turns off Mem0's PostHog telemetry by default; set `MEM0_TELEMETRY=True` to allow it | `pip install "headroom-ai[memory-stack]"` |
 | `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
 | `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |

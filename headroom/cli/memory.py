@@ -1332,6 +1332,16 @@ def export_memories(ctx: click.Context, db_path: str, output: str | None) -> Non
 
         if output:
             output_path = Path(output)
+            from headroom.ignore import IgnorePolicy
+
+            policy = IgnorePolicy.load(Path.cwd())
+            rule = policy.matching_rule(output_path, "mutate")
+            if rule is not None:
+                print_error(
+                    f"Refusing to export to {output_path}: ignored for mutation by rule "
+                    f"'{rule.pattern}' (from {rule.source})."
+                )
+                sys.exit(1)
             fsutil.write_text(output_path, json_output)
             print_success(f"Exported {len(memories)} memory(ies) to {output_path}")
         else:
