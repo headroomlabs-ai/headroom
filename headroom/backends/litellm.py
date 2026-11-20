@@ -692,15 +692,121 @@ def _convert_tool_choice(choice: Any) -> Any:
     return "auto"
 
 
-def _client_tools_only(tools: list[Any]) -> list[Any]:
-    """Drop Anthropic server-side tools, which only Anthropic can execute.
+# Anthropic runs these tools itself. Sent to another vendor's model each would
+# become a function it can call but nobody answers, so they are dropped there.
+# Anthropic's client-executed built-ins (``bash_*``, ``text_editor_*``,
+# ``computer_*``, ``memory_*``) are the caller's to run and are kept.
+_ANTHROPIC_SERVER_TOOL_PREFIXES = (
+    "web_search_",
+    "web_fetch_",
+    "code_execution_",
+    "tool_search_tool_",
+)
 
-    A typed entry (``tool_search_tool_regex_20251119``, ``web_search_20250305``,
-    ...) has no ``input_schema``; converted as-is it becomes a parameterless
-    function the target model can call but nobody can answer. Client tools carry
-    no ``type``, or ``"custom"``.
+# Parameters for client-executed built-ins, which Anthropic declares by type
+# alone (no ``input_schema``). Without them a model from another vendor sees a
+# bare name and has to guess the arguments. Keyed by type prefix; the computer
+# and memory tools keep the bare name, as before.
+_CLIENT_BUILTIN_SCHEMAS: dict[str, dict[str, Any]] = {
+    "bash_": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "The shell command to run."},
+            "restart": {
+                "type": "boolean",
+                "description": "Restart the shell session instead of running a command.",
+            },
+        },
+    },
+    "text_editor_": {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "One of view, create, str_replace or insert.",
+            },
+            "path": {"type": "string", "description": "Absolute path of the file."},
+            "file_text": {"type": "string", "description": "Content for create."},
+            "old_str": {"type": "string", "description": "Exact text to replace."},
+            "new_str": {"type": "string", "description": "Replacement or inserted text."},
+            "insert_line": {"type": "integer", "description": "Line to insert after."},
+            "view_range": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "[start, end] lines to view; end -1 means to the end.",
+            },
+        },
+        "required": ["command", "path"],
+    },
+}
+
+
+def _is_anthropic_server_tool(tool: Any) -> bool:
+    kind = tool.get("type") if isinstance(tool, dict) else None
+    return isinstance(kind, str) and kind.startswith(_ANTHROPIC_SERVER_TOOL_PREFIXES)
+
+
+def _with_builtin_schema(tool: Any) -> Any:
+    """``tool`` with parameters for a client-executed built-in that has none."""
+    kind = tool.get("type") if isinstance(tool, dict) else None
+    if not isinstance(kind, str) or "input_schema" in tool:
+        return tool
+    for prefix, schema in _CLIENT_BUILTIN_SCHEMAS.items():
+        if kind.startswith(prefix):
+            return {**tool, "input_schema": schema}
+    return tool
+
+
+def _translated_tool_kwargs(
+    body: dict[str, Any], *, cross_vendor: bool, bedrock: bool
+) -> tuple[dict[str, Any], str | None]:
+    """The ``tools`` and ``tool_choice`` kwargs for ``body``, and an error.
+
+    The error is set when a request for another vendor's model forces a tool
+    that cannot be sent there (an Anthropic server tool), or demands a tool
+    when none is left: sending the choice anyway would name a function that
+    does not exist, which the target rejects. A choice that does not force a
+    tool is left out when no tool is left, since it cannot stand alone.
     """
-    return [t for t in tools if not isinstance(t, dict) or t.get("type") in (None, "custom")]
+    kwargs: dict[str, Any] = {}
+    remaining: list[Any] | None = None
+    dropped: set[str] = set()
+    if "tools" in body:
+        tools_in = body["tools"]
+        if cross_vendor:
+            dropped = {str(t.get("name")) for t in tools_in if _is_anthropic_server_tool(t)}
+            tools_in = [
+                _with_builtin_schema(t) for t in tools_in if not _is_anthropic_server_tool(t)
+            ]
+        # Bedrock Converse API hard-rejects tool names over 64 chars.
+        # Claude Code injects every globally-added claude.ai MCP connector
+        # tool into every request, even disabled ones; a single oversized
+        # name 401s the whole call. Drop them before conversion instead.
+        if bedrock:
+            tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
+        remaining = tools_in
+        if tools_in or not cross_vendor:
+            kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
+    if "tool_choice" not in body:
+        return kwargs, None
+    choice = body["tool_choice"]
+    if cross_vendor and isinstance(choice, dict):
+        kind, name = choice.get("type"), choice.get("name")
+        if kind == "tool" and name in dropped:
+            return kwargs, (
+                f"tool_choice forces {name!r}, a tool only Anthropic runs, so it cannot be "
+                "sent to a model from another vendor. Send this request to a Claude model, "
+                "or do not force that tool."
+            )
+        if kind == "any" and remaining is not None and not remaining:
+            return kwargs, (
+                "tool_choice requires a tool, but every tool in the request is one only "
+                "Anthropic runs, so none can be sent to a model from another vendor."
+            )
+    if cross_vendor and remaining is not None and not remaining:
+        return kwargs, None
+    kwargs["tool_choice"] = _convert_tool_choice(choice)
+    return kwargs, None
 
 
 # Anthropic effort -> OpenAI ``reasoning_effort``. ``xhigh``/``max`` clamp to
@@ -728,6 +834,15 @@ def _openai_reasoning_effort(body: dict[str, Any]) -> str | None:
     if not isinstance(budget, int) or isinstance(budget, bool):
         return None
     return "low" if budget < 2048 else "medium" if budget < 4096 else "high"
+
+
+def _is_complete_json(text: str) -> bool:
+    """Whether ``text`` is a whole JSON document, not a prefix of one."""
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
 
 
 def _parse_tool_arguments(arguments: Any) -> Any:
@@ -1357,19 +1472,19 @@ class LiteLLMBackend(Backend):
             self._apply_openai_reasoning_effort(kwargs, body)
 
             # Tools (convert Anthropic format to OpenAI format)
-            if "tools" in body:
-                tools_in = body["tools"]
-                if not preserve_thinking:
-                    tools_in = _client_tools_only(tools_in)
-                # Bedrock Converse API hard-rejects tool names over 64 chars.
-                # Claude Code injects every globally-added claude.ai MCP connector
-                # tool into every request, even disabled ones; a single oversized
-                # name 401s the whole call. Drop them before conversion instead.
-                if self.provider == "bedrock":
-                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
-            if "tool_choice" in body:
-                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            tool_kwargs, tool_error = _translated_tool_kwargs(
+                body, cross_vendor=not preserve_thinking, bedrock=self.provider == "bedrock"
+            )
+            if tool_error:
+                return BackendResponse(
+                    body={
+                        "type": "error",
+                        "error": {"type": "invalid_request_error", "message": tool_error},
+                    },
+                    status_code=400,
+                    error=tool_error,
+                )
+            kwargs.update(tool_kwargs)
             # Standard provider param — forward it instead of silently dropping.
             if "service_tier" in body:
                 kwargs["service_tier"] = body["service_tier"]
@@ -1490,17 +1605,19 @@ class LiteLLMBackend(Backend):
             if preserve_thinking and "thinking" in body:
                 kwargs["thinking"] = body["thinking"]
             self._apply_openai_reasoning_effort(kwargs, body)
-            if "tools" in body:
-                tools_in = body["tools"]
-                if not preserve_thinking:
-                    tools_in = _client_tools_only(tools_in)
-                # Bedrock Converse API hard-rejects tool names over 64 chars.
-                # See send_message for the full rationale; same filter here.
-                if self.provider == "bedrock":
-                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
-            if "tool_choice" in body:
-                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            tool_kwargs, tool_error = _translated_tool_kwargs(
+                body, cross_vendor=not preserve_thinking, bedrock=self.provider == "bedrock"
+            )
+            if tool_error:
+                yield StreamEvent(
+                    event_type="error",
+                    data={
+                        "type": "error",
+                        "error": {"type": "invalid_request_error", "message": tool_error},
+                    },
+                )
+                return
+            kwargs.update(tool_kwargs)
             if "system" in body:
                 kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
 
@@ -1560,6 +1677,31 @@ class LiteLLMBackend(Backend):
             current_block_index = -1
             active_block_type: str | None = None  # "text" or "tool_use"
             tool_block_map: dict[int, int] = {}  # litellm tc.index → SSE block index
+            # Arguments that arrived whole on a tool call's opening chunk, by SSE
+            # block index. Some streams (GPT-6 models through litellm's Responses
+            # bridge) send the full arguments there and then the same arguments
+            # again as deltas; forwarding both gives the client the JSON twice.
+            # Held until either deltas follow (a replay: dropped) or the block
+            # closes (sent then).
+            held_arguments: dict[int, str] = {}
+
+            def _release_held(block_idx: int) -> list[StreamEvent]:
+                nonlocal output_tokens
+                arguments = held_arguments.pop(block_idx, None)
+                if arguments is None:
+                    return []
+                output_tokens += 1
+                return [
+                    StreamEvent(
+                        event_type="content_block_delta",
+                        data={
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "input_json_delta", "partial_json": arguments},
+                        },
+                    )
+                ]
+
             stop_reason = "end_turn"
             # Populated from the final usage chunk (stream_options.include_usage=True
             # above). The message_start emitted before this loop always carries
@@ -1722,9 +1864,12 @@ class LiteLLMBackend(Backend):
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                     for tc in delta.tool_calls:
                         idx = tc.index if tc.index is not None else 0
-                        if idx not in tool_block_map:
+                        opening = idx not in tool_block_map
+                        if opening:
                             # Close previous block if open
                             if active_block_type is not None:
+                                for ev in _release_held(current_block_index):
+                                    yield ev
                                 yield StreamEvent(
                                     event_type="content_block_stop",
                                     data={
@@ -1756,6 +1901,10 @@ class LiteLLMBackend(Backend):
                         # Emit argument deltas
                         if tc.function and tc.function.arguments:
                             block_idx = tool_block_map[idx]
+                            if opening and _is_complete_json(tc.function.arguments):
+                                held_arguments[block_idx] = tc.function.arguments
+                                continue
+                            held_arguments.pop(block_idx, None)  # deltas replay it
                             yield StreamEvent(
                                 event_type="content_block_delta",
                                 data={
@@ -1774,6 +1923,8 @@ class LiteLLMBackend(Backend):
                     if active_block_type != "text":
                         # Close previous block if open
                         if active_block_type is not None:
+                            for ev in _release_held(current_block_index):
+                                yield ev
                             yield StreamEvent(
                                 event_type="content_block_stop",
                                 data={
@@ -1812,6 +1963,8 @@ class LiteLLMBackend(Backend):
 
             # Close the last open block
             if active_block_type is not None:
+                for ev in _release_held(current_block_index):
+                    yield ev
                 yield StreamEvent(
                     event_type="content_block_stop",
                     data={"type": "content_block_stop", "index": current_block_index},
