@@ -74,6 +74,15 @@ def _build_tool_result(turn: int, rows: int = 240) -> str:
     return json.dumps(payload)
 
 
+def _tool_use_msg(turn: int) -> dict[str, Any]:
+    # The naming tool_use: a tool_result with no known tool is treated as an
+    # excluded tool (Thread continue turns), so the benchmark keeps it resolvable.
+    return {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": f"tool-{turn}", "name": "Bash", "input": {}}],
+    }
+
+
 def _build_conversation(turn: int) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for t in range(1, turn):
@@ -83,6 +92,7 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
                     "role": "user",
                     "content": f"Analyze tool output turn {t} and summarize anomalies.",
                 },
+                _tool_use_msg(t),
                 {
                     "role": "user",
                     "content": [
@@ -103,6 +113,7 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
                 "role": "user",
                 "content": f"Analyze tool output turn {turn} and summarize anomalies.",
             },
+            _tool_use_msg(turn),
             {
                 "role": "user",
                 "content": [

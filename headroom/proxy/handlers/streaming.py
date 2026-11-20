@@ -32,6 +32,14 @@ from headroom.proxy.provider_usage import (
     usage_int,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.tool_name_registry import (
+    ThreadPinned,
+    message_id_from_sse,
+    record_pending_results,
+    record_thread_alias,
+    thread_pinned_of,
+)
+from headroom.tool_name_registry import record_from_sse as _record_tool_names
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -511,6 +519,9 @@ class StreamingMixin:
         server_memory_tool_names: frozenset[str],
         stream_state: dict[str, Any],
         request_id: str,
+        thread_scope: str = "",
+        thread_forwarded: ThreadPinned | None = None,
+        first_message_id: str | None = None,
         serve_retrieval: bool = False,
     ) -> AsyncIterator[bytes]:
         """Execute withheld proxy tool calls and stream continuation rounds.
@@ -544,6 +555,12 @@ class StreamingMixin:
         proxy_tool_names = server_memory_tool_names | (
             frozenset({CCR_TOOL_NAME}) if serve_retrieval else frozenset()
         )
+
+        # The client keeps round one's message id (its message_start is the only one
+        # forwarded); on a Thread turn the next continue must name the LAST round's.
+        shown_id = (response.get("id") if isinstance(response, dict) else None) or first_message_id
+        last_id = shown_id
+        pending: list[dict[str, Any]] = []
 
         def is_proxy_call(block: Any) -> bool:
             return (
@@ -584,153 +601,201 @@ class StreamingMixin:
 
         # Usage of rounds whose message_delta the client never receives.
         prior_usage: dict[str, int] = {}
-        while True:
-            content: list[Any] = []
-            if response is not None:
-                round_content = response.get("content")
-                content = round_content if isinstance(round_content, list) else []
+        try:
+            while True:
+                content: list[Any] = []
+                if response is not None:
+                    round_content = response.get("content")
+                    content = round_content if isinstance(round_content, list) else []
 
-            if not memory_filter.hid_tool_calls:
-                record_visible(response, content, dropped_client_calls=False)
-                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
-                    yield frame
-                return
-
-            # Run the calls the filter recorded, so they are not lost when the
-            # round could not be reconstructed. Only the proxy's own calls: a
-            # memory-named tool the client declared is the client's to run.
-            hidden_calls = memory_filter.hidden_calls()
-            memory_calls = [c for c in hidden_calls if c.get("name") in server_memory_tool_names]
-            retrieval_calls = [
-                c for c in hidden_calls if serve_retrieval and c.get("name") == CCR_TOOL_NAME
-            ]
-            tool_results: list[dict[str, Any]] = []
-            if memory_calls and memory_user_id is not None and self.memory_handler is not None:
-                tool_results = await self.memory_handler.handle_memory_tool_calls(
-                    {"content": memory_calls},
-                    memory_user_id,
-                    "anthropic",
-                    request_context=memory_request_ctx,
-                    tool_names=server_memory_tool_names,
-                )
-                logger.info(
-                    f"[{request_id}] Memory: Executed {len(tool_results)}/"
-                    f"{len(memory_calls)} proxy-handled tool call(s) "
-                    "withheld from the SSE stream"
-                )
-            ccr_handler = getattr(self, "ccr_response_handler", None)
-            if retrieval_calls and ccr_handler is not None:
-                retrieval_results = ccr_handler.serve_withheld_retrievals(retrieval_calls)
-                tool_results = [*tool_results, *retrieval_results]
-                logger.info(
-                    f"[{request_id}] CCR: Served {len(retrieval_results)}/"
-                    f"{len(retrieval_calls)} headroom_retrieve call(s) withheld from "
-                    "the SSE stream"
-                )
-
-            replayable = response is not None and len(tool_results) == sum(
-                1 for block in content if is_proxy_call(block)
-            )
-            # Unrun client calls can be dropped only while the client has not
-            # seen them, and only for a retrieval: memory results alone do not
-            # give the model a reason to decide again.
-            drop_client_calls = bool(retrieval_calls) and memory_filter.holds_client_tool_use
-            can_continue = (
-                memory_filter.stop_reason == "tool_use"
-                and not memory_filter.visible_tool_use
-                and (drop_client_calls or not memory_filter.holds_client_tool_use)
-                and messages is not None
-                and replayable
-                and rounds < self._MEMORY_CONTINUATION_MAX_ROUNDS
-            )
-            if not can_continue:
-                if memory_filter.visible_tool_use or memory_filter.holds_client_tool_use:
-                    logger.info(
-                        f"[{request_id}] Memory: Round also called a client tool; "
-                        "returning the turn to the client"
-                    )
-                elif rounds >= self._MEMORY_CONTINUATION_MAX_ROUNDS:
-                    logger.warning(
-                        f"[{request_id}] Memory: Stopped after {rounds} continuation "
-                        "round(s) that only called proxy tools"
-                    )
-                elif not replayable:
-                    logger.warning(
-                        f"[{request_id}] Memory: Could not rebuild the round for a "
-                        "continuation; ending the turn after running its proxy calls"
-                    )
-                record_visible(response, content, dropped_client_calls=False)
-                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
-                    yield frame
-                return
-
-            assert response is not None and messages is not None and isinstance(base_body, dict)
-            record_visible(response, content, dropped_client_calls=drop_client_calls)
-            # Blocks held after the first tool call (rarely any but the calls
-            # themselves) still belong to the client's message.
-            for frame in memory_filter.release_held(drop_tool_use=drop_client_calls):
-                yield frame
-            if drop_client_calls:
-                logger.info(
-                    f"[{request_id}] CCR: Round called headroom_retrieve alongside a "
-                    "client tool; serving the retrieval and dropping the unrun client "
-                    "call(s) for the model to re-issue"
-                )
-                content = [block for block in content if not is_client_call(block)]
-            round_usage = response.get("usage")
-            if isinstance(round_usage, dict):
-                for key in _ROUND_USAGE_KEYS:
-                    if isinstance(value := round_usage.get(key), int):
-                        prior_usage[key] = prior_usage.get(key, 0) + value
-            messages = [
-                *messages,
-                {"role": "assistant", "content": content},
-                {"role": "user", "content": tool_results},
-            ]
-            continuation_bytes = json.dumps({**base_body, "messages": messages}).encode("utf-8")
-            assert self.http_client is not None
-            continuation_client = self._select_streaming_client(url)
-            continuation_request = continuation_client.build_request(
-                "POST", url, content=continuation_bytes, headers=headers
-            )
-            continuation = await continuation_client.send(continuation_request, stream=True)
-            rounds += 1
-            async with contextlib.aclosing(continuation) as upstream:
-                if upstream.status_code >= 400:
-                    error_bytes = await upstream.aread()
-                    logger.warning(
-                        f"[{request_id}] Memory: Continuation round {rounds} failed "
-                        f"with upstream status {upstream.status_code}"
-                    )
-                    yield _upstream_error_frame(error_bytes, request_id)
-                    return
-                memory_filter = MemoryToolStreamFilter(
-                    proxy_tool_names,
-                    index_offset=memory_filter.next_index,
-                    forward_message_start=False,
-                    hold_tool_use=serve_retrieval,
-                )
-                # Same cap as the first round's buffer; past it the round is
-                # still streamed, just not rebuilt for a further continuation.
-                round_bytes: bytearray | None = bytearray()
-                async for chunk in upstream.aiter_bytes():
-                    if round_bytes is not None:
-                        round_bytes.extend(chunk)
-                        if len(round_bytes) > MAX_SSE_BUFFER_SIZE:
-                            logger.warning(
-                                f"[{request_id}] Memory: Continuation round {rounds} "
-                                "exceeded the SSE buffer cap"
-                            )
-                            round_bytes = None
-                    for frame in memory_filter.feed(chunk):
+                if not memory_filter.hid_tool_calls:
+                    record_visible(response, content, dropped_client_calls=False)
+                    for frame in memory_filter.closing_frames(prior_usage=prior_usage):
                         yield frame
-            response = (
-                self._parse_sse_to_response(round_bytes.decode("utf-8"), "anthropic")
-                if round_bytes is not None
-                else None
-            )
-            _add_round_usage(stream_state, response)
-            logger.info(f"[{request_id}] Memory: Continuation round {rounds} streamed")
+                    return
+
+                # Run the calls the filter recorded, so they are not lost when the
+                # round could not be reconstructed. Only the proxy's own calls: a
+                # memory-named tool the client declared is the client's to run.
+                hidden_calls = memory_filter.hidden_calls()
+                memory_calls = [c for c in hidden_calls if c.get("name") in server_memory_tool_names]
+                retrieval_calls = [
+                    c for c in hidden_calls if serve_retrieval and c.get("name") == CCR_TOOL_NAME
+                ]
+                hidden_ids = memory_filter.hidden_ids()
+
+                def answers(
+                    results: list[dict[str, Any]], ids: list[str] = hidden_ids
+                ) -> list[dict[str, Any]]:
+                    """One tool_result per withheld call (also one cut off mid-input, which
+                    never runs): its result, else an error result."""
+                    done = {r.get("tool_use_id"): r for r in results if isinstance(r, dict)}
+                    return [
+                        done.get(k)
+                        or {
+                            "type": "tool_result",
+                            "tool_use_id": k,
+                            "content": "Memory tool result unavailable.",
+                            "is_error": True,
+                        }
+                        for k in ids
+                    ]
+
+                if thread_forwarded is not None and hidden_ids:
+                    # Upstream already stores this round with its memory tool_use. Until the
+                    # next round's message_start proves the results were accepted, keep an
+                    # answer for the next continue: errors first (execution or the send may
+                    # be cancelled or fail), the real results once they exist.
+                    pending = answers([])
+                tool_results: list[dict[str, Any]] = []
+                if memory_calls and memory_user_id is not None and self.memory_handler is not None:
+                    tool_results = await self.memory_handler.handle_memory_tool_calls(
+                        {"content": memory_calls},
+                        memory_user_id,
+                        "anthropic",
+                        request_context=memory_request_ctx,
+                        tool_names=server_memory_tool_names,
+                    )
+                    logger.info(
+                        f"[{request_id}] Memory: Executed {len(tool_results)}/"
+                        f"{len(memory_calls)} proxy-handled tool call(s) "
+                        "withheld from the SSE stream"
+                    )
+                ccr_handler = getattr(self, "ccr_response_handler", None)
+                if retrieval_calls and ccr_handler is not None:
+                    retrieval_results = ccr_handler.serve_withheld_retrievals(retrieval_calls)
+                    tool_results = [*tool_results, *retrieval_results]
+                    logger.info(
+                        f"[{request_id}] CCR: Served {len(retrieval_results)}/"
+                        f"{len(retrieval_calls)} headroom_retrieve call(s) withheld from "
+                        "the SSE stream"
+                    )
+                if thread_forwarded is not None and hidden_ids:
+                    pending = answers(tool_results)
+
+                replayable = response is not None and len(tool_results) == sum(
+                    1 for block in content if is_proxy_call(block)
+                )
+                # Unrun client calls can be dropped only while the client has not
+                # seen them, and only for a retrieval: memory results alone do not
+                # give the model a reason to decide again.
+                drop_client_calls = bool(retrieval_calls) and memory_filter.holds_client_tool_use
+                can_continue = (
+                    memory_filter.stop_reason == "tool_use"
+                    and not memory_filter.visible_tool_use
+                    and (drop_client_calls or not memory_filter.holds_client_tool_use)
+                    and messages is not None
+                    and replayable
+                    and rounds < self._MEMORY_CONTINUATION_MAX_ROUNDS
+                )
+                if not can_continue:
+                    if memory_filter.visible_tool_use or memory_filter.holds_client_tool_use:
+                        logger.info(
+                            f"[{request_id}] Memory: Round also called a client tool; "
+                            "returning the turn to the client"
+                        )
+                    elif rounds >= self._MEMORY_CONTINUATION_MAX_ROUNDS:
+                        logger.warning(
+                            f"[{request_id}] Memory: Stopped after {rounds} continuation "
+                            "round(s) that only called proxy tools"
+                        )
+                    elif not replayable:
+                        logger.warning(
+                            f"[{request_id}] Memory: Could not rebuild the round for a "
+                            "continuation; ending the turn after running its proxy calls"
+                        )
+                    record_visible(response, content, dropped_client_calls=False)
+                    for frame in memory_filter.closing_frames(prior_usage=prior_usage):
+                        yield frame
+                    return
+
+                assert response is not None and messages is not None and isinstance(base_body, dict)
+                record_visible(response, content, dropped_client_calls=drop_client_calls)
+                # Blocks held after the first tool call (rarely any but the calls
+                # themselves) still belong to the client's message.
+                for frame in memory_filter.release_held(drop_tool_use=drop_client_calls):
+                    yield frame
+                if drop_client_calls:
+                    logger.info(
+                        f"[{request_id}] CCR: Round called headroom_retrieve alongside a "
+                        "client tool; serving the retrieval and dropping the unrun client "
+                        "call(s) for the model to re-issue"
+                    )
+                    content = [block for block in content if not is_client_call(block)]
+                round_usage = response.get("usage")
+                if isinstance(round_usage, dict):
+                    for key in _ROUND_USAGE_KEYS:
+                        if isinstance(value := round_usage.get(key), int):
+                            prior_usage[key] = prior_usage.get(key, 0) + value
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": tool_results},
+                ]
+                continuation_bytes = json.dumps({**base_body, "messages": messages}).encode("utf-8")
+                assert self.http_client is not None
+                continuation_client = self._select_streaming_client(url)
+                continuation_request = continuation_client.build_request(
+                    "POST", url, content=continuation_bytes, headers=headers
+                )
+                continuation = await continuation_client.send(continuation_request, stream=True)
+                rounds += 1
+                async with contextlib.aclosing(continuation) as upstream:
+                    if upstream.status_code >= 400:
+                        error_bytes = await upstream.aread()
+                        logger.warning(
+                            f"[{request_id}] Memory: Continuation round {rounds} failed "
+                            f"with upstream status {upstream.status_code}"
+                        )
+                        yield _upstream_error_frame(error_bytes, request_id)
+                        return
+                    memory_filter = MemoryToolStreamFilter(
+                        proxy_tool_names,
+                        index_offset=memory_filter.next_index,
+                        forward_message_start=False,
+                        hold_tool_use=serve_retrieval,
+                    )
+                    # Same cap as the first round's buffer; past it the round is
+                    # still streamed, just not rebuilt for a further continuation.
+                    round_bytes: bytearray | None = bytearray()
+                    sse_rest = b""
+                    round_id: str | None = None
+                    id_rest = b""
+                    async for chunk in upstream.aiter_bytes():
+                        if round_id is None:  # from message_start: known even when the
+                            # round is too big to rebuild
+                            round_id, id_rest = message_id_from_sse(id_rest + chunk)
+                            if round_id is not None:
+                                last_id = round_id
+                                pending = []
+                        # A client tool called in a later round is run by the client and
+                        # answered on a Thread continue turn: learn its name here too.
+                        sse_rest = _record_tool_names(
+                            thread_scope, sse_rest + chunk, thread_forwarded
+                        )
+                        if round_bytes is not None:
+                            round_bytes.extend(chunk)
+                            if len(round_bytes) > MAX_SSE_BUFFER_SIZE:
+                                logger.warning(
+                                    f"[{request_id}] Memory: Continuation round {rounds} "
+                                    "exceeded the SSE buffer cap"
+                                )
+                                round_bytes = None
+                        for frame in memory_filter.feed(chunk):
+                            yield frame
+                response = (
+                    self._parse_sse_to_response(round_bytes.decode("utf-8"), "anthropic")
+                    if round_bytes is not None
+                    else None
+                )
+                _add_round_usage(stream_state, response)
+                logger.info(f"[{request_id}] Memory: Continuation round {rounds} streamed")
+        finally:
+            if thread_forwarded is not None:
+                if shown_id and last_id and last_id != shown_id:
+                    record_thread_alias(thread_scope, shown_id, last_id)
+                if pending and last_id:
+                    record_pending_results(thread_scope, last_id, pending)
 
     _MEMORY_CONTINUATION_MAX_ROUNDS = 4
 
@@ -1154,6 +1219,8 @@ class StreamingMixin:
         session_key: str | None = None,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        thread_scope: str = "",
+        thread_inherited: dict[str, Any] | None = None,
         savings_measure: ItemMeasure | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
@@ -1203,6 +1270,8 @@ class StreamingMixin:
                 session_key=session_key,
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
+                thread_scope=thread_scope,
+                thread_inherited=thread_inherited,
                 savings_measure=savings_measure,
                 server_memory_tool_names=server_memory_tool_names,
                 client_beta=client_beta,
@@ -1239,6 +1308,8 @@ class StreamingMixin:
         session_key: str,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        thread_scope: str = "",
+        thread_inherited: dict[str, Any] | None = None,
         savings_measure: ItemMeasure | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
@@ -1797,8 +1868,26 @@ class StreamingMixin:
             try:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
+                    _sse_rest = b""
+                    _thread_forwarded = thread_pinned_of(
+                        body, thread_inherited, server_memory_tool_names
+                    )
+                    # Round one's id from its message_start: known even when the round
+                    # is too big to rebuild (the memory rounds key their alias on it).
+                    _first_message_id: str | None = None
+                    _first_rest = b""
                     async for chunk in response.aiter_bytes():
                         sse_chunk_index += 1
+                        if provider == "anthropic":
+                            # Learn tool_use_id -> name for Thread continue turns
+                            # (tool_use is upstream there); carry the partial line.
+                            _sse_rest = _record_tool_names(
+                                thread_scope, _sse_rest + chunk, _thread_forwarded
+                            )
+                            if _first_message_id is None:
+                                _first_message_id, _first_rest = message_id_from_sse(
+                                    _first_rest + chunk
+                                )
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
@@ -1949,6 +2038,9 @@ class StreamingMixin:
                             server_memory_tool_names=filter_memory_tool_names,
                             stream_state=stream_state,
                             request_id=request_id,
+                            thread_scope=thread_scope,
+                            thread_forwarded=_thread_forwarded,
+                            first_message_id=_first_message_id,
                             serve_retrieval=serve_ccr_retrieval,
                         ):
                             guarded_frame = _client_frame(frame)
@@ -1973,6 +2065,9 @@ class StreamingMixin:
                         server_memory_tool_names=filter_memory_tool_names,
                         stream_state=stream_state,
                         request_id=request_id,
+                        thread_scope=thread_scope,
+                        thread_forwarded=_thread_forwarded,
+                        first_message_id=_first_message_id,
                         serve_retrieval=serve_ccr_retrieval,
                     ):
                         guarded_frame = _client_frame(frame)
