@@ -42,6 +42,7 @@ from headroom.config import resolve_omlx_target_api_url
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.log_safety import describe_exception, safe_id
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.registry import UpstreamAuthUnavailable
 from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
     build_anthropic_upstream_url,
@@ -651,6 +652,28 @@ class AnthropicHandlerMixin:
         from headroom.proxy.token_counting import count_tokens_offloaded
 
         return await count_tokens_offloaded(self, model, messages)
+
+    def _anthropic_route_auth_error(self) -> Any:
+        """502 returned when a matched multi-upstream BearerAuth route has
+        no token (``UpstreamAuthUnavailable``). Fails closed before the
+        upstream is contacted; the message is generic so the env-var name
+        is never leaked to the client.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "message": (
+                        "Upstream route is not configured with a valid "
+                        "credential. Please contact the proxy operator."
+                    ),
+                },
+            },
+        )
 
     def _resolve_ccr_workspace(
         self,
@@ -1864,6 +1887,35 @@ class AnthropicHandlerMixin:
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen
             # user turn later in this handler to preserve Anthropic prefix caching.
+            # Multi-upstream routing: when no fixed anthropic backend and no
+            # per-request base-URL override are in play, a configured route may
+            # claim this model — resolve it before the cache-key snapshot below
+            # so `upstream_base_url` records the real producer. `headers` is the
+            # already-built upstream-bound copy; resolve_upstream substitutes
+            # route auth on top and extra-headers are re-merged so secrets
+            # designated for the resolved host still travel.
+            if (
+                self.anthropic_backend is None
+                and upstream_base_url is None
+                and getattr(self, "provider_runtime", None) is not None
+                and self.provider_runtime.match_upstream_route(model) is not None
+            ):
+                try:
+                    upstream_base_url, headers = self.resolve_upstream(
+                        protocol="anthropic",
+                        model=model,
+                        headers=headers,
+                        default_url=self.ANTHROPIC_API_URL,
+                    )
+                except UpstreamAuthUnavailable:
+                    return self._anthropic_route_auth_error()
+                headers = _build_outbound_anthropic_headers(
+                    headers,
+                    self.config.anthropic_extra_headers,
+                    routed_to_omlx=routed_to_omlx,
+                    upstream_url=upstream_base_url,
+                    config=self.config,
+                )
 
             # Memory: Get user ID when memory is enabled (fallback to "default" for simple DevEx).
             # Reads `request.headers` directly because the local `headers` dict was
