@@ -7,6 +7,7 @@ CLOUDCODE_VERSIONED_INTERNAL_PREFIX = "v1/v1internal:"
 
 ANTIGRAVITY_DAILY_API_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 
+
 def normalize_cloudcode_passthrough_path(path: str) -> str | None:
     """Return the canonical Cloud Code internal path, or ``None`` when unrelated."""
     clean_path = path.lstrip("/")
