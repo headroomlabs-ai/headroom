@@ -150,7 +150,9 @@ class EstimatingTokenCounter(BaseTokenizer):
         Returns:
             Number of dense-script characters in the text.
         """
-        return len(self.CJK_PATTERN.findall(text))
+        # sum(1 for _ in finditer) avoids materializing the full match list
+        # findall would build (perf review F2).
+        return sum(1 for _ in self.CJK_PATTERN.finditer(text))
 
     def _detect_ratio(self, text: str) -> float:
         """Detect optimal chars-per-token ratio based on content.
@@ -170,7 +172,7 @@ class EstimatingTokenCounter(BaseTokenizer):
                 pass
 
         # Check for code
-        code_matches = len(self.CODE_PATTERN.findall(text))
+        code_matches = sum(1 for _ in self.CODE_PATTERN.finditer(text))
         if code_matches > len(text) / 500:  # ~2 matches per KB
             return self.CHARS_PER_TOKEN_CODE
 
@@ -190,15 +192,15 @@ class EstimatingTokenCounter(BaseTokenizer):
         """
         overhead = 0
 
-        # URLs typically tokenize to more tokens
-        urls = self.URL_PATTERN.findall(text)
-        for url in urls:
+        # URLs typically tokenize to more tokens. Iterate finditer directly
+        # (not findall) so the full match list is never materialized (F2).
+        for match in self.URL_PATTERN.finditer(text):
+            url = match.group()
             # Each URL component adds overhead
             overhead += url.count("/") + url.count("?") + url.count("&")
 
         # UUIDs are typically 8-10 tokens despite being 36 chars
-        uuids = self.UUID_PATTERN.findall(text)
-        overhead += len(uuids) * 2  # Each UUID adds ~2 extra tokens
+        overhead += sum(1 for _ in self.UUID_PATTERN.finditer(text)) * 2
 
         return overhead
 

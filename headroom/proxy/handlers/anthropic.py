@@ -429,6 +429,36 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _append_ccr_instructions_to_system(body: dict[str, Any]) -> bool:
+    """Append stable CCR retrieval instructions to an Anthropic body."""
+    from headroom.ccr.tool_calls import client_retrieval_tool_name
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME, create_stable_system_instructions
+
+    marker = "Compressed Context Available"
+    instructions = create_stable_system_instructions(
+        retrieval_tool_name=client_retrieval_tool_name(body.get("tools")) or CCR_TOOL_NAME
+    ).strip()
+    system = body.get("system")
+
+    if isinstance(system, str):
+        if marker in system:
+            return False
+        body["system"] = f"{system}\n\n{instructions}" if system else instructions
+        return True
+
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and marker in str(block.get("text", "")):
+                return False
+            if isinstance(block, str) and marker in block:
+                return False
+        system.append({"type": "text", "text": instructions})
+        return True
+
+    body["system"] = instructions
+    return True
+
+
 def _looks_like_sse_response(response: httpx.Response) -> bool:
     """Return whether an upstream reply is a Server-Sent Events stream.
 
@@ -646,6 +676,49 @@ class AnthropicHandlerMixin:
             json=folded,
             headers=sanitize_forwarded_response_headers(response.headers, "content-type"),
         )
+    def _start_waste_signal_task(
+        self,
+        result,  # noqa: ANN001
+        *,
+        model: str,
+        provider_name: str,
+    ):  # noqa: ANN201
+        provider = getattr(result, "waste_signals_provider", None)
+        if provider is None:
+            return None
+
+        def _job() -> dict[str, int] | None:
+            try:
+                from headroom.observability import get_otel_metrics
+
+                waste_signals = provider()
+                if waste_signals is None:
+                    return None
+                signals_dict = waste_signals.to_dict()
+                get_otel_metrics().record_waste_signals(
+                    model=model,
+                    provider=provider_name,
+                    waste_signals=signals_dict,
+                )
+                return signals_dict
+            except Exception:
+                logger.debug("Background waste-signal detection failed", exc_info=True)
+                return None
+
+        task = asyncio.create_task(self._run_compression_background(_job))
+        tasks = getattr(self, "_waste_signal_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._waste_signal_tasks = tasks
+
+        def _on_done(t) -> None:  # noqa: ANN001
+            tasks.discard(t)
+            if not t.cancelled():
+                t.exception()
+
+        tasks.add(task)
+        task.add_done_callback(_on_done)
+        return task
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
@@ -2121,6 +2194,9 @@ class AnthropicHandlerMixin:
             transforms_applied = []
             pipeline_timing: dict[str, float] = {}
             waste_signals_dict: dict[str, int] | None = None
+            # Set when waste-signal detection is deferred off the response path;
+            # handed to the outcome funnel, which collects it done-only.
+            waste_signals_task: Any | None = None
             optimized_messages = messages
             optimized_tokens = original_tokens
 
@@ -2215,6 +2291,32 @@ class AnthropicHandlerMixin:
             # Pre-strict-override tracker truth: >0 only when a provider cache
             # prefix was actually confirmed (or restored) for this session.
             tracker_frozen_count = frozen_message_count
+
+            # Per-session token-count memo. This handler recounts the whole
+            # transcript at up to six points per request (pre-hook snapshot,
+            # post-hook fold, the single-tokenizer consistency recount, and the
+            # token/cache-mode replay branches), and every recount re-tokenizes
+            # messages that have not changed since the previous turn. Route them
+            # all through the memo so an unchanged message is tokenized once per
+            # session instead of once per recount per turn.
+            #
+            # `count_messages_memoized` is exact, not an approximation: it
+            # verifies the tokenizer declares ADDITIVE_COUNTS and otherwise falls
+            # straight through to `tokenizer.count_messages`, and the memo is
+            # bound to the tokenizer instance so a mid-session swap resets it
+            # rather than serving counts computed under a different tokenizer.
+            _token_count_memo = self._get_token_count_memo(session_id)
+
+            def _count_msgs(
+                msgs: list[dict[str, Any]],
+                *,
+                _memo: Any = _token_count_memo,
+                _tok: Any = tokenizer,
+            ) -> int:
+                from headroom.cache.token_count_memo import count_messages_memoized
+
+                return count_messages_memoized(_memo, _tok, msgs)
+
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
             # pipeline so the net-cost/TTL gate (HEADROOM_NET_COST_POLICY=1) can
@@ -2566,6 +2668,7 @@ class AnthropicHandlerMixin:
                                             compression_policy=compression_policy,
                                             cache_ttl_seconds=_cc_ttl,
                                             skip_kompress=True,
+                                            defer_waste_signals=True,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
                                         timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
@@ -2617,7 +2720,9 @@ class AnthropicHandlerMixin:
                                         protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        defer_waste_signals=True,
                                         cache_ttl_seconds=_cc_ttl,
+
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -2646,7 +2751,7 @@ class AnthropicHandlerMixin:
                         # consistent. The recount cost (~ms on a 50K-token
                         # request) is paid once per request and is dwarfed by
                         # the upstream call latency.
-                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        optimized_tokens = _count_msgs(optimized_messages)
                     elif not is_cache_mode(self.config.mode):
                         async with stage_timer.measure("compression_first_stage"):
                             result = await self._run_compression_in_executor(
@@ -2661,7 +2766,9 @@ class AnthropicHandlerMixin:
                                     protect=protect,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    defer_waste_signals=True,
                                     cache_ttl_seconds=_cc_ttl,
+
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -2690,7 +2797,7 @@ class AnthropicHandlerMixin:
                             timeout=COMPRESSION_TIMEOUT_SECONDS,
                         )
                         optimized_messages = recompacted
-                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        optimized_tokens = _count_msgs(optimized_messages)
                         transforms_applied = _cold_transforms
                     else:
                         if not previous_original_messages and tracker_frozen_count == 0:
@@ -2802,7 +2909,9 @@ class AnthropicHandlerMixin:
                                         protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        defer_waste_signals=True,
                                         cache_ttl_seconds=_cc_ttl,
+
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -2813,10 +2922,10 @@ class AnthropicHandlerMixin:
                                 optimized_messages = stable_forwarded_prefix + compressed_delta
                                 transforms_applied = result.transforms_applied
                                 pipeline_timing = result.timing
-                                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                optimized_tokens = _count_msgs(optimized_messages)
                             else:
                                 optimized_messages = stable_forwarded_prefix
-                                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                optimized_tokens = _count_msgs(optimized_messages)
                         elif previous_original_messages:
                             # Conservative rule for cache mode:
                             # only replay exact stable message-prefix extensions.
@@ -2850,6 +2959,20 @@ class AnthropicHandlerMixin:
 
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
+                    elif result is not None:
+                        # Deferred above, so the pipeline handed back a provider
+                        # instead of parsed signals. Run the detection off the
+                        # response path, overlapping the upstream call, and let
+                        # the outcome funnel collect it if it finishes in time.
+                        # Telemetry is fail-open by design: a task that is still
+                        # running when the funnel fires loses only this request's
+                        # per-row attribution, while its OTel counter is still
+                        # recorded when it completes.
+                        waste_signals_task = self._start_waste_signal_task(
+                            result,
+                            model=model,
+                            provider_name=provider_name,
+                        )
                 except Exception as e:
                     # Types and code locations only: a compressor or hook error can
                     # quote the messages it was given.
@@ -2924,6 +3047,7 @@ class AnthropicHandlerMixin:
                     _decision.passthrough_reason,
                 )
 
+
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
             # and Anthropic hard-errors at >4. Strip message-level markers and
@@ -2985,7 +3109,7 @@ class AnthropicHandlerMixin:
                     previous_optimized_messages = optimized_messages
                     optimized_messages = routed_event.messages
                     if routed_event.messages is not previous_optimized_messages:
-                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        optimized_tokens = _count_msgs(optimized_messages)
                         tokens_saved = max(0, original_tokens - optimized_tokens)
 
             compressed_event = self.pipeline_extensions.emit(
@@ -3008,7 +3132,7 @@ class AnthropicHandlerMixin:
                 previous_optimized_messages = optimized_messages
                 optimized_messages = compressed_event.messages
                 if compressed_event.messages is not previous_optimized_messages:
-                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                    optimized_tokens = _count_msgs(optimized_messages)
                     tokens_saved = max(0, original_tokens - optimized_tokens)
 
             # Mechanism B: activity-based read maturation (flag-gated,
@@ -3057,6 +3181,7 @@ class AnthropicHandlerMixin:
                     if maturation.replacements_applied or maturation.holding_msg_indices:
                         optimized_messages = maturation.messages
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
+
                         tokens_saved = max(0, original_tokens - optimized_tokens)
                         if maturation.newly_matured:
                             transforms_applied.append(f"read_maturation:{maturation.newly_matured}")
@@ -3149,19 +3274,13 @@ class AnthropicHandlerMixin:
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
                 inject_system_instructions = self.config.ccr_inject_system_instructions
-                if inject_system_instructions and frozen_message_count > 0:
-                    logger.info(
-                        f"[{request_id}] CCR: skipping system instruction injection "
-                        f"(frozen prefix={frozen_message_count}) to preserve cache"
-                    )
-                    inject_system_instructions = False
                 configured_inject_tool = self.config.ccr_inject_tool
                 # Scan for compression markers + maybe inject system instructions.
                 # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
                     provider="anthropic",
                     inject_tool=False,  # routed through sticky helper below
-                    inject_system_instructions=inject_system_instructions,
+                    inject_system_instructions=False,
                 )
                 injector.scan_for_markers(optimized_messages)
                 # Shape-only scanning also matches markers from other context
@@ -3169,9 +3288,9 @@ class AnthropicHandlerMixin:
                 # they can drive tool injection (issue #2836).
                 ccr_present_hashes = injector.verify_ownership()
                 if inject_system_instructions and injector.has_compressed_content:
-                    optimized_messages = injector.inject_into_system_message(
-                        optimized_messages, tools=tools
-                    )
+                    if _append_ccr_instructions_to_system(body):
+                        body_mutation_tracker.mark_mutated("ccr_system_instructions")
+
 
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
@@ -3757,7 +3876,7 @@ class AnthropicHandlerMixin:
             if presend_event.headers is not None:
                 headers = presend_event.headers
             if presend_event.messages is not previous_presend_messages:
-                optimized_tokens = tokenizer.count_messages(body["messages"])
+                optimized_tokens = _count_msgs(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
             from headroom.proxy.helpers import (
@@ -3904,7 +4023,7 @@ class AnthropicHandlerMixin:
                 # hook itself folded — comparing against the pipeline's optimized_tokens
                 # instead conflates a real fold with a cross-estimator delta (see below).
                 try:
-                    _pre_hook_tokens = tokenizer.count_messages(optimized_messages)
+                    _pre_hook_tokens = _count_msgs(optimized_messages)
                 except Exception:
                     _pre_hook_tokens = None
                 _th_tools_before = body.get("tools")
@@ -4044,11 +4163,10 @@ class AnthropicHandlerMixin:
                 # Off the event loop (#2810): both passes are CPU-bound real BPE
                 # since #2543, and running them inline stalled every other
                 # in-flight request on the same process (~1s on a 2.3 MB body).
-                # Same tokenizer instance, so the reported values are unchanged.
-                original_tokens = await asyncio.to_thread(tokenizer.count_messages, _orig_snapshot)
-                optimized_tokens = await asyncio.to_thread(
-                    tokenizer.count_messages, optimized_messages
-                )
+                # Keep the PR's session memoization inside the worker thread so
+                # repeated recounts retain their savings without blocking the loop.
+                original_tokens = await asyncio.to_thread(_count_msgs, _orig_snapshot)
+                optimized_tokens = await asyncio.to_thread(_count_msgs, optimized_messages)
                 # Fold the tool-schema/desc compaction delta into BOTH endpoints so
                 # tok_before - tok_after == tok_saved stays coherent in the PERF line
                 # (count_messages never sees tool bytes). Same shape as the OpenAI chat
@@ -4374,7 +4492,7 @@ class AnthropicHandlerMixin:
                         # pre-comp request if the live-zone count fails
                         # so the aggregate denominator stays coherent.
                         try:
-                            attempted_input_tokens = tokenizer.count_messages(
+                            attempted_input_tokens = _count_msgs(
                                 original_client_messages[frozen_message_count:]
                             )
                         except Exception:
@@ -5552,15 +5670,18 @@ class AnthropicHandlerMixin:
                         # Update prefix cache tracker for next turn. Omit the
                         # CCR expansion turn: the client never resends it, so
                         # overlay must replay the pre-injection bytes (#4287).
-                        next_original_messages = copy.deepcopy(original_client_messages)
+                        # Shallow outer-list copies only: update_from_response()
+                        # makes the single defensive deepcopy at record time.
+                        next_original_messages = list(original_client_messages)
                         tracker_forwarded = self._without_proactive_expansion_messages(
                             optimized_messages
                         )
-                        next_forwarded_messages = copy.deepcopy(tracker_forwarded)
+                        next_forwarded_messages = list(tracker_forwarded)
+
                         assistant_message = self._assistant_message_from_response_json(resp_json)
                         if assistant_message is not None:
-                            next_original_messages.append(copy.deepcopy(assistant_message))
-                            next_forwarded_messages.append(copy.deepcopy(assistant_message))
+                            next_original_messages.append(assistant_message)
+                            next_forwarded_messages.append(assistant_message)
 
                         # Cache-miss attribution (#1313): when this turn expected a
                         # prompt-cache hit but got cr_tokens == 0, decide whether the
@@ -5709,6 +5830,7 @@ class AnthropicHandlerMixin:
                                 overhead_ms=optimization_latency,
                                 pipeline_timing=pipeline_timing,
                                 waste_signals=waste_signals_dict,
+                                waste_signals_task=waste_signals_task,
                                 transforms_applied=tuple(transforms_applied),
                                 num_messages=len(messages),
                                 tags=tags,

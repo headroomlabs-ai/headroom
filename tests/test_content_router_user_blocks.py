@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from headroom.tokenizers.base import BaseTokenizer
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 
 
-class _Tokenizer:
+class _Tokenizer(BaseTokenizer):
     def count_text(self, text: str) -> int:
         return max(1, len(str(text)) // 4)
 

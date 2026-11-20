@@ -4,7 +4,7 @@ A full-featured LLM proxy with optimization, caching, rate limiting,
 and observability.
 
 Features:
-- Context optimization (SmartCrusher, CacheAligner — live-zone-only after Phase B)
+- Context optimization (ContentRouter/SmartCrusher — live-zone-only after Phase B)
 - Semantic caching (save costs on repeated queries)
 - Rate limiting (token bucket)
 - Retry with exponential backoff
@@ -51,6 +51,7 @@ from urllib.parse import urlsplit
 if TYPE_CHECKING:
     from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
+    from ..cache.token_count_memo import TokenCountMemo
     from ..memory.tracker import MemoryTracker
     from .outcome import RequestOutcome
 
@@ -1393,7 +1394,7 @@ class HeadroomProxy(
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
         # `CompressionCache` instances have their own internal lock guarding
-        # `_cache`/`_stable_hashes`/`_first_seen` against concurrent
+        # `_cache`/`_stable_hashes` against concurrent
         # async-dispatched requests for the same session.
         # Ordered by last access: `_get_compression_cache` moves a session to
         # the end on every hit, so capacity eviction drops the idlest sessions
@@ -1405,10 +1406,17 @@ class HeadroomProxy(
         self._compression_caches_last_cleanup: float = time.time()
         self._compression_caches_lock = threading.RLock()
 
+        # Per-session memoized message token counts (perf review F2). Same
+        # session-scoped-dict + eviction pattern as `_compression_caches`;
+        # each `TokenCountMemo` has its own internal lock guarding `_counts`.
+        self._token_count_memos: dict[str, TokenCountMemo] = {}
+        self._token_count_memos_lock = threading.RLock()
+
         # Gateway turn contract: its pending-turn registry (`gateway_turns`) is
         # attached by headroom.proxy.gateway_extension.install, which
         # create_app runs by default (HEADROOM_GATEWAY_CONTRACT=0 leaves it out).
         self.gateway_turns = None
+
 
         self.logger = (
             RequestLogger(
@@ -2097,10 +2105,35 @@ class HeadroomProxy(
 
                 cache = CompressionCache(max_entries=COMPRESSION_CACHE_MAX_ENTRIES)
                 self._compression_caches[session_id] = cache
+
             else:
                 self._compression_caches.move_to_end(session_id)
             self._compression_cache_last_seen[session_id] = now
             return cache
+
+    def _get_token_count_memo(self, session_id: str) -> TokenCountMemo:
+        """Get or create a TokenCountMemo for a session (perf review F2).
+
+        Same thread-safety and eviction contract as `_get_compression_cache`.
+        """
+        with self._token_count_memos_lock:
+            if session_id not in self._token_count_memos:
+                from headroom.cache.token_count_memo import TokenCountMemo
+
+                if len(self._token_count_memos) >= MAX_COMPRESSION_CACHE_SESSIONS:
+                    oldest_keys = list(self._token_count_memos.keys())[
+                        : MAX_COMPRESSION_CACHE_SESSIONS // 4
+                    ]
+                    for key in oldest_keys:
+                        del self._token_count_memos[key]
+                    logger.info(
+                        "Evicted %d token-count memos (exceeded %d max sessions)",
+                        len(oldest_keys),
+                        MAX_COMPRESSION_CACHE_SESSIONS,
+                    )
+
+                self._token_count_memos[session_id] = TokenCountMemo()
+            return self._token_count_memos[session_id]
 
     def _eager_preload_transforms(self) -> tuple[dict[str, str], list[dict[str, str]]]:
         """Eagerly load every compressor/parser/detector once (dedup by ``id()``).

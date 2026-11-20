@@ -8,6 +8,7 @@ import pytest
 
 import headroom._ort as ort_runtime
 import headroom.transforms.content_router as content_router_module
+from headroom.tokenizers.base import BaseTokenizer
 from headroom.transforms.content_detector import ContentType, DetectionResult
 from headroom.transforms.content_router import (
     CompressionCache,
@@ -422,7 +423,7 @@ def test_normal_compress_path_still_uses_content_detection(
 def test_force_kompress_apply_uses_lightweight_detection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeTokenizer:
+    class FakeTokenizer(BaseTokenizer):
         def count_text(self, text: str) -> int:
             return len(text.split())
 
@@ -473,7 +474,7 @@ def test_force_kompress_apply_uses_lightweight_detection(
 def test_force_kompress_apply_lightweight_detection_protects_recent_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeTokenizer:
+    class FakeTokenizer(BaseTokenizer):
         def count_text(self, text: str) -> int:
             return len(text.split())
 
@@ -1985,8 +1986,8 @@ def test_detect_content_python_backend_skips_native(
 # ---------------------------------------------------------------------------
 
 
-class _ChurnTokenizer:
-    """Word-count tokenizer; apply() only calls ``count_text``."""
+class _ChurnTokenizer(BaseTokenizer):
+    """Word-count tokenizer."""
 
     def count_text(self, text: str) -> int:
         return len(str(text).split())

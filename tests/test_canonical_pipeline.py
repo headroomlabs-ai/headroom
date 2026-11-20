@@ -15,6 +15,7 @@ from headroom.pipeline import (
     summarize_routing_markers,
 )
 from headroom.providers.base import Provider, TokenCounter
+from headroom.tokenizers.base import BaseTokenizer
 from headroom.transforms import ContentRouter, TransformPipeline
 from headroom.transforms.content_router import CompressionStrategy
 
@@ -158,7 +159,7 @@ def test_default_transform_pipeline_always_uses_content_router() -> None:
 
 
 def test_content_router_protects_instruction_roles_but_compresses_tool_outputs() -> None:
-    class Tokenizer:
+    class Tokenizer(BaseTokenizer):
         def count_text(self, text: str) -> int:
             return max(1, len(text.split()))
 

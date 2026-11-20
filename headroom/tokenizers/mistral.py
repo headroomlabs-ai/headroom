@@ -120,6 +120,10 @@ class MistralTokenizer(BaseTokenizer):
 
     MESSAGE_OVERHEAD = 4
     REPLY_OVERHEAD = 3
+    # count_messages uses encode_chat_completion over the whole conversation
+    # when available — NOT the additive per-message loop. Never memoize
+    # per-message.
+    ADDITIVE_COUNTS = False
 
     def __init__(self, model: str = "mistral-large"):
         """Initialize Mistral tokenizer.

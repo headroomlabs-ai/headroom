@@ -6643,7 +6643,9 @@ class OpenAIHandlerMixin:
         # chat handler uses so multi-endpoint clients within one
         # conversation share the sticky-token set.
         _responses_session_id = self.session_tracker_store.compute_session_id(
-            request, model, messages
+            request,
+            model,
+            messages,
         )
         from headroom.proxy.helpers import (
             get_session_beta_tracker as _get_session_beta_tracker_resp,

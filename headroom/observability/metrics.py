@@ -623,12 +623,43 @@ class HeadroomOtelMetrics:
                 )
 
         if waste_signals:
-            for signal_name, token_count in waste_signals.items():
-                if token_count > 0:
-                    self._waste_signal_tokens.add(
-                        token_count,
-                        self._attrs(model=model, provider=provider, signal=signal_name),
-                    )
+            self._record_waste_signal_counters(
+                model=model, provider=provider, waste_signals=waste_signals
+            )
+
+    def _record_waste_signal_counters(
+        self,
+        *,
+        model: str | None,
+        provider: str | None,
+        waste_signals: dict[str, int],
+    ) -> None:
+        for signal_name, token_count in waste_signals.items():
+            if token_count > 0:
+                self._waste_signal_tokens.add(
+                    token_count,
+                    self._attrs(model=model, provider=provider, signal=signal_name),
+                )
+
+    def record_waste_signals(
+        self,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+        waste_signals: dict[str, int],
+    ) -> None:
+        """Record waste-signal counters alone (perf review F5).
+
+        For callers that deferred waste-signal detection out of
+        ``record_pipeline_run`` (proxy background job) and derive it later —
+        calling ``record_pipeline_run`` again here would double-count
+        ``_compression_runs``/tokens/duration, which were already recorded
+        synchronously with ``waste_signals=None``.
+        """
+        if waste_signals:
+            self._record_waste_signal_counters(
+                model=model, provider=provider, waste_signals=waste_signals
+            )
 
     def record_compression_failure(
         self,

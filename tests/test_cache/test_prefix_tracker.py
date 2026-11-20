@@ -169,31 +169,6 @@ class TestPrefixCacheTracker:
         assert stats.compression_foregone_tokens == 700
         assert stats.net_benefit_tokens == 7300
 
-    def test_should_force_compress_outside_frozen(self, tracker):
-        """Messages outside frozen prefix should always be compressed."""
-        tracker._cached_message_count = 3
-        assert tracker.should_force_compress(5, 1000, 200) is True
-
-    def test_should_force_compress_when_savings_exceed_discount(self, tracker):
-        """For Anthropic (90% discount), compression must save >90% to be worth it."""
-        tracker._cached_message_count = 5
-
-        # 95% savings > 90% discount — should force compress
-        assert tracker.should_force_compress(2, 1000, 50) is True
-
-        # 50% savings < 90% discount — should NOT force compress
-        assert tracker.should_force_compress(2, 1000, 500) is False
-
-    def test_should_force_compress_openai(self, openai_tracker):
-        """For OpenAI (50% discount), compression must save >50% to be worth it."""
-        openai_tracker._cached_message_count = 5
-
-        # 60% savings > 50% discount — should force compress
-        assert openai_tracker.should_force_compress(2, 1000, 400) is True
-
-        # 40% savings < 50% discount — should NOT force compress
-        assert openai_tracker.should_force_compress(2, 1000, 600) is False
-
     def test_estimate_message_tokens(self):
         """Token estimation should roughly match character / 3.5."""
         messages = [

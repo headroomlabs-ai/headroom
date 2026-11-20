@@ -491,6 +491,12 @@ class BaseTokenizer(ABC):
     MESSAGE_OVERHEAD = 4
     REPLY_OVERHEAD = 3  # Assistant reply start tokens
 
+    # True when count_messages(msgs) == sum(count_message(m)) + REPLY_OVERHEAD
+    # (the base per-message loop). Per-message memoization (TokenCountMemo)
+    # is only sound under this identity; subclasses that encode the whole
+    # conversation jointly (chat templates) MUST set this False.
+    ADDITIVE_COUNTS = True
+
     # Oversized-blob token estimation (see _count_serialized). Serializing a blob
     # is cheap; running count_text over the whole multi-megabyte string is what
     # blocks the proxy event loop, so a large blob is counted from an even-spread

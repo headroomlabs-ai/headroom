@@ -279,6 +279,18 @@ class TransformPipeline:
                 - request_id: Optional request ID for diff artifact.
                 - waste_messages: Optional richer conversion of the same request
                   used for waste-signal detection only (never transformed).
+                - defer_waste_signals: Skip the inline waste-signal re-parse;
+                  ``TransformResult.waste_signals`` is always None. When the
+                  inline gate would have parsed, the result instead carries a
+                  ``waste_signals_provider`` closure the caller runs off-path
+                  (the Anthropic proxy handler does, in a background task that
+                  feeds the outcome funnel). Default False.
+
+            Note: ``apply`` also injects ``tokens_before_hint`` (the
+            already-computed ``tokens_before``) into the kwargs passed to
+            every transform, so transforms needing a pre-transform token
+            count (e.g. ContentRouter's context-pressure calc) can reuse it
+            instead of recounting the messages themselves.
 
         Returns:
             Combined TransformResult.
@@ -288,6 +300,11 @@ class TransformPipeline:
         waste_signal_token_limit = int(
             kwargs.pop("waste_signal_token_limit", MAX_WASTE_SIGNAL_DETECTION_TOKENS)
         )
+        # perf review F5: skip the inline telemetry-only re-parse on the proxy's
+        # critical path. Defaults False so SDK/library callers (and `simulate`)
+        # keep identical inline behavior; the proxy passes True explicitly at
+        # covered handler call sites and re-parses off-path instead (anthropic.py).
+        defer_waste_signals = bool(kwargs.pop("defer_waste_signals", False))
         tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()
 
@@ -313,6 +330,10 @@ class TransformPipeline:
         t_count = time.perf_counter()
         tokens_before = tokenizer.count_messages(messages)
         count_ms = (time.perf_counter() - t_count) * 1000
+        # Count-hint plumbing (perf review F2/F3): pass the already-computed
+        # tokens_before through **kwargs so transforms (ContentRouter) can
+        # reuse it instead of re-counting the same messages themselves.
+        kwargs["tokens_before_hint"] = tokens_before
 
         logger.debug(
             "Pipeline starting: %d messages, %d tokens, model=%s",
@@ -411,6 +432,13 @@ class TransformPipeline:
 
                     # Update messages for next transform
                     current_messages = result.messages
+
+                    # Keep the count hint honest for the NEXT transform: this
+                    # transform may have changed the messages (e.g. the
+                    # HEADROOM_INTERCEPT_ENABLED interceptor runs before the
+                    # ContentRouter), so the pipeline-entry count no longer
+                    # describes what the next transform receives.
+                    kwargs["tokens_before_hint"] = result.tokens_after
 
                     # Use token counts reported by the transform itself — avoids
                     # redundant O(N) recount of the full message list after each step.
@@ -521,11 +549,35 @@ class TransformPipeline:
             # pass a richer waste_messages list that is parsed instead — it is
             # telemetry-only and never transformed.
             waste_signals: WasteSignals | None = None
+            waste_signals_provider: Callable[[], WasteSignals | None] | None = None
             saved_enough = (
                 tokens_before > tokens_after
                 and (tokens_before - tokens_after) > _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS
             )
-            if saved_enough and tokens_before > waste_signal_token_limit:
+            if defer_waste_signals:
+                # perf review F5: keep the telemetry-only re-parse off the
+                # critical path, but evaluate the SAME gate here (this call's
+                # own token counts, including the waste_signal_token_limit
+                # override) and hand the caller a closure over the exact
+                # inputs the inline parse would have used. The caller runs it
+                # off-path (anthropic.py background task) and feeds the result
+                # into the outcome funnel.
+                if saved_enough and tokens_before <= waste_signal_token_limit:
+                    deferred_input = deep_copy_messages(waste_messages or messages)
+                    deferred_compressed = deep_copy_messages(current_messages)
+
+                    def _deferred_waste_parse() -> WasteSignals | None:
+                        from ..parser import parse_messages
+
+                        _, _, deferred_ws = parse_messages(
+                            deferred_input,
+                            tokenizer,
+                            compressed_messages=deferred_compressed,
+                        )
+                        return deferred_ws if deferred_ws.total() > 0 else None
+
+                    waste_signals_provider = _deferred_waste_parse
+            elif saved_enough and tokens_before > waste_signal_token_limit:
                 # Telemetry-only re-parse would risk the compression timeout on a
                 # request this large (#296); skip it and keep the result.
                 logger.debug(
@@ -583,7 +635,9 @@ class TransformPipeline:
             diff_artifact=diff_artifact,
             timing=all_timing,
             waste_signals=waste_signals,
+            waste_signals_provider=waste_signals_provider,
             message_decisions=all_message_decisions,
+
         )
 
     def simulate(

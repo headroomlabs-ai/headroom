@@ -373,6 +373,10 @@ class HuggingFaceTokenizer(BaseTokenizer):
         tokens = counter.count_text("Hello, world!")
     """
 
+    # count_messages uses apply_chat_template over the whole conversation when
+    # available — NOT the additive per-message loop. Never memoize per-message.
+    ADDITIVE_COUNTS = False
+
     # Overhead per message (varies by model, this is a reasonable default)
     MESSAGE_OVERHEAD = 4
     REPLY_OVERHEAD = 3

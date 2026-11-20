@@ -292,14 +292,20 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         return SimpleNamespace(
             apply_cached=lambda m: m,
             compute_frozen_count=lambda m: 0,
+            prepare_turn=lambda m, t: (min(t, 0), m),
             mark_stable_from_messages=lambda *a, **k: None,
-            should_defer_compression=lambda h: False,
             mark_stable=lambda h: None,
             content_hash=lambda c: "h",
             update_from_result=lambda *a, **k: None,
             _cache={},
             _stable_hashes=set(),
         )
+
+    def _get_token_count_memo(self, session_id):
+        from headroom.cache.token_count_memo import TokenCountMemo
+
+        self._memo = getattr(self, "_memo", TokenCountMemo())
+        return self._memo
 
 
 def _build_request(body: dict | bytes, headers: dict[str, str]) -> Request:

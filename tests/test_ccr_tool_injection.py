@@ -276,7 +276,7 @@ class TestCCRToolInjector:
         assert tools == []
 
     def test_inject_system_instructions(self):
-        """System instructions are injected when compression detected."""
+        """System instructions are injected (hash-free) when compression detected."""
         messages = [
             {"role": "system", "content": "You are helpful."},
             {
@@ -290,7 +290,12 @@ class TestCCRToolInjector:
         updated = injector.inject_into_system_message(messages)
 
         assert "Compressed Context Available" in updated[0]["content"]
-        assert "abc123def456abc123def456" in updated[0]["content"]
+        # The injected instructions are the hash-free stable variant, so the
+        # per-turn hash list no longer leaks into the system segment (keeps it
+        # byte-stable for the prompt cache); the model finds each hash from the
+        # marker in its own tool result instead.
+        assert "abc123def456abc123def456" not in updated[0]["content"]
+        assert CCR_TOOL_NAME in updated[0]["content"]
 
     def test_process_request_full_flow(self):
         """process_request handles complete injection flow."""

@@ -762,6 +762,38 @@ class TestTransformInterface:
         assert result.messages[0]["content"] == "Hello"
         assert result.messages[1]["content"] == "Hi there!"
 
+    def test_apply_consumes_tokens_before_hint(self, default_config, tokenizer):
+        """apply() uses tokens_before_hint from kwargs instead of recounting."""
+        router = ContentRouter(default_config)
+        messages = [{"role": "user", "content": "small"}]
+
+        result = router.apply(messages, tokenizer, tokens_before_hint=12_345)
+
+        assert result.tokens_before == 12_345
+
+    def test_apply_does_not_inflate_tokens_for_block_list_content(self, default_config, tokenizer):
+        """apply() must not str() Anthropic content-block lists when counting
+        tokens (perf review F3) — that counts Python repr punctuation
+        (brackets, quotes, key names) as if it were real content, inflating
+        tokens_before/context_pressure. No hint provided here, so this
+        exercises the direct-SDK fallback path.
+        """
+        router = ContentRouter(default_config)
+        block_messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}] * 20,
+            }
+        ]
+        repr_based_count = sum(
+            tokenizer.count_text(str(m.get("content", ""))) for m in block_messages
+        )
+
+        result = router.apply(block_messages, tokenizer)
+
+        assert result.tokens_before == tokenizer.count_messages(block_messages)
+        assert result.tokens_before < repr_based_count
+
 
 # =============================================================================
 # TestCompressorDisabling
