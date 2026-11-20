@@ -189,6 +189,16 @@ Partitioning is then governed by `--memory-storage`, which defaults to `project`
 the storage root for `project` mode. Scoping can also be steered per-request with the
 `x-headroom-project-id` and `x-headroom-cwd` headers.
 
+By default the `project` key is a hash of the session's working directory, so two
+sessions started in different directories of one repository get different DBs. Pass
+`--memory-project-key=git` (env `HEADROOM_MEMORY_PROJECT_KEY`) to key a project on its
+git repository instead: the main checkout, every linked worktree, and every
+subdirectory share one DB per repository, with submodules and nested repositories kept
+apart. It resolves through git metadata on the proxy host — in `git` mode a cwd that
+isn't a local git work tree keeps the per-directory key, so remote or container clients
+on other machines are unaffected. Resolution precedence is unchanged:
+`x-headroom-project-id` → `x-headroom-cwd` → `--memory-project-root` → system-prompt cwd.
+
 `x-headroom-user-id` is treated differently, and the distinction matters for anyone
 reasoning about who can read whose memories. It is a partition **hint, not an
 authenticated identity**, and `resolve_memory_identity` honors it only for loopback

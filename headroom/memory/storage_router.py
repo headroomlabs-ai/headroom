@@ -27,10 +27,12 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -58,12 +60,197 @@ _BASENAME_ALLOWED: frozenset[str] = frozenset(
 )
 
 
+# How long a resolved git common dir is trusted before it is re-walked, and
+# how many resolved directories are remembered. The walk itself is cheap
+# (one in-process ``.git`` probe per ancestor — no subprocess, no PATH), but
+# it is still worth memoising because one request resolves once and long-lived
+# sessions re-resolve the same directory every turn. Entries expire so that a
+# directory which *becomes* a repository mid-session (``git init`` inside a
+# parent checkout, adding a nested repo, checking out a submodule) starts
+# resolving to its own key within the TTL instead of keeping the parent's
+# project store for the life of the process (GH #4712 review).
+_GIT_COMMON_DIR_TTL_SECONDS = 30.0
+_GIT_COMMON_DIR_MAX_ENTRIES = 512
+_git_common_dir_cache: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
+_git_common_dir_lock = threading.Lock()
+_git_common_dir_stats = {"hits": 0, "misses": 0}
+
+
+def _git_common_dir_cache_clear() -> None:
+    """Drop every memoised common dir. Test/app hygiene, not a request path."""
+    with _git_common_dir_lock:
+        _git_common_dir_cache.clear()
+        _git_common_dir_stats["hits"] = 0
+        _git_common_dir_stats["misses"] = 0
+
+
+def _git_common_dir_cache_info() -> dict[str, int | float]:
+    """Cache counters, mirroring ``functools.lru_cache``'s ``cache_info``."""
+    with _git_common_dir_lock:
+        return {
+            **_git_common_dir_stats,
+            "currsize": len(_git_common_dir_cache),
+            "maxsize": _GIT_COMMON_DIR_MAX_ENTRIES,
+            "ttl_seconds": _GIT_COMMON_DIR_TTL_SECONDS,
+        }
+
+
+def _walk_git_common_dir(resolved_dir: str) -> str | None:
+    """Walk ``resolved_dir``'s ancestors for the repository's common git dir.
+
+    The uncached walk behind :func:`_git_common_dir`; see that function for
+    the semantics. Split out so the cache and the filesystem logic each stay
+    readable, and so tests can exercise the walk directly.
+    """
+    current = Path(resolved_dir)
+    for _ in range(128):
+        dot_git = current / ".git"
+        try:
+            if dot_git.is_dir():
+                # Linked-worktree gitdirs carry ``commondir`` (relative to the
+                # gitdir); absence means this IS the common dir.
+                commondir_file = dot_git / "commondir"
+                if commondir_file.is_file():
+                    text = commondir_file.read_text(encoding="utf-8", errors="replace")
+                    target = text.strip()
+                    if target:
+                        return str((dot_git / target).resolve())
+                return str(dot_git.resolve())
+            if dot_git.is_file():
+                # ``gitdir: <path>`` — absolute, or relative to this work tree.
+                text = dot_git.read_text(encoding="utf-8", errors="replace")
+                line = next(
+                    (ln.strip() for ln in text.splitlines() if ln.strip().startswith("gitdir:")),
+                    "",
+                )
+                target = line.removeprefix("gitdir:").strip()
+                if not target:
+                    return None
+                gitdir = (current / target).resolve() if not os.path.isabs(target) else Path(target)
+                if not gitdir.is_dir():
+                    return None
+                commondir_file = gitdir / "commondir"
+                if commondir_file.is_file():
+                    text = commondir_file.read_text(encoding="utf-8", errors="replace")
+                    inner = text.strip()
+                    if inner:
+                        return str((gitdir / inner).resolve())
+                return str(gitdir)
+        except OSError:
+            return None
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def _git_common_dir(resolved_dir: str) -> str | None:
+    """Common git dir of the repository containing ``resolved_dir``.
+
+    Mirrors ``git rev-parse --path-format=absolute --git-common-dir``
+    without spawning git: walk up from ``resolved_dir`` for a ``.git``
+    entry. A ``.git`` *directory* (or its ``commondir`` file when the
+    directory is a linked-worktree gitdir) identifies the shared common
+    dir; a ``.git`` *file* (``gitdir: <path>``) re-points the search at
+    the worktree / submodule gitdir, where ``commondir`` splits it away
+    from the main checkout.
+
+    Returns ``None`` when ``resolved_dir`` is not inside a git work tree
+    on this host (or anything is unreadable / nested past ~128 levels) —
+    the caller falls back to the cwd key (GH #4712 fallback rule).
+
+    Results are memoised per resolved directory with a
+    ``_GIT_COMMON_DIR_TTL_SECONDS`` freshness window, so the proxy pays
+    one filesystem walk per distinct project per window rather than one
+    per request, while a directory that becomes (or stops being) a
+    repository mid-session is picked up within that window instead of
+    being pinned to the old answer for the process lifetime. The walk has
+    no cheap exact validation — confirming the answer is still current
+    means re-walking the same ancestry — so the TTL is the invalidation
+    policy rather than an optimisation.
+    """
+    now = time.monotonic()
+    with _git_common_dir_lock:
+        entry = _git_common_dir_cache.get(resolved_dir)
+        if entry is not None and now - entry[0] < _GIT_COMMON_DIR_TTL_SECONDS:
+            _git_common_dir_cache.move_to_end(resolved_dir)
+            _git_common_dir_stats["hits"] += 1
+            return entry[1]
+    value = _walk_git_common_dir(resolved_dir)
+    with _git_common_dir_lock:
+        _git_common_dir_stats["misses"] += 1
+        _git_common_dir_cache[resolved_dir] = (now, value)
+        _git_common_dir_cache.move_to_end(resolved_dir)
+        while len(_git_common_dir_cache) > _GIT_COMMON_DIR_MAX_ENTRIES:
+            _git_common_dir_cache.popitem(last=False)
+    return value
+
+
+@lru_cache(maxsize=512)
+def _main_worktree_basename(git_common_dir: str) -> str:
+    """Readable project label for a git-keyed repository.
+
+    The common dir of the main checkout is ``<repo>/.git``, so its
+    parent's basename is the repository directory name; a linked
+    worktree's gitdir (``<main>/.git/worktrees/<name>``) collapses to the
+    same label via ``commondir`` already resolving to ``<main>/.git``.
+    A submodule's gitdir lives under ``<main>/.git/modules/`` at a path
+    mirroring its work-tree location, so a submodule at ``vendor/lib``
+    has common dir ``<main>/.git/modules/vendor/lib``: the label is the
+    last segment (``lib``), not an intermediate one — matching what the
+    user would call the project.
+    """
+    path = Path(git_common_dir).resolve()
+    if path.name == ".git":
+        return path.parent.name or "git-project"
+    parts = path.parts
+    # ``<main>/.git/modules/<name>`` for a top-level submodule and
+    # ``<main>/.git/modules/vendor/lib`` for a nested one. Walk to the
+    # deepest ``modules`` segment so a repo that itself lives under a
+    # directory called ``.git`` still labels on the right submodule.
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] == "modules" and parts[index - 1] == ".git":
+            return path.name or "git-project"
+    return path.parent.name or "git-project"
+
+
 class MemoryStorageMode(str, Enum):
     """Physical layout for the on-disk memory store."""
 
     PROJECT = "project"
     USER = "user"
     GLOBAL = "global"
+
+
+@dataclass(frozen=True)
+class ProjectKeyStrategy:
+    """How a resolved directory becomes a project key (GH #4712).
+
+    ``mode`` selects between the two strategies:
+
+    * ``"cwd"`` (default): hash the resolved working directory itself —
+      today's behaviour. Distinct directories (including two linked
+      worktrees of one repository, or the repo root and a subdirectory)
+      get distinct memory DBs.
+    * ``"git"``: hash the repository's *common git dir* instead. The main
+      checkout, every linked worktree, and every subdirectory of the work
+      tree share one DB per repository, which is what users expect a
+      "project" to be. Submodules and nested repositories resolve to
+      their own git dir, matching git itself.
+
+    ``"git"`` falls back to the ``"cwd"`` key whenever the resolved
+    directory is not inside a readable git work tree on this host — a
+    plain directory, a remote/container client path that does not exist
+    on the proxy machine, or a work tree whose `.git` files cannot be
+    read. Nothing errors; those callers keep exactly today's key.
+    """
+
+    mode: str = "cwd"
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("cwd", "git"):
+            raise ValueError(f"project key strategy must be 'cwd' or 'git', got {self.mode!r}")
 
 
 @dataclass
@@ -79,6 +266,11 @@ class RequestContext:
     system_prompt: str
     base_user_id: str
     project_root_override: str | None = None
+    # GH #4712: strategy the resolver keys resolved cwds with. ``None``
+    # means ``cwd`` (today's behaviour); handlers set it from
+    # ``ProxyConfig.memory_project_key_strategy`` so CCR scoping, Codex
+    # project resolution, and the memory router all agree on one key.
+    key_strategy: ProjectKeyStrategy | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +304,12 @@ class BackendRouterConfig:
         backend_config_template: Template ``LocalBackendConfig`` to clone
             for each backend; only ``db_path`` / ``graph_db_path`` differ
             per project.
+        project_key_strategy: How a resolved directory becomes a project
+            key (GH #4712). ``cwd`` (default) hashes the directory —
+            today's behaviour. ``git`` hashes the repository's common
+            git dir so linked worktrees and subdirectories of one repo
+            share one memory DB; non-git or non-local paths fall back to
+            the cwd key.
         unresolved_project_fallback: Behavior when ``mode`` is PROJECT but
             ``ProjectResolver.resolve()`` returns ``None`` (no header, no
             CLI override, no ``cwd:`` in system prompt).
@@ -135,6 +333,7 @@ class BackendRouterConfig:
     global_db_path: Path
     max_open_backends: int = 16
     backend_config_template: LocalBackendConfig = field(default_factory=LocalBackendConfig)
+    project_key_strategy: ProjectKeyStrategy = field(default_factory=ProjectKeyStrategy)
     unresolved_project_fallback: str = "empty"
 
 
@@ -144,7 +343,15 @@ class ProjectResolver:
     Looks at request signals in priority order and returns ``None`` when
     no trusted signal yields a project. The router uses that ``None`` to
     apply the configured fallback (fail-closed ``empty`` by default).
+
+    ``key_strategy`` (GH #4712) controls how a resolved directory becomes
+    a key once found — see :class:`ProjectKeyStrategy`. Tier precedence
+    is unchanged; explicit ``x-headroom-project-id`` is untouched by the
+    strategy.
     """
+
+    def __init__(self, key_strategy: ProjectKeyStrategy | None = None) -> None:
+        self._key_strategy = key_strategy or ProjectKeyStrategy(mode="cwd")
 
     def resolve(self, ctx: RequestContext) -> tuple[str, str] | None:
         """Return ``(project_key, display_name)`` or ``None``.
@@ -154,6 +361,10 @@ class ProjectResolver:
         human-readable label for log lines and the provenance header in
         the injected memory block.
         """
+        # Per-request strategy (set from ProxyConfig by handler call sites)
+        # wins; the resolver's own constructor strategy is the fallback
+        # for direct construction (tests, router default).
+        strategy = ctx.key_strategy or self._key_strategy
 
         # Tier 1: client-provided explicit project id (any client).
         explicit = self._first_nonempty_header(ctx.headers, "x-headroom-project-id")
@@ -173,20 +384,22 @@ class ProjectResolver:
         # Tier 2: client-provided explicit cwd (any client).
         explicit_cwd = self._first_nonempty_header(ctx.headers, "x-headroom-cwd")
         if explicit_cwd:
-            ident = self._identity_from_cwd(explicit_cwd, percent_encoded=True)
+            ident = self._identity_from_cwd(
+                explicit_cwd, percent_encoded=True, key_strategy=strategy
+            )
             if ident is not None:
                 return ident
 
         # Tier 3: CLI-level override of the project root.
         if ctx.project_root_override:
-            ident = self._identity_from_cwd(ctx.project_root_override)
+            ident = self._identity_from_cwd(ctx.project_root_override, key_strategy=strategy)
             if ident is not None:
                 return ident
 
         # Tier 4: parse client working-directory context from the system prompt.
         sys_cwd = self._extract_cwd_from_system_prompt(ctx.system_prompt)
         if sys_cwd:
-            ident = self._identity_from_cwd(sys_cwd)
+            ident = self._identity_from_cwd(sys_cwd, key_strategy=strategy)
             if ident is not None:
                 return ident
 
@@ -233,7 +446,11 @@ class ProjectResolver:
 
     @classmethod
     def _identity_from_cwd(
-        cls, raw_cwd: str, *, percent_encoded: bool = False
+        cls,
+        raw_cwd: str,
+        *,
+        percent_encoded: bool = False,
+        key_strategy: ProjectKeyStrategy | None = None,
     ) -> tuple[str, str] | None:
         # ``percent_encoded`` is set only for the ``x-headroom-cwd`` header,
         # which the wrapper percent-encodes so non-ASCII paths stay valid HTTP
@@ -257,6 +474,21 @@ class ProjectResolver:
         except (OSError, ValueError):
             normalised = cwd
         normalised = normalised.rstrip(os.sep) or os.sep
+        key_source = normalised
+        basename: str | None = None
+        if key_strategy is not None and key_strategy.mode == "git":
+            # GH #4712: key the project on the repository's common git dir
+            # so the main checkout, linked worktrees, and subdirectories of
+            # one repo share a memory DB. Only attempt the walk when the
+            # path exists on this host; a remote/container client cwd keeps
+            # today's cwd-based key.
+            if os.path.isdir(normalised):
+                common_dir = _git_common_dir(normalised)
+                if common_dir:
+                    key_source = str(Path(common_dir).resolve())
+                    basename = _main_worktree_basename(common_dir)
+        if basename is None:
+            basename = os.path.basename(normalised) or "root"
         # A path with no UTF-8 form cannot be hashed without a lossy encoding
         # that could merge distinct directories onto one store. It reaches
         # here either from the input (an unpaired surrogate, e.g. a
@@ -266,10 +498,9 @@ class ProjectResolver:
         # covered, and treat the cwd as unusable: resolution falls through to
         # the next tier, or fails closed, instead of raising (#4162).
         try:
-            encoded = normalised.encode("utf-8")
+            encoded = key_source.encode("utf-8")
         except UnicodeEncodeError:
             return None
-        basename = os.path.basename(normalised) or "root"
         safe_basename = cls._sanitize_basename(basename) or "project"
         digest = hashlib.sha256(encoded).hexdigest()[:16]
         key = f"{safe_basename}-{digest}"
@@ -309,7 +540,7 @@ class BackendRouter:
         resolver: ProjectResolver | None = None,
     ) -> None:
         self._config = config
-        self._resolver = resolver or ProjectResolver()
+        self._resolver = resolver or ProjectResolver(key_strategy=config.project_key_strategy)
         self._backends: OrderedDict[Path, LocalBackend] = OrderedDict()
         self._lock = threading.Lock()
 
