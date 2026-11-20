@@ -301,6 +301,26 @@ def count_system_tokens(
         return None
 
 
+def accounting_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """``fn(*args, **kwargs)``, or ``None`` when it raises: accounting never
+    fails a request or keeps a hook from running.
+
+    For the token counts around turn hooks (here, in the gateway turn and in
+    the OpenAI handlers), whose counters tokenize prompts and client tool
+    schemas and can raise whatever their tokenizer raises.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        # The arguments are prompts and tool schemas: never their text in a log.
+        log.debug(
+            "turn-hook accounting: %s failed; savings uncounted: %s",
+            getattr(fn, "__name__", type(fn).__name__),
+            describe_exception(exc),
+        )
+        return None
+
+
 def run_request_hooks(
     ctx: TurnContext,
     *,
@@ -347,38 +367,48 @@ def run_request_hooks(
         if fn is None:
             continue
         booked_tag = ctx.tags.get("tool_search_deferred_tokens")
-        before_messages = before_system = before_tools = None
+        # Measurements go through accounting_call: a counter that fails leaves
+        # that delta unbooked, never the hook unrun.
+        before_messages = before_tools = None
+        if count_messages is not None:
+            before_messages = accounting_call(count_messages, measured(ctx))
+        before_system = count_system_tokens(count_messages, ctx.system)
+        if ctx.count_tools is not None:
+            before_tools = accounting_call(
+                tools_before_hook,
+                ctx.tools,
+                _tool_loading_history(ctx),
+                ctx.count_tools,
+                ctx.tags,
+                deferred_billed=ctx.deferred_tools_billed,
+            )
         try:
-            if count_messages is not None:
-                before_messages = count_messages(measured(ctx))
-                before_system = count_system_tokens(count_messages, ctx.system)
-            if ctx.count_tools is not None:
-                before_tools = tools_before_hook(
-                    ctx.tools,
-                    _tool_loading_history(ctx),
-                    ctx.count_tools,
-                    ctx.tags,
-                    deferred_billed=ctx.deferred_tools_billed,
-                )
             fn(ctx)
+        except Exception:  # a hook must never break the proxy
+            log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
+        else:
             # Signed deltas, netted: a hook that folds messages but ADDS a tool
             # (skill search's ``search_skills``) saved the difference, not the
             # fold alone. Booked only when the net is a saving.
-            message_saved = system_saved = 0
+            message_saved = system_saved = tool_saved = 0
             if count_messages is not None and before_messages is not None:
-                message_saved = before_messages - count_messages(measured(ctx))
+                after_messages = accounting_call(count_messages, measured(ctx))
+                if after_messages is not None:
+                    message_saved = before_messages - after_messages
             after_system = count_system_tokens(count_messages, ctx.system)
             if before_system is not None and after_system is not None:
                 system_saved = before_system - after_system
-            tool_saved = 0
             if before_tools is not None and ctx.count_tools is not None:
-                tools_was, tools_now = hook_tool_counts(
+                counts = accounting_call(
+                    hook_tool_counts,
                     before_tools,
                     ctx.tools,
                     _tool_loading_history(ctx),
                     ctx.count_tools,
                 )
-                tool_saved = tools_was - tools_now
+                if counts is not None:
+                    tools_was, tools_now = counts
+                    tool_saved = tools_was - tools_now
             net_saved = message_saved + system_saved + tool_saved
             sequence_net += net_saved
             system_net += system_saved
@@ -392,8 +422,6 @@ def run_request_hooks(
                     details,
                 )
             )
-        except Exception:  # a hook must never break the proxy
-            log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
         if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
             # This hook booked (or re-booked) the deferral: it is the new baseline.
             booking = deferred_booking(ctx.tags, ctx.tools, _tool_loading_history(ctx))

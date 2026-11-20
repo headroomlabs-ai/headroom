@@ -499,10 +499,7 @@ def net_hook_tool_saving(
     if isinstance(tags, dict):
         _debit_hook_rows(tags, min(hook_debit, cost))
     if raw < 0 and isinstance(tags, dict):
-        try:
-            credit = max(0, int(tags.get("tool_search_deferred_tokens") or 0))
-        except (TypeError, ValueError):
-            credit = 0
+        credit = _deferral_credit(tags)
         offset = min(-raw, credit)
         if offset:
             tags["tool_search_deferred_tokens"] = credit - offset
@@ -511,9 +508,20 @@ def net_hook_tool_saving(
                 entry["tokens"] = max(0, int(entry.get("tokens") or 0) - offset)
             raw += offset
     if from_messages and isinstance(tags, dict):
-        headline = max(0, raw) + tool_schema_saved_from_tags(tags)
-        _debit_hook_rows(tags, min(from_messages, _realized_row_tokens(tags) - headline))
+        # The deferral credit is on the headline but on the estimated
+        # tool_search row, not a realized one: the realized rows are measured
+        # against the rest of the headline.
+        measured = max(0, raw) + tool_schema_saved_from_tags(tags) - _deferral_credit(tags)
+        _debit_hook_rows(tags, min(from_messages, _realized_row_tokens(tags) - measured))
     return max(0, raw)
+
+
+def _deferral_credit(tags: dict[str, Any]) -> int:
+    """The tool-search deferral credit on ``tags``, 0 when absent or unreadable."""
+    try:
+        return max(0, int(tags.get("tool_search_deferred_tokens") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def accumulate_tool_schema_saved(into: dict[str, int], tags: object) -> None:

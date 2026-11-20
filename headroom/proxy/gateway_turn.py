@@ -50,7 +50,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from headroom.log_safety import describe_exception
 from headroom.proxy.gateway_native import VIEW_MARKER as GATEWAY_NATIVE_VIEW_MARKER
 from headroom.proxy.gateway_native import native_shape, view_shape
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
@@ -64,6 +63,7 @@ from headroom.proxy.tool_schema_savings_policy import (
 )
 from headroom.proxy.turn_hooks import (
     TurnContext,
+    accounting_call,
     count_system_tokens,
     merge_provider_headers,
     registered_turn_hooks,
@@ -1138,24 +1138,6 @@ class RequestTransformer:
             system=ctx.system,
         )
         return messages
-
-
-def accounting_call(fn: Callable[..., Any], *args: Any) -> Any:
-    """``fn(*args)``, or ``None`` when it raises: accounting never fails a turn.
-
-    Shared with the OpenAI handlers' turn-hook tool counts, whose counters
-    tokenize client schemas and can raise whatever their tokenizer raises.
-    """
-    try:
-        return fn(*args)
-    except Exception as exc:
-        # The arguments are prompts and tool schemas: never their text in a log.
-        logger.debug(
-            "turn-hook accounting: %s failed; savings uncounted: %s",
-            fn.__name__,
-            describe_exception(exc),
-        )
-        return None
 
 
 def _safe_count(counter: Callable[[Any], int] | None, value: Any) -> int | None:

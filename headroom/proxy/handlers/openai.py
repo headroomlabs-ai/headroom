@@ -3399,9 +3399,9 @@ class OpenAIHandlerMixin:
         # the outbound tools before we send — the extensible counterpart to the
         # built-in deferral above. Gated on the registry so it is a no-op (no copy,
         # no context construction) when no hook is registered.
-        from headroom.proxy.gateway_turn import accounting_call
         from headroom.proxy.turn_hooks import (
             TurnContext,
+            accounting_call,
             registered_turn_hooks,
             run_request_hooks,
         )
@@ -5248,9 +5248,9 @@ class OpenAIHandlerMixin:
         # buffered runs all of them. Gated on the registry so it's a no-op when
         # none are registered; the net tool-schema token delta is recorded as a
         # saving.
-        from headroom.proxy.gateway_turn import accounting_call
         from headroom.proxy.turn_hooks import (
             TurnContext,
+            accounting_call,
             registered_turn_hooks,
             run_request_hooks,
         )

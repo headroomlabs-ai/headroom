@@ -498,3 +498,41 @@ def test_steering_comes_off_a_message_only_hook_row(monkeypatch) -> None:
     headline = headline_tokens_saved(outcome.tokens_saved, outcome.tags)
     (row,) = from_tags(outcome.tags)
     assert row["tokens"] == headline > 0
+
+
+def test_steering_comes_off_a_message_only_hook_row_beside_a_deferral_credit(monkeypatch) -> None:
+    # Reviewer's case: tool search books a 14-tool deferral credit on its own
+    # (estimated) row, and the hook's message saving pays for the steering
+    # block. The credit is on the headline but not on a realized row, so it
+    # must not hide the hook row's share of the steering cost.
+    from headroom.proxy.savings_attribution import from_tags
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    monkeypatch.setenv("HEADROOM_TOOL_SEARCH", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+    register_turn_hook(_ShortenMessage())
+    tools = [
+        {
+            "name": f"mcp__srv__tool_{i}",
+            "description": "Look things up. " * 30,
+            "input_schema": {"type": "object"},
+        }
+        for i in range(14)
+    ]
+    outcome, upstream = _send_outcome(
+        monkeypatch,
+        {"messages": [{"role": "user", "content": "some words " * 400}], "tools": tools},
+    )
+    tags = outcome.tags
+    assert upstream["messages"] == [{"role": "user", "content": "short"}]
+    assert tags.get("tool_search_mode") == "headroom"
+    credit = tags["tool_search_deferred_tokens"]
+    rows = from_tags(tags)
+    (hook_row,) = [r for r in rows if r["source"] == "message_trim"]
+    (deferral_row,) = [r for r in rows if r["source"] == "tool_search"]
+    headline = headline_tokens_saved(outcome.tokens_saved, tags)
+    assert deferral_row["tokens"] == credit > 0
+    assert hook_row["tokens"] == outcome.tokens_saved > 0
+    assert hook_row["details"]["proxy_cost_tokens"] > 0  # the steering block
+    assert headline == hook_row["tokens"] + deferral_row["tokens"]

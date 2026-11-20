@@ -773,15 +773,16 @@ def test_a_fold_larger_than_the_undeferred_schema_books_the_difference_on_respon
     assert headline == ledger == fold_only - growth
 
 
-def test_a_failing_tool_count_leaves_the_tool_delta_uncounted(monkeypatch) -> None:
-    # The tool counter tokenizes client schemas; if it raises, the request still
-    # goes out with the hook's edits and only the tool delta goes unbooked.
-    import headroom.proxy.handlers.openai as openai_handler
+def test_a_tool_counter_failure_still_runs_the_hook_and_books_its_fold(monkeypatch) -> None:
+    # The real counter raises whenever it sees the named tool schema, so every
+    # tool measurement fails, the pre-hook one included. The hook must still
+    # run and its fold be sent and booked; only the tool delta is left out.
+    def count_text(_self: Any, text: str) -> int:
+        if '"lookup"' in text:
+            raise ValueError("tokenizer failed")
+        return len(text.split())
 
-    def broken(*_args: Any) -> tuple[int, int]:
-        raise ValueError("tokenizer failed")
-
-    monkeypatch.setattr(openai_handler, "hook_tool_counts", broken)
+    monkeypatch.setattr(_StubTokenizer, "count_text", count_text)
 
     def fold(ctx: Any) -> None:
         ctx.messages[0]["output"] = "folded"
@@ -795,7 +796,7 @@ def test_a_failing_tool_count_leaves_the_tool_delta_uncounted(monkeypatch) -> No
         },
     )
     assert working["input"][0]["output"] == "folded"
-    assert headline > 0
+    assert headline == ledger > 0
 
 
 def test_undeferring_a_tool_nested_in_a_namespace_is_charged() -> None:

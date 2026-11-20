@@ -279,8 +279,7 @@ def test_an_accounting_failure_keeps_its_input_out_of_debug_logs(monkeypatch, si
     import logging
 
     from headroom.log_safety import CONTENT_OPT_IN_ENV
-    from headroom.proxy.gateway_turn import accounting_call
-    from headroom.proxy.turn_hooks import count_system_tokens
+    from headroom.proxy.turn_hooks import accounting_call, count_system_tokens
 
     monkeypatch.delenv(CONTENT_OPT_IN_ENV, raising=False)
     records: list[logging.LogRecord] = []
