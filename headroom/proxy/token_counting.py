@@ -32,19 +32,24 @@ def _record_fallback_model(owner: Any, model: Any, message: str) -> None:
         logger.warning(message)
 
 
-async def _count_offloaded(owner: Any, model: Any, count: Callable[[Any], int]) -> tuple[Any, int]:
+async def _count_offloaded(
+    owner: Any, model: Any, count: Callable[[Any], int], *, fail_open: bool = True
+) -> tuple[Any, int]:
     """Resolve a tokenizer and apply ``count`` off the event loop when possible.
 
     ``count`` maps a resolved tokenizer to a token total. Returns
     ``(tokenizer, total)``; the returned tokenizer is fully initialized, so later
     counts on it are pure CPU work. Fails open to ``EstimatingTokenCounter`` when
-    the owner has no compression executor, or on timeout/error.
+    the owner has no compression executor, or on timeout/error, unless
+    ``fail_open=False`` requests failure delivery for admission checks.
     """
     from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
     from headroom.tokenizers import EstimatingTokenCounter, get_tokenizer
 
     runner = getattr(owner, "_run_compression_in_executor", None)
     if runner is None:
+        if not fail_open:
+            raise RuntimeError("Token counting executor unavailable")
         estimator = EstimatingTokenCounter()
         return estimator, count(estimator)
 
@@ -56,6 +61,8 @@ async def _count_offloaded(owner: Any, model: Any, count: Callable[[Any], int]) 
         result = await runner(_resolve_and_count, timeout=float(COMPRESSION_TIMEOUT_SECONDS))
         return cast(tuple[Any, int], result)
     except Exception as e:  # fail open — includes asyncio.TimeoutError
+        if not fail_open:
+            raise
         _record_fallback_model(
             owner,
             model,
@@ -66,9 +73,13 @@ async def _count_offloaded(owner: Any, model: Any, count: Callable[[Any], int]) 
         return estimator, count(estimator)
 
 
-async def count_tokens_offloaded(owner: Any, model: Any, messages: Any) -> tuple[Any, int]:
+async def count_tokens_offloaded(
+    owner: Any, model: Any, messages: Any, *, fail_open: bool = True
+) -> tuple[Any, int]:
     """Resolve a tokenizer and count ``messages`` off the event loop when possible."""
-    return await _count_offloaded(owner, model, lambda counter: counter.count_messages(messages))
+    return await _count_offloaded(
+        owner, model, lambda counter: counter.count_messages(messages), fail_open=fail_open
+    )
 
 
 async def count_texts_offloaded(owner: Any, model: Any, texts: Any) -> tuple[Any, int]:
