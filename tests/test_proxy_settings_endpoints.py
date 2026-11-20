@@ -65,6 +65,15 @@ def network_client(workspace):
 
 
 class TestSchemaAndRead:
+    def test_save_to_missing_settings_directory(self, client, workspace, monkeypatch):
+        target = workspace / "separate config" / "nested" / "settings.json"
+        monkeypatch.setenv(settings_store.paths.HEADROOM_SETTINGS_PATH_ENV, str(target))
+
+        response = client.post("/settings", json={"values": {"mode": "token"}})
+
+        assert response.status_code == 200, response.text
+        assert settings_store.load() == {"mode": "token"}
+
     def test_schema_returns_grouped_fields(self, client):
         resp = client.get("/settings/schema")
         assert resp.status_code == 200, resp.text
