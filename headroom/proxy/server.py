@@ -157,9 +157,7 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.kompress_health_detail_policy import (
     KOMPRESS_DETAIL_LOADED,
-    KOMPRESS_DETAIL_NOT_CACHED,
     KOMPRESS_DETAIL_NOT_INSTALLED,
-    KOMPRESS_DETAIL_WARM_FAILED,
     KOMPRESS_DETAIL_WARMING,
     public_detail,
 )
