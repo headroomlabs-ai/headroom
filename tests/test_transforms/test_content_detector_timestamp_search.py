@@ -78,3 +78,26 @@ def test_grep_on_timestamped_file_names_still_routes_to_search() -> None:
 def test_extensionless_paths_still_match() -> None:
     assert _is_search_result_line("Makefile:12:all:")
     assert _is_search_result_line("Dockerfile:3:FROM scratch")
+
+
+def test_ansi_tracing_subscriber_log_routes_as_log_not_search() -> None:
+    """ANSI-colored tracing-subscriber logs must detect as BUILD_OUTPUT, not SEARCH_RESULTS."""
+    mixed = "\n".join(
+        f"\x1b[2m2026-11-17T22:44:{i % 60:02d}.520030Z\x1b[0m "
+        + (
+            "\x1b[31mERROR\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m upstream timeout"
+            if i % 10 == 0
+            else "\x1b[32m INFO\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m request handled"
+        )
+        for i in range(60)
+    )
+    error_only = "\n".join(
+        f"\x1b[2m2026-11-17T22:45:{i % 60:02d}.806331Z\x1b[0m "
+        f"\x1b[31mERROR\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m upstream timeout req_id={i}"
+        for i in range(40)
+    )
+
+    for payload in (mixed, error_only):
+        assert _try_detect_search(payload) is None
+        result = detect_content_type(payload)
+        assert result.content_type is ContentType.BUILD_OUTPUT

@@ -386,9 +386,30 @@ impl LevelClassifier {
 }
 
 fn is_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
-    let left_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+    let left_ok =
+        start == 0 || !is_word_byte(bytes[start - 1]) || ends_with_ansi_csi(&bytes[..start]);
     let right_ok = end == bytes.len() || !is_word_byte(bytes[end]);
     left_ok && right_ok
+}
+
+/// True when `prefix` ends with an ANSI CSI SGR/erase escape sequence
+/// (`\x1b[...m` or `\x1b[...K`). Color terminators are ASCII letters, so
+/// `is_word_byte` would otherwise treat `\x1b[31mERROR` as mid-word.
+fn ends_with_ansi_csi(prefix: &[u8]) -> bool {
+    let Some((&final_byte, mut rest)) = prefix.split_last() else {
+        return false;
+    };
+    if !matches!(final_byte, b'm' | b'K') {
+        return false;
+    }
+    while let Some((&b, head)) = rest.split_last() {
+        if matches!(b, b'0'..=b'9' | b';' | b':') {
+            rest = head;
+        } else {
+            return b == b'[' && head.ends_with(&[0x1b]);
+        }
+    }
+    false
 }
 
 #[inline]
@@ -1836,6 +1857,77 @@ mod tests {
             let parsed = c.parse_lines(&[line]);
             assert_eq!(parsed[0].level, *expected, "level for {line:?}");
         }
+    }
+
+    #[test]
+    fn level_classifier_recognizes_ansi_prefixed_levels_without_false_positives() {
+        let c = cmp();
+        let positive: &[(&str, LogLevel)] = &[
+            (
+                "\x1b[2m2026-11-17T22:45:37.806331Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m timeout",
+                LogLevel::Error,
+            ),
+            ("\x1b[33m WARN\x1b[0m slow upstream", LogLevel::Warn),
+            ("\x1b[32m INFO\x1b[0m ok", LogLevel::Info),
+            ("\x1b[34mDEBUG\x1b[0m details", LogLevel::Debug),
+            ("\x1b[35mTRACE\x1b[0m trace", LogLevel::Trace),
+            ("\x1b[1;31mFATAL\x1b[0m crash", LogLevel::Error),
+            ("\x1b[38;2;255;0;0mERROR\x1b[0m rgb", LogLevel::Error),
+            ("\x1b[38:2:255:0:0mERROR\x1b[0m colon rgb", LogLevel::Error),
+            ("\x1b[mERROR reset-prefixed", LogLevel::Error),
+            ("\x1b[01;31m\x1b[KERROR\x1b[m\x1b[K grep color", LogLevel::Error),
+        ];
+        for (line, expected) in positive {
+            let parsed = c.parse_lines(&[line]);
+            assert_eq!(parsed[0].level, *expected, "positive case {line:?}");
+        }
+
+        let negative = [
+            "systemERROR occurred",
+            "foo[31mERROR occurred",
+            "[31mERROR occurred",
+            "\x1b[31mERROR_CODE=1",
+            "\x1b[31mmyERROR occurred",
+        ];
+        for line in negative {
+            let parsed = c.parse_lines(&[line]);
+            assert_eq!(parsed[0].level, LogLevel::Unknown, "negative case {line:?}");
+        }
+    }
+
+    #[test]
+    fn compress_ansi_tracing_log_keeps_errors_and_preserves_ccr_original() {
+        let mut raw_lines = Vec::with_capacity(200);
+        for i in 0..200 {
+            let ts = format!("\x1b[2m2026-11-17T22:44:{:02}.000000Z\x1b[0m", i % 60);
+            if i % 50 == 49 {
+                raw_lines.push(format!(
+                    "{ts} \x1b[31mERROR\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m timeout req_id={i}"
+                ));
+            } else if i % 50 == 17 {
+                raw_lines.push(format!(
+                    "{ts} \x1b[33m WARN\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m slow req_id={i}"
+                ));
+            } else {
+                raw_lines.push(format!(
+                    "{ts} \x1b[32m INFO\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m ok req_id={i}"
+                ));
+            }
+        }
+        let content = raw_lines.join("\n");
+        let store = InMemoryCcrStore::new();
+        let (res, _) = cmp().compress_with_store(&content, 1.0, Some(&store));
+
+        assert_eq!(res.stats.get("errors").copied(), Some(4));
+        assert_eq!(
+            res.compressed
+                .lines()
+                .filter(|l| l.contains("ERROR") && !l.starts_with('['))
+                .count(),
+            4
+        );
+        let key = res.cache_key.expect("CCR key should be emitted");
+        assert_eq!(store.get(&key).as_deref(), Some(content.as_str()));
     }
 
     #[test]

@@ -64,6 +64,19 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
             for m in range(60)
         ),
         _ruby_logger_log(),
+        "\n".join(
+            f"\x1b[2m2026-11-17T22:45:{m:02d}.806331Z\x1b[0m \x1b[31mERROR\x1b[0m "
+            f"\x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m upstream timeout req_id={m}"
+            for m in range(60)
+        ),
+        "\n".join(
+            f"\x1b[2m15:{m:02d}:53\x1b[0m \x1b[32mINFO\x1b[0m worker heartbeat {m}"
+            for m in range(60)
+        ),
+        "\n".join(
+            f"\x1b[38:2:255:0:0m2026-11-17T22:45:{m:02d}Z\x1b[0m \x1b[31mERROR\x1b[0m timeout id={m}"
+            for m in range(40)
+        ),
     ],
     ids=[
         "iso-datetime",
@@ -76,6 +89,9 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
         "access-log",
         "access-log-longest-host",
         "ruby-logger",
+        "ansi-tracing-subscriber",
+        "ansi-bare-clock",
+        "ansi-colon-truecolor",
     ],
 )
 def test_timestamped_logs_are_never_folded(sample: str) -> None:
@@ -90,8 +106,12 @@ def test_timestamped_logs_are_never_folded(sample: str) -> None:
         ("logs/controller.log", "E0902 14:30:{s:02d}.000000       1 reflector.go:100] list failed"),
         ("/var/log/nginx/access.log", '10.0.0.7 - - [02/Sep/2026:14:30:{s:02d} +0000] "GET /" 500'),
         ("log/production.log", "I, [2026-09-02T14:30:{s:02d}.000000 #1]  INFO -- : 200 OK"),
+        (
+            "logs/service.log",
+            "\x1b[2m2026-11-17T22:45:{s:02d}.806331Z\x1b[0m \x1b[31mERROR\x1b[0m timeout",
+        ),
     ],
-    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger"],
+    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger", "ansi-tracing-subscriber"],
 )
 def test_grep_rows_over_those_logs_still_fold(path: str, row: str) -> None:
     """``grep -n`` output starts with the file path, so it is not a log row."""
@@ -105,6 +125,24 @@ def test_fatal_line_keeps_its_full_timestamp() -> None:
     out = compact_lossless(_multi_hour_log(), "search")
     fatal = [line for line in out.split("\n") if "FATAL" in line]
     assert fatal == ["2026-09-02 14:30:00 [FATAL] node evicted disk full"]
+
+
+def test_colon_form_truecolor_logs_detect_as_build_not_search() -> None:
+    """ITU-T T.416 colon-form SGR (``\\x1b[38:2:255:0:0m``) must not hide the
+    timestamp from detection or folding, matching the semicolon form."""
+    from headroom.transforms.content_detector import ContentType, detect_content_type
+
+    colon = "\n".join(
+        f"\x1b[38:2:255:0:0m2026-11-17T22:45:{i:02d}Z\x1b[0m \x1b[31mERROR\x1b[0m timeout id={i}"
+        for i in range(40)
+    )
+    semicolon = colon.replace("38:2:255:0:0", "38;2;255;0;0")
+
+    assert detect_content_type(colon).content_type == ContentType.BUILD_OUTPUT
+    assert detect_content_type(semicolon).content_type == ContentType.BUILD_OUTPUT
+    # Neither form is folded as grep rows; every full timestamp survives.
+    assert compact_lossless(colon, "search") == colon
+    assert compact_lossless(semicolon, "search") == semicolon
 
 
 def test_genuine_grep_output_still_folds() -> None:
