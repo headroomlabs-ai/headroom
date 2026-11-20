@@ -235,6 +235,16 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
             if not isinstance(parts, list):
                 continue
 
+            # Calls answered by ID somewhere in this message are reserved for that
+            # exact match, so an earlier ID-less response can't take them by FIFO.
+            reserved_ids = {
+                (part["functionResponse"].get("name", ""), part["functionResponse"].get("id"))
+                for part in parts
+                if isinstance(part, dict)
+                and isinstance(part.get("functionResponse"), dict)
+                and part["functionResponse"].get("id") is not None
+            }
+
             for part in parts:
                 if not isinstance(part, dict):
                     continue
@@ -301,6 +311,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                                     for i, (call_id, _, _, idx, _) in enumerate(pending)
                                     if idx == last_call_msg.get(name)
                                     and (response_id is None or call_id is None)
+                                    and (call_id is None or (name, call_id) not in reserved_ids)
                                 ),
                                 None,
                             )

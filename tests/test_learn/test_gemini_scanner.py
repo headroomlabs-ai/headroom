@@ -216,6 +216,38 @@ class TestJsonSessionParsing:
 
         assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [({"path": "b"}, "b")]
 
+    def test_mixed_id_responses_keep_exact_match(self, tmp_path):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        messages = [
+            {
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "read_file", "id": "a", "args": {"path": "a.py"}}},
+                    {"functionCall": {"name": "read_file", "args": {"path": "b.py"}}},
+                ],
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {"functionResponse": {"name": "read_file", "response": {"output": "b"}}},
+                    {
+                        "functionResponse": {
+                            "name": "read_file",
+                            "id": "a",
+                            "response": {"output": "a"},
+                        }
+                    },
+                ],
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [
+            ({"path": "b.py"}, "b"),
+            ({"path": "a.py"}, "a"),
+        ]
+
     def test_basic_tool_call(self, tmp_path):
         gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
         session = _make_gemini_session(
