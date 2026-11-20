@@ -1735,7 +1735,7 @@ def store_kompress_in_ccr(
         from ..cache.compression_store import get_compression_store
 
         signature = _kompress_content_signature(original)
-        compressed_tokens = len(compressed.split())
+        compressed_tokens = payload_tokens(compressed)
         store = get_compression_store()
         cache_key = store.store(
             original,
@@ -1757,8 +1757,8 @@ def store_kompress_in_ccr(
 
                 get_toin().record_compression(
                     tool_signature=signature,
-                    original_count=original_tokens,
-                    compressed_count=compressed_tokens,
+                    original_count=0,
+                    compressed_count=0,
                     original_tokens=original_tokens,
                     compressed_tokens=compressed_tokens,
                     strategy="kompress",
@@ -2210,7 +2210,7 @@ class KompressCompressor(Transform):
             # the shipped payload rather than a word count.
             if self.config.enable_ccr:
                 ccr_source = ccr_original if ccr_original is not None else content
-                ccr_source_tokens = len(ccr_source.split())
+                ccr_source_tokens = payload_tokens(ccr_source)
                 gate: dict[str, bool] = {} if record_toin else {"record_toin": False}
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens, **gate)
                 if cache_key:
@@ -2653,7 +2653,7 @@ class KompressCompressor(Transform):
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
-                ccr_source_tokens = len(ccr_source.split())
+                ccr_source_tokens = payload_tokens(ccr_source)
                 gate: dict[str, bool] = {} if record_toin else {"record_toin": False}
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens, **gate)
                 if cache_key:

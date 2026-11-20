@@ -114,7 +114,7 @@ def _run_lossless(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _run_kompress_store(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(compression_store, "get_compression_store", _boom)
-    assert kompress_compressor.store_kompress_in_ccr("original words", "compressed", 2) is None
+    assert kompress_compressor.store_kompress_in_ccr("original words", "compressed") is None
 
 
 def _run_crusher_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
