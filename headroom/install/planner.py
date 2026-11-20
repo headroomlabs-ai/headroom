@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Iterable
+from pathlib import Path
 
 import click
 
@@ -148,10 +149,14 @@ def build_manifest(
     backend: str,
     anyllm_provider: str | None,
     region: str | None,
-    proxy_mode: str,
+    proxy_mode: str | None,
     memory_enabled: bool,
     telemetry_enabled: bool | None,
     image: str,
+    learn_enabled: bool | None = None,
+    memory_storage_mode: str = "project",
+    traffic_learning_min_evidence: int = 5,
+    memory_project_root: str = "",
     no_rate_limit: bool = False,
     no_http2: bool = False,
     code_aware: bool | None = None,
@@ -190,7 +195,6 @@ def build_manifest(
     base_env = {
         "HEADROOM_PORT": str(port),
         "HEADROOM_HOST": "127.0.0.1",
-        "HEADROOM_MODE": proxy_mode,
         "HEADROOM_BACKEND": backend,
     }
     if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
@@ -260,11 +264,11 @@ def build_manifest(
         normalized_profile,
         "--headroom-deployment-runtime",
         runtime_kind,
-        "--mode",
-        proxy_mode,
         "--backend",
         backend,
     ]
+    if proxy_mode is not None:
+        proxy_args.extend(["--mode", proxy_mode])
     if telemetry_enabled is not None:
         proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
     # Agentic CLI targets (Claude Code, Codex) burst well above 60 req/min.
@@ -286,6 +290,15 @@ def build_manifest(
         # runtime the resolved host path is correct, so keep passing it.
         if runtime_kind != RuntimeKind.DOCKER.value:
             proxy_args.extend(["--memory-db-path", str(_paths.memory_db_path())])
+    if learn_enabled is not None:
+        proxy_args.append("--learn" if learn_enabled else "--no-learn")
+    proxy_args.extend(["--memory-storage", memory_storage_mode])
+    if not base_env.get("HEADROOM_MIN_EVIDENCE"):
+        proxy_args.extend(["--min-evidence", str(traffic_learning_min_evidence)])
+    if memory_project_root and not Path(memory_project_root).is_absolute():
+        memory_project_root = str(Path(memory_project_root).expanduser().resolve())
+    if memory_project_root:
+        proxy_args.extend(["--memory-project-root", memory_project_root])
     if anyllm_provider:
         proxy_args.extend(["--anyllm-provider", anyllm_provider])
     if region:
@@ -321,6 +334,10 @@ def build_manifest(
         proxy_mode=proxy_mode,
         memory_enabled=memory_enabled,
         memory_db_path=str(_paths.memory_db_path()),
+        learn_enabled=learn_enabled,
+        memory_storage_mode=memory_storage_mode,
+        traffic_learning_min_evidence=traffic_learning_min_evidence,
+        memory_project_root=memory_project_root,
         telemetry_enabled=telemetry_enabled,
         image=image,
         service_name=f"headroom-{normalized_profile}",
