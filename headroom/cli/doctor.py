@@ -14,18 +14,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import click
 
 from headroom._version import format_version_label, normalize_release_version
-from headroom.install.health import probe_json
+from headroom.install.health import probe_json, probe_text
 from headroom.install.models import DeploymentManifest
 from headroom.install.paths import (
     claude_settings_path,
@@ -44,6 +45,12 @@ from headroom.providers.claude import (
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
+)
+from headroom.providers.pi_extension import (
+    _config_payload,
+    extension_config_path,
+    extension_release_version,
+    inspect_host_package,
 )
 
 from .main import get_version, main
@@ -177,6 +184,31 @@ def check_proxy_liveness(livez: dict[str, Any] | None, base_url: str) -> CheckRe
     )
 
 
+def check_metrics(scrape: tuple[int, str] | None, base_url: str) -> CheckResult:
+    """Is /metrics scrapable with a diagnosable failure body?"""
+    name = "metrics"
+    if scrape is None:
+        return CheckResult(
+            name=name,
+            status=FAIL,
+            summary=f"not reachable at {base_url}/metrics",
+            hint="restart the proxy, then retry: headroom doctor",
+        )
+    status, body = scrape
+    if status != 200 or "# scrape_error" in body:
+        return CheckResult(
+            name=name,
+            status=FAIL,
+            summary=f"scrape failed ({status}): {body.strip()[:160]}",
+            hint="inspect proxy logs, then restart: headroom proxy",
+        )
+    if "headroom_requests_total" not in body:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary="/metrics responded without the core request counter",
+        )
+    return CheckResult(name=name, status=PASS, summary=f"scrapable at {base_url}/metrics")
 def note_live_proxy_elsewhere(check: CheckResult, live_port: int | None) -> CheckResult:
     """Point an unreachable-proxy row at a live Headroom proxy on another port."""
     if live_port is None or check.status == PASS:
@@ -714,6 +746,70 @@ def check_codex_routing(
             hint="re-run: headroom wrap codex (or headroom init codex) to rewrite the block",
         )
     return routing
+
+
+def check_native_extension(
+    host: Literal["pi", "omp"], binary: str | None, expected_version: str | None
+) -> CheckResult:
+    """Check a native host's enabled Headroom extension without changing it."""
+    name = f"{host} extension"
+    if binary is None:
+        return CheckResult(name=name, status=SKIP, summary=f"{host} not found on PATH")
+    if expected_version is None:
+        return CheckResult(
+            name=name,
+            status=SKIP,
+            summary="cannot determine the extension version for this Headroom build",
+        )
+    try:
+        package = inspect_host_package(host, binary)
+    except click.ClickException as exc:
+        return CheckResult(name=name, status=WARN, summary=f"could not inspect package: {exc}")
+    hint = f"repair it with: headroom init -g {host}"
+    if package is None:
+        return CheckResult(
+            name=name,
+            status=FAIL,
+            summary="Headroom extension is not enabled",
+            hint=hint,
+        )
+    if package.version != expected_version:
+        return CheckResult(
+            name=name,
+            status=FAIL,
+            summary=f"version {package.version} installed; expected {expected_version}",
+            hint=hint,
+        )
+    return CheckResult(
+        name=name,
+        status=PASS,
+        summary=f"enabled at exact version {package.version}",
+    )
+
+
+def check_native_extension_config(path: Path, port: int) -> CheckResult:
+    """Check the shared native extension endpoint without repairing it."""
+    name = "pi extension config"
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return CheckResult(name=name, status=SKIP, summary=f"not found at {path}")
+    except OSError as exc:
+        return CheckResult(name=name, status=WARN, summary=f"could not read {path}: {exc}")
+    try:
+        payload = _config_payload(content, path)
+    except click.ClickException as exc:
+        return CheckResult(name=name, status=WARN, summary=str(exc))
+    base_url = payload.get("baseUrl")
+    expected = f"http://127.0.0.1:{port}"
+    if base_url != expected:
+        return CheckResult(
+            name=name,
+            status=FAIL,
+            summary=f"points at {base_url!r}; expected {expected}",
+            hint="repair it with: headroom init -g pi (or headroom init -g omp)",
+        )
+    return CheckResult(name=name, status=PASS, summary=f"routed to {expected}")
 
 
 def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
@@ -1297,7 +1393,14 @@ def doctor(
     readyz = probe_json(f"{base_url}/readyz", timeout=3.0) if livez else None
     health = probe_json(f"{base_url}/health", timeout=5.0) if livez else None
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
+    metrics = probe_text(f"{base_url}/metrics") if livez else None
     installed = get_version()
+    try:
+        extension_version = extension_release_version(installed)
+    except click.ClickException:
+        extension_version = None
+
+
     project_claude_settings = Path.cwd() / ".claude" / "settings.json"
     project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     live_elsewhere = None
@@ -1320,6 +1423,10 @@ def doctor(
     checks = [
         note_live_proxy_elsewhere(check_proxy_liveness(livez, base_url), live_elsewhere),
         check_proxy_readiness(livez, readyz, base_url),
+        check_metrics(metrics, base_url)
+        if livez is not None
+        else CheckResult(name="metrics", status=SKIP, summary="proxy not reachable"),
+
         check_version_drift(livez, installed),
         check_claude_routing(
             claude_settings_path(),
@@ -1329,6 +1436,10 @@ def doctor(
         check_wrap_marker_staleness(project_local_claude_settings),
         check_codex_routing(codex_config_path(), port, [codex_project_config_path()]),
         check_installed_hooks(expected_init_hooks(manifests)),
+        check_native_extension("pi", shutil.which("pi"), extension_version),
+        check_native_extension("omp", shutil.which("omp"), extension_version),
+        check_native_extension_config(extension_config_path(), port),
+
         check_shell_env(os.environ, port),
         check_kompress_health(health),
         check_savings(stats, savings_path()),

@@ -169,15 +169,19 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build the launch environment and display lines for the omp wrap.
 
-    The endpoint redirects themselves live in ``models.yml`` (see module
-    docstring), so the environment passes through unchanged; the display
-    lines surface where the overrides went.
+    The provider redirects themselves live in ``models.yml`` (see module
+    docstring); the environment additionally exports the loopback endpoint
+    the Pi-compatible Headroom extension reads.
     """
     env = dict(environ or os.environ)
     base_url = proxy_anthropic_base_url(port, project)
     openai_base_url = proxy_openai_base_url(port, project)
+    extension_url = f"http://127.0.0.1:{port}"
+    env["HEADROOM_PI_BASE_URL"] = extension_url
     return env, [
         f"models.yml: providers.anthropic.baseUrl={base_url}",
         f"models.yml: providers.openai.baseUrl={openai_base_url}",
         f"models.yml: providers.openai-codex.baseUrl={openai_base_url}",
+        f"HEADROOM_PI_BASE_URL={extension_url}",
+
     ]

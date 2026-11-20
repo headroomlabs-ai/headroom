@@ -1,3 +1,4 @@
+# mypy: disable-error-code="no-untyped-def,func-returns-value"
 from __future__ import annotations
 
 import subprocess
@@ -532,6 +533,112 @@ def test_render_runner_scripts_writes_windows_scripts(monkeypatch, tmp_path: Pat
     ]
 
 
+def test_native_init_selects_task_supervisor(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type(
+                "Record",
+                (),
+                {
+                    "kind": "script",
+                    "path": (tmp_path / "ensure-headroom.sh").as_posix(),
+                },
+            )(),
+        ],
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors._linux_task_spec",
+        lambda manifest, script: (
+            None,
+            "# >>> headroom init-user >>>\n@reboot ensure\n# <<< headroom init-user <<<\n",
+        ),
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(command)
+        return type(
+            "Result",
+            (),
+            {"returncode": 1, "stdout": b"", "stderr": b"no crontab for test"},
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    records = install_supervisor(
+        _manifest(profile="init-user", supervisor=SupervisorKind.TASK.value)
+    )
+
+    assert records[-1].kind == "crontab"
+    assert calls == [["crontab", "-l"], ["crontab", "-"]]
+
+
+def test_install_supervisor_linux_crontab_preserves_raw_bytes(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type(
+                "Record",
+                (),
+                {"kind": "script", "path": (tmp_path / "ensure-headroom.sh").as_posix()},
+            )(),
+        ],
+    )
+    original = b"# user cron\n\xff\n"
+    writes: list[bytes] = []
+
+    def fake_run(command: list[str], **kwargs):
+        if command == ["crontab", "-l"]:
+            assert kwargs.get("text") is not True
+            return type("Result", (), {"returncode": 0, "stdout": original, "stderr": b""})()
+        writes.append(kwargs["input"])
+        return type("Result", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    install_supervisor(_manifest(profile="raw", supervisor=SupervisorKind.TASK.value))
+
+    assert writes == [
+        original
+        + b"# >>> headroom raw >>>\n"
+        + b"@reboot "
+        + str(tmp_path / "ensure-headroom.sh").encode()
+        + b"\n*/5 * * * * "
+        + str(tmp_path / "ensure-headroom.sh").encode()
+        + b"\n# <<< headroom raw <<<\n"
+    ]
+
+
+def test_install_supervisor_linux_crontab_query_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type(
+                "Record",
+                (),
+                {"kind": "script", "path": (tmp_path / "ensure-headroom.sh").as_posix()},
+            )(),
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(command)
+        return type(
+            "Result", (), {"returncode": 2, "stdout": b"", "stderr": b"permission denied"}
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(click.ClickException, match="permission denied"):
+        install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+    assert calls == [["crontab", "-l"]]
+
+
 def test_install_supervisor_none_returns_runner_records(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
     monkeypatch.setattr(
@@ -616,7 +723,7 @@ def test_install_supervisor_linux_service_and_tasks(monkeypatch, tmp_path: Path)
     user_task_records = install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
     assert user_task_records[-1].kind == "crontab"
     assert calls[-1][0] == ["crontab", "-"]
-    assert "@reboot ensure" in calls[-1][1]["input"]
+    assert b"@reboot ensure" in calls[-1][1]["input"]
 
 
 def _stub_windows_task_install(monkeypatch, tmp_path: Path) -> None:
@@ -1355,6 +1462,23 @@ def test_remove_supervisor_removes_user_crontab_block(monkeypatch) -> None:
     assert calls[1][0] == ["crontab", "-"]
 
 
+def test_remove_supervisor_rejects_failed_user_crontab_read(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors._linux_task_spec",
+        lambda manifest, script: (None, "cron"),
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: type(
+            "Result", (), {"returncode": 2, "stdout": "", "stderr": "permission denied"}
+        )(),
+    )
+
+    with pytest.raises(click.ClickException, match="crontab -l failed"):
+        remove_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+
 def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1582,3 +1706,51 @@ def test_windows_task_backed_removal_accepts_stopped_legacy_service(
     monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
     remove_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     assert len([c for c in calls if c[0] == "schtasks"]) == 2
+
+
+def test_remove_supervisor_keeps_macos_plist_when_bootout_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    plist_path = tmp_path / "com.headroom.default.plist"
+    plist_path.write_text("plist", encoding="utf-8")
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 55, raising=False)
+    monkeypatch.setattr(
+        "headroom.install.supervisors._macos_launchd_plist",
+        lambda manifest, script, interval=None: (plist_path, "plist"),
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: type(
+            "Result",
+            (),
+            {"returncode": 9, "stdout": "", "stderr": "Operation not permitted"},
+        )(),
+    )
+
+    with pytest.raises(click.ClickException, match="launchctl bootout failed"):
+        remove_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+
+    assert plist_path.exists()
+
+
+def test_remove_supervisor_rejects_failed_windows_task_delete(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    results = iter(
+        [
+            type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            type(
+                "Result",
+                (),
+                {"returncode": 5, "stdout": "", "stderr": "Access is denied"},
+            )(),
+        ]
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: next(results),
+    )
+
+    with pytest.raises(click.ClickException, match="schtasks startup delete failed"):
+        remove_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))

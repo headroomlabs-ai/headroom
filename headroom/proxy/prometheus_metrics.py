@@ -166,6 +166,8 @@ class PrometheusMetrics:
         # healthy proxies. "unknown" is a real bucket -- record_failed uses it
         # when no provider is attributed -- so seeding it invents no provider.
         self.requests_failed_by_provider: dict[str, int] = defaultdict(int, {_PROVIDER_UNKNOWN: 0})
+        self.scrape_errors_total = 0
+
         self.inbound_requests_total = 0
         self.inbound_requests_completed = 0
         self.inbound_requests_active = 0
@@ -1427,6 +1429,11 @@ class PrometheusMetrics:
         self.savings_tracker.record_lifetime_failed(provider=provider, model=model)
         self._get_otel_metrics().record_proxy_failed(provider=provider, model=model)
 
+    def record_scrape_error(self) -> int:
+        """Count a failed /metrics scrape."""
+        self.scrape_errors_total += 1
+        return self.scrape_errors_total
+
     async def export(self) -> str:
         """Export metrics in Prometheus format."""
         # Snapshot stage-timing dicts under the tiny synchronous lock so
@@ -1488,6 +1495,13 @@ class PrometheusMetrics:
                     f'{_escape_label_value(str(_provider))}"}} {_count}'
                 )
             lines.append("")
+            _append_metric(
+                lines,
+                name="headroom_metrics_scrape_errors_total",
+                metric_type="counter",
+                help_text="Failed Prometheus /metrics scrapes",
+                value=self.scrape_errors_total,
+            )
             _append_metric(
                 lines,
                 name="headroom_inbound_requests_total",
