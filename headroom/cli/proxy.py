@@ -1015,6 +1015,20 @@ def dashboard(port: int | None, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--memory-tool-receipts",
+    type=click.Choice(["off", "text"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    envvar="HEADROOM_MEMORY_TOOL_RECEIPTS",
+    help=(
+        "How to record proxy-run memory tool calls in the client stream. The calls are "
+        "hidden from the client (GH #2195), so without a receipt later turns cannot tell a "
+        "save ran and save again (GH #4888). text (default): append a short receipt text "
+        "block, e.g. '[headroom memory] memory_save ok id=7f58fdac'; off: leave the stream "
+        "clean. Env: HEADROOM_MEMORY_TOOL_RECEIPTS."
+    ),
+)
+@click.option(
     "--no-memory-context",
     is_flag=True,
     envvar="HEADROOM_NO_MEMORY_CONTEXT",
@@ -1302,6 +1316,7 @@ def proxy(
     memory_storage: str,
     memory_project_root: str,
     no_memory_tools: bool,
+    memory_tool_receipts: str,
     no_memory_context: bool,
     memory_top_k: int,
     memory_qdrant_url: str | None,
@@ -1696,6 +1711,7 @@ def proxy(
         memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
         memory_project_root_override=memory_project_root,
         memory_inject_tools=not no_memory_tools,
+        memory_tool_receipts=cast(Literal["off", "text"], memory_tool_receipts.lower()),
         memory_inject_context=not no_memory_context,
         memory_top_k=memory_top_k,
         **qdrant_overrides,
