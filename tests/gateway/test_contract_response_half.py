@@ -337,6 +337,39 @@ def test_both_cache_fields_zero_is_a_confirmed_cold_turn(headroom_client) -> Non
 # --------------------------------------------------------------------------- #
 
 
+def test_deferred_outcome_is_booked_under_the_request_halfs_labels(
+    headroom_client, monkeypatch
+) -> None:
+    """The response half is another HTTP request, with its own (or no) labels;
+    the outcome carries the labels of the request that opened the turn."""
+    from headroom.proxy.attribution import get_current_attribution
+
+    monkeypatch.setenv("HEADROOM_ATTRIBUTION_DIMENSIONS", "team")
+    proxy = headroom_client.app.state.proxy
+    booked: list[dict[str, str]] = []
+
+    async def _spy(outcome: Any, *args: Any, **kwargs: Any) -> None:
+        booked.append(dict(get_current_attribution()))
+
+    monkeypatch.setattr(proxy, "_record_request_outcome", _spy)
+    body: dict[str, Any] = {
+        "model": "gpt-4o",
+        "messages": big_tool_history(),
+        "gateway": {"can_relay_response": True},
+        "config": {"session_id": "labels-defer"},
+    }
+    turn = compress(headroom_client, body, headers={"X-Headroom-Team": "alpha"}).json()
+    assert "relay_usage" in turn["obligations"]
+    assert booked == []
+    resp = headroom_client.post(
+        RESPONSE_HALF,
+        json={"turn_id": turn["turn_id"], "status": 200, "usage": {"prompt_tokens": 10}},
+        headers={"X-Headroom-Team": "bravo"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert booked == [{"team": "alpha"}]
+
+
 def test_outcome_deferred_then_recorded_once_with_provider_numbers(
     headroom_client, outcome_spy
 ) -> None:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 from typing import Any
 
 import pytest
@@ -406,6 +407,84 @@ def test_on_turn_expired_without_loop_parks_the_draft_then_flushes() -> None:
     asyncio.run(scenario())
     assert sorted(o.request_id for o in recorded) == ["fresh", "orphan"]
     assert proxy.gateway_turns.orphaned_outcomes == []
+
+
+def test_an_expired_draft_is_booked_under_its_own_requests_labels() -> None:
+    """The sweep runs inside some later request; the draft keeps the turn's labels."""
+    from headroom.proxy.attribution import get_current_attribution, set_current_attribution
+
+    booked: list[tuple[str, dict[str, str]]] = []
+    clock = [time.time()]  # register_pending_turn sets deadlines from time.time()
+
+    class _Proxy:
+        async def _record_request_outcome(self, outcome: RequestOutcome) -> None:
+            booked.append((outcome.request_id, dict(get_current_attribution())))
+
+    proxy = _Proxy()
+    proxy.gateway_turns = PendingTurnRegistry(
+        ttl_seconds=10,
+        max_entries=10,
+        on_expire=lambda turn: gt.on_turn_expired(proxy, turn),
+        clock=lambda: clock[0],
+    )
+
+    def _register(turn_id: str, draft: RequestOutcome | None) -> None:
+        gt.register_pending_turn(
+            proxy,
+            turn_id=turn_id,
+            session_key=None,
+            session_id=None,
+            provider="openai",
+            model="gpt-4o",
+            body={"model": "gpt-4o", "messages": []},
+            ctx=None,
+            obligations=["relay_usage"],
+            outcome_draft=draft,
+            tags={},
+            client=None,
+        )
+
+    async def request_a() -> None:
+        set_current_attribution({"team": "alpha"})
+        _register("a", _outcome("a"))
+
+    async def request_b() -> None:
+        set_current_attribution({"team": "bravo", "project": "secret"})
+        clock[0] += 20
+        _register("b", None)  # sweeps the expired turn "a"
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def scenario() -> None:
+        await asyncio.create_task(request_a())
+        await asyncio.create_task(request_b())
+
+    asyncio.run(scenario())
+    assert booked == [("a", {"team": "alpha"})]
+
+
+def test_an_orphaned_draft_is_booked_with_no_labels() -> None:
+    from headroom.proxy.attribution import get_current_attribution, set_current_attribution
+
+    booked: list[tuple[str, dict[str, str]]] = []
+
+    class _Proxy:
+        gateway_turns = PendingTurnRegistry(ttl_seconds=1, max_entries=10)
+
+        async def _record_request_outcome(self, outcome: RequestOutcome) -> None:
+            booked.append((outcome.request_id, dict(get_current_attribution())))
+
+    proxy = _Proxy()
+    gt.on_turn_expired(proxy, _turn("a", 0.0, 1, _outcome("orphan")))
+
+    async def scenario() -> None:
+        set_current_attribution({"team": "bravo"})
+        gt.on_turn_expired(proxy, _turn("b", 0.0, 1))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert booked == [("orphan", {})]
 
 
 # --------------------------------------------------------------------------- #
