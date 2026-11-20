@@ -119,6 +119,24 @@ FEATURES: dict[str, FeatureSpec] = {
         legacy_env=("HEADROOM_READ_MATURATION",),
         description="Hold-back Read maturation: compress a Read once its file quiesces.",
     ),
+    "copilot_model_catalog": FeatureSpec(
+        name="copilot_model_catalog",
+        available_in=RolloutChannel.STABLE,
+        # Default-on from beta, opt-in on stable. It decides which wire API,
+        # reasoning effort and output cap a Copilot request gets from a live
+        # `/models` read instead of the model-name heuristic, so it is the
+        # difference between a published `/responses`-only model working or
+        # 400ing -- but it is still a live dependency, and stable keeps the
+        # heuristic until it has been qualified there. HEADROOM_MODEL_CATALOG=1
+        # (or HEADROOM_FEATURES=copilot_model_catalog) turns it on anywhere;
+        # HEADROOM_MODEL_CATALOG=0 turns it off on every channel.
+        default_enabled_in=RolloutChannel.BETA,
+        legacy_env=("HEADROOM_MODEL_CATALOG",),
+        description=(
+            "Route Copilot requests from the live /models catalog (wire API, "
+            "reasoning effort, output caps) instead of the model-name heuristic."
+        ),
+    ),
     "bedrock_openai_prompt_caching": FeatureSpec(
         name="bedrock_openai_prompt_caching",
         available_in=RolloutChannel.STABLE,
