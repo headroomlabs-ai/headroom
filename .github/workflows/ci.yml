@@ -129,6 +129,19 @@ jobs:
       - name: mypy
         run: mypy headroom --ignore-missing-imports
 
+  architectural-guardrails:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6 (resolved current same-major tag)
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Run Headroom architectural guardrails
+        run: python scripts/headroom_guardrails.py
+
   build-wheel:
     needs: changes
     if: needs.changes.outputs.code == 'true'

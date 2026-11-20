@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Core Headroom types and compression transform traits (Rust)."
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
