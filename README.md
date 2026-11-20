@@ -163,9 +163,12 @@ Launch a wrapped agent session each time, so the setup runs. `headroom wrap`
 starts a local proxy and launches the agent configured to route through
 Headroom. Add `--code-memory serena` to also install
 **[Serena](https://github.com/oraios/serena)** for semantic code navigation (off
-by default). For Claude Code, Serena is registered for the wrapped project only
+by default), or `--code-memory ix` to register the
+[Ix](https://github.com/ix-infrastructure/Ix) code-graph MCP instead. For Claude
+Code, the code-memory MCP is registered for the wrapped project only
 (as a `local`-scope MCP server in `~/.claude.json`); use `--code-memory-scope user`
-to make it available in every project. `headroom unwrap` removes either registration.
+to make it available in every project. `headroom unwrap` removes any of these
+registrations that Headroom made.
 
 `headroom wrap ...` is session-scoped: its proxy exits with the wrapped agent.
 For a proxy that survives reboots, use the turnkey `headroom deploy` command.
