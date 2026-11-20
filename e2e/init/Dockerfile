@@ -4,7 +4,7 @@
 # `__isoc23_strtoll` (glibc 2.38+) that the same image's runtime libc
 # couldn't resolve. Building inside manylinux_2_28 (AlmaLinux 8, glibc
 # 2.28 baseline) yields a wheel portable to any glibc 2.28+ runtime.
-FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder
+FROM quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c AS builder
 
 # No OpenSSL system deps required (rustls-everywhere refactor). See
 # e2e/wrap/Dockerfile for the full rationale.
@@ -24,15 +24,21 @@ COPY headroom/ headroom/
 
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 # Build for Python 3.11 to match Stage 2's `python:3.11-slim` runtime.
-RUN /opt/python/cp311-cp311/bin/pip install 'maturin>=1.5,<2.0' && \
-    /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11
+# Exact build tools, and the runtime dependency set uv.lock resolved for
+# [proxy], so the runtime stage installs reviewed versions instead of
+# re-resolving pyproject.toml's ranges against PyPI.
+COPY e2e/build-tools.txt /tmp/build-tools.txt
+RUN /opt/python/cp311-cp311/bin/pip install --require-hashes --only-binary :all: -r /tmp/build-tools.txt && \
+    /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11 && \
+    /opt/python/cp311-cp311/bin/uv export --frozen --no-dev --no-emit-project --no-hashes \
+      --extra proxy --format requirements-txt -o /constraints.txt
 
 # ─── Stage 2: python runtime ───────────────────────────────────────────────
 # `python:3.11-slim` (now trixie, glibc 2.41) — see e2e/wrap/Dockerfile
 # for why we need glibc ≥ 2.38 (the wheel's `_core.so` references C23
 # symbols that bookworm's 2.36 doesn't export). The init e2e harness
 # only needs python (no node) — `headroom init -g <target>` is Python.
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/opt/headroom-venv/bin:${PATH}" \
@@ -59,6 +65,8 @@ RUN apt-get update && \
 WORKDIR /workspace
 
 COPY --from=builder /dist/*.whl /tmp/wheels/
+COPY --from=builder /constraints.txt /tmp/constraints.txt
+COPY e2e/pip.txt /tmp/pip.txt
 
 # Init e2e harness imports from e2e._lib + .claude-plugin assets.
 # DO NOT copy `headroom/` or `pyproject.toml` from the workspace —
@@ -72,8 +80,8 @@ COPY e2e/_lib ./e2e/_lib
 COPY e2e/init ./e2e/init
 
 RUN python -m venv /opt/headroom-venv && \
-    /opt/headroom-venv/bin/python -m pip install --upgrade pip && \
-    /opt/headroom-venv/bin/python -m pip install "$(ls /tmp/wheels/headroom_ai-*.whl)[proxy]" && \
+    /opt/headroom-venv/bin/python -m pip install --require-hashes --only-binary :all: -r /tmp/pip.txt && \
+    /opt/headroom-venv/bin/python -m pip install -c /tmp/constraints.txt "$(ls /tmp/wheels/headroom_ai-*.whl)[proxy]" && \
     /opt/headroom-venv/bin/python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 
 CMD ["python", "e2e/init/run.py"]

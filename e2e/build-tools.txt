@@ -1,0 +1,5 @@
+# Build tools for the manylinux_2_28_x86_64 builder stage of e2e/init and
+# e2e/wrap, installed with --require-hashes. The hashes are PyPI's sha256 for
+# the x86_64 wheels; change a version and its hash together.
+maturin==1.16.0 --hash=sha256:837db2f4d93d4899c3ac393fb3cc9eebf35b6002336e5d574f4a4fb6c49fe283
+uv==0.11.18 --hash=sha256:9a4ee93dd0cc86046eb234ff8f3a5090c6cbb1466a825c5201aaf4ee4b45158d
