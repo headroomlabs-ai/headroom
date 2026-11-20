@@ -78,3 +78,35 @@ def test_totals_does_not_walk_the_cost_records() -> None:
     assert not called, "totals() still walks the cost records"
     tracker.stats()
     assert called, "stats() should still report budget_basis"
+
+
+def test_totals_prices_requests_without_a_usage_breakdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requests that reported no API usage breakdown still count their tokens in
+    ``total_input_tokens`` but must not contribute $0 to the recomputed input
+    cost. Once any request for a model carried a breakdown, the remaining
+    ``sent`` tokens (the no-breakdown requests) were priced at $0.
+    """
+    # $3/M list price = $0.000003/token uncached, read/write rates arbitrary.
+    uncached_price = 3.0 / 1_000_000
+    monkeypatch.setattr(
+        CostTracker,
+        "_get_cache_prices",
+        lambda _self, model, long_context=False, for_billing=True: (
+            uncached_price * 0.1,
+            uncached_price * 1.25,
+            uncached_price * 2.0,
+            uncached_price,
+        ),
+    )
+
+    tracker = CostTracker()
+    model = "claude-sonnet-4-5"
+    tracker.record_tokens(model, 0, 1000, uncached_tokens=1000)  # with breakdown
+    tracker.record_tokens(model, 0, 1000)  # no breakdown
+
+    assert tracker.totals() == (2000, round(2000 * uncached_price, 4))
+    stats = tracker.stats()
+    assert stats["total_input_tokens"] == 2000
+    assert stats["total_input_cost_usd"] == round(2000 * uncached_price, 4)
