@@ -316,3 +316,45 @@ def test_event_stream_under_a_vague_content_type_is_still_adapted() -> None:
     assert resp.status_code == 200
     assert "application/json" in resp.headers["content-type"]
     assert resp.json()["content"] == [{"type": "text", "text": "hello"}]
+
+
+def _bom_data_only(sse: str) -> bytes:
+    """``sse`` as a data-only stream opening with one UTF-8 BOM (#4255)."""
+    frames = [
+        "\n".join(line for line in frame.splitlines() if not line.startswith("event:"))
+        for frame in sse.split("\n\n")
+        if frame
+    ]
+    return "﻿".encode() + "".join(f"{frame}\n\n" for frame in frames).encode()
+
+
+def test_bom_prefixed_data_only_event_stream_is_adapted() -> None:
+    """A leading BOM must not hide ``message_start`` from the reconstruction (#4255)."""
+    resp, _ = _drive(
+        upstream=httpx.Response(
+            200,
+            content=_bom_data_only(COMPLETE_SSE),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == "msg_1"
+    assert body["content"] == [{"type": "text", "text": "hello"}]
+    assert body["usage"]["input_tokens"] == 10
+
+
+def test_bom_prefixed_event_stream_under_a_vague_content_type_is_still_adapted() -> None:
+    """The sniff for an undeclared stream must also look past a leading BOM (#4255)."""
+    resp, _ = _drive(
+        upstream=httpx.Response(
+            200,
+            content=_bom_data_only(COMPLETE_SSE),
+            headers={"content-type": "application/octet-stream"},
+        )
+    )
+
+    assert resp.status_code == 200
+    assert "application/json" in resp.headers["content-type"]
+    assert resp.json()["id"] == "msg_1"
