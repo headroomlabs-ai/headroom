@@ -11,7 +11,10 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import Response
 
 from headroom.log_safety import redact_url
-from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
+from headroom.providers.cloudcode import (
+    cloudcode_passthrough_target,
+    normalize_cloudcode_passthrough_path,
+)
 from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.live import (
@@ -339,7 +342,13 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
             return await proxy.handle_passthrough(
                 request,
-                _api_target(proxy, "cloudcode"),
+                # Antigravity's non-generateContent calls (fetchAvailableModels,
+                # loadCodeAssist) land here, not in the Gemini handler, so the
+                # daily-sandbox routing has to happen at this seam too (#4957).
+                cloudcode_passthrough_target(
+                    request.headers.get("user-agent"),
+                    _api_target(proxy, "cloudcode"),
+                ),
             )
 
         return await proxy.handle_passthrough(
