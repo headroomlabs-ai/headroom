@@ -503,6 +503,7 @@ class TestAnthropicCostEstimation:
     @pytest.mark.parametrize(
         ("model", "expected"),
         [
+            ("claude-fable-5-2", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
             ("claude-fable-5-1", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
             ("claude-opus-5-5", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
             ("claude-opus-5", {"input": 5.00, "output": 25.00, "cached_input": 0.50}),
@@ -512,6 +513,17 @@ class TestAnthropicCostEstimation:
             ("claude-sonnet-5-5[1m]", {"input": 2.00, "output": 10.00, "cached_input": 0.20}),
             ("claude-haiku-5-5-20261001", {"input": 0.10, "output": 0.50, "cached_input": 0.01}),
             ("claude-fable-5-1-20261001", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
+            ("claude-fable-5-2-20261101", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
+            ("anthropic.claude-fable-5-2", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
+            # Mythos shares each Fable release's rate card.
+            ("claude-mythos-5-2", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
+            ("claude-mythos-5-1", {"input": 10.00, "output": 50.00, "cached_input": 0.25}),
+            ("claude-mythos-5", {"input": 10.00, "output": 50.00, "cached_input": 1.00}),
+            ("anthropic.claude-mythos-5-2", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
+            # Dated base releases keep their own card, not the 5.2 one.
+            ("claude-fable-5-20260901", {"input": 10.00, "output": 50.00, "cached_input": 1.00}),
+            ("claude-mythos-5-20260901", {"input": 10.00, "output": 50.00, "cached_input": 1.00}),
+            ("claude-mythos-5-2-latest", {"input": 8.00, "output": 40.00, "cached_input": 0.20}),
             ("claude-opus-5-5-20261001", {"input": 4.00, "output": 20.00, "cached_input": 0.20}),
         ],
     )
@@ -521,7 +533,11 @@ class TestAnthropicCostEstimation:
     @pytest.mark.parametrize(
         "model",
         [
+            "claude-fable-5-2",
             "claude-fable-5-1",
+            "claude-mythos-5-2",
+            "claude-mythos-5-1",
+            "claude-mythos-5",
             "claude-opus-5-5",
             "claude-opus-5",
             "claude-sonnet-5-5",
@@ -530,6 +546,25 @@ class TestAnthropicCostEstimation:
     )
     def test_context_limit_claude_5_point_releases(self, anthropic_provider, model):
         assert anthropic_provider.get_context_limit(model) == 1_000_000
+
+    @pytest.mark.parametrize("model", ["claude-fable-5-2", "claude-mythos-5-2"])
+    def test_5_2_without_litellm(self, monkeypatch, model):
+        """Fable / Mythos 5.2 keep their 1M window and rate card without LiteLLM.
+
+        With LiteLLM present its live map already knows the model, which hides a
+        missing row here; without it, a missing row fell back to 200K and
+        Sonnet-tier $3/$15 pricing.
+        """
+        import headroom.providers.anthropic as anthropic_module
+
+        monkeypatch.setattr(anthropic_module, "_get_litellm_clients", lambda: (None, None))
+        provider = anthropic_module.AnthropicProvider()
+        assert provider.get_context_limit(model) == 1_000_000
+        assert provider._get_pricing(model) == {
+            "input": 8.00,
+            "output": 40.00,
+            "cached_input": 0.20,
+        }
 
     def test_shorter_id_does_not_inherit_a_newer_release(self, monkeypatch):
         """``claude-haiku-5`` is not ``claude-haiku-5-5``: no 1M window, no 5.5 card.
@@ -558,6 +593,14 @@ class TestAnthropicCostEstimation:
             ("claude-sonnet-4", "claude-sonnet-4-6", False),
             ("claude-sonnet-5-5", "claude-sonnet-5", False),
             ("claude-sonnet-5-5-20261001", "claude-sonnet-5", False),
+            # A dated base release is not the next point release: the "2" of
+            # the year must not read as the minor version.
+            ("claude-fable-5-20260901", "claude-fable-5-2", False),
+            ("claude-fable-5-20260901", "claude-fable-5", True),
+            ("claude-mythos-5-20260901", "claude-mythos-5-2", False),
+            ("claude-fable-5-2-20261101", "claude-fable-5-2", True),
+            ("claude-fable-5-2-latest", "claude-fable-5-2", True),
+            ("us.anthropic.claude-fable-5-2-v1:0", "claude-fable-5-2", True),
             # A bare fragment is not an alias.
             ("sonnet", "claude-3-5-sonnet-20241022", False),
         ],
