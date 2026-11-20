@@ -97,6 +97,16 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
     "enabled",
 )
 
+# Set HEADROOM_MCP_STATS=off to hide headroom_stats, for hosts that already show
+# savings in their own UI and don't want a second, differently scoped figure.
+_STATS_ENABLED = os.environ.get("HEADROOM_MCP_STATS", "on").lower().strip() not in (
+    "off",
+    "false",
+    "0",
+    "no",
+    "disabled",
+)
+
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
 # MCP 2.x removed ``Server.request_context``; the per-request context is now only
@@ -801,20 +811,24 @@ class HeadroomMCPServer:
                     "required": ["hash"],
                 },
             ),
-            Tool(
-                name=STATS_TOOL_NAME,
-                description=(
-                    "Show compression statistics for this session: "
-                    "total compressions, tokens saved, estimated cost savings, "
-                    "and recent compression events."
-                ),
-                input_schema={
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                },
-            ),
         ]
+
+        if _STATS_ENABLED:
+            tools.append(
+                Tool(
+                    name=STATS_TOOL_NAME,
+                    description=(
+                        "Show compression statistics for this session: "
+                        "total compressions, tokens saved, estimated cost savings, "
+                        "and recent compression events."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                )
+            )
 
         # Conditionally add headroom_read (behind feature flag)
         if _READ_ENABLED:
@@ -872,7 +886,7 @@ class HeadroomMCPServer:
                 result = await self._handle_compress(arguments)
             elif name == CCR_TOOL_NAME:
                 result = await self._handle_retrieve(arguments)
-            elif name == STATS_TOOL_NAME:
+            elif name == STATS_TOOL_NAME and _STATS_ENABLED:
                 result = await self._handle_stats()
             elif name == READ_TOOL_NAME and _READ_ENABLED:
                 result = await self._handle_read(arguments)
