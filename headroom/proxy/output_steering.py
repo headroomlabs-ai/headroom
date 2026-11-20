@@ -8,6 +8,9 @@ from headroom.proxy.output_verbosity_policy import (
     STEERING_SENTINEL as _STEERING_SENTINEL,
 )
 from headroom.proxy.output_verbosity_policy import (
+    STEERING_SUFFIX as _STEERING_SUFFIX,
+)
+from headroom.proxy.output_verbosity_policy import (
     replace_or_append_steering_block,
     steering_text,
 )
@@ -113,13 +116,51 @@ def apply_openai_chat_verbosity_steering(
     return False
 
 
+def _input_already_steered(items: Any) -> bool:
+    """True when a user message in a Responses ``input`` ends with a steering block.
+
+    Only user messages are read, and only a block at the very end counts: that is where
+    ``replace_or_append_steering_block`` puts it. Tool outputs and quoted source can contain the
+    marker text (this module's own policy file does) without anything having been steered, and
+    must not switch core's steering off.
+    """
+    if isinstance(items, str):  # Responses accepts a bare string as one user message
+        items = [{"role": "user", "content": items}]
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        if item.get("type") not in (None, "message"):
+            continue
+        content = item.get("content")
+        parts = content if isinstance(content, list) else [{"text": content}]
+        for part in parts:
+            text = part.get("text") if isinstance(part, dict) else None
+            if not isinstance(text, str):
+                continue
+            stripped = text.rstrip()
+            if stripped.endswith(_STEERING_SUFFIX) and _STEERING_SENTINEL in stripped:
+                return True
+    return False
+
+
 def apply_openai_responses_verbosity_steering(
     body: dict[str, Any],
     level: int,
 ) -> bool:
-    """Append or replace steering in OpenAI Responses ``instructions``."""
+    """Append or replace steering in OpenAI Responses ``instructions``.
+
+    Leaves the body alone when a steering block already rides in ``input``. A
+    client whose upstream rejects ``instructions`` (Kiro's runtime returns 400
+    for it) has its steering placed in the user turns by an extension's
+    ``on_responses_create`` hook; adding a second copy here would break that
+    request outright.
+    """
     text = steering_text(level)
     if text is None:
+        return False
+    if _input_already_steered(body.get("input")):
         return False
 
     instructions = body.get("instructions")
