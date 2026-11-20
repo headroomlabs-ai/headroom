@@ -6123,8 +6123,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Returns empty list if log_full_messages is disabled (messages are not stored).
         """
-        if limit > 100:
-            limit = 100
+        # Clamp both ends: limit<=0 would otherwise slice the whole log.
+        limit = max(1, min(limit, 100))
 
         transformations = []
         log_full_messages = proxy.config.log_full_messages if proxy else False

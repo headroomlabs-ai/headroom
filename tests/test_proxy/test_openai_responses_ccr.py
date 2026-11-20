@@ -18,10 +18,12 @@ import pytest
 
 fastapi = pytest.importorskip("fastapi")
 httpx = pytest.importorskip("httpx")
+openai = pytest.importorskip("openai")
 
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
+from openai.types.responses import ResponseErrorEvent  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
 from headroom.cache.compression_store import reset_compression_store  # noqa: E402
@@ -48,12 +50,13 @@ def _reset_store():
     reset_compression_store()
 
 
-def _make_app():
+def _make_app(**overrides):
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
+        **overrides,
     )
     app = create_app(config)
     app.dependency_overrides[require_loopback] = lambda: None
@@ -546,3 +549,155 @@ async def test_buffered_responses_ccr_pre_keepalive_exception_returns_json_error
         payload["error"]["message"]
         == "An error occurred while processing your request. Please try again."
     )
+
+
+@pytest.mark.asyncio
+async def test_buffered_responses_ccr_post_commit_error_is_a_valid_response_error_event():
+    """Past the grace window, a late 429 must arrive as a valid error event.
+
+    The commit already spent the HTTP status, so the failure has to survive as
+    a typed stream error. Responses clients validate that frame against
+    ``ResponseErrorEvent`` (flat ``type``/``message``/``sequence_number``), and
+    openai-python additionally requires the nested ``error`` object to raise
+    its typed ``APIError`` instead of handing the frame over as a plain event.
+    """
+    app = _make_app(buffered_ccr_grace_seconds=0.01)
+    body = {
+        "model": "gpt-5-codex",
+        "input": "please wait",
+        "tools": [_RETRIEVE_TOOL],
+        "stream": True,
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with TestClient(app):
+        server = app.state.proxy
+
+        async def delayed_rate_limit(*args, **kwargs):  # noqa: ANN002, ANN003
+            await asyncio.sleep(0.05)
+            return httpx.Response(
+                429,
+                json={"error": {"message": "slow down", "type": "rate_limit_error"}},
+                headers={"content-type": "application/json", "retry-after": "1"},
+                request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            )
+
+        server._retry_request = delayed_rate_limit
+        response = await server.handle_openai_responses(Request(scope, receive))
+
+        events: list[dict] = []
+
+        async def send(message):  # noqa: ANN001
+            events.append(message)
+
+        await response(scope, receive, send)
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    assert start["status"] == 200, "the grace window already committed the status"
+    assert bodies.startswith(b": ping\n\n"), "the heartbeat must open the stream"
+
+    payload = json.loads(bodies.split(b"data: ")[-1].strip())
+    assert payload["type"] == "error"
+    assert payload["code"] == "rate_limit_exceeded"
+    assert payload["message"] == "slow down"
+    assert payload["param"] is None
+    assert payload["sequence_number"] == 0
+    assert payload["error"] == {
+        "type": "rate_limit_exceeded",
+        "code": "rate_limit_exceeded",
+        "message": "slow down",
+        "param": None,
+    }
+
+    event = ResponseErrorEvent.model_validate(payload)
+    assert event.type == "error"
+    assert event.code == "rate_limit_exceeded"
+    assert event.message == "slow down"
+    assert event.sequence_number == 0
+
+
+@pytest.mark.asyncio
+async def test_buffered_responses_ccr_residual_retrieve_call_fails_closed():
+    """A retrieve call the handler could not resolve must fail closed.
+
+    Same rule as the Chat twin: before the commit the real 502 and a JSON
+    error body are still deliverable, so they win. The wrapper converts the
+    same body into the typed Responses SSE frame if SSE is already on the
+    wire, which the post-commit test covers.
+    """
+    app = _make_app()
+    url = "https://api.openai.com/v1/responses"
+    body = {
+        "model": "gpt-5-codex",
+        "input": "unresolvable",
+        "tools": [_RETRIEVE_TOOL],
+        "stream": True,
+    }
+
+    delivered = False
+
+    async def receive():
+        # After the body, block instead of replaying http.request: a real
+        # server-side StreamingResponse parks a disconnect listener on this.
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with TestClient(app):
+        server = app.state.proxy
+        server._retry_request = AsyncMock(return_value=_tool_call_response(url))
+        # Leave the retrieve call unresolved, which is what trips the guard.
+        server.ccr_response_handler.handle_response = AsyncMock(
+            return_value=_tool_call_response(url).json()
+        )
+
+        response = await server.handle_openai_responses(Request(scope, receive))
+        events: list[dict] = []
+
+        async def send(message):  # noqa: ANN001
+            events.append(message)
+
+        await response(scope, receive, send)
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 502
+    assert dict(start["headers"])[b"content-type"] == b"application/json"
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    payload = json.loads(bodies)
+    assert payload["error"]["type"] == "server_error"
+    assert payload["error"]["code"] == "proxy_error"
+    assert payload["error"]["message"] == "Unable to safely complete streamed CCR retrieval."
