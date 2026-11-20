@@ -1548,8 +1548,6 @@ class ToolIntelligenceNetwork:
                     "error": str(first_error),
                 },
             )
-        return sanitized
-
         if purged:
             logger.info(
                 "TOIN dropped pre-upgrade pools that now collide with digested tenant keys",
@@ -1558,6 +1556,8 @@ class ToolIntelligenceNetwork:
                     "purged": purged,
                 },
             )
+
+        return sanitized
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
         """Merge imported pattern into existing."""
