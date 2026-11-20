@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from headroom.learn.loops import detect_loops
 from headroom.learn.models import ProjectInfo, Recommendation, RecommendationTarget
 from headroom.learn.scanner import GeminiScanner
 from headroom.learn.writer import GeminiWriter
@@ -178,6 +179,42 @@ class TestJsonSessionParsing:
         assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [
             ({"path": path}, path) for path in response_order
         ]
+
+    def test_parallel_same_name_calls_count_as_a_loop(self, tmp_path):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        call = {"functionCall": {"name": "read_file", "args": {"path": "a"}}}
+        response = {"functionResponse": {"name": "read_file", "response": {"output": "a"}}}
+        messages = [
+            {"role": "model", "parts": [call, call, call]},
+            {"role": "user", "parts": [response, response, response]},
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert len({tc.tool_call_id for tc in session.tool_calls}) == 3
+        loops = detect_loops([session])
+        assert [loop.count for loop in loops] == [3]
+
+    def test_unanswered_call_does_not_take_later_result(self, tmp_path):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        messages = [
+            {
+                "role": "model",
+                "parts": [{"functionCall": {"name": "read_file", "args": {"path": "a"}}}],
+            },
+            {
+                "role": "model",
+                "parts": [{"functionCall": {"name": "read_file", "args": {"path": "b"}}}],
+            },
+            {
+                "role": "user",
+                "parts": [{"functionResponse": {"name": "read_file", "response": {"output": "b"}}}],
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [({"path": "b"}, "b")]
 
     def test_basic_tool_call(self, tmp_path):
         gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
