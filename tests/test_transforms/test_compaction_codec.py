@@ -254,6 +254,16 @@ def test_dictionary_cells_still_decode_edge_values() -> None:
     ]
 
 
+def test_value_factoring_round_trips_equals_in_column_names() -> None:
+    records = [
+        {"a": "first=value", "a=b": "second=[value]", "a=b=c": "third=value", "id": i}
+        for i in range(80)
+    ]
+    factored = factor_values(_crush(records))
+    assert "__dict:3" in factored
+    assert expand_compacted(factored) == records
+
+
 def test_container_shaped_string_cells_round_trip() -> None:
     # A string whose text is a JSON container (`"[]"`, `"{}"`, `"[1,2]"`) must come back as
     # that string, not as the value it spells. #4053 fixed the scalar-looking case; containers
