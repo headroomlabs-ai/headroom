@@ -41,6 +41,7 @@ def test_tool_schema_savings_tags_are_stable() -> None:
     assert TOOL_SCHEMA_SAVINGS_TAGS == (
         "tool_search_deferred_tokens",
         "turn_hook_tools_saved_tokens",
+        "turn_hook_system_saved_tokens",
     )
 
 
@@ -180,10 +181,14 @@ def test_reconcile_failure_keeps_private_schema_out_of_every_log_record(monkeypa
         raise ValueError(f"cannot tokenize {tools!r}")
 
     tags = {"tool_search_deferred_tokens": 100}
-    booking = (100, {"Read": dict(tool)}, None)
+    booking = (100, {"Read": dict(tool)}, None, frozenset())
     try:
-        policy.reconcile_deferred_tokens(tags, booking, [dict(tool)], _tokenizer_echoes_schema)
-        policy.reconcile_deferred_tokens(tags, booking, [dict(tool)], _tokenizer_echoes_schema)
+        policy.reconcile_deferred_tokens(
+            tags, booking, [dict(tool)], _tokenizer_echoes_schema, None
+        )
+        policy.reconcile_deferred_tokens(
+            tags, booking, [dict(tool)], _tokenizer_echoes_schema, None
+        )
     finally:
         policy.logger.removeHandler(handler)
         policy.logger.setLevel(old_level)
@@ -207,7 +212,7 @@ def test_reconcile_warns_again_for_a_new_exception_type(monkeypatch) -> None:
 
     policy, records, handler, old_level = _capture_policy_logs(monkeypatch)
     tool = {"name": "Read", "defer_loading": True, "description": "x"}
-    booking = (100, {"Read": dict(tool)}, None)
+    booking = (100, {"Read": dict(tool)}, None, frozenset())
 
     def _runtime(tools: object) -> int:
         raise RuntimeError("boom")
@@ -218,12 +223,12 @@ def test_reconcile_warns_again_for_a_new_exception_type(monkeypatch) -> None:
     try:
         # A healthy reconcile logs nothing.
         policy.reconcile_deferred_tokens(
-            {"tool_search_deferred_tokens": 100}, booking, [dict(tool)], lambda t: 10
+            {"tool_search_deferred_tokens": 100}, booking, [dict(tool)], lambda t: 10, None
         )
         assert records == []
         for counter in (_runtime, _runtime, _value):
             policy.reconcile_deferred_tokens(
-                {"tool_search_deferred_tokens": 100}, booking, [dict(tool)], counter
+                {"tool_search_deferred_tokens": 100}, booking, [dict(tool)], counter, None
             )
     finally:
         policy.logger.removeHandler(handler)

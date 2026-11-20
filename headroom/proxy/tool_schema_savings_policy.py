@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from headroom.log_safety import WarnOnce, describe_exception
@@ -62,25 +64,238 @@ def without_deferral_flags(tools: object) -> object:
     appear or disappear: un-deferring a tool would shorten the JSON by the
     flag text and be booked as a small saving although the bill goes UP, and
     deferring one would add a phantom cost. So the flag is ignored here, and a
-    hook's measured tool delta covers only real removals and rewrites. Never
-    mutates its input.
+    hook's measured tool delta covers only real removals and rewrites. Tools
+    nested in a Responses ``namespace`` group (Codex) are measured the same
+    way. Never mutates its input.
+    """
+    return _measured_view(tools, frozenset())
+
+
+def unbilled_deferred_tool_names(tools: object, messages: object) -> frozenset[str]:
+    """Names of the ``defer_loading`` tools in ``tools`` that are not billed.
+
+    A deferred tool costs nothing until a ``tool_reference`` naming it is in
+    the history; from then on its full definition is billed (measured on
+    Copilot's Claude API). ``messages`` is the request's Anthropic message
+    list; pass ``None`` where loading cannot be read from the history (OpenAI
+    tool search), and every tool is then treated as billed, the old behaviour.
+    """
+    if messages is None or not isinstance(tools, list):
+        return frozenset()
+    deferred = _tool_ids(tools, deferred_only=True)
+    if not deferred:
+        return frozenset()
+    from headroom.proxy.helpers import (
+        referenced_tool_names,
+        strip_unsupported_tool_search_blocks,
+    )
+
+    # What the provider receives: repair drops a reference this request's tools
+    # cannot support, and that one loads nothing.
+    repaired, _ = strip_unsupported_tool_search_blocks(messages, tools)
+    referenced = referenced_tool_names(repaired)
+    return frozenset(i for i in deferred if i.rsplit(_NAMESPACE_SEP, 1)[-1] not in referenced)
+
+
+# Joins a namespace and a member's name into the member's identity. Two
+# namespaces may each hold a ``search``; keyed by bare name, the one still
+# deferred would hide the one a hook put on the bill. A top-level tool keeps
+# its bare name, which is what a ``tool_reference`` names.
+_NAMESPACE_SEP = "\x1f"
+
+# The detail key every turn-hook ledger row carries (turn_hooks.run_request_hooks);
+# :func:`_debit_hook_rows` finds the hooks' rows by it.
+HOOK_TOOL_DETAIL = "tool_tokens_saved"
+
+
+def _member_prefix(group: dict[str, Any]) -> str:
+    """The prefix a ``namespace`` group gives its members' identities."""
+    return f"{group.get('name')}{_NAMESPACE_SEP}"
+
+
+def _tool_ids(tools: object, *, deferred_only: bool = False) -> frozenset[str]:
+    """The identity of every named tool in ``tools``, ``namespace`` members
+    qualified by their group's name (see :data:`_NAMESPACE_SEP`)."""
+    ids: set[str] = set()
+    if not isinstance(tools, list):
+        return frozenset()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        members = [("", tool)]
+        if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
+            members += [(_member_prefix(tool), m) for m in tool["tools"] if isinstance(m, dict)]
+        for prefix, member in members:
+            if member.get("name") and (member.get("defer_loading") or not deferred_only):
+                ids.add(f"{prefix}{member['name']}")
+    return frozenset(ids)
+
+
+def _measured_view(tools: object, excluded: frozenset[str], prefix: str = "") -> object:
+    """``tools`` without ``defer_loading`` flags or the ``excluded`` tools, the
+    members of a ``namespace`` group included. Never mutates its input."""
+    if not isinstance(tools, list):
+        return tools
+    view: list[Any] = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            if tool.get("name") and f"{prefix}{tool['name']}" in excluded:
+                continue
+            if "defer_loading" in tool:
+                tool = {k: v for k, v in tool.items() if k != "defer_loading"}
+            if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
+                tool = {
+                    **tool,
+                    "tools": _measured_view(tool["tools"], excluded, _member_prefix(tool)),
+                }
+        view.append(tool)
+    return view
+
+
+@dataclass(frozen=True)
+class ToolsBeforeHook:
+    """What :func:`hook_tool_counts` needs from the tools before a hook ran."""
+
+    names: frozenset[str]
+    unbilled: frozenset[str]
+    # Tools whose schema is growth once the hook puts them on the bill: those
+    # not billed before it, less those the deferral credit covers.
+    chargeable: frozenset[str] = frozenset()
+    # A copy of the tools, kept only when some tool was unbilled or chargeable:
+    # whether it is left out of the count depends on what the hook does to it.
+    tools: object = None
+    # Counted up front otherwise (nothing to decide later).
+    count: int | None = None
+
+
+def tools_before_hook(
+    tools: object,
+    messages: object,
+    count_tools: Callable[[Any], int],
+    tags: object = None,
+    *,
+    deferred_billed: bool = False,
+) -> ToolsBeforeHook:
+    """Snapshot ``tools`` for a hook's measured tool delta; see :func:`hook_tool_counts`.
+
+    ``messages`` as for :func:`unbilled_deferred_tool_names`; ``tags`` are the
+    request's tags, read for the deferral credit. ``deferred_billed``: a
+    translating backend bills every tool, deferred or not. May raise whatever
+    ``count_tools`` raises.
+    """
+    unbilled = unbilled_deferred_tool_names(tools, messages)
+    names = _tool_ids(tools)
+    if deferred_billed:
+        chargeable: frozenset[str] = frozenset()
+    else:
+        # Where loading is unreadable (``messages`` is None, OpenAI tool
+        # search) a deferred tool is taken as unloaded: un-deferring it is
+        # charged as growth, and condensing or removing it books nothing (see
+        # hook_tool_counts). Either way that under-books at worst.
+        # With a deferral credit, every deferred tool is left to
+        # reconcile_deferred_tokens. The credit's tools are all of them: core
+        # and tool-search defer only when request_already_defers_tools() is
+        # False (no ``defer_loading`` anywhere, namespace members included),
+        # and they flag top-level tools only.
+        chargeable = unbilled if messages is not None else _tool_ids(tools, deferred_only=True)
+        if isinstance(tags, dict) and "tool_search_deferred_tokens" in tags:
+            chargeable -= _tool_ids(tools, deferred_only=True)
+    if not unbilled and not chargeable:
+        return ToolsBeforeHook(
+            names, unbilled, count=int(count_tools(without_deferral_flags(tools)))
+        )
+    return ToolsBeforeHook(names, unbilled, chargeable, tools=copy.deepcopy(tools))
+
+
+def hook_tool_counts(
+    before: ToolsBeforeHook,
+    tools: object,
+    messages: object,
+    count_tools: Callable[[Any], int],
+) -> tuple[int, int]:
+    """Return the ``(before, after)`` tool counts a hook's delta is taken from.
+
+    Measured as :func:`without_deferral_flags` does, and additionally without
+    every tool that is billed on neither side: deferred and not loaded before
+    the hook (or absent), and deferred and not loaded after it (or absent).
+    Condensing, adding or removing such a tool changes nothing on the bill, so
+    it books nothing. A chargeable tool (:class:`ToolsBeforeHook`) billed
+    after the hook, because it un-deferred or loaded it, is left out of the
+    ``before`` count only: its whole schema is growth, netted against the
+    hook's other savings. Any other tool the hook defers or un-defers stays in
+    both counts: the flag itself is never booked, and the deferral credit
+    (``tool_search_deferred_tokens``, reconciled by
+    :func:`reconcile_deferred_tokens`) carries that change. May raise
+    whatever ``count_tools`` raises.
+    """
+    unbilled_after = unbilled_deferred_tool_names(tools, messages)
+    billed_before = before.names - before.unbilled
+    billed_after = _tool_ids(tools) - unbilled_after
+    excluded = frozenset((before.unbilled | unbilled_after) - billed_before - billed_after)
+    if messages is None:
+        # Unreadable loading: a deferred tool is taken as unloaded, so only
+        # un-deferring is seen to bill it. A chargeable tool the hook leaves
+        # deferred, condenses or removes was billed on neither side.
+        billed_after -= _tool_ids(tools, deferred_only=True)
+        excluded |= before.chargeable - billed_after
+    newly_billed = before.chargeable & billed_after
+    if before.count is not None:
+        before_count = before.count
+    else:
+        before_count = int(count_tools(_measured_view(before.tools, excluded | newly_billed)))
+    return before_count, int(count_tools(_measured_view(tools, excluded)))
+
+
+def billed_tools(tools: object, history: object) -> object:
+    """The tools that enter the billed context, for compaction counts.
+
+    ``history`` is :func:`loading_history`'s result. With one, a deferred tool
+    counts once a ``tool_reference`` has loaded it; without one (loading is
+    unreadable), every ``defer_loading`` tool is left out, since a client's
+    own deferral keeps it off the bill until the model asks for it.
     """
     if not isinstance(tools, list):
         return tools
+    if history is None:
+        return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
+    unbilled = unbilled_deferred_tool_names(tools, history)
+    if not unbilled:
+        return tools
     return [
-        {k: v for k, v in tool.items() if k != "defer_loading"}
-        if isinstance(tool, dict) and "defer_loading" in tool
-        else tool
-        for tool in tools
+        t
+        for t in tools
+        if not (isinstance(t, dict) and t.get("name") and str(t["name"]) in unbilled)
     ]
 
 
-DeferredBooking = tuple[int, dict[str, Any], "dict[str, Any] | None"]
+def loading_history(provider: str, messages: object) -> object:
+    """The history that says which deferred tools are loaded, or ``None``.
+
+    Only an Anthropic history can be read (``tool_reference`` blocks); OpenAI
+    tool search loads tools outside it.
+    """
+    return messages if provider == "anthropic" else None
 
 
-def deferred_booking(tags: object, tools: object) -> DeferredBooking | None:
-    """Snapshot the deferral currently booked: the tag, the tools it covers and
-    its own ledger entry.
+def proxy_added_tools(tools: object, client_tools: object, name: str) -> list[Any]:
+    """The tool named ``name`` in the outbound ``tools`` when the client did not
+    declare it: a definition the proxy added and the request pays for."""
+    if name in _tool_ids(client_tools):
+        return []
+    return [
+        t
+        for t in (tools if isinstance(tools, list) else [])
+        if isinstance(t, dict) and t.get("name") == name
+    ]
+
+
+DeferredBooking = tuple[int, dict[str, Any], "dict[str, Any] | None", frozenset[str]]
+
+
+def deferred_booking(tags: object, tools: object, messages: object) -> DeferredBooking | None:
+    """Snapshot the deferral currently booked: the tag, the tools it covers,
+    its own ledger entry and which of those tools no ``tool_reference`` in
+    ``messages`` has loaded yet (as for :func:`unbilled_deferred_tool_names`).
 
     ``None`` when nothing is booked. The schemas are copied as they were when
     booked, so a later in-place edit cannot change what the credit stands for.
@@ -100,10 +315,15 @@ def deferred_booking(tags: object, tools: object) -> DeferredBooking | None:
         for t in (tools if isinstance(tools, list) else [])
         if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
     }
+    return booked, snapshot, _deferral_entry(tags), unbilled_deferred_tool_names(tools, messages)
+
+
+def _deferral_entry(tags: dict[str, Any]) -> dict[str, Any] | None:
+    """The ledger's estimated ``tool_search`` row, if there is one."""
     from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
 
     ledger = tags.get(SAVINGS_ATTRIBUTION_TAG)
-    entry = next(
+    return next(
         (
             item
             for item in reversed(ledger if isinstance(ledger, list) else [])
@@ -113,11 +333,51 @@ def deferred_booking(tags: object, tools: object) -> DeferredBooking | None:
         ),
         None,
     )
-    return booked, snapshot, entry
+
+
+def _debit_hook_rows(tags: dict[str, Any], amount: int) -> None:
+    """Lower the turn hooks' realized ledger rows by ``amount``, latest first.
+
+    A hook row is one :func:`~headroom.proxy.turn_hooks.run_request_hooks`
+    booked: its details split the saving into :data:`HOOK_TOOL_DETAIL` and the rest.
+    That split stays as booked; ``proxy_cost_tokens`` says what came off it.
+    """
+    from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+
+    ledger = tags.get(SAVINGS_ATTRIBUTION_TAG)
+    for row in reversed(ledger if isinstance(ledger, list) else []):
+        if amount <= 0:
+            return
+        details = row.get("details") if isinstance(row, dict) else None
+        if not (isinstance(details, dict) and HOOK_TOOL_DETAIL in details):
+            continue
+        if not row.get("realized") or row.get("estimated"):
+            continue
+        take = min(amount, max(0, int(row.get("tokens") or 0)))
+        if take <= 0:
+            continue
+        row["tokens"] = int(row.get("tokens") or 0) - take
+        details["proxy_cost_tokens"] = int(details.get("proxy_cost_tokens") or 0) + take
+        amount -= take
+
+
+def _realized_row_tokens(tags: dict[str, Any]) -> int:
+    """The tokens on the realized, measured ledger rows: the by-source total."""
+    from headroom.proxy.savings_attribution import from_tags
+
+    return sum(
+        int(row.get("tokens") or 0)
+        for row in from_tags(tags)
+        if row.get("realized") and not row.get("estimated")
+    )
 
 
 def reconcile_deferred_tokens(
-    tags: object, booking: DeferredBooking | None, tools: object, count_tools: object
+    tags: object,
+    booking: DeferredBooking | None,
+    tools: object,
+    count_tools: object,
+    messages: object,
 ) -> None:
     """Cap the deferral credit at the booked tools still deferred after hooks.
 
@@ -126,24 +386,31 @@ def reconcile_deferred_tokens(
     deferred is credited at the SMALLER of its booked and its final schema:
     growing another schema cannot keep an un-deferred tool's credit alive, and
     a schema a hook shortened (and booked as its own saving) is not credited
-    twice. Only ever lowers the tag, and lowers the deferral's own ledger entry
-    by the same amount so ``/stats`` by-source agrees with the headline.
-    Never raises.
+    twice. A tool unloaded both when booked and in the final ``messages`` is
+    the exception: billed at neither point, :func:`hook_tool_counts` books no
+    hook saving for it, so it keeps its booked schema. ``messages`` as for
+    :func:`unbilled_deferred_tool_names`. Only ever lowers the tag, and lowers
+    the deferral's own ledger entry by the same amount so ``/stats`` by-source
+    agrees with the headline. Never raises.
     """
     if booking is None or not isinstance(tags, dict) or not callable(count_tools):
         return
-    booked, snapshot, entry = booking
+    booked, snapshot, entry, unbilled_when_booked = booking
     try:
         final = {
             str(t["name"]): t
             for t in (tools if isinstance(tools, list) else [])
             if isinstance(t, dict) and t.get("defer_loading") and t.get("name")
         }
+        unbilled = unbilled_deferred_tool_names(tools, messages)
         kept = []
         for name, schema in snapshot.items():
             if name not in final:
                 continue
             now = final[name]
+            if name in unbilled and name in unbilled_when_booked:
+                kept.append(schema)
+                continue
             kept.append(now if int(count_tools([now])) < int(count_tools([schema])) else schema)
         measured = int(count_tools(kept)) if kept else 0
         released = booked - measured
@@ -158,14 +425,19 @@ def reconcile_deferred_tokens(
         return
 
 
+# System-prompt text a turn hook removed: like a tool schema it sits in the
+# cached prefix, so it is priced as these tags are, not as live-zone content.
+TURN_HOOK_SYSTEM_SAVED_TAG = "turn_hook_system_saved_tokens"
 TOOL_SCHEMA_SAVINGS_TAGS: tuple[str, ...] = (
     "tool_search_deferred_tokens",
     "turn_hook_tools_saved_tokens",
+    TURN_HOOK_SYSTEM_SAVED_TAG,
 )
 
 
 def tool_schema_saved_from_tags(tags: object) -> int:
-    """Return tool-definition tokens Headroom kept out of context for one request.
+    """Return prefix tokens (tool definitions, a hook's system-prompt cut) Headroom
+    kept out of context for one request.
 
     The summed tags are set only on paths where Headroom performed the deferral,
     so clients that already had tool search enabled contribute zero here.
@@ -184,7 +456,9 @@ def tool_schema_saved_from_tags(tags: object) -> int:
     return total
 
 
-def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> int:
+def net_hook_tool_saving(
+    raw_saved: int, tags: object, hook_tool_saved: int, *, proxy_cost: int = 0
+) -> int:
     """Net a request's message-side saving against the tool saving its turn
     hooks booked on ``turn_hook_tools_saved_tokens``; return it clamped at 0.
 
@@ -192,16 +466,76 @@ def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> 
     message text while removing tools leaves ``raw_saved`` negative, and the
     clamp alone would drop the growth while the tag kept the full removal. The
     deficit is debited from the tag first (at most what the hooks booked on
-    this request), so headline == messages + tools, signed, clamped once.
+    this request), then from the system-prompt cut they booked, then from the
+    tool-search credit and its ledger row, so headline == messages + tools + system,
+    signed, clamped once.
+
+    ``proxy_cost`` is the part of the deficit the proxy added after the hooks
+    ran (steering, the retrieve tool). The hooks' ledger rows already net
+    their own growth, but not that: what it takes from the hooks' tags comes
+    off their rows too, so ``/stats`` by-source agrees with the headline. So
+    does the part it takes from the message saving, as far as the realized
+    rows would otherwise top the headline (a saving no row claims, such as
+    compression, absorbs it first).
     """
     raw = int(raw_saved)
+    cost = max(0, int(proxy_cost or 0))
+    from_messages = min(cost, max(0, raw + cost))
     booked = max(0, int(hook_tool_saved or 0))
+    hook_debit = 0
     if raw < 0 and booked > 0 and isinstance(tags, dict):
         offset = min(-raw, booked)
         current = int(tags.get("turn_hook_tools_saved_tokens", 0) or 0)
         tags["turn_hook_tools_saved_tokens"] = max(0, current - offset)
         raw += offset
+        hook_debit += offset
+    if raw < 0 and isinstance(tags, dict):
+        system_cut = max(0, int(tags.get(TURN_HOOK_SYSTEM_SAVED_TAG, 0) or 0))
+        offset = min(-raw, system_cut)
+        if offset:
+            tags[TURN_HOOK_SYSTEM_SAVED_TAG] = system_cut - offset
+            raw += offset
+            hook_debit += offset
+    if isinstance(tags, dict):
+        _debit_hook_rows(tags, min(hook_debit, cost))
+    if raw < 0 and isinstance(tags, dict):
+        credit = _deferral_credit(tags)
+        offset = min(-raw, credit)
+        if offset:
+            tags["tool_search_deferred_tokens"] = credit - offset
+            entry = _deferral_entry(tags)
+            if entry is not None:
+                entry["tokens"] = max(0, int(entry.get("tokens") or 0) - offset)
+            raw += offset
+    if from_messages and isinstance(tags, dict):
+        # The deferral credit is on the headline but on the estimated
+        # tool_search row, not a realized one: the realized rows are measured
+        # against the rest of the headline.
+        measured = max(0, raw) + tool_schema_saved_from_tags(tags) - _deferral_credit(tags)
+        _debit_hook_rows(tags, min(from_messages, _realized_row_tokens(tags) - measured))
     return max(0, raw)
+
+
+def _deferral_credit(tags: dict[str, Any]) -> int:
+    """The tool-search deferral credit on ``tags``, 0 when absent or unreadable."""
+    try:
+        return max(0, int(tags.get("tool_search_deferred_tokens") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def accumulate_tool_schema_saved(into: dict[str, int], tags: object) -> None:
+    """Add one request's ``TOOL_SCHEMA_SAVINGS_TAGS`` into ``into``, for a
+    transport that books several requests' savings on one later outcome."""
+    if not isinstance(tags, dict):
+        return
+    for key in TOOL_SCHEMA_SAVINGS_TAGS:
+        try:
+            amount = int(tags.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            into[key] = into.get(key, 0) + amount
 
 
 def headline_tokens_saved(tokens_saved: object, tags: object) -> int:
