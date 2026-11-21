@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-# SSE byte-buffer helper supports LF and CRLF event separators. Per the SSE
-# spec the default event name is "message"; we return ``None`` so callers can
-# decide whether to apply that default.
-SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
+# SSE byte-buffer helper supports LF, CR and CRLF event separators (#4252).
+# WHATWG SSE allows CR-only line endings; without b"\r\r" a CR-only stream
+# never frames, so its tail stays buffered and memory_save never intercepts.
+SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n", b"\r\r")
 SSE_EVENT_LINE_PREFIX = "event:"
 SSE_DATA_LINE_PREFIX = "data:"
 
