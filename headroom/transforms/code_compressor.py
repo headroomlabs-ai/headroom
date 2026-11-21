@@ -1465,7 +1465,8 @@ class CodeAwareCompressor(Transform):
                         compression_ratio=1.0,
                         language=detected_lang,
                         language_confidence=confidence,
-                        syntax_valid=True,
+                        # The original goes back unchanged and it does not parse.
+                        syntax_valid=False,
                     )
                 if detected_lang == CodeLanguage.PYTHON:
                     compressed, structure, symbol_scores = self._compress_with_ast(

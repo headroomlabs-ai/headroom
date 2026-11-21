@@ -150,6 +150,8 @@ def test_already_invalid_input_is_not_blamed_on_the_compressor(caplog):
         result = compressor.compress(_CPP_FRAGMENT, language="cpp")
 
     assert result.compressed == _CPP_FRAGMENT
+    # The result contract: syntax_valid describes the returned text.
+    assert result.syntax_valid is False
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
     assert False not in cc._syntax_breaker_outcomes.get("cpp", [])
 
