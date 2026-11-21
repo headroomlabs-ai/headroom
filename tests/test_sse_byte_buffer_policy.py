@@ -37,6 +37,30 @@ def test_parse_sse_events_splits_crlf_lines() -> None:
     assert not buf
 
 
+def test_parse_sse_events_splits_cr_only_lines() -> None:
+    """WHATWG SSE allows CR-only line endings (#4252).
+
+    Without b"\\r\\r" as a terminator the event never frames and its tail
+    stays buffered forever, so memory_save interception never fires.
+    """
+    buf = bytearray(b"event: delta\rdata: one\rdata: two\r\r")
+
+    assert parse_sse_events_from_byte_buffer(buf) == [("delta", "one\ntwo")]
+    assert not buf
+
+
+def test_parse_sse_events_drains_cr_only_event_split_across_chunks() -> None:
+    buf = bytearray(b"data: hello")
+
+    assert parse_sse_events_from_byte_buffer(buf) == []
+    buf.extend(b"\r\rdata: world\r\r")
+    assert parse_sse_events_from_byte_buffer(buf) == [
+        (None, "hello"),
+        (None, "world"),
+    ]
+    assert not buf
+
+
 def test_parse_sse_events_raises_on_complete_invalid_utf8_event() -> None:
     with pytest.raises(UnicodeDecodeError):
         parse_sse_events_from_byte_buffer(bytearray(b"data: \xff\n\n"))

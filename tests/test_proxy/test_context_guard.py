@@ -293,6 +293,39 @@ class TestStreamUsageGuard:
         assert b"\n" not in out.replace(b"\r\n", b"")
         assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
 
+    def test_cr_only_rewritten_frames_keep_three_independent_events(self):
+        # A CR-only stream frames on b"\r\r". The usage guard rewrites
+        # message_start and message_delta; both must keep both CRs or an SSE
+        # client reads one event carrying three JSON payloads (#4252).
+        guard = StreamUsageGuard(believed_limit=2_000, effective_limit=1_000)
+
+        def frame(payload: dict) -> bytes:
+            return b"data: " + json.dumps(payload).encode() + b"\r\r"
+
+        start = frame(
+            {
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 900}},
+            }
+        )
+        delta = frame({"type": "message_delta", "usage": {"input_tokens": 900}})
+        stop = frame({"type": "message_stop"})
+        out = guard.feed(start + delta + stop)
+
+        assert out.count(b"\r\r") == 3
+        decoded = [
+            json.loads(line[len(b"data:") :].strip())
+            for line in out.split(b"\r\r")
+            if line
+        ]
+        assert [payload["type"] for payload in decoded] == [
+            "message_start",
+            "message_delta",
+            "message_stop",
+        ]
+        assert decoded[0]["message"]["usage"]["input_tokens"] == 1_900
+        assert decoded[1]["usage"]["input_tokens"] == 1_900
+
     def test_a_chunk_over_the_buffer_cap_still_gets_its_message_start_read(self):
         guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         filler = b"event: content_block_delta\ndata: " + b"x" * (300 * 1024) + b"\n\n"
