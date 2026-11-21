@@ -2060,7 +2060,13 @@ class StreamingMixin:
                 )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except Exception as e:
-                logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                # Name the type: httpx transport errors raised mid-stream often
+                # have an empty str(), which logged as a bare "error:" line.
+                detail = (
+                    f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__} (no message)"
+                )
+                logger.error("[%s] Unexpected streaming error: %s", request_id, detail)
+                logger.debug("[%s] Unexpected streaming error traceback", request_id, exc_info=True)
                 guarded_tail = _drain_context_guard()
                 if guarded_tail:
                     yield guarded_tail
