@@ -19,10 +19,10 @@
   "input_sha256": "5c057f7bfd56af058ab2f8745bf0242d97e3a458ce8efedae8263066c1c709a7",
   "output": {
     "cache_key": null,
-    "compressed": "package com.example;\nimport java.util.List;\nimport java.util.ArrayList;\n\npublic class Processor {\n    private String name;\n    private int count;\n\n    public Processor(String name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    @Override\n    public String toString() {\n        return \"Processor(\" + name + \")\";\n    }\n\n    public List<String> process(List<String> items) {\n        List<String> results = new ArrayList<>();\n        for (String item : items) {\n            if (item == null || item.isEmpty()) {\n                continue;\n            }\n            String clean = item.trim().toLowerCase();\n            results.add(clean);\n            this.count += 1;\n        }\n        return results;\n    }\n}\n\n// variant 1",
+    "compressed": "package com.example;\nimport java.util.List;\nimport java.util.ArrayList;\n\npublic class Processor {\n    private String name;\n    private int count;\n    public Processor(String name) {\n        this.name = name;\n        this.count = 0;\n    }\n    @Override\n    public String toString() {\n        return \"Processor(\" + name + \")\";\n    }\n    public List<String> process(List<String> items) {\n        List<String> results = new ArrayList<>();\n        // [9 lines omitted]\n    }\n}\n\n// variant 1",
     "compressed_bodies": 0,
-    "compressed_tokens": 183,
-    "compression_ratio": 1.0,
+    "compressed_tokens": 121,
+    "compression_ratio": 0.6612021857923497,
     "language": "java",
     "language_confidence": 1.0,
     "original": "package com.example;\n\nimport java.util.List;\nimport java.util.ArrayList;\n\npublic class Processor {\n    private String name;\n    private int count;\n\n    public Processor(String name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    @Override\n    public String toString() {\n        return \"Processor(\" + name + \")\";\n    }\n\n    public List<String> process(List<String> items) {\n        List<String> results = new ArrayList<>();\n        for (String item : items) {\n            if (item == null || item.isEmpty()) {\n                continue;\n            }\n            String clean = item.trim().toLowerCase();\n            results.add(clean);\n            this.count += 1;\n        }\n        return results;\n    }\n}\n\n// variant 1",
@@ -36,6 +36,6 @@
     },
     "syntax_valid": true
   },
-  "recorded_at": "2026-06-19T00:15:16.346983+00:00",
+  "recorded_at": "2026-11-21T08:10:00.970409+00:00",
   "transform": "code_aware_compressor"
 }

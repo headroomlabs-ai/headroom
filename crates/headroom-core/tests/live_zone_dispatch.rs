@@ -15,8 +15,8 @@
 mod common;
 
 use common::{
-    body_with_tool_result, dispatch, go_handlers_source, kompress_available, python_module_source,
-    sha256, tool_result_action,
+    body_with_tool_result, dispatch, kompress_available, python_module_source,
+    python_script_source, sha256, tool_result_action,
 };
 use headroom_core::transforms::{BlockAction, LiveZoneOutcome};
 use serde_json::{json, Value};
@@ -288,13 +288,13 @@ fn source_code_tool_result_routes_to_code_compressor() {
 
 #[test]
 fn source_code_declined_by_code_compressor_is_never_kompressed() {
-    // The code compressor leaves Go source untouched (exact passthrough).
+    // The code compressor leaves this script untouched (exact passthrough).
     // That must stay a NoOp: handing it to Kompress, a prose model, drops
-    // keywords such as `func`, `if` and `for` from the code (#4214). The
+    // keywords such as `def`, `if` and `return` from the code (#4214). The
     // warmup makes Kompress live when the model is cache-resident, so on
     // such a host the old fallback would have rewritten this block.
     let _ = kompress_available();
-    let code = go_handlers_source(30);
+    let code = python_script_source(30);
     assert!(
         code.len() > 2048,
         "fixture must clear the SourceCode byte threshold (2048); got {} bytes",

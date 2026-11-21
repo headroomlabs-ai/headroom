@@ -38,7 +38,7 @@
 //! convention via the dispatcher. Parity fixtures are recorded with
 //! `enable_ccr=False` so the output is deterministic and store-independent.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tree_sitter::{Language, Node, Parser, Tree};
 
@@ -153,6 +153,14 @@ struct LangConfig {
     comment_prefix: &'static str,
     uses_colon_after_signature: bool,
     package_node: Option<&'static str>,
+    /// Member-list node types of classes; empty means `body_node_types`.
+    class_body_node_types: &'static [&'static str],
+    /// Wrappers whose member list is compressed like a class body (C++
+    /// namespaces and `extern "C"` blocks, Rust inline modules).
+    container_node_types: &'static [&'static str],
+    /// Wrappers that prefix exactly one declaration (C++ `template <...>`):
+    /// the prefix is kept and the declaration it wraps is compressed.
+    prefix_wrapper_node_types: &'static [&'static str],
 }
 
 impl LangConfig {
@@ -171,6 +179,19 @@ impl LangConfig {
     fn is_body(&self, k: &str) -> bool {
         self.body_node_types.contains(&k)
     }
+    fn is_class_body(&self, k: &str) -> bool {
+        if self.class_body_node_types.is_empty() {
+            self.is_body(k)
+        } else {
+            self.class_body_node_types.contains(&k)
+        }
+    }
+    fn is_container(&self, k: &str) -> bool {
+        self.container_node_types.contains(&k)
+    }
+    fn is_prefix_wrapper(&self, k: &str) -> bool {
+        self.prefix_wrapper_node_types.contains(&k)
+    }
 }
 
 /// Returns the `LangConfig` for a language, or `None` for `Unknown`
@@ -178,7 +199,11 @@ impl LangConfig {
 fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
     Some(match language {
         CodeLanguage::Python => LangConfig {
-            import_nodes: &["import_statement", "import_from_statement"],
+            import_nodes: &[
+                "future_import_statement",
+                "import_statement",
+                "import_from_statement",
+            ],
             function_nodes: &["function_definition"],
             class_nodes: &["class_definition"],
             type_nodes: &["type_alias_statement"],
@@ -187,6 +212,9 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "#",
             uses_colon_after_signature: true,
             package_node: None,
+            class_body_node_types: &[],
+            container_node_types: &[],
+            prefix_wrapper_node_types: &[],
         },
         CodeLanguage::Javascript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -198,6 +226,9 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            class_body_node_types: &["class_body"],
+            container_node_types: &[],
+            prefix_wrapper_node_types: &[],
         },
         CodeLanguage::Typescript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -209,6 +240,9 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            class_body_node_types: &["class_body"],
+            container_node_types: &[],
+            prefix_wrapper_node_types: &[],
         },
         CodeLanguage::Go => LangConfig {
             import_nodes: &["import_declaration"],
@@ -220,6 +254,9 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: Some("package_clause"),
+            class_body_node_types: &[],
+            container_node_types: &[],
+            prefix_wrapper_node_types: &[],
         },
         CodeLanguage::Rust => LangConfig {
             import_nodes: &["use_declaration"],
@@ -231,6 +268,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            class_body_node_types: &["declaration_list"],
+            // Inline modules (`mod tests { ... }`); `mod name;` has no body.
+            container_node_types: &["mod_item"],
+            prefix_wrapper_node_types: &[],
         },
         CodeLanguage::Java => LangConfig {
             import_nodes: &["import_declaration"],
@@ -242,6 +283,9 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: Some("package_declaration"),
+            class_body_node_types: &["class_body"],
+            container_node_types: &[],
+            prefix_wrapper_node_types: &[],
         },
         CodeLanguage::C => LangConfig {
             import_nodes: &["preproc_include"],
@@ -253,6 +297,9 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            class_body_node_types: &[],
+            container_node_types: &[],
+            prefix_wrapper_node_types: &[],
         },
         CodeLanguage::Cpp => LangConfig {
             import_nodes: &["preproc_include"],
@@ -264,6 +311,11 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            // `declaration_list` is the member list of namespaces and
+            // `extern "C" { ... }` blocks; classes use `field_declaration_list`.
+            class_body_node_types: &["field_declaration_list", "declaration_list"],
+            container_node_types: &["namespace_definition", "linkage_specification"],
+            prefix_wrapper_node_types: &["template_declaration"],
         },
         CodeLanguage::Unknown => return None,
     })
@@ -358,8 +410,11 @@ impl CodeCompressionResult {
 /// `(compressed, structure, symbol_scores)` — the result of an AST pass.
 type AstCompression = (String, CodeStructure, Vec<(String, f64)>);
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct CodeStructure {
+    /// Uncaptured top-level nodes before the first captured one (license
+    /// banners, module comments): emitted first, in original order.
+    header_code: Vec<String>,
     imports: Vec<String>,
     type_definitions: Vec<String>,
     class_definitions: Vec<String>,
@@ -369,6 +424,30 @@ struct CodeStructure {
     function_bodies: Vec<(String, String, i64)>,
     top_level_code: Vec<String>,
     other: Vec<String>,
+    /// Set when the fixed assembly order (declarations before top-level
+    /// code) would move a Python definition across executable code.
+    reorder_unsafe: bool,
+}
+
+/// Mutable state of one structure extraction: the structure being built,
+/// the captured byte ranges in capture order (rollback truncates them), and
+/// import entries keyed by start byte in insertion order.
+#[derive(Default)]
+struct ExtractState {
+    structure: CodeStructure,
+    captured: Vec<(usize, usize)>,
+    import_entries: Vec<(usize, String)>,
+}
+
+const COMMENT_NODE_TYPES: &[&str] = &["comment", "line_comment", "block_comment"];
+/// Grammar siblings that decorate the following declaration (Rust outer
+/// attributes: `#[derive(...)]`, `#[cfg(...)]`).
+const ATTACHED_NODE_TYPES: &[&str] = &["attribute_item"];
+
+/// A trailing `;` sibling on the declaration's last line (C++ `class X {};`).
+fn same_line_trailing_semicolon(node: Node) -> Option<Node> {
+    node.next_sibling()
+        .filter(|n| n.kind() == ";" && n.start_position().row == node.end_position().row)
 }
 
 // ─── Symbol analysis ────────────────────────────────────────────────────
@@ -970,6 +1049,13 @@ impl CodeAwareCompressor {
             (extract_generic_structure(code), Vec::new())
         };
 
+        // Declarations are assembled before the top-level code bucket, so
+        // executable code that precedes a definition would be moved after it.
+        // That changes definition-time behavior, so keep the original.
+        if structure.reorder_unsafe {
+            return Some((code.to_string(), structure, Vec::new()));
+        }
+
         let compressed = assemble_compressed(&structure);
         Some((compressed, structure, symbol_scores))
     }
@@ -1024,6 +1110,7 @@ fn assemble_compressed(structure: &CodeStructure) -> String {
             parts.push(String::new());
         }
     };
+    push_section(&mut parts, &structure.header_code);
     push_section(&mut parts, &structure.imports);
     push_section(&mut parts, &structure.type_definitions);
     push_section(&mut parts, &structure.class_definitions);
@@ -1378,52 +1465,172 @@ impl<'a> Ctx<'a> {
         self.code_lines[start..=end_inclusive].join("\n")
     }
 
+    /// Line-based slice of a node's source, preserving indentation. When the
+    /// node shares its first line with a preceding sibling (`export function`),
+    /// the sibling's text is trimmed off. Mirrors `_get_node_lines`, which
+    /// slices the first line by character index at the node's column.
+    fn node_lines(&self, node: Node) -> Vec<String> {
+        let start_row = node.start_position().row;
+        let start_col = node.start_position().column;
+        let end_row = node.end_position().row;
+        let mut lines: Vec<String> = self.code_lines[start_row..=end_row]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if let Some(first) = lines.first_mut() {
+            let prefix: String = first.chars().take(start_col).collect();
+            if !prefix.trim().is_empty() {
+                *first = first.chars().skip(start_col).collect();
+            }
+        }
+        lines
+    }
+
+    /// Contiguous comment and attribute siblings preceding `node`, captured so
+    /// they stay attached to it. Mirrors `_get_leading_comment_text`.
+    fn leading_comment_text(&self, node: Node, captured: &mut Vec<(usize, usize)>) -> String {
+        let mut preamble: Vec<Node> = Vec::new();
+        let mut sibling = node.prev_sibling();
+        let mut anchor_row = node.start_position().row as i64;
+        while let Some(s) = sibling {
+            let k = s.kind();
+            let attached = ATTACHED_NODE_TYPES.contains(&k);
+            if !attached && !COMMENT_NODE_TYPES.contains(&k) {
+                break;
+            }
+            if attached || anchor_row - s.end_position().row as i64 <= 1 {
+                preamble.push(s);
+                anchor_row = s.start_position().row as i64;
+            }
+            // A detached comment is skipped, not fatal: an outer attribute
+            // behind it still decorates this node.
+            sibling = s.prev_sibling();
+        }
+        if preamble.is_empty() {
+            return String::new();
+        }
+        preamble.reverse();
+        captured.extend(preamble.iter().map(|c| (c.start_byte(), c.end_byte())));
+        let texts: Vec<&str> = preamble
+            .iter()
+            .map(|c| self.node_text(*c).trim_end_matches('\n'))
+            .collect();
+        format!("{}\n", texts.join("\n"))
+    }
+
     /// Extract structure from the AST. Mirrors `_extract_structure`.
     fn extract_structure(&self, root: Node) -> CodeStructure {
-        let mut structure = CodeStructure::default();
-        let mut captured: std::collections::HashSet<(usize, usize)> =
-            std::collections::HashSet::new();
-        self.visit(root, &mut structure, &mut captured);
-
-        // Top-level children not captured → top_level_code.
+        let mut st = ExtractState::default();
         let mut cursor = root.walk();
-        for child in root.children(&mut cursor) {
+        let root_children: Vec<Node> = root.children(&mut cursor).collect();
+
+        // Visit each top-level node with a rollback point. A wrapper no
+        // handler recognizes (an include guard, `#ifdef`, a TypeScript
+        // `namespace`) is recursed into, so declarations inside it get
+        // captured and compressed on their own while the sweep below
+        // re-emits the uncaptured wrapper verbatim: its content would appear
+        // twice. Undo the nested captures so the wrapper goes out once.
+        for child in &root_children {
+            let snapshot = st.structure.clone();
+            let captured_before = st.captured.len();
+            let imports_before = st.import_entries.len();
+            self.visit(*child, &mut st);
+            let child_range = (child.start_byte(), child.end_byte());
+            let nested_captures = st.captured[captured_before..]
+                .iter()
+                .any(|(s, e)| child.start_byte() <= *s && *e <= child.end_byte());
+            if nested_captures && !st.captured.contains(&child_range) {
+                st.structure = snapshot;
+                st.captured.truncate(captured_before);
+                st.import_entries.truncate(imports_before);
+            }
+        }
+
+        // Top-level code no handler captured. Uncaptured nodes before the
+        // first captured one are file headers, emitted first in order.
+        let first_captured = st.captured.iter().map(|r| r.0).min();
+        let is_declaration = |k: &str| {
+            self.lang.is_function(k)
+                || self.lang.is_class(k)
+                || self.lang.is_type(k)
+                || self.lang.is_container(k)
+                || self.lang.decorator_node == Some(k)
+        };
+        let python = self.language == CodeLanguage::Python;
+        let mut saw_top_level_code = false;
+        let mut demoted_import_starts: HashSet<usize> = HashSet::new();
+        for child in &root_children {
             let range = (child.start_byte(), child.end_byte());
-            if !captured.contains(&range) {
-                let text = self.node_text(child).trim();
-                if !text.is_empty() {
-                    structure.top_level_code.push(text.to_string());
+            if st.captured.contains(&range) {
+                // Python runs top-level statements in source order: an import
+                // after executable code stays in place with that code.
+                if python && saw_top_level_code && self.lang.is_import(child.kind()) {
+                    if let Some((_, entry)) = st
+                        .import_entries
+                        .iter()
+                        .find(|(start, _)| *start == child.start_byte())
+                    {
+                        st.structure.top_level_code.push(entry.clone());
+                        demoted_import_starts.insert(child.start_byte());
+                    }
+                }
+                // A definition after executable code would run before it.
+                if python && saw_top_level_code && is_declaration(child.kind()) {
+                    st.structure.reorder_unsafe = true;
+                }
+                continue;
+            }
+            // A root-level `;` between two statements on one line would
+            // become a bare `;` line.
+            if !child.is_named() && (child.kind() == ";" || child.kind() == ",") {
+                continue;
+            }
+            let text = self.node_text(*child).trim();
+            if !text.is_empty() {
+                if first_captured.is_some_and(|fc| child.end_byte() <= fc) {
+                    st.structure.header_code.push(text.to_string());
+                } else {
+                    st.structure.top_level_code.push(text.to_string());
+                    saw_top_level_code = true;
                 }
             }
         }
-        structure
+        if !demoted_import_starts.is_empty() {
+            st.structure.imports = st
+                .import_entries
+                .iter()
+                .filter(|(start, _)| !demoted_import_starts.contains(start))
+                .map(|(_, entry)| entry.clone())
+                .collect();
+        }
+        st.structure
     }
 
-    fn visit(
-        &self,
-        node: Node,
-        structure: &mut CodeStructure,
-        captured: &mut std::collections::HashSet<(usize, usize)>,
-    ) {
+    fn visit(&self, node: Node, st: &mut ExtractState) {
         let nt = node.kind();
         let range = (node.start_byte(), node.end_byte());
 
         // Package declarations (Go, Java).
         if self.lang.package_node == Some(nt) {
-            structure
+            let leading = self.leading_comment_text(node, &mut st.captured);
+            st.structure
                 .imports
-                .insert(0, self.node_text(node).to_string());
-            captured.insert(range);
+                .insert(0, format!("{leading}{}", self.node_text(node)));
+            st.captured.push(range);
             return;
         }
         // Import statements.
         if self.lang.is_import(nt) {
-            structure.imports.push(self.node_text(node).to_string());
-            captured.insert(range);
+            let leading = self.leading_comment_text(node, &mut st.captured);
+            let entry = format!("{leading}{}", self.node_text(node));
+            st.structure.imports.push(entry.clone());
+            st.import_entries.push((node.start_byte(), entry));
+            st.captured.push(range);
             return;
         }
         // Export statements (JS/TS).
         if nt == "export_statement" {
+            let leading = self.leading_comment_text(node, &mut st.captured);
             let text = self.node_text(node).to_string();
             let mut has_func_or_class = false;
             let mut cursor = node.walk();
@@ -1433,20 +1640,21 @@ impl<'a> Ctx<'a> {
                     let compressed = self.compress_function_ast(child);
                     let export_prefix = &self.code[node.start_byte()..child.start_byte()];
                     let export_suffix = &self.code[child.end_byte()..node.end_byte()];
-                    structure
-                        .function_signatures
-                        .push(format!("{export_prefix}{compressed}{export_suffix}"));
+                    st.structure.function_signatures.push(format!(
+                        "{leading}{export_prefix}{compressed}{export_suffix}"
+                    ));
                     break;
                 }
             }
             if !has_func_or_class {
-                structure.imports.push(text);
+                st.structure.imports.push(format!("{leading}{text}"));
             }
-            captured.insert(range);
+            st.captured.push(range);
             return;
         }
         // Decorated definitions (Python).
         if self.lang.decorator_node == Some(nt) {
+            let leading = self.leading_comment_text(node, &mut st.captured);
             let mut decorator_text: Vec<String> = Vec::new();
             let mut definition_compressed: Option<String> = None;
             let mut has_class_child = false;
@@ -1466,53 +1674,95 @@ impl<'a> Ctx<'a> {
             }
             match definition_compressed {
                 Some(def) if !decorator_text.is_empty() => {
-                    let full_def = format!("{}\n{}", decorator_text.join("\n"), def);
+                    let full_def = format!("{leading}{}\n{}", decorator_text.join("\n"), def);
                     if has_class_child {
-                        structure.class_definitions.push(full_def);
+                        st.structure.class_definitions.push(full_def);
                     } else {
-                        structure.function_signatures.push(full_def);
+                        st.structure.function_signatures.push(full_def);
                     }
                 }
-                Some(def) => structure.function_signatures.push(def),
+                Some(def) => st
+                    .structure
+                    .function_signatures
+                    .push(format!("{leading}{def}")),
                 None => {}
             }
-            captured.insert(range);
+            st.captured.push(range);
             return;
         }
         // Function/method definitions.
         if self.lang.is_function(nt) {
+            let leading = self.leading_comment_text(node, &mut st.captured);
             let compressed = self.compress_function_ast(node);
-            structure.function_signatures.push(compressed);
-            captured.insert(range);
+            st.structure
+                .function_signatures
+                .push(format!("{leading}{compressed}"));
+            st.captured.push(range);
+            return;
+        }
+        // Prefix wrappers (C++ `template <...>`).
+        if self.lang.is_prefix_wrapper(nt) {
+            let Some((compressed, wraps_class)) = self.compress_prefix_wrapper(node) else {
+                // Nothing compressible inside (an alias or prototype): leave
+                // it uncaptured and unvisited, so the sweep keeps it verbatim.
+                return;
+            };
+            let leading = self.leading_comment_text(node, &mut st.captured);
+            let target = if wraps_class {
+                &mut st.structure.class_definitions
+            } else {
+                &mut st.structure.function_signatures
+            };
+            target.push(format!("{leading}{compressed}"));
+            st.captured.push(range);
+            return;
+        }
+        // Containers (C++ namespaces, Rust inline modules): attributes and
+        // doc comments stay attached (`#[cfg(test)]` on `mod tests`).
+        if self.lang.is_container(nt) {
+            let leading = self.leading_comment_text(node, &mut st.captured);
+            let compressed = self.compress_class_ast(node);
+            st.structure
+                .class_definitions
+                .push(format!("{leading}{compressed}"));
+            st.captured.push(range);
             return;
         }
         // Class definitions.
         if self.lang.is_class(nt) {
+            let leading = self.leading_comment_text(node, &mut st.captured);
             let compressed = self.compress_class_ast(node);
-            structure.class_definitions.push(compressed);
-            captured.insert(range);
+            st.structure
+                .class_definitions
+                .push(format!("{leading}{compressed}"));
+            st.captured.push(range);
+            if let Some(semi) = same_line_trailing_semicolon(node) {
+                st.captured.push((semi.start_byte(), semi.end_byte()));
+            }
             return;
         }
         // Type definitions.
         if self.lang.is_type(nt) {
-            structure
+            let leading = self.leading_comment_text(node, &mut st.captured);
+            st.structure
                 .type_definitions
-                .push(self.node_text(node).to_string());
-            captured.insert(range);
+                .push(format!("{leading}{}", self.node_text(node)));
+            st.captured.push(range);
             return;
         }
         // Recurse.
         let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            self.visit(child, structure, captured);
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        for child in children {
+            self.visit(child, st);
         }
     }
 
     /// Compress a function/method body. Mirrors `_compress_function_ast`.
     fn compress_function_ast(&self, node: Node) -> String {
         let start_row = node.start_position().row;
-        let end_row = node.end_position().row;
-        let node_lines: Vec<&str> = self.code_lines[start_row..=end_row].to_vec();
+        let node_lines_owned = self.node_lines(node);
+        let node_lines: Vec<&str> = node_lines_owned.iter().map(|s| s.as_str()).collect();
         let node_text = node_lines.join("\n");
 
         let func_name = get_definition_name(node, self.code);
@@ -1569,10 +1819,9 @@ impl<'a> Ctx<'a> {
         if !self.lang.uses_colon_after_signature {
             if brace_in_signature {
                 // opening brace already in signature line.
-            } else if body_lines
-                .first()
-                .is_some_and(|l| l.trim_start().starts_with('{'))
-            {
+            } else if body_lines.first().is_some_and(|l| l.trim().ends_with('{')) {
+                // A bare `{` line or a multi-line signature's closing line
+                // (Go's `) error {`), where the brace shares the line.
                 opening_brace_line = Some(body_lines[0]);
                 body_lines = body_lines[1..].to_vec();
             }
@@ -1662,8 +1911,31 @@ impl<'a> Ctx<'a> {
             if !child.is_named() {
                 continue;
             }
+            // Some grammars (Go) wrap all body statements in one list node;
+            // as a single statement its rows would swallow the closing brace.
+            if child.kind() == "statement_list" {
+                let mut icursor = child.walk();
+                for inner in child.children(&mut icursor) {
+                    if SKIP_TYPES.contains(&inner.kind()) || !inner.is_named() {
+                        continue;
+                    }
+                    body_stmts.push((inner.start_position().row, inner.end_position().row));
+                }
+                continue;
+            }
             body_stmts.push((child.start_position().row, child.end_position().row));
         }
+
+        // Statements can share a physical line (`a = 1; b = 2`): merge
+        // overlapping row ranges so the shared line is kept once.
+        let mut merged_stmts: Vec<(usize, usize)> = Vec::new();
+        for (s_row, e_row) in body_stmts {
+            match merged_stmts.last_mut() {
+                Some(last) if s_row <= last.1 => last.1 = last.1.max(e_row),
+                _ => merged_stmts.push((s_row, e_row)),
+            }
+        }
+        let body_stmts = merged_stmts;
 
         let total_body_lines_count: i64 =
             body_stmts.iter().map(|(s, e)| (*e - *s + 1) as i64).sum();
@@ -1729,14 +2001,15 @@ impl<'a> Ctx<'a> {
     /// `_compress_class_ast`.
     fn compress_class_ast(&self, node: Node) -> String {
         let start_row = node.start_position().row;
-        let end_row = node.end_position().row;
-        let node_lines: Vec<&str> = self.code_lines[start_row..=end_row].to_vec();
+        let node_lines_owned = self.node_lines(node);
+        let node_lines: Vec<&str> = node_lines_owned.iter().map(|s| s.as_str()).collect();
         let node_text = node_lines.join("\n");
 
+        // The class/member container: not always a function body's node type.
         let mut body_node: Option<Node> = None;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if self.lang.is_body(child.kind()) {
+            if self.lang.is_class_body(child.kind()) {
                 body_node = Some(child);
                 break;
             }
@@ -1749,17 +2022,44 @@ impl<'a> Ctx<'a> {
         let body_start_line = body_node.start_position().row;
         let sig_end = body_start_line - node_start_line;
         let header_lines: Vec<&str> = if sig_end > 0 {
-            node_lines[..sig_end].to_vec()
+            let mut header = node_lines[..sig_end].to_vec();
+            let brace_line = node_lines[sig_end];
+            // A multi-line signature can share the brace line with its last
+            // fragment (`class Foo implements Bar {`): keep the line whenever
+            // the container starts with the brace.
+            let brace_starts_line = brace_line.trim().starts_with('{');
+            let body_starts_with_brace = !self.lang.uses_colon_after_signature
+                && self.code.as_bytes().get(body_node.start_byte()) == Some(&b'{');
+            if brace_starts_line || body_starts_with_brace {
+                header.push(brace_line);
+            }
+            header
         } else {
             vec![node_lines[0]]
         };
 
         let mut body_parts: Vec<String> = Vec::new();
+        let mut last_processed_end: i64 = -1;
         let mut bcursor = body_node.walk();
         for child in body_node.children(&mut bcursor) {
+            if !child.is_named() {
+                continue;
+            }
             let ck = child.kind();
-            let child_start = child.start_position().row;
-            let child_end = child.end_position().row;
+            let mut child_start = child.start_position().row;
+            let mut child_end = child.end_position().row;
+            if child.end_position().column == 0 && child_end > child_start {
+                child_end -= 1;
+            }
+            // Statements can share a physical line: skip rows already
+            // emitted, keeping any continuation lines of this node.
+            if child_start as i64 <= last_processed_end {
+                child_start = (last_processed_end + 1) as usize;
+                if child_start > child_end {
+                    continue;
+                }
+            }
+            last_processed_end = child_end as i64;
             let child_text = self.lines_joined(child_start, child_end);
 
             if self.lang.is_function(ck) {
@@ -1770,7 +2070,10 @@ impl<'a> Ctx<'a> {
                 let mut dc = child.walk();
                 for deco_child in child.children(&mut dc) {
                     if deco_child.kind() == "decorator" {
-                        decorator_lines.push(self.node_text(deco_child).to_string());
+                        decorator_lines.push(self.lines_joined(
+                            deco_child.start_position().row,
+                            deco_child.end_position().row,
+                        ));
                     } else if self.lang.is_function(deco_child.kind()) {
                         method_compressed = Some(self.compress_function_ast(deco_child));
                     }
@@ -1782,7 +2085,12 @@ impl<'a> Ctx<'a> {
                     Some(m) => body_parts.push(m),
                     None => body_parts.push(child_text),
                 }
-            } else if self.lang.is_class(ck) {
+            } else if self.lang.is_prefix_wrapper(ck) {
+                match self.compress_prefix_wrapper(child) {
+                    Some((text, _)) => body_parts.push(text),
+                    None => body_parts.push(child_text),
+                }
+            } else if self.lang.is_class(ck) || self.lang.is_container(ck) {
                 body_parts.push(self.compress_class_ast(child));
             } else if !child_text.trim().is_empty() {
                 body_parts.push(child_text);
@@ -1792,19 +2100,66 @@ impl<'a> Ctx<'a> {
         let mut result_parts: Vec<String> = header_lines.iter().map(|s| s.to_string()).collect();
         result_parts.extend(body_parts);
 
+        // Closing brace: the body node ends at the brace, while a C++
+        // class_specifier excludes its trailing `;`, which is re-added here.
         let body_end_line = body_node.end_position().row;
         let body_end_rel = body_end_line - node_start_line + 1;
-        let after_lines: Vec<&str> = node_lines[body_end_rel..].to_vec();
-        if !after_lines.is_empty() {
-            result_parts.extend(after_lines.iter().map(|s| s.to_string()));
-        } else if !self.lang.uses_colon_after_signature {
-            let last_body_line = node_lines.last().copied().unwrap_or("");
-            if last_body_line.trim() == "}" {
-                result_parts.push(last_body_line.to_string());
+        if !self.lang.uses_colon_after_signature {
+            if body_end_line != start_row {
+                let closing_line = self.code_lines[body_end_line];
+                let mut closing_text: String = closing_line
+                    .chars()
+                    .take(body_node.end_position().column)
+                    .collect();
+                if same_line_trailing_semicolon(node).is_some() {
+                    closing_text.push(';');
+                }
+                if !closing_text.trim().is_empty() {
+                    result_parts.push(closing_text);
+                }
             }
+        } else if body_end_rel < node_lines.len() {
+            result_parts.extend(node_lines[body_end_rel..].iter().map(|s| s.to_string()));
         }
 
         result_parts.join("\n")
+    }
+
+    /// Compress the declaration a prefix wrapper holds, keeping the prefix.
+    /// Returns `(text, wraps_class)`, or `None` when it holds no function,
+    /// class or container. Mirrors `_compress_prefix_wrapper`.
+    fn compress_prefix_wrapper(&self, node: Node) -> Option<(String, bool)> {
+        let mut cursor = node.walk();
+        let inner = node.named_children(&mut cursor).find(|c| {
+            let k = c.kind();
+            self.lang.is_function(k) || self.lang.is_class(k) || self.lang.is_container(k)
+        })?;
+        let wraps_class = !self.lang.is_function(inner.kind());
+        let compressed = if wraps_class {
+            self.compress_class_ast(inner)
+        } else {
+            self.compress_function_ast(inner)
+        };
+        let mut prefix = self.code[node.start_byte()..inner.start_byte()].to_string();
+        if prefix.contains('\n') {
+            // The compressed declaration starts with its whole first line,
+            // indentation included; keep that indentation once.
+            prefix = prefix.trim_end_matches([' ', '\t']).to_string();
+        }
+        let mut suffix = self.code[inner.end_byte()..node.end_byte()].to_string();
+        if suffix.trim() == ";" && compressed.trim_end().ends_with(';') {
+            // Class compression already re-adds the same-line `;`.
+            suffix.clear();
+        }
+        let first_line = self.code_lines[node.start_position().row];
+        let mut indent: String = first_line
+            .chars()
+            .take(node.start_position().column)
+            .collect();
+        if !indent.trim().is_empty() {
+            indent.clear();
+        }
+        Some((format!("{indent}{prefix}{compressed}{suffix}"), wraps_class))
     }
 }
 
@@ -2024,5 +2379,216 @@ def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n   
         assert_eq!(r.compressed, "def f(): pass"); // < min_tokens → passthrough
         assert_eq!(r.compression_ratio, 1.0);
         assert_eq!(r.language, CodeLanguage::Unknown);
+    }
+
+    // ─── Wrapper nodes (mirrors tests/test_code_compressor_wrapper_nodes.py) ──
+    //
+    // A wrapper no handler knows was recursed into: its declarations were
+    // captured on their own and the top-level sweep re-emitted the whole
+    // wrapper, so the output held the code twice.
+
+    fn body(template: &str, n: usize) -> String {
+        (0..n)
+            .map(|i| template.replace("{i}", &i.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn compress_as(code: &str, language: &str) -> CodeCompressionResult {
+        let config = CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        };
+        CodeAwareCompressor::new(config).compress_with(code, Some(language), "")
+    }
+
+    fn parses(code: &str, language: &str) -> bool {
+        let lang = CodeLanguage::from_name(language).unwrap();
+        parse_code(code, lang).is_some_and(|t| !has_syntax_issues(t.root_node()))
+    }
+
+    fn cpp_class_in_namespace() -> String {
+        format!(
+            "#include <vector>\nnamespace app {{\nclass Cache {{\n public:\n  int lookup(int x) {{\n    int t = 0;\n{}\n    return t;\n  }}\n}};\n}}\n",
+            body("    t += step(x, {i});", 30)
+        )
+    }
+    fn cpp_function_in_namespace() -> String {
+        format!(
+            "#include <vector>\nnamespace app {{\nint lookup(int x) {{\n  int t = 0;\n{}\n  return t;\n}}\n}}\n",
+            body("  t += step(x, {i});", 30)
+        )
+    }
+    fn cpp_template_class() -> String {
+        format!(
+            "#include <vector>\ntemplate <typename T>\nclass Cache {{\n public:\n  int lookup(int x) {{\n    int t = 0;\n{}\n    return t;\n  }}\n}};\n",
+            body("    t += step(x, {i});", 30)
+        )
+    }
+    fn cpp_template_class_in_namespace() -> String {
+        format!(
+            "#include <vector>\nnamespace app {{\ntemplate <typename T>\nclass Cache {{\n public:\n  int lookup(int x) {{\n    int t = 0;\n{}\n    return t;\n  }}\n  std::vector<T> items_;\n}};\n}}  // namespace app\n",
+            body("    t += step(x, {i});", 30)
+        )
+    }
+    fn cpp_extern_c() -> String {
+        format!(
+            "#include <vector>\nextern \"C\" {{\nint lookup(int x) {{\n  int t = 0;\n{}\n  return t;\n}}\n}}\n",
+            body("  t += step(x, {i});", 30)
+        )
+    }
+    fn rust_impl_in_mod() -> String {
+        format!(
+            "use std::fmt;\nmod store {{\n    pub struct Cache;\n    impl Cache {{\n        pub fn lookup(&self, x: i32) -> i32 {{\n            let mut t = 0;\n{}\n            t\n        }}\n    }}\n}}\n",
+            body("            t += step(x, {i});", 30)
+        )
+    }
+    fn rust_fn_and_test_mod() -> String {
+        format!(
+            "use std::fmt;\npub fn lookup(x: i32) -> i32 {{\n    let mut t = 0;\n{}\n    t\n}}\n\n#[cfg(test)]\nmod tests {{\n    use super::*;\n\n    #[test]\n    fn lookup_is_stable() {{\n{}\n    }}\n}}\n",
+            body("    t += step(x, {i});", 30),
+            body("        assert_eq!(lookup({i}), lookup({i}));", 15)
+        )
+    }
+    fn c_function() -> String {
+        format!(
+            "int lookup(int x) {{\n  int t = 0;\n{}\n  return t;\n}}\n",
+            body("  t += step(x, {i});", 30)
+        )
+    }
+
+    #[test]
+    fn wrapped_declarations_are_not_emitted_twice() {
+        let cases: Vec<(&str, &str, String, &str)> = vec![
+            ("cpp-class-in-namespace", "cpp", cpp_class_in_namespace(), "int lookup(int x) {"),
+            ("cpp-function-in-namespace", "cpp", cpp_function_in_namespace(), "int lookup(int x) {"),
+            ("cpp-template-class", "cpp", cpp_template_class(), "int lookup(int x) {"),
+            ("cpp-extern-c", "cpp", cpp_extern_c(), "int lookup(int x) {"),
+            ("rust-impl-in-mod", "rust", rust_impl_in_mod(), "pub fn lookup(&self, x: i32) -> i32 {"),
+            ("rust-fn-and-test-mod", "rust", rust_fn_and_test_mod(), "fn lookup_is_stable() {"),
+            // Wrappers no config lists stay verbatim, but only once.
+            (
+                "c-include-guard",
+                "c",
+                format!("#ifndef CACHE_H\n#define CACHE_H\n#include <stdio.h>\n{}#endif\n", c_function()),
+                "int lookup(int x) {",
+            ),
+            (
+                "c-ifdef-block",
+                "c",
+                format!("#include <stdio.h>\n#ifdef DEBUG\n{}#endif\n", c_function()),
+                "int lookup(int x) {",
+            ),
+            (
+                "typescript-namespace",
+                "typescript",
+                format!(
+                    "import {{ x }} from 'y';\nnamespace App {{\n  export function lookup(x: number): number {{\n    let t = 0;\n{}\n    return t;\n  }}\n}}\n",
+                    body("    t += step(x, {i});", 30)
+                ),
+                "function lookup(x: number): number {",
+            ),
+        ];
+        for (name, lang, code, kept_line) in cases {
+            let r = compress_as(&code, lang);
+            assert_eq!(
+                r.compressed.matches(kept_line).count(),
+                1,
+                "[{name}]\n{}",
+                r.compressed
+            );
+            assert!(
+                parses(&r.compressed, lang),
+                "[{name}] output does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_test_module_items_stay_inside_the_module() {
+        let r = compress_as(&rust_fn_and_test_mod(), "rust");
+        assert!(
+            !r.compressed.lines().any(|l| l == "use super::*;"),
+            "use super::*; hoisted to crate root:\n{}",
+            r.compressed
+        );
+    }
+
+    #[test]
+    fn known_wrappers_compress_inside_and_keep_their_shape() {
+        let cases: Vec<(&str, &str, String, &str)> = vec![
+            ("cpp-class-in-namespace", "cpp", cpp_class_in_namespace(), "namespace app {\nclass Cache {"),
+            ("cpp-function-in-namespace", "cpp", cpp_function_in_namespace(), "namespace app {\nint lookup(int x) {"),
+            ("cpp-template-class", "cpp", cpp_template_class(), "template <typename T>\nclass Cache {"),
+            (
+                "cpp-template-class-in-namespace",
+                "cpp",
+                cpp_template_class_in_namespace(),
+                "namespace app {\ntemplate <typename T>\nclass Cache {",
+            ),
+            ("cpp-extern-c", "cpp", cpp_extern_c(), "extern \"C\" {\nint lookup(int x) {"),
+            ("rust-impl-in-mod", "rust", rust_impl_in_mod(), "mod store {\n    pub struct Cache;\n    impl Cache {"),
+            (
+                "rust-fn-and-test-mod",
+                "rust",
+                rust_fn_and_test_mod(),
+                "#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn lookup_is_stable() {",
+            ),
+        ];
+        for (name, lang, code, wrapper) in cases {
+            let deep_line = if code.contains("mod tests") {
+                "assert_eq!(lookup(14), lookup(14));"
+            } else {
+                "t += step(x, 29);"
+            };
+            assert!(
+                code.contains(deep_line),
+                "[{name}] fixture lacks {deep_line}"
+            );
+            let r = compress_as(&code, lang);
+            assert!(
+                !r.compressed.contains(deep_line),
+                "[{name}] not compressed inside:\n{}",
+                r.compressed
+            );
+            assert!(
+                r.compressed_tokens < r.original_tokens,
+                "[{name}] did not shrink"
+            );
+            assert!(
+                r.compressed.contains(wrapper),
+                "[{name}] wrapper lost:\n{}",
+                r.compressed
+            );
+            assert!(
+                parses(&r.compressed, lang),
+                "[{name}] output does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn bodiless_wrappers_are_kept_once() {
+        for (lang, code) in [
+            (
+                "cpp",
+                format!(
+                    "extern \"C\" int lookup(int x);\n{}",
+                    cpp_function_in_namespace()
+                ),
+            ),
+            ("rust", format!("mod store;\n{}", rust_impl_in_mod())),
+        ] {
+            let first_line = code.lines().next().unwrap();
+            let r = compress_as(&code, lang);
+            assert_eq!(
+                r.compressed.matches(first_line).count(),
+                1,
+                "{}",
+                r.compressed
+            );
+            assert!(parses(&r.compressed, lang));
+        }
     }
 }
