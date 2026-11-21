@@ -307,7 +307,8 @@ class UsageReporter:
         # cache split. Lets the cloud side show a number that reconciles with
         # the provider's console (input + cache read + cache write) and flag
         # any remainder as an estimate instead of passing it off as the bill.
-        provider_deltas = self._provider_counter_deltas(cost_tracker)
+        current_provider = self._current_provider_counters(cost_tracker)
+        provider_deltas = self._provider_counter_deltas(current_provider)
 
         payload = {
             "license_key": self._license_key,
@@ -361,7 +362,13 @@ class UsageReporter:
                 # both baselines intact makes the next report retry the full
                 # period. (The empty-report early-return above only advances the
                 # time, since there is nothing to lose.)
-                self._snapshot_metrics()
+                # Rebase onto the values this report was built from, not the live
+                # counters: requests recorded while the POST was awaiting are not in
+                # this payload and must be reported next time.
+                self._last_tokens_saved_by_model = current_saved
+                self._last_tokens_sent_by_model = current_sent
+                self._last_requests_by_model = current_reqs
+                self._last_provider_counters = current_provider
                 self._last_report_time = now
             else:
                 logger.warning("Usage report returned status %d", resp.status_code)
@@ -382,9 +389,8 @@ class UsageReporter:
             for name, attr in self._PROVIDER_COUNTERS.items()
         }
 
-    def _provider_counter_deltas(self, cost_tracker: Any) -> dict[str, int]:
+    def _provider_counter_deltas(self, current: dict[str, dict[str, int]]) -> dict[str, int]:
         """Totals of the provenance counters since the last successful report."""
-        current = self._current_provider_counters(cost_tracker)
         deltas: dict[str, int] = {}
         for name, by_model in current.items():
             last = getattr(self, "_last_provider_counters", {}).get(name, {})
