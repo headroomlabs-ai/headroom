@@ -1723,6 +1723,68 @@ def _is_managed_copilot_seeded_bearer(token: str) -> bool:
     )
 
 
+_WEBSOCKET_SCHEME = {"https": "wss", "http": "ws"}
+_DEFAULT_PORTS = {"http": 80, "ws": 80, "https": 443, "wss": 443}
+
+
+def _origin_key(parsed: Any) -> tuple[str, str, int] | None:
+    """(scheme, hostname, effective port) of a parsed URL, None when it has none."""
+
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    elif port == 0:
+        return None  # an explicit port 0 is never the default port
+    if not parsed.hostname or port is None:
+        return None
+    return scheme, parsed.hostname.lower(), port
+
+
+def _is_trusted_copilot_origin(url: str) -> bool:
+    """Return True when the operator's Copilot credential may be sent to *url*.
+
+    ``is_copilot_upstream_url`` answers by host only, so ``http://`` and a
+    non-default port on a Copilot host also matched. A client can name its own
+    upstream (``x-headroom-base-url``), which would send the credential in
+    cleartext. A host the operator configured keeps whatever scheme and port
+    they chose; GitHub's public and enterprise hosts need ``https``/``wss`` on
+    the default port. A scheme-less value is accepted as before.
+    """
+
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if not scheme:
+        return True
+    configured = (
+        _configured_api_url(),
+        os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip(),
+        copilot_completions_base_url(),
+    )
+    origins: set[tuple[str, str, int]] = set()
+    for value in configured:
+        if not value:
+            continue
+        key = _origin_key(urlparse(value))
+        if key is None:
+            continue
+        origins.add(key)
+        # The WebSocket handler derives wss:// from https:// and ws:// from http://.
+        if key[0] in _WEBSOCKET_SCHEME:
+            origins.add((_WEBSOCKET_SCHEME[key[0]], key[1], key[2]))
+    # Compare by effective port: ``:80`` and no port are the same http origin.
+    if _origin_key(parsed) in origins:
+        return True
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return scheme in {"https", "wss"} and port in (None, 443)
+
+
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
     """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
@@ -1794,6 +1856,22 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
             _token_kind(raw_token) if raw_token else "none",
         )
+
+    # The operator's own credential goes only to a trusted origin; a client's own
+    # token was handled (and returned) above.
+    if not _is_trusted_copilot_origin(url):
+        parsed_url = urlparse(url)
+        logger.warning(
+            "apply_copilot_api_auth: not minting a credential for untrusted origin scheme=%s host=%s",
+            parsed_url.scheme,
+            parsed_url.hostname,
+        )
+        _remove_headers(resolved, "x-api-key")
+        # A managed seeded bearer IS the operator's token (the wrapper seeds the
+        # client with it); it must not travel to an origin we would not mint for.
+        if raw_token and _is_managed_copilot_seeded_bearer(raw_token):
+            _remove_headers(resolved, "authorization")
+        return resolved
 
     token = await get_copilot_token_provider().get_api_token(integration_id=integration_id)
     _remove_headers(resolved, "authorization", "x-api-key")
