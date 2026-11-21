@@ -298,17 +298,27 @@ class LocalBackend:
 
         if extracted_entities:
             for ent in extracted_entities:
-                name = ent.get("entity", "")
+                # LLM-supplied junk is skipped before anything is persisted.
+                name = ent.get("entity", "") if isinstance(ent, dict) else None
+                if not isinstance(name, str):
+                    logger.debug("memory_save: skipping malformed extracted entity %r", ent)
+                    continue
                 if name and name not in all_entity_names:
                     all_entity_names.append(name)
                 if name:
-                    entity_types[name.lower()] = ent.get("entity_type", "unknown")
+                    entity_type = ent.get("entity_type", "unknown")
+                    entity_types[name.lower()] = (
+                        entity_type if isinstance(entity_type, str) else "unknown"
+                    )
 
         # Merge relationships from both formats
         all_relationships: list[dict[str, Any]] = list(relationships) if relationships else []
 
         if extracted_relationships:
             for rel in extracted_relationships:
+                if not isinstance(rel, dict):
+                    all_relationships.append({})  # dropped by the validation below
+                    continue
                 # Convert from optimized format to standard format
                 all_relationships.append(
                     {
@@ -317,6 +327,29 @@ class LocalBackend:
                         "type": rel.get("relationship", "related_to"),
                     }
                 )
+
+        # Validate before the first write: the graph step below runs after the
+        # memory row is stored, so a malformed LLM-supplied relationship used to
+        # raise after the save and a retry duplicated the memory.
+        valid_relationships: list[tuple[str, str, str]] = []
+        for rel in all_relationships:
+            if not isinstance(rel, dict):
+                logger.debug("memory_save: skipping malformed relationship %r", rel)
+                continue
+            source, target = rel.get("source", ""), rel.get("target", "")
+            # The memory_save tool schema names the key `relation`
+            # (tools.py); direct callers and older docs use `type`.
+            rel_type = rel.get("type") or rel.get("relation") or "related_to"
+            if not (isinstance(source, str) and isinstance(target, str)):
+                logger.debug("memory_save: skipping malformed relationship %r", rel)
+                continue
+            valid_relationships.append(
+                (
+                    source.lower(),
+                    target.lower(),
+                    rel_type if isinstance(rel_type, str) else "related_to",
+                )
+            )
 
         # Prepare base metadata
         base_metadata = metadata or {}
@@ -383,14 +416,8 @@ class LocalBackend:
                     entity_id_map[entity_name.lower()] = entity.id
 
             # Add relationships to graph
-            if all_relationships:
-                for rel in all_relationships:
-                    source_name = rel.get("source", "").lower()
-                    target_name = rel.get("target", "").lower()
-                    # The memory_save tool schema names the key `relation`
-                    # (tools.py); direct callers and older docs use `type`.
-                    rel_type = rel.get("type") or rel.get("relation") or "related_to"
-
+            if valid_relationships:
+                for source_name, target_name, rel_type in valid_relationships:
                     source_id = entity_id_map.get(source_name)
                     target_id = entity_id_map.get(target_name)
 
