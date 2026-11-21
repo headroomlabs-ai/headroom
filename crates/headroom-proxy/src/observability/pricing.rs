@@ -367,27 +367,21 @@ pub fn lookup_card_on(model: &str, upstream: Option<llm_prices::Provider>) -> Op
     None
 }
 
-static UPSTREAM: OnceLock<llm_prices::Provider> = OnceLock::new();
-
-/// Record the pricing provider behind the configured `--upstream`
-/// host. Unknown hosts leave it unset.
-pub fn set_upstream_host(host: &str) {
-    if let Some(p) = provider_for_host(host) {
-        let _ = UPSTREAM.set(p);
-    }
-}
-
 /// The pricing provider for a ledger lane: Bedrock and Vertex lanes
-/// name their own; the HTTP lanes use the configured upstream.
-pub fn upstream_for_lane(lane: &str) -> Option<llm_prices::Provider> {
+/// name their own; the HTTP lanes use the ledger's upstream.
+pub fn upstream_for_lane(
+    lane: &str,
+    upstream: Option<llm_prices::Provider>,
+) -> Option<llm_prices::Provider> {
     match lane {
         "bedrock" => Some(llm_prices::Provider::Bedrock),
         "vertex" => Some(llm_prices::Provider::Vertex),
-        _ => UPSTREAM.get().copied(),
+        _ => upstream,
     }
 }
 
-fn provider_for_host(host: &str) -> Option<llm_prices::Provider> {
+/// The pricing provider behind an `--upstream` host, if known.
+pub fn provider_for_host(host: &str) -> Option<llm_prices::Provider> {
     use llm_prices::Provider as P;
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     [

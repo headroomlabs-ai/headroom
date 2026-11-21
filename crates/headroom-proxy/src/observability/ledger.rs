@@ -547,6 +547,9 @@ pub struct Ledger {
     flush_gate: tokio::sync::Mutex<()>,
     persistence_error: Mutex<Option<String>>,
     started_at: SystemTime,
+    /// Pricing provider behind this proxy's `--upstream`, for the
+    /// llm-prices fallback.
+    upstream: Option<llm_prices::Provider>,
 }
 
 impl Ledger {
@@ -628,7 +631,14 @@ impl Ledger {
             flush_gate: tokio::sync::Mutex::new(()),
             persistence_error: Mutex::new(error),
             started_at: SystemTime::now(),
+            upstream: None,
         }
+    }
+
+    /// Price fallback lookups as sold by the provider behind `host`.
+    pub fn with_upstream_host(mut self, host: Option<&str>) -> Self {
+        self.upstream = host.and_then(pricing::provider_for_host);
+        self
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -660,7 +670,10 @@ impl Ledger {
         let usd = if ev.failed {
             EventUsd::default()
         } else {
-            match pricing::lookup_card_on(&ev.model, pricing::upstream_for_lane(ev.provider)) {
+            match pricing::lookup_card_on(
+                &ev.model,
+                pricing::upstream_for_lane(ev.provider, self.upstream),
+            ) {
                 Some(card) => {
                     // When the response carried no usage block, bill
                     // the post-compression estimate instead so

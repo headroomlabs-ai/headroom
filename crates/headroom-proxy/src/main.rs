@@ -166,9 +166,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Pay the vendored price-table parse now, not on the first
         // recorded request.
         headroom_proxy::observability::pricing::warm();
-        if let Some(host) = config.upstream.host_str() {
-            headroom_proxy::observability::pricing::set_upstream_host(host);
-        }
         tracing::info!(
             event = "stats_enabled",
             path = ?stats_ledger.path().map(|p| p.display().to_string()),
