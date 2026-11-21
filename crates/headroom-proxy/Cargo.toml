@@ -47,6 +47,9 @@ humantime = "2"
 bytesize = "2"
 tokio-util = { version = "0.7" }
 headroom-core = { path = "../headroom-core" }
+# Dated, source-cited price table: fallback for ids the vendored
+# LiteLLM snapshot does not carry.
+llm-prices = "1.8.0"
 # Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS
 # default credential chain.
 aws-sigv4 = { workspace = true }

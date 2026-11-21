@@ -30,8 +30,9 @@
 //! The vendored snapshot tracks current model generations plus every
 //! Bedrock/Vertex-prefixed id, but it does not carry every legacy
 //! direct-API id (`claude-3-5-sonnet-20241022`, for one, is absent
-//! while its Bedrock form is present). Those price at $0 with a WARN
-//! until the table is refreshed — see the module note below.
+//! while its Bedrock form is present), nor models released after the
+//! snapshot. A miss falls back to the `llm-prices` crate, a dated,
+//! source-cited table; only a miss in both prices at $0 with a WARN.
 //!
 //! # Long-context tiers
 //!
@@ -352,8 +353,38 @@ pub fn lookup_card(model: &str) -> Option<PriceCard> {
             return Some(*card);
         }
     }
+    if let Some(card) = llm_prices_card(model) {
+        return Some(card);
+    }
     warn_once(model);
     None
+}
+
+/// Fallback card from `llm-prices` (USD per 1M tokens) for ids the
+/// vendored snapshot does not carry.
+fn llm_prices_card(model: &str) -> Option<PriceCard> {
+    let row = llm_prices::lookup(model)?;
+    let per_token = |m: f64| m / 1_000_000.0;
+    let (input, output) = (row.input?, row.output?);
+    let base = ModelPrice {
+        input: per_token(input),
+        output: per_token(output),
+        cache_read: per_token(row.cache_read.unwrap_or(input)),
+        cache_write: per_token(row.cache_write("5m").unwrap_or(input)),
+    };
+    let long_context = row.long_context.map(|lc| {
+        let cw = lc.cache_write.iter().find(|(ttl, _)| *ttl == "5m");
+        LongContextTier {
+            above_tokens: lc.threshold_tokens,
+            price: ModelPrice {
+                input: lc.input.map_or(base.input, per_token),
+                output: lc.output.map_or(base.output, per_token),
+                cache_read: lc.cache_read.map_or(base.cache_read, per_token),
+                cache_write: cw.map_or(base.cache_write, |(_, v)| per_token(*v)),
+            },
+        }
+    });
+    Some(PriceCard { base, long_context })
 }
 
 /// Look up a model's base per-token pricing — the card a prompt below
@@ -543,6 +574,18 @@ mod tests {
         let bare = lookup("gpt-4o").expect("bare id priced");
         let routed = lookup("openai/gpt-4o").expect("routed id priced");
         assert_eq!(bare, routed);
+    }
+
+    /// Ids newer than the vendored snapshot price from `llm-prices`
+    /// instead of recording $0.
+    #[test]
+    fn vendored_miss_falls_back_to_llm_prices() {
+        assert!(book().get("claude-opus-4-8").is_none(), "fixture guard");
+        let p = lookup("claude-opus-4-8").expect("priced via llm-prices");
+        let row = llm_prices::lookup("claude-opus-4-8").unwrap();
+        assert!((p.input - row.input.unwrap() / 1e6).abs() < 1e-15);
+        assert!((p.output - row.output.unwrap() / 1e6).abs() < 1e-15);
+        assert!(p.cache_read < p.input && p.cache_write > p.input);
     }
 
     #[test]
