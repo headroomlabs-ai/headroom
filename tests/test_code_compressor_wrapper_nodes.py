@@ -155,3 +155,83 @@ def test_unlisted_wrappers_are_not_duplicated(language, code, kept_line):
 
     assert result.compressed.count(kept_line) == 1, result.compressed
     assert _valid(result.compressed, language)
+
+
+# --- wrappers the config knows: compress inside, keep the wrapper ----------
+
+CPP_TEMPLATE_CLASS_IN_NAMESPACE = (
+    "#include <vector>\nnamespace app {\ntemplate <typename T>\nclass Cache {\n public:\n"
+    "  int lookup(int x) {\n    int t = 0;\n"
+    + _body("    t += step(x, {i});")
+    + "\n    return t;\n  }\n  std::vector<T> items_;\n};\n}  // namespace app\n"
+)
+
+# (name, language, code, text that must survive exactly, in order). Each case
+# must also drop a line from deep inside the wrapped body: the proof that the
+# wrapper was compressed inside rather than emitted verbatim.
+CONTAINERS = [
+    ("cpp-class-in-namespace", "cpp", CPP_CLASS_IN_NAMESPACE, "namespace app {\nclass Cache {"),
+    (
+        "cpp-function-in-namespace",
+        "cpp",
+        CPP_FUNCTION_IN_NAMESPACE,
+        "namespace app {\nint lookup(int x) {",
+    ),
+    ("cpp-template-class", "cpp", CPP_TEMPLATE_CLASS, "template <typename T>\nclass Cache {"),
+    (
+        "cpp-template-class-in-namespace",
+        "cpp",
+        CPP_TEMPLATE_CLASS_IN_NAMESPACE,
+        "namespace app {\ntemplate <typename T>\nclass Cache {",
+    ),
+    ("cpp-extern-c", "cpp", CPP_EXTERN_C, 'extern "C" {\nint lookup(int x) {'),
+    (
+        "rust-impl-in-mod",
+        "rust",
+        RUST_IMPL_IN_MOD,
+        "mod store {\n    pub struct Cache;\n    impl Cache {",
+    ),
+    (
+        "rust-fn-and-test-mod",
+        "rust",
+        RUST_FN_AND_TEST_MOD,
+        "#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn lookup_is_stable() {",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("language", "code", "wrapper"),
+    [pytest.param(lang, code, wrapper, id=name) for name, lang, code, wrapper in CONTAINERS],
+)
+def test_known_wrappers_compress_inside_and_keep_their_shape(language, code, wrapper):
+    result = _compress(code, language)
+    deep_line = (
+        "assert_eq!(lookup(14), lookup(14));" if "mod tests" in code else "t += step(x, 29);"
+    )
+
+    assert deep_line in code
+    assert deep_line not in result.compressed, result.compressed
+    assert result.compressed_tokens < result.original_tokens, result.compressed
+    assert "omitted" in result.compressed, result.compressed
+    assert wrapper in result.compressed, result.compressed
+    assert _valid(result.compressed, language)
+
+
+@pytest.mark.parametrize(
+    ("language", "code"),
+    [
+        pytest.param(
+            "cpp",
+            'extern "C" int lookup(int x);\n' + CPP_FUNCTION_IN_NAMESPACE,
+            id="cpp-extern-c-declaration",
+        ),
+        pytest.param("rust", "mod store;\n" + RUST_IMPL_IN_MOD, id="rust-mod-declaration"),
+    ],
+)
+def test_bodiless_wrappers_are_kept_once(language, code):
+    result = _compress(code, language)
+    first_line = code.splitlines()[0]
+
+    assert result.compressed.count(first_line) == 1, result.compressed
+    assert _valid(result.compressed, language)

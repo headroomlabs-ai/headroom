@@ -436,6 +436,10 @@ class LangConfig:
     # descendants individually while the top-level pass re-emits the whole
     # wrapper verbatim, duplicating content. Prefer the false negative.
     opaque_node_types: frozenset[str] | None = None
+    # Optional wrappers that prefix exactly one declaration (C++
+    # `template <...>`). The prefix is kept verbatim and the declaration it
+    # wraps is compressed, so the two stay attached.
+    prefix_wrapper_node_types: frozenset[str] | None = None
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
@@ -499,6 +503,9 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         uses_colon_after_signature=False,
         detection_hints=("fn ", "struct ", "impl ", "mod ", "use "),
         class_body_node_types=frozenset({"declaration_list"}),
+        # Inline modules (`mod tests { ... }`); `mod name;` has no body and
+        # is kept as written.
+        container_node_types=frozenset({"mod_item"}),
     ),
     CodeLanguage.JAVA: LangConfig(
         import_nodes=frozenset({"import_declaration"}),
@@ -534,7 +541,11 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("#include", "namespace ", "class ", "::"),
-        class_body_node_types=frozenset({"field_declaration_list"}),
+        # `declaration_list` is the member list of namespaces and
+        # `extern "C" { ... }` blocks; classes use `field_declaration_list`.
+        class_body_node_types=frozenset({"field_declaration_list", "declaration_list"}),
+        container_node_types=frozenset({"namespace_definition", "linkage_specification"}),
+        prefix_wrapper_node_types=frozenset({"template_declaration"}),
     ),
     CodeLanguage.PERL: LangConfig(
         import_nodes=frozenset({"use_statement", "use_version_statement"}),
@@ -1765,11 +1776,36 @@ class CodeAwareCompressor(Transform):
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
+            if (
+                lang_config.prefix_wrapper_node_types
+                and node_type in lang_config.prefix_wrapper_node_types
+            ):
+                wrapped = self._compress_prefix_wrapper(
+                    node, code, language, lang_config, body_limits, analysis
+                )
+                if wrapped is None:
+                    # Nothing compressible inside (a template alias or
+                    # prototype): leave it uncaptured, unvisited, so the
+                    # top-level sweep keeps it verbatim.
+                    return
+                compressed, wraps_class = wrapped
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                target = (
+                    structure.class_definitions if wraps_class else structure.function_signatures
+                )
+                target.append(leading + _validated_candidate(node, compressed))
+                captured_byte_ranges.append((node.start_byte, node.end_byte))
+                return
+
             if lang_config.container_node_types and node_type in lang_config.container_node_types:
+                # Attributes and doc comments stay on the container
+                # (`#[cfg(test)]` on `mod tests`); detached, a dangling
+                # attribute would decorate whatever came next.
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_class_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.class_definitions.append(_validated_candidate(node, compressed))
+                structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -2313,6 +2349,16 @@ class CodeAwareCompressor(Transform):
                 else:
                     body_parts.append(child_text)
                 processed_ranges.append((child.start_byte, child.end_byte))
+            # Prefixed declarations (C++ `template <...>`) inside a container
+            elif (
+                lang_config.prefix_wrapper_node_types
+                and child.type in lang_config.prefix_wrapper_node_types
+            ):
+                wrapped = self._compress_prefix_wrapper(
+                    child, code, language, lang_config, body_limits, analysis
+                )
+                body_parts.append(wrapped[0] if wrapped is not None else child_text)
+                processed_ranges.append((child.start_byte, child.end_byte))
             # Nested classes / containers (e.g. nested namespaces) — recurse
             elif child.type in lang_config.class_nodes or (
                 lang_config.container_node_types and child.type in lang_config.container_node_types
@@ -2353,6 +2399,58 @@ class CodeAwareCompressor(Transform):
             result_parts.extend(after_lines)
 
         return "\n".join(result_parts)
+
+    def _compress_prefix_wrapper(
+        self,
+        node: Any,
+        code: str,
+        language: CodeLanguage,
+        lang_config: LangConfig,
+        body_limits: dict[str, int],
+        analysis: _SymbolAnalysis,
+    ) -> tuple[str, bool] | None:
+        """Compress the declaration a prefix wrapper holds, keeping the prefix.
+
+        Returns ``(text, wraps_class)``, or ``None`` when the wrapper holds no
+        function, class or container (the caller keeps it verbatim).
+        """
+        inner = None
+        for child in node.named_children:
+            if (
+                child.type in lang_config.function_nodes
+                or child.type in lang_config.class_nodes
+                or (
+                    lang_config.container_node_types
+                    and child.type in lang_config.container_node_types
+                )
+            ):
+                inner = child
+                break
+        if inner is None:
+            return None
+        wraps_class = inner.type not in lang_config.function_nodes
+        if wraps_class:
+            compressed = self._compress_class_ast(
+                inner, code, language, lang_config, body_limits, analysis
+            )
+        else:
+            compressed = self._compress_function_ast(
+                inner, code, language, lang_config, body_limits, analysis
+            )
+        prefix = _slice_code_bytes(code, node.start_byte, inner.start_byte)
+        if "\n" in prefix:
+            # The compressed declaration starts with its whole first line,
+            # indentation included; keep that indentation once.
+            prefix = prefix.rstrip(" \t")
+        suffix = _slice_code_bytes(code, inner.end_byte, node.end_byte)
+        if suffix.strip() == ";" and compressed.rstrip().endswith(";"):
+            # Class compression already re-adds the same-line `;`.
+            suffix = ""
+        first_line = code.split("\n")[node.start_point[0]]
+        indent = first_line[: node.start_point[1]]
+        if indent.strip():
+            indent = ""
+        return indent + prefix + compressed + suffix, wraps_class
 
     def _extract_generic_structure(self, root: Any, code: str) -> CodeStructure:
         """Extract structure from generic/unknown code.
