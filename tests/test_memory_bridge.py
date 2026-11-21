@@ -341,8 +341,40 @@ class TestMarkdownSectionMerge:
             ),
             pytest.param(
                 "## Facts\r\n- a\r\n\r\n## Updates\r\n- b\r\n",
-                "## Facts\n- a\n- new\n\n## Updates\n- b\n",
+                "## Facts\r\n- a\r\n- new\r\n\r\n## Updates\r\n- b\r\n",
                 id="crlf",
+            ),
+            pytest.param(
+                "## Facts\n- a\n```sh\n# Description\necho hi\n```\n",
+                "## Facts\n- a\n```sh\n# Description\necho hi\n```\n- new\n",
+                id="fenced-shell-description",
+            ),
+            pytest.param(
+                "## Facts\n- left\u2028right\n",
+                "## Facts\n- left\u2028right\n- new\n",
+                id="unicode-line-separator",
+            ),
+            pytest.param(
+                "```md\n## Facts\n- fenced\n```\n## Updates\n- real\n",
+                "```md\n## Facts\n- fenced\n```\n## Updates\n- real\n\n## Facts\n- new\n",
+                id="topic-heading-inside-fence",
+            ),
+            pytest.param(
+                "## Facts\n- a\n~~~text\n## Updates\n- fenced\n~~~\n## Real Updates\n- real\n",
+                "## Facts\n- a\n~~~text\n## Updates\n- fenced\n~~~\n- new\n"
+                "## Real Updates\n- real\n",
+                id="tilde-fence-heading",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n```sh\n# Description\necho hi\n",
+                "## Facts\n- a\n- new\n\n```sh\n# Description\necho hi\n",
+                id="unterminated-fence",
+            ),
+            pytest.param(
+                "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n## Real Updates\n- real\n",
+                "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n- new\n"
+                "## Real Updates\n- real\n",
+                id="shorter-fence-does-not-close-longer-does",
             ),
             pytest.param(
                 "## Facts\n- a\n## Updates\n- b\n## Facts\n- e\n",
@@ -719,6 +751,33 @@ class TestMemoryBridgeSync:
         sections = {s.heading: s.facts for s in parse_markdown(content, str(md_path)).sections}
         assert sections["Facts"] == ["User likes Python", "Release label is cobalt-47"]
         assert sections["Updates"] == ["Project uses SQLite"]
+
+    @pytest.mark.asyncio
+    async def test_sync_preserves_fence_and_unicode_separator(self, bridge, tmp_dir, backend):
+        """Export after a fence without rewriting its contents or Unicode separators."""
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+
+        organic = await backend.save_memory(
+            content="Release label is cobalt-47",
+            user_id="test_user",
+            metadata={"topic": "Facts"},
+        )
+        created_at = organic.created_at.replace(tzinfo=timezone.utc)
+        bridge._sync_state["last_sync"] = (created_at - timedelta(minutes=1)).isoformat()
+        bridge._save_sync_state()
+        fixture = "## Facts\n- left\u2028right\n```sh\n# Description\necho hi\n```\n"
+        md_path.write_text(fixture, encoding="utf-8", newline="\n")
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = created_at + timedelta(minutes=1)
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.memories_exported == 1
+        assert md_path.read_text(encoding="utf-8") == (fixture + "- Release label is cobalt-47\n")
 
     @pytest.mark.asyncio
     async def test_first_sync_exports_existing_organic_memory(self, bridge, tmp_dir, backend):
