@@ -34,7 +34,10 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
     """
 
     def __init__(self, codex_dir: Path | None = None):
-        self.codex_dir = codex_dir or Path.home() / ".codex"
+        # Imported here: the install package pulls in click and is heavy.
+        from headroom.install.paths import codex_home_dir
+
+        self.codex_dir = codex_dir or codex_home_dir()
         self.sessions_dir = self.codex_dir / "sessions"
 
     # --- LearnPlugin identity ---

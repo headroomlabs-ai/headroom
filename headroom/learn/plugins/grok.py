@@ -23,7 +23,10 @@ class GrokPlugin(LearnPlugin, ConversationScanner):
     """Reads Grok CLI session logs from ~/.grok/sessions/."""
 
     def __init__(self, grok_dir: Path | None = None):
-        self.grok_dir = grok_dir or Path.home() / ".grok"
+        # Imported here to keep the provider package off the plugin import path.
+        from headroom.providers.grok_build.config import grok_home_dir
+
+        self.grok_dir = grok_dir or grok_home_dir()
         self.sessions_dir = self.grok_dir / "sessions"
 
     @property
