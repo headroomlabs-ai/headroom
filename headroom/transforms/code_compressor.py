@@ -1824,7 +1824,31 @@ class CodeAwareCompressor(Transform):
             for child in node.children:
                 visit(child)
 
-        visit(root)
+        # Visit each top-level node with a rollback point. A wrapper no handler
+        # recognizes (a C/C++ include guard or `#ifdef`, a TypeScript
+        # `namespace`, a Python `if` block) is recursed into, so declarations
+        # inside it get captured and compressed on their own, while the sweep
+        # below re-emits the uncaptured wrapper verbatim: the output would hold
+        # its content twice. When that happens, undo the nested captures and
+        # let the wrapper go out verbatim, once. Only the root needs this: the
+        # sweep is the one place uncaptured nodes are re-emitted.
+        list_fields = [name for name, value in vars(structure).items() if isinstance(value, list)]
+        for child in root.children:
+            lists_before = {name: list(getattr(structure, name)) for name in list_fields}
+            captured_before = len(captured_byte_ranges)
+            imports_before = set(import_entries)
+            visit(child)
+            child_range = (child.start_byte, child.end_byte)
+            nested_captures = any(
+                child.start_byte <= start and end <= child.end_byte
+                for start, end in captured_byte_ranges[captured_before:]
+            )
+            if nested_captures and child_range not in captured_byte_ranges:
+                for name, value in lists_before.items():
+                    setattr(structure, name, value)
+                del captured_byte_ranges[captured_before:]
+                for start in set(import_entries) - imports_before:
+                    del import_entries[start]
 
         # Capture top-level code that wasn't handled by any of the above.
         # This preserves global variables, constants, if __name__ blocks,
