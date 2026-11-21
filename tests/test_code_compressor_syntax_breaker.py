@@ -10,6 +10,8 @@ and the original content are unaffected.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from headroom.transforms import code_compressor as cc
@@ -105,3 +107,78 @@ def test_status_reports_open_languages_for_stats(monkeypatch):
     # the field diagnosis, and it would be invisible if this reset.
     assert reopened["trips"] == 1
     assert reopened["reopens_in_seconds"] == 0.0
+
+
+# --- input that was already invalid ----------------------------------------
+#
+# Coding agents feed the compressor fragments all the time: a Read with an
+# offset, a file cut mid-function, grep context. Their syntax was broken before
+# compression, so the output fails validation too. That is not the grammar
+# mangling real code, which is what the warning and the breaker are for.
+
+_CPP_BODY = "\n".join(
+    f"    int v{i} = compute(x, {i});\n    if (v{i} > limit) {{ total += v{i}; }}"
+    for i in range(25)
+)
+_VALID_CPP = (
+    "#include <vector>\n#include <string>\nnamespace app {\n"
+    "template <typename T>\nclass Cache {\n public:\n"
+    "  explicit Cache(int cap) : cap_(cap) {}\n"
+    "  int lookup(const std::string& key, int x, int limit) {\n"
+    "    int total = 0;\n" + _CPP_BODY + "\n    return total;\n  }\n"
+    "  void clear() { items_.clear(); }\n private:\n  int cap_;\n"
+    "  std::vector<T> items_;\n};\n}  // namespace app\n"
+)
+# Cut mid-function, as a Read with a line limit returns it.
+_CPP_FRAGMENT = _VALID_CPP[: int(len(_VALID_CPP) * 0.6)]
+
+needs_tree_sitter = pytest.mark.skipif(
+    not cc._check_tree_sitter_available(), reason="tree-sitter not installed"
+)
+
+
+def _compressor() -> cc.CodeAwareCompressor:
+    return cc.CodeAwareCompressor(cc.CodeCompressorConfig(min_tokens_for_compression=1))
+
+
+@needs_tree_sitter
+def test_already_invalid_input_is_not_blamed_on_the_compressor(caplog):
+    compressor = _compressor()
+    assert not compressor._verify_syntax(_CPP_FRAGMENT, cc.CodeLanguage.CPP)
+
+    with caplog.at_level(logging.WARNING, logger=cc.logger.name):
+        result = compressor.compress(_CPP_FRAGMENT, language="cpp")
+
+    assert result.compressed == _CPP_FRAGMENT
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert False not in cc._syntax_breaker_outcomes.get("cpp", [])
+
+
+@needs_tree_sitter
+def test_fragments_do_not_pause_compression_of_valid_files():
+    compressor = _compressor()
+    for _ in range(cc._SYNTAX_BREAKER_MIN_FAILURES):
+        compressor.compress(_CPP_FRAGMENT, language="cpp")
+
+    assert not cc._syntax_breaker_open("cpp")
+    result = compressor.compress(_VALID_CPP, language="cpp")
+    assert result.compressed != _VALID_CPP
+    assert compressor._verify_syntax(result.compressed, cc.CodeLanguage.CPP)
+
+
+@needs_tree_sitter
+def test_valid_input_mangled_by_the_compressor_still_warns_and_counts(monkeypatch, caplog):
+    """A real compressor bug keeps its WARNING and its breaker count."""
+
+    def _mangle(self, code, language, context, tokenizer, **kwargs):
+        return "class Broken {\n  int f( {\n", None, {}
+
+    monkeypatch.setattr(cc.CodeAwareCompressor, "_compress_with_ast", _mangle)
+    compressor = _compressor()
+
+    with caplog.at_level(logging.WARNING, logger=cc.logger.name):
+        result = compressor.compress(_VALID_CPP, language="cpp")
+
+    assert result.compressed == _VALID_CPP
+    assert any("produced invalid syntax for cpp" in r.getMessage() for r in caplog.records)
+    assert list(cc._syntax_breaker_outcomes["cpp"]) == [False]
