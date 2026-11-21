@@ -1732,9 +1732,13 @@ def _origin_key(parsed: Any) -> tuple[str, str, int] | None:
 
     scheme = parsed.scheme.lower()
     try:
-        port = parsed.port or _DEFAULT_PORTS.get(scheme)
+        port = parsed.port
     except ValueError:
         return None
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    elif port == 0:
+        return None  # an explicit port 0 is never the default port
     if not parsed.hostname or port is None:
         return None
     return scheme, parsed.hostname.lower(), port

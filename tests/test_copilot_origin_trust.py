@@ -134,6 +134,8 @@ def test_a_configured_origin_matches_by_effective_port(
         ("http://api.githubcopilot.com:80", "http://api.githubcopilot.com:8080/v1/x"),
         ("http://api.githubcopilot.com:80", "http://evil.example/v1/x"),
         ("https://api.githubcopilot.com:443", "http://api.githubcopilot.com/v1/x"),
+        ("http://gateway.invalid:0", "http://gateway.invalid/v1/x"),
+        ("http://api.githubcopilot.com:80", "http://api.githubcopilot.com:0/v1/x"),
     ],
 )
 def test_effective_port_matching_does_not_widen_the_configured_origin(
@@ -143,3 +145,13 @@ def test_effective_port_matching_does_not_widen_the_configured_origin(
     headers = _apply(url)
     assert "copilot-session" not in str(headers)
     assert headers["authorization"] == "Bearer downstream"
+
+
+def test_explicit_port_zero_is_not_the_default_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "http://gateway.invalid:0")
+    # The configuration never authorized port 80, so the omitted port must not match it.
+    assert not copilot_auth._is_trusted_copilot_origin("http://gateway.invalid")
+    assert not copilot_auth._is_trusted_copilot_origin("http://gateway.invalid:0")
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "http://gateway.invalid:80")
+    assert copilot_auth._is_trusted_copilot_origin("http://gateway.invalid")
+    assert not copilot_auth._is_trusted_copilot_origin("http://gateway.invalid:0")
