@@ -347,29 +347,79 @@ fn push_revision_trimmed(push: &mut impl FnMut(String), id: &str) {
 /// table" — the caller records $0 for USD fields and this module logs
 /// one WARN per distinct model id.
 pub fn lookup_card(model: &str) -> Option<PriceCard> {
+    lookup_card_on(model, None)
+}
+
+/// [`lookup_card`] for a request served by `upstream`: on a vendored
+/// miss, `llm-prices` is asked for that provider's own price for the
+/// id (`qwen/qwen3.8-27b` bills differently on OpenRouter and Groq).
+pub fn lookup_card_on(model: &str, upstream: Option<llm_prices::Provider>) -> Option<PriceCard> {
     let table = book();
     for key in candidates(model) {
         if let Some(card) = table.get(&key) {
             return Some(*card);
         }
     }
-    if let Some(card) = llm_prices_card(model) {
+    if let Some(card) = llm_prices_card(model, upstream) {
         return Some(card);
     }
     warn_once(model);
     None
 }
 
+static UPSTREAM: OnceLock<llm_prices::Provider> = OnceLock::new();
+
+/// Record the pricing provider behind the configured `--upstream`
+/// host. Unknown hosts leave it unset.
+pub fn set_upstream_host(host: &str) {
+    if let Some(p) = provider_for_host(host) {
+        let _ = UPSTREAM.set(p);
+    }
+}
+
+/// The pricing provider for a ledger lane: Bedrock and Vertex lanes
+/// name their own; the HTTP lanes use the configured upstream.
+pub fn upstream_for_lane(lane: &str) -> Option<llm_prices::Provider> {
+    match lane {
+        "bedrock" => Some(llm_prices::Provider::Bedrock),
+        "vertex" => Some(llm_prices::Provider::Vertex),
+        _ => UPSTREAM.get().copied(),
+    }
+}
+
+fn provider_for_host(host: &str) -> Option<llm_prices::Provider> {
+    use llm_prices::Provider as P;
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    [
+        ("openrouter.ai", P::OpenRouter),
+        ("groq.com", P::Groq),
+        ("together.xyz", P::Together),
+        ("together.ai", P::Together),
+        ("fireworks.ai", P::Fireworks),
+        ("anthropic.com", P::Anthropic),
+        ("openai.com", P::OpenAi),
+        ("deepseek.com", P::DeepSeek),
+        ("mistral.ai", P::Mistral),
+        ("x.ai", P::Xai),
+    ]
+    .into_iter()
+    .find(|(d, _)| host == *d || host.ends_with(&format!(".{d}")))
+    .map(|(_, p)| p)
+}
+
 /// Fallback card from `llm-prices` (USD per 1M tokens) for ids the
 /// vendored snapshot does not carry.
-fn llm_prices_card(model: &str) -> Option<PriceCard> {
-    let row = llm_prices::lookup(model)?;
+fn llm_prices_card(model: &str, upstream: Option<llm_prices::Provider>) -> Option<PriceCard> {
+    let row = match upstream {
+        Some(p) => p.lookup(model)?,
+        None => llm_prices::lookup(model)?,
+    };
     // A non-numeric colon suffix (`:priority`) must name the row
     // exactly, or the variant would take its base model's price.
     let id = model.trim();
     if id
         .rsplit_once(':')
-        .is_some_and(|(_, rev)| !rev.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(|(_, rev)| rev.is_empty() || !rev.bytes().all(|b| b.is_ascii_digit()))
         && !std::iter::once(row.model)
             .chain(row.aliases.iter().copied())
             .any(|m| m.eq_ignore_ascii_case(id))
@@ -605,6 +655,25 @@ mod tests {
     #[test]
     fn llm_prices_fallback_keeps_colon_variant_miss() {
         assert!(lookup_card("us.anthropic.claude-opus-4-8-v1:priority").is_none());
+        assert!(lookup_card("us.anthropic.claude-opus-4-8-v1:").is_none());
+    }
+
+    /// The same open-weight id bills at each upstream's own rate.
+    #[test]
+    fn llm_prices_fallback_uses_the_upstream_provider() {
+        use llm_prices::Provider;
+        let id = "qwen/qwen3.8-27b";
+        assert!(book().get(id).is_none(), "fixture guard");
+        let or = lookup_card_on(id, Some(Provider::OpenRouter)).unwrap().base;
+        let groq = lookup_card_on(id, Some(Provider::Groq)).unwrap().base;
+        assert!((or.input - 0.06e-6).abs() < 1e-15 && (or.output - 2.2e-6).abs() < 1e-15);
+        assert!((groq.input - 0.8e-6).abs() < 1e-15 && (groq.output - 4.0e-6).abs() < 1e-15);
+        assert_eq!(
+            provider_for_host("openrouter.ai"),
+            Some(Provider::OpenRouter)
+        );
+        assert_eq!(provider_for_host("api.groq.com"), Some(Provider::Groq));
+        assert_eq!(provider_for_host("127.0.0.1"), None);
     }
 
     #[test]

@@ -660,7 +660,7 @@ impl Ledger {
         let usd = if ev.failed {
             EventUsd::default()
         } else {
-            match pricing::lookup_card(&ev.model) {
+            match pricing::lookup_card_on(&ev.model, pricing::upstream_for_lane(ev.provider)) {
                 Some(card) => {
                     // When the response carried no usage block, bill
                     // the post-compression estimate instead so
