@@ -9372,7 +9372,18 @@ class OpenAIHandlerMixin:
                             await upstream.close()
                         return
                 async with upstream:
-                    await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
+
+                    async def _send_upstream(payload: str) -> None:
+                        nonlocal upstream_close_code
+                        try:
+                            await upstream.send(payload)
+                        except Exception as exc:
+                            upstream_close_code = getattr(upstream, "close_code", None) or getattr(
+                                getattr(exc, "rcvd", None), "code", None
+                            )
+                            raise
+
+                    await _send_upstream(_strip_codex_lite_metadata(first_msg_raw))
 
                     # Unit 3: flag the upstream side flips on seeing
                     # ``response.completed`` so the outer cause
@@ -9878,7 +9889,7 @@ class OpenAIHandlerMixin:
                                         "transforms_applied": transforms_applied,
                                     },
                                 )
-                                await upstream.send(_strip_codex_lite_metadata(msg))
+                                await _send_upstream(_strip_codex_lite_metadata(msg))
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
                             # orchestrator — re-raise so
@@ -9931,7 +9942,8 @@ class OpenAIHandlerMixin:
                         # over ``upstream_disconnect``.
                         nonlocal response_completed_seen
                         nonlocal upstream_relay_error
-                        nonlocal client_close_code, upstream_close_code, closing_client_from_upstream
+                        nonlocal client_close_code, upstream_close_code
+                        nonlocal closing_client_from_upstream
                         nonlocal ws_memory_response_pending
                         nonlocal ws_input_tokens_total, ws_output_tokens_total
                         nonlocal ws_cache_read_tokens_total, ws_cache_write_tokens_total
@@ -10387,7 +10399,7 @@ class OpenAIHandlerMixin:
                                 }
                                 continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
                                 ws_memory_response_pending = True
-                                await upstream.send(
+                                await _send_upstream(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
                                 logger.info(

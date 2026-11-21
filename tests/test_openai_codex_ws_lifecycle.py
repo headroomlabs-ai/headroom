@@ -1447,8 +1447,8 @@ async def test_client_disconnect_cancels_upstream_relay_within_100ms(caplog):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("close_code", [1000, None])
-async def test_upstream_closes_first_cancels_client_task(close_code, caplog):
+@pytest.mark.parametrize(("close_code", "echo_close"), [(1000, False), (None, False), (1000, True)])
+async def test_upstream_closes_first_cancels_client_task(close_code, echo_close, caplog):
     """Upstream iterator ends naturally; client task should be cancelled.
 
     The client is set to block on ``receive_text`` indefinitely; only a
@@ -1468,7 +1468,8 @@ async def test_upstream_closes_first_cancels_client_task(close_code, caplog):
             self.trigger_disconnect()
             await asyncio.sleep(0)  # Let receive_text observe the close handshake.
 
-    client_ws = EchoCloseWebSocket(
+    websocket_type = EchoCloseWebSocket if echo_close else _FakeWebSocket
+    client_ws = websocket_type(
         frames=[_first_frame()],
         hold_after_initial=True,
     )
@@ -1484,6 +1485,26 @@ async def test_upstream_closes_first_cancels_client_task(close_code, caplog):
     # We must still have recorded exactly one session duration.
     assert len(handler.metrics.ws_session_durations) == 1
     assert f"client_close_code=None upstream_close_code={close_code}" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent_before_close", [0, 1])
+async def test_upstream_close_code_during_send(sent_before_close, caplog):
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    class ClosedDuringSend(_FakeUpstream):
+        async def send(self, payload):
+            if len(self.sent) == sent_before_close:
+                raise ConnectionClosedError(Close(4002, "session closed"), None)
+            await super().send(payload)
+
+    upstream = ClosedDuringSend([], hold_after_events=True)
+    client = _FakeWebSocket(frames=[_first_frame(), _first_frame()], hold_after_initial=True)
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(_DummyOpenAIHandler().handle_openai_responses_ws(client), timeout=2)
+    assert "client_close_code=None upstream_close_code=4002" in caplog.text
 
 
 @pytest.mark.asyncio
