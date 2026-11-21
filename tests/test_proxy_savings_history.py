@@ -612,7 +612,10 @@ def test_fallback_input_cost_uses_breakdown_sum_not_input_tokens_when_litellm_un
     # Regression: when both `input_tokens` and a nonzero cache breakdown are
     # present and LiteLLM is unavailable, the fallback must price only the
     # breakdown sum — never input_tokens + breakdown_sum — to avoid
-    # double-counting the tokens that the breakdown already covers.
+    # double-counting the tokens that the breakdown already covers. Cache
+    # reads inside that sum bill at half the fallback input rate, the shared
+    # effective convention the ledger uses (#3825), so the breakdown prices
+    # as 0.5 * reads + writes + uncached -- not the full rate for every slice.
     monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
     monkeypatch.setattr(savings_tracker_module, "litellm", None)
 
@@ -631,7 +634,7 @@ def test_fallback_input_cost_uses_breakdown_sum_not_input_tokens_when_litellm_un
     )
 
     fallback_rate = savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    expected = breakdown_sum * fallback_rate
+    expected = (0.5 * cache_read + cache_write + uncached) * fallback_rate
     double_counted = (input_tokens + breakdown_sum) * fallback_rate
 
     assert result == pytest.approx(expected)
@@ -1124,6 +1127,49 @@ def test_savings_tracker_rollup_carries_exact_cache_read_cost_per_provider(tmp_p
     assert bucket["cache_read_cost_usd_delta"] == pytest.approx(0.27)
     assert bucket["cache_savings_usd_delta"] == pytest.approx(9.93)
     assert bucket["by_model"]["steep-model"]["cache_read_cost_usd_delta"] == pytest.approx(0.25)
+
+
+def test_savings_tracker_rollup_prices_unknown_model_reads_at_ledger_rate(tmp_path, monkeypatch):
+    # #3825: an unpriced model's cache reads must cost the same in the
+    # rollup as in the ledger -- half the shared $3.00/M unknown-model
+    # fallback ($1.50/M), not the full fallback rate ($3.00/M) the
+    # estimator used to charge. The read cost must also reconcile with the
+    # recorded input cost exactly as it does for priced models: input cost
+    # minus read cost is the uncached spend.
+    savings_tracker_module._resolve_litellm_model.cache_clear()
+    fake_litellm = SimpleNamespace(
+        cost_per_token=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unknown model")),
+        model_cost={},
+    )
+    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
+    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+    tracker = SavingsTracker(
+        path=str(tmp_path / "proxy_savings.json"),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+
+    tracker.record_request(
+        model="zz-unpriced-rollup-model",
+        provider="openai",
+        input_tokens=1_010_000,
+        tokens_saved=0,
+        cache_read_tokens=1_000_000,
+        uncached_input_tokens=10_000,
+        timestamp="2026-03-27T09:10:00Z",
+    )
+
+    bucket = tracker.history_response()["series"]["hourly"][0]
+    fallback = savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
+    assert bucket["cache_read_tokens_delta"] == 1_000_000
+    assert bucket["cache_read_cost_usd_delta"] == pytest.approx(1_000_000 * 0.5 * fallback)
+    assert bucket["by_model"]["zz-unpriced-rollup-model"][
+        "cache_read_cost_usd_delta"
+    ] == pytest.approx(1_000_000 * 0.5 * fallback)
+    # Input cost minus read cost is the uncached spend, as for priced models.
+    assert bucket["total_input_cost_usd_delta"] - bucket["cache_read_cost_usd_delta"] == (
+        pytest.approx(10_000 * fallback)
+    )
 
 
 def test_savings_tracker_rollup_read_cost_unknown_for_model_less_checkpoints(tmp_path):
