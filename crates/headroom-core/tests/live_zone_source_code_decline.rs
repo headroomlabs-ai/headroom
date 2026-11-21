@@ -19,13 +19,13 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{body_with_tool_result, dispatch, go_handlers_source};
+use common::{body_with_tool_result, dispatch, python_script_source};
 use headroom_core::transforms::live_zone;
 use headroom_core::transforms::LiveZoneOutcome;
 
 #[test]
 fn declined_source_code_never_starts_kompress() {
-    let code = go_handlers_source(30);
+    let code = python_script_source(30);
     assert!(
         code.len() > 2048,
         "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
