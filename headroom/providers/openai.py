@@ -16,7 +16,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
-from headroom.log_safety import describe_exception, safe_id
+from headroom.log_safety import WarnOnce, describe_exception, safe_id
 from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
@@ -40,13 +40,14 @@ _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 _PRICING_FALLBACK_WARNINGS: set[str] = set()
 # Models that fell through every price source to the unknown-model default
 # (issue #3732). A cost computed from one of these is a guess, not a lookup.
-# Capped: model names come from clients, so an unbounded dedup set grows
-# with every distinct unknown name. Past the cap a new name still gets its
-# one warning -- it just is not retained -- so warning behaviour is unchanged
-# and memory stays bounded. Same 200-name bound as the tracker's per-model
-# maps (``MAX_TRACKED_MODELS``).
+# Dedup is the bounded ``WarnOnce`` guard: at most
+# ``_MAX_WARNED_UNKNOWN_PRICING_MODELS`` names warn per window, then one
+# overflow notice and silence -- so a past-cap name can never warn on every
+# resolution (#3825 re-review: the old capped set never retained a past-cap
+# name, so the same model warned on every lookup). Same 200-name bound as
+# the tracker's per-model maps (``MAX_TRACKED_MODELS``).
 _MAX_WARNED_UNKNOWN_PRICING_MODELS = 200
-_UNKNOWN_PRICING_MODELS: set[str] = set()
+_UNKNOWN_PRICING_WARNINGS = WarnOnce(_MAX_WARNED_UNKNOWN_PRICING_MODELS, "models without pricing")
 
 TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
@@ -755,7 +756,7 @@ class OpenAIProvider(Provider):
         the built-in table/family patterns are decisions or catalog data, not
         guesses — so a model that later resolves (explicit config added,
         LiteLLM catalog updated) stops being flagged without any cache to
-        clear. The module-global ``_UNKNOWN_PRICING_MODELS`` set is only the
+        clear. The module-global ``_UNKNOWN_PRICING_WARNINGS`` guard is only the
         warning-dedup mechanism; it is never consulted for provenance.
         """
         # 1. Explicit configuration wins.
@@ -842,19 +843,19 @@ class OpenAIProvider(Provider):
     def _warn_unknown_pricing(self, model: str) -> None:
         """Warn once per model priced at the unknown-model default (issue #3732).
 
-        The ``_UNKNOWN_PRICING_MODELS`` set is ONLY the warning-dedup
+        The ``_UNKNOWN_PRICING_WARNINGS`` guard is ONLY the warning-dedup
         mechanism. Pricing provenance is derived per lookup by
-        :meth:`_resolve_pricing`, never from this set, so a model that later
+        :meth:`_resolve_pricing`, never from this guard, so a model that later
         resolves (explicit override, catalog update) stops being flagged.
-        The set is capped at ``_MAX_WARNED_UNKNOWN_PRICING_MODELS`` names:
-        past the cap a new name still warns once, it just is not retained.
-        The logged name is sanitized with :func:`safe_id` -- it comes from
-        clients, so a raw ``%s`` could forge log lines or flood the log.
+        The guard is bounded at ``_MAX_WARNED_UNKNOWN_PRICING_MODELS`` names
+        per window: past the cap a further name warns no more -- one overflow
+        notice, then silence -- instead of warning on every resolution
+        (#3825 re-review). The logged name is sanitized with :func:`safe_id`
+        -- it comes from clients, so a raw ``%s`` could forge log lines or
+        flood the log.
         """
-        if model in _UNKNOWN_PRICING_MODELS:
+        if not _UNKNOWN_PRICING_WARNINGS.first(model, logger):
             return
-        if len(_UNKNOWN_PRICING_MODELS) < _MAX_WARNED_UNKNOWN_PRICING_MODELS:
-            _UNKNOWN_PRICING_MODELS.add(model)
         in_price, out_price = cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
         logger.warning(
             "No pricing found for model %s in explicit config, LiteLLM, or the "

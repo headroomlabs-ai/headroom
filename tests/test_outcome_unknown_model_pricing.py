@@ -352,9 +352,14 @@ def test_real_openai_provider_resolves_unknown_default_estimated(
     shared $3.00 unknown-model fallback with estimated provenance (the reviewer's scenario)."""
     import headroom.pricing.litellm_pricing as lp
     import headroom.providers.openai as openai_mod
+    from headroom.log_safety import WarnOnce
 
     monkeypatch.setattr(lp, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+    monkeypatch.setattr(
+        openai_mod,
+        "_UNKNOWN_PRICING_WARNINGS",
+        WarnOnce(openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS, "models without pricing"),
+    )
 
     ct = _tracker(budget_limit_usd=0.01)
     handler = _Handler(ct)
@@ -438,3 +443,29 @@ def test_unknown_model_cache_heavy_displayed_read_cannot_exceed_input_spend(
     cache_read_component = 190_000 * read_price
     total_input_spend = ct.stats()["total_input_cost_usd"]
     assert cache_read_component <= total_input_spend + 1e-9
+
+
+# ── Literal-`other` selected request (#3825 re-review) ────────────────
+
+
+def test_literal_other_model_books_and_displays_selected_spend(no_litellm):
+    """A request literally named ``other`` is a selected request, not a folded one.
+
+    The reviewer's probe: fresh tracker, no catalog price for ``other``,
+    1M cache-read tokens, zero uncached/output. The ledger booked $1.50
+    (1M reads at 50% of the $3.00 fallback) but totals() reported $0.00:
+    the raw name matches the aggregate label, so the folded path never ran
+    for it, yet the per-model capture skipped ``other`` too. Both must now
+    agree at $1.50.
+    """
+    ct = _tracker(budget_limit_usd=100.0)
+    ct.record_tokens("other", 0, 1_000_000, cache_read_tokens=1_000_000)
+
+    assert _budget_basis(ct)["total_usd"] == pytest.approx(1.50)
+    assert ct.totals() == (1_000_000, 1.50)
+    assert ct.stats()["total_cost_usd"] == pytest.approx(1.50)
+    # The spend is captured under the aggregate label, but the price itself
+    # is never stored in ``_fixed_pricing_by_model``: that map is consulted
+    # for folded models too, and an ``other`` entry there would misprice
+    # folded traffic at this request's rate.
+    assert "other" not in ct._fixed_pricing_by_model

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pytest
 
+from headroom.log_safety import WarnOnce
 from headroom.pricing.litellm_model_resolution import unwrapped_model_forms
 from headroom.providers.openai import OpenAIProvider
 from tests._dotenv import importorskip_no_env_leak
@@ -152,7 +153,11 @@ def test_unknown_model_warns_once_and_is_flagged_estimated(
 
     monkeypatch.setattr(lp, "LITELLM_AVAILABLE", False)
     # Isolation: the unknown-model registry is module-global.
-    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+    monkeypatch.setattr(
+        openai_mod,
+        "_UNKNOWN_PRICING_WARNINGS",
+        WarnOnce(openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS, "models without pricing"),
+    )
 
     provider = OpenAIProvider()
     with caplog.at_level(logging.WARNING, logger="headroom.providers.openai"):
@@ -172,25 +177,39 @@ def test_unknown_model_warns_once_and_is_flagged_estimated(
 
 
 def test_unknown_pricing_warning_registry_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The unknown-pricing warning registry cannot grow without bound (#3825).
+    """The unknown-pricing warning guard cannot warn without bound (#3825).
 
     Model names come from clients: 250 distinct unknown names must not
-    create 250 retained entries. Past the cap a new name still warns once;
-    it just is not retained.
+    create 250 retained entries -- and past the cap a further name must not
+    warn on every resolution (#3825 re-review: the old capped set never
+    retained a past-cap name, so the same model warned on every lookup).
+    After 200 distinct lookups, resolving the same additional model three
+    times emits no warning naming it: only the guard's single overflow
+    notice fires.
     """
+    import logging
+
     import headroom.providers.openai as openai_mod
 
-    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+    monkeypatch.setattr(
+        openai_mod,
+        "_UNKNOWN_PRICING_WARNINGS",
+        WarnOnce(openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS, "models without pricing"),
+    )
 
     provider = OpenAIProvider()
-    for i in range(250):
-        provider._warn_unknown_pricing(f"bound-probe-{i}")
+    with caplog.at_level(logging.WARNING, logger="headroom.providers.openai"):
+        for i in range(200):
+            provider._warn_unknown_pricing(f"bound-probe-{i}")
+        for _ in range(3):
+            provider._warn_unknown_pricing("bound-probe-overflow")
 
-    assert len(openai_mod._UNKNOWN_PRICING_MODELS) <= (
-        openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS
-    )
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert sum("bound-probe-overflow" in r.getMessage() for r in warnings) == 0
+    # 200 first-time warnings + the guard's single overflow notice.
+    assert len(warnings) == 201
 
 
 def test_unknown_pricing_warning_sanitizes_model_id(
@@ -201,7 +220,11 @@ def test_unknown_pricing_warning_sanitizes_model_id(
 
     import headroom.providers.openai as openai_mod
 
-    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+    monkeypatch.setattr(
+        openai_mod,
+        "_UNKNOWN_PRICING_WARNINGS",
+        WarnOnce(openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS, "models without pricing"),
+    )
 
     provider = OpenAIProvider()
     nasty = "evil-model\nFORGED log line"
@@ -227,7 +250,11 @@ def test_resolved_prices_are_not_flagged_estimated(
     import headroom.providers.openai as openai_mod
 
     monkeypatch.setattr(lp, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+    monkeypatch.setattr(
+        openai_mod,
+        "_UNKNOWN_PRICING_WARNINGS",
+        WarnOnce(openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS, "models without pricing"),
+    )
 
     provider = OpenAIProvider()
     provider._pricing_overrides["my-custom-model"] = (1.0, 2.0)
@@ -258,7 +285,11 @@ def test_pricing_provenance_is_per_lookup_not_sticky(
     import headroom.providers.openai as openai_mod
 
     monkeypatch.setattr(lp, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+    monkeypatch.setattr(
+        openai_mod,
+        "_UNKNOWN_PRICING_WARNINGS",
+        WarnOnce(openai_mod._MAX_WARNED_UNKNOWN_PRICING_MODELS, "models without pricing"),
+    )
 
     provider = OpenAIProvider()
     model = "mystery-model-per-lookup"
