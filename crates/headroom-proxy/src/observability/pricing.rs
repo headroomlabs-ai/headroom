@@ -364,6 +364,18 @@ pub fn lookup_card(model: &str) -> Option<PriceCard> {
 /// vendored snapshot does not carry.
 fn llm_prices_card(model: &str) -> Option<PriceCard> {
     let row = llm_prices::lookup(model)?;
+    // A non-numeric colon suffix (`:priority`) must name the row
+    // exactly, or the variant would take its base model's price.
+    let id = model.trim();
+    if id
+        .rsplit_once(':')
+        .is_some_and(|(_, rev)| !rev.bytes().all(|b| b.is_ascii_digit()))
+        && !std::iter::once(row.model)
+            .chain(row.aliases.iter().copied())
+            .any(|m| m.eq_ignore_ascii_case(id))
+    {
+        return None;
+    }
     let per_token = |m: f64| m / 1_000_000.0;
     let (input, output) = (row.input?, row.output?);
     let base = ModelPrice {
@@ -586,6 +598,13 @@ mod tests {
         assert!((p.input - row.input.unwrap() / 1e6).abs() < 1e-15);
         assert!((p.output - row.output.unwrap() / 1e6).abs() < 1e-15);
         assert!(p.cache_read < p.input && p.cache_write > p.input);
+    }
+
+    /// An unlisted colon variant keeps missing; llm-prices would strip
+    /// the whole `-v1:priority` suffix and price the base model.
+    #[test]
+    fn llm_prices_fallback_keeps_colon_variant_miss() {
+        assert!(lookup_card("us.anthropic.claude-opus-4-8-v1:priority").is_none());
     }
 
     #[test]
