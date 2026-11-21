@@ -759,12 +759,17 @@ def test_claude_code_toolsearch_resolving_its_deferred_tools_is_not_an_orphan(
     assert [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()] == []
 
 
-def test_toolsearch_without_deferred_marks_still_reports_eager_schemas() -> None:
+def test_toolsearch_without_deferred_marks_still_reports_eager_schemas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Pairing ``ToolSearch`` with marks must not make the bare name a signal.
 
     Claude Code carries ``ToolSearch`` even when it inlines its whole catalog,
     and that is exactly what the eager-schema hint (#746) exists to report.
+    ``HEADROOM_CLIENT_TOOL_SEARCH_NAMES=ToolSearch`` opts into the opposite on
+    purpose, so the test must not inherit it from the shell.
     """
+    monkeypatch.delenv("HEADROOM_CLIENT_TOOL_SEARCH_NAMES", raising=False)
     tools = [CLAUDE_CODE_TOOL_SEARCH, *_mcp(3)]
 
     assert request_already_defers_tools(tools) is False
