@@ -491,6 +491,7 @@ class TestBatchErrorHandling:
         # Should return error for non-existent file
         assert response.status_code in [400, 404]
 
+    @pytest.mark.live
     def test_openai_batch_missing_auth(self, openai_batch_client):
         """Missing authentication returns error (401 or 404 depending on routing)."""
         response = openai_batch_client.post(

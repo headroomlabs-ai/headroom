@@ -107,6 +107,8 @@ LIVE_PREFIXES = (
     PASSTHROUGH + "::TestAnthropicModels",
     PASSTHROUGH + "::TestPassthroughStats",
     PASSTHROUGH + "::TestPassthroughErrorHandling::test_invalid_json_body",
+    # no key set still means an unauthenticated request leaves the process
+    PASSTHROUGH + "::TestPassthroughErrorHandling::test_missing_auth_header_openai",
     # batch: create-with-compression, list, stats, and the file lookup upstream
     BATCH + "::TestOpenAIBatchCreate::test_batch_create_with_compression",
     BATCH + "::TestOpenAIBatchList",
@@ -115,6 +117,7 @@ LIVE_PREFIXES = (
     BATCH + "::TestBatchCompressionStats",
     BATCH + "::TestAnthropicBatchCompressionStats",
     BATCH + "::TestBatchErrorHandling::test_openai_batch_invalid_file_id",
+    BATCH + "::TestBatchErrorHandling::test_openai_batch_missing_auth",
     # memory proxy and streaming backend: real Anthropic / OpenAI requests
     MEMORY + "::TestMemoryHeaderValidation",
     MEMORY + "::TestMemoryToolInjection",

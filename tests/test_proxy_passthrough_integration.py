@@ -482,6 +482,7 @@ class TestPassthroughStats:
 class TestPassthroughErrorHandling:
     """Test error handling for passthrough endpoints."""
 
+    @pytest.mark.live
     def test_missing_auth_header_openai(self, openai_client):
         """Missing auth header returns appropriate error."""
         response = openai_client.get("/v1/models")
