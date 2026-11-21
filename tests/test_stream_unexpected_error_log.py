@@ -5,12 +5,16 @@ httpx transport errors raised while reading the upstream body (``ReadError``,
 catch-all in ``_stream_response``'s generator logged only ``str(e)``, so the
 operator saw a bare ``Unexpected streaming error:`` with nothing after it and
 no way to tell a dropped connection from a bug.
+
+Exception messages, including those of chained causes, can quote request or
+response content, so they reach the log only with ``HEADROOM_DEBUG_DUMP=full``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,7 +42,7 @@ MESSAGE_START = (
 ).encode()
 
 
-def _proxy(mid_stream_error: Exception) -> HeadroomProxy:
+def _proxy(mid_stream_error: Exception | Callable[[], None]) -> HeadroomProxy:
     proxy = object.__new__(HeadroomProxy)
     proxy.http_client = MagicMock(spec=httpx.AsyncClient)
     proxy._config = MagicMock()
@@ -53,6 +57,8 @@ def _proxy(mid_stream_error: Exception) -> HeadroomProxy:
 
     async def aiter_bytes():
         yield MESSAGE_START
+        if callable(mid_stream_error):
+            mid_stream_error()
         raise mid_stream_error
 
     response.aiter_bytes = aiter_bytes
@@ -102,7 +108,13 @@ async def test_mid_stream_error_with_empty_message_logs_its_type(caplog):
     assert "ReadError" in lines[0]
 
 
-async def test_mid_stream_error_keeps_its_message(caplog):
+@pytest.fixture
+def _no_content_logging(monkeypatch):
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+
+
+@pytest.mark.usefixtures("_no_content_logging")
+async def test_mid_stream_error_message_stays_out_of_the_log_by_default(caplog):
     proxy = _proxy(RuntimeError("parser exploded"))
 
     with caplog.at_level(logging.ERROR, logger="headroom.proxy"):
@@ -111,4 +123,38 @@ async def test_mid_stream_error_keeps_its_message(caplog):
     lines = _unexpected_lines(caplog)
     assert len(lines) == 1
     assert "RuntimeError" in lines[0]
+    assert "parser exploded" not in lines[0]
+
+
+async def test_mid_stream_error_message_is_logged_with_full_debug_dump(caplog, monkeypatch):
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    proxy = _proxy(RuntimeError("parser exploded"))
+
+    with caplog.at_level(logging.ERROR, logger="headroom.proxy"):
+        await _drain(proxy)
+
+    lines = _unexpected_lines(caplog)
+    assert len(lines) == 1
     assert "parser exploded" in lines[0]
+
+
+@pytest.mark.usefixtures("_no_content_logging")
+async def test_chained_inner_message_stays_out_of_every_log_record(caplog):
+    """A cause's message must not leak through a traceback, at any level."""
+    secret = "synthetic-private-inner-exception-message"
+
+    def _raise_chained() -> None:
+        raise RuntimeError("parser exploded") from ValueError(secret)
+
+    proxy = _proxy(_raise_chained)
+
+    with caplog.at_level(logging.DEBUG), caplog.at_level(logging.DEBUG, logger="headroom"):
+        body = await _drain(proxy)
+
+    assert b"event: error" in body
+    assert secret not in caplog.text
+    assert "parser exploded" not in caplog.text
+    lines = _unexpected_lines(caplog)
+    assert len(lines) == 1
+    assert "RuntimeError" in lines[0]
+    assert "caused by ValueError" in lines[0]

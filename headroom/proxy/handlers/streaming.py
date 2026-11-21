@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.log_safety import describe_exception
 from headroom.proxy import public_errors
 from headroom.proxy.memory_tool_stream import (
     MemoryToolStreamFilter,
@@ -2060,13 +2061,14 @@ class StreamingMixin:
                 )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except Exception as e:
-                # Name the type: httpx transport errors raised mid-stream often
-                # have an empty str(), which logged as a bare "error:" line.
-                detail = (
-                    f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__} (no message)"
+                # Name the type and where it was raised: httpx transport errors
+                # raised mid-stream often have an empty str(), which logged as a
+                # bare "error:" line. Messages and the full traceback can quote
+                # request or response content, so describe_exception includes
+                # them only with HEADROOM_DEBUG_DUMP=full.
+                logger.error(
+                    "[%s] Unexpected streaming error: %s", request_id, describe_exception(e)
                 )
-                logger.error("[%s] Unexpected streaming error: %s", request_id, detail)
-                logger.debug("[%s] Unexpected streaming error traceback", request_id, exc_info=True)
                 guarded_tail = _drain_context_guard()
                 if guarded_tail:
                     yield guarded_tail
