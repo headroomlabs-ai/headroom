@@ -88,6 +88,40 @@ def test_responses_subpath_keeps_the_base_version(
     assert seen == [f"{method} https://ark.cn-beijing.volces.com{expected_path}"]
 
 
+@pytest.mark.parametrize(
+    ("base", "expected_prefix"),
+    [
+        # A base that is already versioned takes the routes without another /v1 ...
+        ("https://gateway.example/api/v3", "https://gateway.example/api/v3"),
+        # ... while an explicitly configured /v1 under it is kept, not normalized away.
+        ("https://gateway.example/api/v3/v1", "https://gateway.example/api/v3/v1"),
+    ],
+)
+def test_configured_upstream_path_is_preserved(base: str, expected_prefix: str) -> None:
+    seen: list[str] = []
+    with _make_proxy_client(openai_api_url=base) as client:
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=_batch_upstream(seen))
+        responses = client.get("/v1/responses/resp_1", headers={"authorization": "Bearer x"})
+        batch = client.post(
+            "/v1/batches",
+            headers={"authorization": "Bearer x"},
+            json={
+                "input_file_id": "file-abc",
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h",
+            },
+        )
+
+    assert responses.status_code == 200, responses.text
+    assert batch.status_code == 200, batch.text
+    assert seen == [
+        f"GET {expected_prefix}/responses/resp_1",
+        f"GET {expected_prefix}/files/file-abc/content",
+        f"POST {expected_prefix}/files",
+        f"POST {expected_prefix}/batches",
+    ]
+
+
 def test_responses_subpath_on_an_unversioned_base_keeps_v1() -> None:
     seen: list[str] = []
     with _make_proxy_client(openai_api_url="https://api.deepseek.com") as client:
