@@ -1524,7 +1524,12 @@ class CostTracker:
                     self._fixed_pricing_by_model.pop(key, None)
             if model == OTHER_MODEL and fixed_pricing is not None:
                 input_price = fixed_pricing[0] / 1_000_000
-                rates = (0.5 * input_price, input_price, input_price, input_price)
+                rates: tuple[float, float, float, float] | None = (
+                    0.5 * input_price,
+                    input_price,
+                    input_price,
+                    input_price,
+                )
             else:
                 rates = self._get_cache_prices(model, long_context=long_context)
             if rates is not None:
@@ -1544,7 +1549,7 @@ class CostTracker:
                     self._input_spend_by_model.get(key, 0.0) + input_spend
                 )
             if model == OTHER_MODEL and fixed_pricing is not None:
-                output_price = fixed_pricing[1] / 1_000_000
+                output_price: float | None = fixed_pricing[1] / 1_000_000
             else:
                 output_price = self._get_output_price(model, long_context=long_context)
             if output_price is not None:
