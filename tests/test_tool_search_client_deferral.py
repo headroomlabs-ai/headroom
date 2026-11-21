@@ -730,6 +730,50 @@ def test_a_recognized_search_tool_is_not_an_orphan(caplog: pytest.LogCaptureFixt
     assert [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()] == []
 
 
+def test_claude_code_toolsearch_resolving_its_deferred_tools_is_not_an_orphan(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Claude Code's own deferral: its client-side ``ToolSearch`` resolves the marks.
+
+    While Claude Code defers, every request carries ``ToolSearch`` next to a
+    deferred ``DeferredToolPlaceholder`` and any tools it has loaded, still
+    marked. ``ToolSearch`` is the resolver, so this is a coherent request and
+    the hourly orphan warning (which tells operators an intermediary may have
+    stripped the search tool) must stay quiet. Standing down is still right.
+    """
+    reset_deferred_orphan_warn_state()
+    tools = [
+        {"name": "Read", "input_schema": {"type": "object"}},
+        CLAUDE_CODE_TOOL_SEARCH,
+        {
+            "name": "DeferredToolPlaceholder",
+            "input_schema": {"type": "object"},
+            "defer_loading": True,
+        },
+        {"name": "Monitor", "input_schema": {"type": "object"}, "defer_loading": True},
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        assert request_already_defers_tools(tools) is True
+
+    assert [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()] == []
+
+
+def test_toolsearch_without_deferred_marks_still_reports_eager_schemas() -> None:
+    """Pairing ``ToolSearch`` with marks must not make the bare name a signal.
+
+    Claude Code carries ``ToolSearch`` even when it inlines its whole catalog,
+    and that is exactly what the eager-schema hint (#746) exists to report.
+    """
+    tools = [CLAUDE_CODE_TOOL_SEARCH, *_mcp(3)]
+
+    assert request_already_defers_tools(tools) is False
+    assert (
+        claude_code_tool_search_inactive(client="claude-code", tools=tools, anthropic_beta=None)
+        is True
+    )
+
+
 def test_the_orphan_warning_is_throttled(caplog: pytest.LogCaptureFixture) -> None:
     """It is evaluated per request; one line per request would be a flood."""
     reset_deferred_orphan_warn_state()
