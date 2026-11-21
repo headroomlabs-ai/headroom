@@ -254,7 +254,17 @@ Every label vocabulary is bounded by code, not customer input:
   It is bounded at record time by `MAX_DISTINCT_MODELS`
   (`headroom.telemetry.context`): once the cap is reached, further
   distinct models bucket into the `"other"` sentinel and a one-time
-  warning is logged, mirroring the `tier` discipline above. The
+  warning is logged, mirroring the `tier` discipline above. A name
+  containing control characters or longer than 128 characters never
+  becomes a key at all: it buckets straight into `"other"`. Such writes
+  are also excluded from the per-model cache-bust attribution, so a junk
+  write cannot make a later genuine `"other"` model's first write look
+  like a bust. Cache-bust attribution keys on the caller's model value
+  rather than the display string, so a numeric model (123) and its string
+  form ("123") keep separate histories. Cache history is bounded
+  independently of the display map: once it holds `MAX_DISTINCT_MODELS`
+  entries, further new model values attribute to `"other"`, so the
+  history can never exceed the cap plus `"other"` either. The
   in-memory dicts and the exported `headroom_requests_by_model` series
   can never exceed the cap plus `"other"`.
 
