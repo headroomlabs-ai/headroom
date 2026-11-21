@@ -520,18 +520,21 @@ class BatchResultProcessor:
         result = dict(original_result)
 
         if provider == "anthropic":
-            # Update result.result.message
-            if "result" not in result:
-                result["result"] = {}
-            result["result"]["message"] = final_response
-            # Update type if it was tool_use
-            result["result"]["type"] = "succeeded"
+            # Copy the nested mapping too (#4185): mutating it in place would
+            # overwrite the caller's raw result, so replaying the same result
+            # skips subsequent continuations and loses the tool-call evidence.
+            result["result"] = {
+                **result.get("result", {}),
+                "message": final_response,
+                "type": "succeeded",
+            }
 
         elif provider == "openai":
-            # Update response.body
-            if "response" not in result:
-                result["response"] = {}
-            result["response"]["body"] = final_response
+            # Same nested-copy rule for the OpenAI branch.
+            result["response"] = {
+                **result.get("response", {}),
+                "body": final_response,
+            }
 
         elif provider == "google":
             # Update response directly
