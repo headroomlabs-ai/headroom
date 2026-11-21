@@ -1437,9 +1437,6 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
 
     normalized_base = base_url.rstrip("/")
     normalized_path = path if path.startswith("/") else f"/{path}"
-    if _ends_in_version_segment(normalized_base) and normalized_path.startswith("/v1/"):
-        # Custom OpenAI-compatible bases can already carry a vendor API version.
-        normalized_path = normalized_path[3:]
     if is_copilot_upstream_url(normalized_base):
         # Single routing chokepoint for every Copilot surface (OpenAI
         # chat/responses and Anthropic messages all build their upstream URL
@@ -1464,6 +1461,11 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
             normalized_path = normalized_path[3:]
     else:
         reset_request_routed_to_copilot()
+        # Custom OpenAI-compatible bases can already carry a vendor API version.
+        # Checked only here: a Copilot override such as GITHUB_COPILOT_API_URL may
+        # end in /vN, and its native paths above must reach it unchanged.
+        if _ends_in_version_segment(normalized_base) and normalized_path.startswith("/v1/"):
+            normalized_path = normalized_path[3:]
     return f"{normalized_base}{normalized_path}"
 
 

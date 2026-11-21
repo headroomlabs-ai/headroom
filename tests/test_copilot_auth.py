@@ -1236,6 +1236,26 @@ def test_build_copilot_upstream_url_preserves_v1_for_unversioned_base(base_url: 
     )
 
 
+@pytest.mark.parametrize(
+    ("env_var", "base_url", "path"),
+    [
+        ("GITHUB_COPILOT_API_URL", "https://chat.example.test/api/v4", "/v1/messages"),
+        (
+            "GITHUB_COPILOT_PROXY_URL",
+            "https://inline.example.test/api/v12",
+            "/v1/engines/model/completions",
+        ),
+    ],
+)
+def test_build_copilot_upstream_url_keeps_native_paths_on_versioned_copilot_override(
+    monkeypatch: pytest.MonkeyPatch, env_var: str, base_url: str, path: str
+) -> None:
+    # A Copilot override that ends in /vN is still Copilot: its native paths
+    # must not lose /v1 to the generic versioned-base rule.
+    monkeypatch.setenv(env_var, base_url)
+    assert copilot_auth.build_copilot_upstream_url(base_url, path) == f"{base_url}{path}"
+
+
 def test_build_copilot_upstream_url_preserves_v1_messages_for_copilot() -> None:
     # Copilot's Anthropic surface for Claude models is /v1/messages (with the
     # /v1); stripping it forwarded /messages and Copilot 404'd (#2409).
