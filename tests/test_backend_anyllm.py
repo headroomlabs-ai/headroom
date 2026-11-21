@@ -870,6 +870,27 @@ def test_error_response_maps_sdk_rate_limit_error_without_status(
     assert response.body["error"]["type"] == "rate_limit_error"
 
 
+@pytest.mark.parametrize(
+    ("openai_format", "error_type"),
+    [(True, "model_not_found"), (False, "not_found_error")],
+)
+def test_error_response_maps_sdk_model_not_found_error_without_status(
+    monkeypatch: pytest.MonkeyPatch, openai_format: bool, error_type: str
+) -> None:
+    handler = pytest.importorskip("any_llm.utils.exception_handler")
+    backend, _instance = make_backend(monkeypatch)
+
+    converted = handler.convert_exception(
+        RuntimeError("The model requested does not exist"), "test-provider"
+    )
+    assert type(converted).__name__ == "ModelNotFoundError"
+
+    response = backend._error_response(converted, openai_format=openai_format)
+
+    assert response.status_code == 404
+    assert response.body["error"]["type"] == error_type
+
+
 @pytest.mark.asyncio
 async def test_close_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)

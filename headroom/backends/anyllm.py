@@ -621,6 +621,10 @@ class AnyLLMBackend(Backend):
             # Typed throttling without a usable status (any-llm's RateLimitError).
             error_type = "rate_limit_exceeded" if openai_format else "rate_limit_error"
             status_code = 429
+        elif any(c.__name__ == "ModelNotFoundError" for x in chain for c in type(x).__mro__):
+            # Typed unknown model without a usable status (any-llm's ModelNotFoundError).
+            error_type = "model_not_found" if openai_format else "not_found_error"
+            status_code = 404
         elif _RATE_LIMIT_RE.search(error_str):
             error_type = "rate_limit_exceeded" if openai_format else "rate_limit_error"
             status_code = 429
