@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,6 +50,52 @@ if TYPE_CHECKING:
     from headroom.memory.models import Memory
 
 logger = logging.getLogger(__name__)
+
+# Same heading rule as the bridge parsers, so exported bullets re-import under their topic.
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+
+
+def _merge_bullets_into_markdown(
+    existing_content: str, bullets_by_topic: dict[str, list[str]]
+) -> str:
+    """Insert each topic's bullets into its existing section, appending missing sections.
+
+    A topic matches the first heading, of any level, whose text equals the topic. Its
+    bullets go after the heading's own content, before the next heading, so they never
+    land under a later section or a sub-heading.
+    """
+    lines = existing_content.splitlines()
+    headings = [
+        (index, match.group(2).strip())
+        for index, line in enumerate(lines)
+        if (match := _HEADING_RE.match(line))
+    ]
+    inserts: dict[int, list[str]] = defaultdict(list)
+    appended: list[str] = []
+
+    for topic, bullets in bullets_by_topic.items():
+        position = next(
+            (pos for pos, (_, text) in enumerate(headings) if text == topic.strip()), None
+        )
+        if position is None:
+            appended.append(f"\n## {topic}")
+            appended.extend(bullets)
+            continue
+
+        start = headings[position][0] + 1
+        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+        while end > start and not lines[end - 1].strip():
+            end -= 1
+        inserts[end].extend(bullets)
+
+    merged: list[str] = []
+    for index, line in enumerate(lines):
+        merged.extend(inserts.get(index, ()))
+        merged.append(line)
+    merged.extend(inserts.get(len(lines), ()))
+
+    append_text = "\n".join(appended) + "\n" if appended else ""
+    return "\n".join(merged).rstrip() + "\n" + append_text
 
 
 # ---------------------------------------------------------------------------
@@ -606,8 +653,8 @@ class MemoryBridge:
     ) -> int:
         """Append new memories to an existing markdown file.
 
-        Reads the file, appends memories under appropriate sections,
-        writes back. Returns count of memories appended.
+        Reads the file, inserts memories into their existing sections (appending a
+        section for a topic without one), writes back. Returns count of memories appended.
         """
         if not memories:
             return 0
@@ -622,29 +669,23 @@ class MemoryBridge:
 
         # Group new memories by topic
         grouped = self._group_memories_by_topic(memories)
-        lines_to_append: list[str] = []
+        bullets_by_topic: dict[str, list[str]] = {}
 
         for topic, topic_memories in grouped.items():
-            # Check if section already exists in the file
-            section_exists = f"## {topic}" in existing_content
-
-            if not section_exists:
-                lines_to_append.append(f"\n## {topic}")
-
+            bullets: list[str] = []
             for memory in topic_memories:
                 content = memory.content.strip()
                 first_line = content.split("\n")[0].strip()
                 if first_line.startswith("- "):
-                    lines_to_append.append(first_line)
+                    bullets.append(first_line)
                 else:
-                    lines_to_append.append(f"- {first_line}")
+                    bullets.append(f"- {first_line}")
+            bullets_by_topic[topic] = bullets
 
-        if not lines_to_append:
+        if not bullets_by_topic:
             return 0
 
-        # Append to file
-        append_text = "\n".join(lines_to_append) + "\n"
-        new_content = existing_content.rstrip() + "\n" + append_text
+        new_content = _merge_bullets_into_markdown(existing_content, bullets_by_topic)
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

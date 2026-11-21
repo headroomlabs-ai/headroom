@@ -318,6 +318,79 @@ class TestRelationshipExtraction:
         assert uses_rels[0]["destination"] == long_dst
 
 
+class TestMarkdownSectionMerge:
+    """Exported bullets join their exact heading's own content (pure function)."""
+
+    @pytest.mark.parametrize(
+        ("existing", "expected"),
+        [
+            pytest.param(
+                "## Facts\n- a\n\n## Updates\n- b\n",
+                "## Facts\n- a\n- new\n\n## Updates\n- b\n",
+                id="heading-above-last-section",
+            ),
+            pytest.param(
+                "## Facts and figures\n- a\n- see ## Facts\n",
+                "## Facts and figures\n- a\n- see ## Facts\n\n## Facts\n- new\n",
+                id="exact-heading-only",
+            ),
+            pytest.param(
+                "## Facts\n- a\n### Details\n- d\n## Updates\n- b\n",
+                "## Facts\n- a\n- new\n### Details\n- d\n## Updates\n- b\n",
+                id="before-sub-heading",
+            ),
+            pytest.param(
+                "## Facts\r\n- a\r\n\r\n## Updates\r\n- b\r\n",
+                "## Facts\n- a\n- new\n\n## Updates\n- b\n",
+                id="crlf",
+            ),
+            pytest.param(
+                "## Facts\n- a\n## Updates\n- b\n## Facts\n- e\n",
+                "## Facts\n- a\n- new\n## Updates\n- b\n## Facts\n- e\n",
+                id="first-duplicate-heading",
+            ),
+            pytest.param("## Facts\n- a", "## Facts\n- a\n- new\n", id="no-trailing-newline"),
+            pytest.param(
+                "## Facts\n- a\n\n\n", "## Facts\n- a\n- new\n", id="trailing-blank-lines"
+            ),
+            pytest.param("## Facts  \n- a\n", "## Facts  \n- a\n- new\n", id="heading-whitespace"),
+            pytest.param(
+                "## Facts\n## Updates\n- b\n",
+                "## Facts\n- new\n## Updates\n- b\n",
+                id="empty-section",
+            ),
+            pytest.param("", "\n\n## Facts\n- new\n", id="empty-file"),
+            pytest.param(
+                "## Updates\n- b\n", "## Updates\n- b\n\n## Facts\n- new\n", id="missing-section"
+            ),
+        ],
+    )
+    def test_merge_places_bullets_in_matching_section(self, existing, expected):
+        from headroom.memory.bridge import _merge_bullets_into_markdown
+
+        assert _merge_bullets_into_markdown(existing, {"Facts": ["- new"]}) == expected
+
+    def test_merge_matches_sub_heading_topic_and_reimports_by_section(self):
+        from headroom.memory.bridge import _merge_bullets_into_markdown
+
+        merged = _merge_bullets_into_markdown(
+            "## Facts\n- a\n### Details\n- d\n\n## Updates\n- b\n",
+            {"Details": ["- detail"], "Facts": ["- fact"], "General": ["- general"]},
+        )
+
+        assert merged == (
+            "## Facts\n- a\n- fact\n### Details\n- d\n- detail\n\n## Updates\n- b\n"
+            "\n## General\n- general\n"
+        )
+        sections = {s.heading: s.facts for s in parse_claude_code_memory(merged).sections}
+        assert sections == {
+            "Facts": ["a", "fact"],
+            "Details": ["d", "detail"],
+            "Updates": ["b"],
+            "General": ["general"],
+        }
+
+
 # =============================================================================
 # Bridge Tests (require backend)
 # =============================================================================
@@ -596,6 +669,56 @@ class TestMemoryBridgeSync:
         content = md_path.read_text(encoding="utf-8")
         assert content.count("Release label is cobalt-47") == 1
         assert content.count("Project uses SQLite") == 1
+
+        # A restarted bridge reloads the saved cutoff and file hash, so nothing replays.
+        from headroom.memory.bridge import MemoryBridge
+
+        restarted = MemoryBridge(bridge._config, backend)
+        repeat = await restarted.sync(user_id="test_user")
+
+        assert repeat.import_stats.files_skipped_unchanged == 1
+        assert repeat.import_stats.sections_imported == 0
+        assert repeat.memories_exported == 0
+        assert md_path.read_text(encoding="utf-8") == content
+
+    @pytest.mark.asyncio
+    async def test_sync_inserts_export_into_existing_section_above_last_heading(
+        self, bridge, tmp_dir, backend
+    ):
+        """An exported memory joins its own section, not the file's last heading."""
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+
+        organic = await backend.save_memory(
+            content="Release label is cobalt-47",
+            user_id="test_user",
+            metadata={"topic": "Facts"},
+        )
+        created_at = organic.created_at.replace(tzinfo=timezone.utc)
+        bridge._sync_state["last_sync"] = (created_at - timedelta(minutes=1)).isoformat()
+        bridge._save_sync_state()
+        md_path.write_text(
+            "## Facts\n- User likes Python\n\n## Updates\n- Project uses SQLite\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = created_at + timedelta(minutes=1)
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.memories_exported == 1
+        content = md_path.read_text(encoding="utf-8")
+        assert content == (
+            "## Facts\n- User likes Python\n- Release label is cobalt-47\n\n"
+            "## Updates\n- Project uses SQLite\n"
+        )
+        sections = {s.heading: s.facts for s in parse_markdown(content, str(md_path)).sections}
+        assert sections["Facts"] == ["User likes Python", "Release label is cobalt-47"]
+        assert sections["Updates"] == ["Project uses SQLite"]
 
     @pytest.mark.asyncio
     async def test_first_sync_exports_existing_organic_memory(self, bridge, tmp_dir, backend):
