@@ -1507,13 +1507,26 @@ class CostTracker:
         # supplied names created 250 entries). A request whose label folded
         # into ``other`` is skipped here: its dollars are priced once by
         # ``_book_folded_usd`` above, and capturing them again would
-        # double-count them.
-        if key != OTHER_MODEL and key != OTHER_PASSTHROUGH_MODEL:
-            if fixed_pricing is not None:
-                self._fixed_pricing_by_model[key] = fixed_pricing
+        # double-count them. A request literally NAMED ``other`` is not
+        # folded -- it is a selected request, and its spend is captured here
+        # (#3825 re-review): the folded path above never ran for it, so
+        # skipping it left its dollars in the ledger but $0.00 in totals().
+        # Its price is resolved from the already-selected ``fixed_pricing``
+        # directly and is NOT stored in ``_fixed_pricing_by_model``: that map
+        # is consulted for folded models too, and an ``other`` entry there
+        # would misprice folded traffic -- and double-count folded savings
+        # in stats() -- at this request's rate.
+        if (key != OTHER_MODEL and key != OTHER_PASSTHROUGH_MODEL) or model == OTHER_MODEL:
+            if key != OTHER_MODEL:
+                if fixed_pricing is not None:
+                    self._fixed_pricing_by_model[key] = fixed_pricing
+                else:
+                    self._fixed_pricing_by_model.pop(key, None)
+            if model == OTHER_MODEL and fixed_pricing is not None:
+                input_price = fixed_pricing[0] / 1_000_000
+                rates = (0.5 * input_price, input_price, input_price, input_price)
             else:
-                self._fixed_pricing_by_model.pop(key, None)
-            rates = self._get_cache_prices(model, long_context=long_context)
+                rates = self._get_cache_prices(model, long_context=long_context)
             if rates is not None:
                 read_price, write_5m_price, write_1h_price, input_price = rates
                 if cache_read_tokens or write_eff or uncached_tokens:
@@ -1530,7 +1543,10 @@ class CostTracker:
                 self._input_spend_by_model[key] = (
                     self._input_spend_by_model.get(key, 0.0) + input_spend
                 )
-            output_price = self._get_output_price(model, long_context=long_context)
+            if model == OTHER_MODEL and fixed_pricing is not None:
+                output_price = fixed_pricing[1] / 1_000_000
+            else:
+                output_price = self._get_output_price(model, long_context=long_context)
             if output_price is not None:
                 self._output_spend_by_model[key] = (
                     self._output_spend_by_model.get(key, 0.0) + max(0, output_tokens) * output_price
