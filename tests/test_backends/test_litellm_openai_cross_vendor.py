@@ -14,6 +14,7 @@ Contract pinned here:
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -138,6 +139,16 @@ async def test_tool_call_round_trip_on_an_openai_model() -> None:
         ({"thinking": {"type": "enabled", "budget_tokens": 2048}}, "medium"),
         ({"thinking": {"type": "enabled", "budget_tokens": 31999}}, "high"),
         ({"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}, "low"),
+        # A malformed effort falls back to the thinking config instead of failing.
+        ({"output_config": {"effort": []}}, None),
+        ({"output_config": {"effort": {"x": 1}}}, None),
+        (
+            {
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "output_config": {"effort": []},
+            },
+            "medium",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -226,6 +237,10 @@ def _call(arguments: str, *, opening: bool) -> SimpleNamespace:
         ('{"city":"Paris"}', ['{"cit', 'y":"P', 'aris"', "}"]),
         # Whole arguments and nothing after: sent once, before the block closes.
         ('{"city":"Paris"}', []),
+        # Whole arguments, then a fragment that is not a replay: both, in order.
+        ('{"city":"Paris"}', [" "]),
+        # A replay cut short: the held arguments, not the partial replay.
+        ('{"city":"Paris"}', ['{"cit']),
         # A prefix on the opening chunk is part of the stream, never held.
         ('{"ci', ['ty":"Paris"}']),
         # The usual chat-completions shape.
@@ -253,7 +268,8 @@ async def test_streamed_tool_arguments_reach_the_client_once(
         events = [e.data async for e in backend.stream_message(body, {})]
 
     sent = "".join(e["delta"]["partial_json"] for e in events if e["type"] == "content_block_delta")
-    assert sent == '{"city":"Paris"}'
+    assert json.loads(sent) == {"city": "Paris"}
+    assert sent.count("Paris") == 1
     stop = next(i for i, e in enumerate(events) if e["type"] == "content_block_stop")
     assert all(e["type"] != "content_block_delta" for e in events[stop:])
 

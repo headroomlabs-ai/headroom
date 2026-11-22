@@ -825,7 +825,7 @@ def _openai_reasoning_effort(body: dict[str, Any]) -> str | None:
     """
     output_config = body.get("output_config")
     effort = output_config.get("effort") if isinstance(output_config, dict) else None
-    if effort in _OPENAI_EFFORT:
+    if isinstance(effort, str) and effort in _OPENAI_EFFORT:
         return _OPENAI_EFFORT[effort]
     thinking = body.get("thinking")
     if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
@@ -1681,12 +1681,16 @@ class LiteLLMBackend(Backend):
             # block index. Some streams (GPT-6 models through litellm's Responses
             # bridge) send the full arguments there and then the same arguments
             # again as deltas; forwarding both gives the client the JSON twice.
-            # Held until either deltas follow (a replay: dropped) or the block
-            # closes (sent then).
+            # Later deltas count as a replay only while together they are still
+            # a prefix of the held arguments (``replayed``). The held arguments
+            # are sent once: when the replay completes, when a delta departs from
+            # them (followed by what came after), or when the block closes.
             held_arguments: dict[int, str] = {}
+            replayed: dict[int, str] = {}
 
             def _release_held(block_idx: int) -> list[StreamEvent]:
                 nonlocal output_tokens
+                replayed.pop(block_idx, None)
                 arguments = held_arguments.pop(block_idx, None)
                 if arguments is None:
                     return []
@@ -1901,10 +1905,23 @@ class LiteLLMBackend(Backend):
                         # Emit argument deltas
                         if tc.function and tc.function.arguments:
                             block_idx = tool_block_map[idx]
-                            if opening and _is_complete_json(tc.function.arguments):
-                                held_arguments[block_idx] = tc.function.arguments
+                            arguments = tc.function.arguments
+                            if opening and _is_complete_json(arguments):
+                                held_arguments[block_idx] = arguments
                                 continue
-                            held_arguments.pop(block_idx, None)  # deltas replay it
+                            held = held_arguments.get(block_idx)
+                            if held is not None:
+                                so_far = replayed.get(block_idx, "") + arguments
+                                if held.startswith(so_far):
+                                    replayed[block_idx] = so_far
+                                    if so_far == held:
+                                        for ev in _release_held(block_idx):
+                                            yield ev
+                                    continue
+                                # Not a replay: the held arguments, then what followed.
+                                held_arguments.pop(block_idx)
+                                replayed.pop(block_idx, None)
+                                arguments = held + so_far
                             yield StreamEvent(
                                 event_type="content_block_delta",
                                 data={
@@ -1912,7 +1929,7 @@ class LiteLLMBackend(Backend):
                                     "index": block_idx,
                                     "delta": {
                                         "type": "input_json_delta",
-                                        "partial_json": tc.function.arguments,
+                                        "partial_json": arguments,
                                     },
                                 },
                             )
