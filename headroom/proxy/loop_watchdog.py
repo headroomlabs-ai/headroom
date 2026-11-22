@@ -42,7 +42,9 @@ from __future__ import annotations
 import asyncio
 import faulthandler
 import logging
+import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -63,13 +65,30 @@ _MIN_HEARTBEAT_SECS = 0.05
 # leaves a readable log instead of a megabyte of identical stacks.
 _REDUMP_EVERY = 1.0
 
-_started = threading.Event()
-_stop = threading.Event()
+# Per-lifespan state. The watchdog is process-global but its heartbeat belongs to
+# one running proxy lifespan, so start/stop must be restartable: an embedded app
+# that stops its proxy and starts another inside the same interpreter would
+# otherwise keep a lifecycle guard from the first run and serve with no stall
+# monitoring at all.
+_lifecycle_lock = threading.Lock()
+_stop: threading.Event | None = None
+_monitor_thread: threading.Thread | None = None
+_reporter_thread: threading.Thread | None = None
 # Strong reference to the heartbeat task. ``asyncio`` only keeps a weak one, so
 # a fire-and-forget task can be collected mid-flight and the loop would look
 # stalled forever -- the watchdog would then dump stacks at every proxy that
 # armed it successfully.
 _heartbeat_task: asyncio.Task[None] | None = None
+
+# Reporting never happens on the monitor thread directly. Python logging
+# serialises emission per handler, and the proxy installs a *synchronous*
+# rotating file handler, so a loop thread blocked in logging I/O holds that
+# handler's lock -- exactly the situation worth dumping a stack for. A monitor
+# that logs first would then wait on the same lock and reach its dump only after
+# the loop unblocked, i.e. never while it mattered. So the monitor dumps first
+# and hands the message to this thread, which absorbs the blocking.
+_LOG_QUEUE_MAX = 64
+_log_queue: queue.Queue[tuple[int, str, tuple[Any, ...]]] | None = None
 
 # Stall bookkeeping shared with ``/health`` through :func:`snapshot`. Written by
 # the monitor thread and the heartbeat task, read by the loop thread, so every
@@ -96,6 +115,13 @@ def _resolve_secs() -> float:
     except ValueError:
         logger.warning("Ignoring non-numeric %s=%r; using %ss", ENV_VAR, raw, DEFAULT_SECS)
         return DEFAULT_SECS
+    # ``nan``/``inf`` parse fine and then poison everything downstream: a nan
+    # threshold makes every comparison false, so the watchdog arms and never
+    # reports, and it reaches ``/health`` and ``/readyz`` where json.dumps emits
+    # a bare ``NaN`` token that strict parsers reject. Fall back to the default.
+    if not math.isfinite(secs):
+        logger.warning("Ignoring non-finite %s=%r; using %ss", ENV_VAR, raw, DEFAULT_SECS)
+        return DEFAULT_SECS
     if secs <= 0:
         return 0.0
     return max(secs, MIN_SECS)
@@ -115,6 +141,16 @@ def _stderr_fd() -> int | None:
         return None
 
 
+def _finite(value: float) -> float:
+    """Never let a non-finite number reach an HTTP payload.
+
+    ``json.dumps`` renders ``nan``/``inf`` as the bare tokens ``NaN``/``Infinity``,
+    which ``allow_nan=False`` rejects and which many clients refuse to parse, so a
+    single bad number would break ``/health`` for the whole proxy.
+    """
+    return value if math.isfinite(value) else 0.0
+
+
 def snapshot() -> dict[str, Any]:
     """Return the watchdog's current view for ``/health``.
 
@@ -125,16 +161,53 @@ def snapshot() -> dict[str, Any]:
     with _stats_lock:
         threshold = _threshold_seconds
         last = _last_tick
-        stalled_for = (now - last) if last > 0.0 else 0.0
-        current_stall = stalled_for if threshold > 0.0 and stalled_for >= threshold else 0.0
-        return {
-            "enabled": _enabled,
-            "stall_threshold_seconds": threshold,
-            "current_stall_seconds": round(current_stall, 2),
-            "stalls_total": _stalls_total,
-            "stall_seconds_max": round(_stall_seconds_max, 2),
-            "last_stall_seconds": round(_last_stall_seconds, 2),
-        }
+        stalls_total = _stalls_total
+        seconds_max = _stall_seconds_max
+        last_stall = _last_stall_seconds
+        enabled = _enabled
+    stalled_for = (now - last) if last > 0.0 else 0.0
+    current_stall = stalled_for if threshold > 0.0 and stalled_for >= threshold else 0.0
+    return {
+        "enabled": enabled,
+        "stall_threshold_seconds": _finite(threshold),
+        "current_stall_seconds": round(_finite(current_stall), 2),
+        "stalls_total": stalls_total,
+        "stall_seconds_max": round(_finite(seconds_max), 2),
+        "last_stall_seconds": round(_finite(last_stall), 2),
+    }
+
+
+def _report(level: int, msg: str, *args: Any) -> None:
+    """Hand a log record to the reporter thread; never block, never raise."""
+    queue_ = _log_queue
+    if queue_ is None:
+        try:
+            logger.log(level, msg, *args)
+        except Exception:  # pragma: no cover - diagnostics must never raise
+            pass
+        return
+    try:
+        queue_.put_nowait((level, msg, args))
+    except queue.Full:
+        # Logging is wedged. The stack dump already written by the caller is the
+        # diagnostic that matters; dropping the annotation beats a stuck monitor.
+        pass
+
+
+def _reporter(stop: threading.Event) -> None:
+    """Emit queued records, absorbing any block in the logging handlers."""
+    while not stop.is_set():
+        queue_ = _log_queue
+        if queue_ is None:
+            return
+        try:
+            level, msg, args = queue_.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            logger.log(level, msg, *args)
+        except Exception:  # pragma: no cover - diagnostics must never raise
+            pass
 
 
 def _dump_stacks(fd: int | None) -> None:
@@ -146,16 +219,17 @@ def _dump_stacks(fd: int | None) -> None:
     of the dump is to outlive the process that produced it.
     """
     if fd is None:
-        logger.warning(
+        _report(
+            logging.WARNING,
             "event=proxy_event_loop_stall_dump_skipped reason=no_stderr_fd "
             "detail=stderr has no usable fileno (captured or replaced); "
-            "stack dump unavailable"
+            "stack dump unavailable",
         )
         return
     try:
         faulthandler.dump_traceback(file=fd, all_threads=True)
     except (OSError, ValueError, RuntimeError) as exc:
-        logger.warning("event=proxy_event_loop_stall_dump_failed error=%r", exc)
+        _report(logging.WARNING, "event=proxy_event_loop_stall_dump_failed error=%r", exc)
 
 
 def _begin_stall(last_tick: float, stalled_for: float, threshold: float, fd: int | None) -> None:
@@ -166,22 +240,25 @@ def _begin_stall(last_tick: float, stalled_for: float, threshold: float, fd: int
         _last_stall_seconds = stalled_for
         if stalled_for > _stall_seconds_max:
             _stall_seconds_max = stalled_for
-    logger.error(
+    # Dump first, log second: the dump is the whole point and must not queue
+    # behind a logging handler the blocked loop thread may be holding.
+    _dump_stacks(fd)
+    _report(
+        logging.ERROR,
         "event=proxy_event_loop_stall pid=%d stall_seconds=%.1f "
         "threshold_seconds=%.1f detail=event loop has not run a callback; asyncio "
         "timeouts (compression deadline, pre-upstream acquire) cannot fire and "
-        "in-flight requests are frozen; dumping all thread stacks to the proxy log",
+        "in-flight requests are frozen; stack dump written above",
         os.getpid(),
         stalled_for,
         threshold,
     )
-    _dump_stacks(fd)
 
 
-def _monitor(threshold: float, poll: float, fd: int | None) -> None:
+def _monitor(threshold: float, poll: float, fd: int | None, stop: threading.Event) -> None:
     in_stall = False
     last_dump_at = 0.0
-    while not _stop.wait(poll):
+    while not stop.wait(poll):
         now = time.monotonic()
         with _stats_lock:
             last_tick = _last_tick
@@ -195,12 +272,13 @@ def _monitor(threshold: float, poll: float, fd: int | None) -> None:
             _begin_stall(last_tick, stalled_for, threshold, fd)
         elif now - last_dump_at >= threshold * _REDUMP_EVERY:
             last_dump_at = now
-            logger.error(
+            _dump_stacks(fd)
+            _report(
+                logging.ERROR,
                 "event=proxy_event_loop_stall_still_wedged pid=%d stall_seconds=%.1f",
                 os.getpid(),
                 stalled_for,
             )
-            _dump_stacks(fd)
 
 
 async def _heartbeat(threshold: float) -> None:
@@ -222,7 +300,8 @@ async def _heartbeat(threshold: float) -> None:
                 _last_stall_seconds = duration
                 if duration > _stall_seconds_max:
                     _stall_seconds_max = duration
-            logger.warning(
+            _report(
+                logging.WARNING,
                 "event=proxy_event_loop_stall_recovered pid=%d stall_seconds=%.1f "
                 "detail=event loop resumed; the stack dump above covers the window "
                 "the loop was frozen",
@@ -231,40 +310,80 @@ async def _heartbeat(threshold: float) -> None:
             )
 
 
-def start_loop_watchdog() -> bool:
-    """Arm the event-loop watchdog for this process. Returns True when armed.
-
-    Safe to call more than once; the first call wins. Needs a running loop (it
-    schedules the heartbeat on it). Never raises: a proxy that cannot arm its
-    own diagnostic must still serve traffic.
-    """
-    global _enabled, _threshold_seconds, _last_tick
-    if _started.is_set():
-        return _enabled
-    secs = _resolve_secs()
-    if not secs:
-        logger.info("Event-loop watchdog disabled (%s=0)", ENV_VAR)
-        _started.set()
-        return False
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        logger.debug("Event-loop watchdog not armed: no running event loop")
-        return False
-
-    _started.set()
+def _stop_current_lifecycle() -> None:
+    """Tear down the current monitor/reporter/heartbeat. Expects the lock."""
+    global _enabled, _last_tick, _stall_started_at, _heartbeat_task
+    global _stop, _monitor_thread, _reporter_thread, _log_queue
+    stop = _stop
+    _stop = None
+    _monitor_thread = None
+    _reporter_thread = None
+    _log_queue = None
+    if stop is not None:
+        stop.set()
+    task = _heartbeat_task
+    _heartbeat_task = None
+    if task is not None and not task.done():
+        try:
+            task.cancel()
+        except RuntimeError:  # pragma: no cover - loop already closed
+            pass
     with _stats_lock:
-        _enabled = True
-        _threshold_seconds = secs
-        _last_tick = time.monotonic()
-    global _heartbeat_task
-    _heartbeat_task = loop.create_task(_heartbeat(secs), name="headroom-loop-watchdog-heartbeat")
-    threading.Thread(
-        target=_monitor,
-        args=(secs, max(secs / _HEARTBEAT_DIVISOR, _MIN_HEARTBEAT_SECS), _stderr_fd()),
-        name="headroom-loop-watchdog",
-        daemon=True,
-    ).start()
+        _enabled = False
+        _last_tick = 0.0
+        _stall_started_at = 0.0
+
+
+def start_loop_watchdog() -> bool:
+    """Arm the event-loop watchdog for the current lifespan. True when armed.
+
+    Restartable: a previous lifespan's monitor is stopped and a fresh one armed,
+    so an embedded app that stops its proxy and starts another keeps its
+    diagnostics. Re-arming while the monitor is already alive is a no-op. Needs
+    a running loop (it schedules the heartbeat on it). Never raises: a proxy
+    that cannot arm its own diagnostic must still serve traffic.
+    """
+    global _enabled, _threshold_seconds, _last_tick, _heartbeat_task
+    global _stop, _monitor_thread, _reporter_thread, _log_queue
+    with _lifecycle_lock:
+        if _monitor_thread is not None and _monitor_thread.is_alive():
+            return _enabled
+        secs = _resolve_secs()
+        if not secs:
+            _stop_current_lifecycle()
+            logger.info("Event-loop watchdog disabled (%s=0)", ENV_VAR)
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("Event-loop watchdog not armed: no running event loop")
+            return False
+
+        _stop_current_lifecycle()
+        stop = threading.Event()
+        _log_queue = queue.Queue(maxsize=_LOG_QUEUE_MAX)
+        with _stats_lock:
+            _enabled = True
+            _threshold_seconds = secs
+            _last_tick = time.monotonic()
+        _stop = stop
+        _reporter_thread = threading.Thread(
+            target=_reporter,
+            args=(stop,),
+            name="headroom-loop-watchdog-reporter",
+            daemon=True,
+        )
+        _reporter_thread.start()
+        _monitor_thread = threading.Thread(
+            target=_monitor,
+            args=(secs, max(secs / _HEARTBEAT_DIVISOR, _MIN_HEARTBEAT_SECS), _stderr_fd(), stop),
+            name="headroom-loop-watchdog",
+            daemon=True,
+        )
+        _monitor_thread.start()
+        _heartbeat_task = loop.create_task(
+            _heartbeat(secs), name="headroom-loop-watchdog-heartbeat"
+        )
     logger.info(
         "Event-loop watchdog armed: log and stack-dump if the loop runs no "
         "callback for %.0fs (%s to tune, 0 to disable)",
@@ -276,27 +395,15 @@ def start_loop_watchdog() -> bool:
 
 def stop_loop_watchdog() -> None:
     """Stop the monitor thread and the heartbeat. Idempotent; used by shutdown."""
-    global _enabled, _last_tick, _stall_started_at, _heartbeat_task
-    _stop.set()
-    task = _heartbeat_task
-    _heartbeat_task = None
-    if task is not None and not task.done():
-        task.cancel()
-    with _stats_lock:
-        _enabled = False
-        _last_tick = 0.0
-        _stall_started_at = 0.0
+    with _lifecycle_lock:
+        _stop_current_lifecycle()
 
 
 def _reset_for_test() -> None:
     """Reset module state so a test can arm the watchdog again in-process."""
-    global _started, _stop, _heartbeat_task
     global _enabled, _threshold_seconds, _last_tick
     global _stall_started_at, _stall_seconds_max, _last_stall_seconds, _stalls_total
     stop_loop_watchdog()
-    _heartbeat_task = None
-    _started = threading.Event()
-    _stop = threading.Event()
     with _stats_lock:
         _enabled = False
         _threshold_seconds = 0.0

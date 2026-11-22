@@ -18,6 +18,8 @@ stand-in for the GIL-releasing native initialization that parks in the report
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import subprocess
 import sys
@@ -61,6 +63,78 @@ _HEALTHY_LOOP = textwrap.dedent(
     """
 )
 
+# A logging handler whose lock is held by the blocked loop thread -- the shape of
+# the proxy's synchronous rotating file handler with an unresponsive filesystem.
+# The monitor must still reach its stack dump (#4967 review).
+_STALLED_LOOP_WITH_HELD_LOG_LOCK = textwrap.dedent(
+    """
+    import asyncio, logging, os, sys, time, threading
+    from headroom.proxy.loop_watchdog import start_loop_watchdog
+
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+
+    class BlockingHandler(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.armed = False
+            self.released = False
+
+        def emit(self, record):
+            # Only the loop thread's records block, and only once armed; the
+            # reporter thread must not add a second confounder, and arming must
+            # not deadlock start_loop_watchdog's own "armed" line.
+            if self.armed and threading.current_thread().name == "MainThread":
+                while not self.released:
+                    time.sleep(0.05)
+
+    handler = BlockingHandler()
+    logging.getLogger().addHandler(handler)
+
+    def mark_later(delay, text):
+        # Timestamp a point in the stream without touching logging.
+        time.sleep(delay)
+        os.write(2, (text + "MARKLINE").encode())
+
+    async def main():
+        assert start_loop_watchdog()
+        await asyncio.sleep(0.2)  # let the reporter thread start
+        threading.Thread(target=mark_later, args=(3.5, "STALL_MARK"), daemon=True).start()
+        handler.armed = True
+        handler.acquire()  # loop thread holds the handler lock while it stalls
+        time.sleep(6)
+        handler.released = True
+        handler.release()
+        print("TICKED", flush=True)
+        await asyncio.sleep(0.5)
+
+    asyncio.run(main())
+    """
+)
+
+# Start, stop, start again inside one interpreter: the second lifespan must
+# still detect a blocked loop (review: the old start guard was terminal).
+_RESTART_LIFESPAN = textwrap.dedent(
+    """
+    import asyncio, logging, sys, time
+    from headroom.proxy.loop_watchdog import start_loop_watchdog, stop_loop_watchdog
+
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+
+    async def lifespan(marker):
+        assert start_loop_watchdog(), marker
+        time.sleep(3)  # block the loop: this lifespan must report a stall
+        await asyncio.sleep(0.3)
+        print(marker, flush=True)
+        stop_loop_watchdog()
+
+    async def main():
+        await lifespan("FIRST")
+        await lifespan("SECOND")
+
+    asyncio.run(main())
+    """
+)
+
 
 def _subprocess_env(**extra: str) -> dict[str, str]:
     """Full environment plus overrides.
@@ -90,6 +164,50 @@ def test_resolve_secs_defaults_and_clamps(monkeypatch):
 
     monkeypatch.setenv("HEADROOM_LOOP_WATCHDOG_SECS", "not-a-number")
     assert _resolve_secs() == DEFAULT_SECS
+
+
+def test_resolve_secs_rejects_non_finite(monkeypatch):
+    """``nan``/``inf`` parse fine and must not be allowed to arm.
+
+    A nan threshold makes every ``stalled_for >= threshold`` comparison false, so
+    the watchdog arms and silently never reports; and the value reaches
+    ``/health`` and ``/readyz``, where ``json.dumps`` emits a bare ``NaN`` token
+    that strict parsers reject. Falling back to the finite default keeps both
+    true.
+    """
+    for raw in ("nan", "NaN", "-nan", "inf", "-inf", "Infinity", "1e999"):
+        monkeypatch.setenv("HEADROOM_LOOP_WATCHDOG_SECS", raw)
+        assert math.isfinite(_resolve_secs()), raw
+        assert _resolve_secs() == DEFAULT_SECS, raw
+
+
+def test_snapshot_is_strict_json():
+    """Nothing non-finite may reach the HTTP payload, even if state goes bad.
+
+    ``/health`` and ``/readyz`` serve ``snapshot()`` verbatim and both are what
+    orchestration probes parse. ``round(nan, 2)`` stays nan, so the guard has to
+    be explicit.
+    """
+    from headroom.proxy import loop_watchdog
+
+    assert json.dumps(snapshot(), allow_nan=False)
+    loop_watchdog._reset_for_test()
+    try:
+        with loop_watchdog._stats_lock:
+            loop_watchdog._threshold_seconds = float("nan")
+            loop_watchdog._stall_seconds_max = float("nan")
+            loop_watchdog._last_stall_seconds = float("inf")
+        payload = snapshot()
+        assert json.dumps(payload, allow_nan=False)  # must not raise
+        for key in (
+            "stall_threshold_seconds",
+            "current_stall_seconds",
+            "stall_seconds_max",
+            "last_stall_seconds",
+        ):
+            assert math.isfinite(payload[key]), key
+    finally:
+        loop_watchdog._reset_for_test()
 
 
 def test_snapshot_is_inert_before_arming():
@@ -155,6 +273,95 @@ def test_healthy_loop_is_never_reported():
     assert proc.returncode == 0, proc.stderr
     assert "SURVIVED" in proc.stdout
     assert "proxy_event_loop_stall" not in proc.stderr
+
+
+def test_stack_dump_survives_a_wedged_log_handler():
+    """Logging must never gate the dump.
+
+    The proxy installs a synchronous rotating file handler. If the loop thread
+    blocks inside it, it holds the handler lock -- so a monitor that logs before
+    dumping would wait on that same lock and produce nothing for the duration of
+    the stall, which is exactly the outage this watchdog exists to explain. The
+    dump therefore comes first and the record goes to a reporter thread.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _STALLED_LOOP_WITH_HELD_LOG_LOCK],
+        env=_subprocess_env(HEADROOM_LOOP_WATCHDOG_SECS="1"),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "TICKED" in proc.stdout
+
+    # The discriminating assertion is the *order*: the dump must land while the
+    # loop still holds the logging lock (marker written at 3.5s, lock released at
+    # 6.2s). Logging-then-dumping writes it after the marker instead.
+    stderr = proc.stderr
+    dump_at = stderr.find("Thread 0x")
+    assert dump_at >= 0, stderr
+    assert "asyncio" in stderr[dump_at:]
+    mark_at = stderr.find("STALL_MARK")
+    assert mark_at >= 0, stderr
+    assert dump_at < mark_at, (
+        "stack dump did not precede the marker: the monitor waited for the "
+        + "logging handler lock instead of dumping first\n"
+        + stderr
+    )
+
+
+def test_watchdog_restarts_with_a_second_lifespan():
+    """Stop then start inside one interpreter must re-arm, not no-op.
+
+    An embedded app (or a test harness) can run two proxy lifespans in one
+    process; a terminal start guard left the second one unmonitored.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _RESTART_LIFESPAN],
+        env=_subprocess_env(HEADROOM_LOOP_WATCHDOG_SECS="1"),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "FIRST" in proc.stdout and "SECOND" in proc.stdout
+    assert proc.stderr.count("event=proxy_event_loop_stall pid=") == 2, proc.stderr
+
+
+def test_health_and_readyz_are_valid_json_with_nan_threshold(monkeypatch):
+    """Both probes must stay parseable when the env var is non-finite."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy import loop_watchdog
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import create_app
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_LOOP_WATCHDOG_SECS", "nan")
+    loop_watchdog._reset_for_test()
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    try:
+        with TestClient(app) as client:
+            for path in ("/health", "/readyz"):
+                response = client.get(path)
+                # allow_nan=False is the parser contract orchestration uses.
+                body = json.loads(json.dumps(response.json(), allow_nan=False))
+                watchdog = body["runtime"]["event_loop_watchdog"]
+                assert watchdog["stall_threshold_seconds"] == pytest.approx(DEFAULT_SECS)
+                for key, value in watchdog.items():
+                    if isinstance(value, float):
+                        assert math.isfinite(value), (path, key)
+    finally:
+        loop_watchdog._reset_for_test()
 
 
 def test_health_reports_watchdog_and_arming_flips_enabled(monkeypatch):
