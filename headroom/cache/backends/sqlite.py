@@ -152,22 +152,28 @@ class SQLiteBackend:
     def _open(self) -> sqlite3.Connection:
         self._ensure_private(self._path)
         conn = sqlite3.connect(self._path, check_same_thread=False)
-        # Wait for competing writers instead of failing with SQLITE_BUSY —
-        # multiple proxy workers share this file, and writes are frequent
-        # but tiny, so contention resolves in milliseconds.
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.executescript(_SCHEMA)
-        # Startup hygiene: expired rows are only purged opportunistically
-        # on writes, so a quiet store could otherwise hold expired
-        # originals (which may contain sensitive tool output) on disk
-        # indefinitely. Sweep them on every open.
-        conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (time.time(),),
-        )
-        conn.commit()
+        try:
+            # Wait for competing writers instead of failing with SQLITE_BUSY —
+            # multiple proxy workers share this file, and writes are frequent
+            # but tiny, so contention resolves in milliseconds.
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(_SCHEMA)
+            # Startup hygiene: expired rows are only purged opportunistically
+            # on writes, so a quiet store could otherwise hold expired
+            # originals (which may contain sensitive tool output) on disk
+            # indefinitely. Sweep them on every open.
+            conn.execute(
+                "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
+                (time.time(),),
+            )
+            conn.commit()
+        except BaseException:
+            # Close a half-set-up handle now, not at GC: a locked store is
+            # retried with backoff, and each failed open would leak one.
+            conn.close()
+            raise
         # Originals can contain sensitive tool output (file contents,
         # command output) — keep the database private to the user.
         for suffix in ("", "-wal", "-shm"):

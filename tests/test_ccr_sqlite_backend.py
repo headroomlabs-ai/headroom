@@ -899,3 +899,31 @@ class TestLockedAtStartup:
         monkeypatch.delenv("HEADROOM_COMPRESS_SESSION_STORE", raising=False)
         monkeypatch.setenv("HEADROOM_CCR_SQLITE_PATH", str(db_path))
         assert isinstance(_create_default_ccr_backend(), SQLiteBackend)
+
+    def test_failed_open_closes_its_connection(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        class LockedConnection(sqlite3.Connection):
+            closed = False
+
+            def execute(self, sql, *args):
+                if sql.startswith("PRAGMA journal_mode"):
+                    raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *args)
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        opened = []
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            conn = real_connect(*args, factory=LockedConnection, **kwargs)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(sqlite_mod.sqlite3, "connect", connect)
+        SQLiteBackend(db_path)
+        assert len(opened) == 1
+        assert opened[0].closed
