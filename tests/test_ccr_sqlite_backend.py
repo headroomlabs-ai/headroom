@@ -822,3 +822,80 @@ class TestProducerDuringOutage:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestLockedAtStartup:
+    """Another process (the previous revision in a rolling deploy) holds the
+    file when the backend is built: it starts down and retries the open with
+    backoff, instead of the factory falling back to memory for good."""
+
+    @pytest.fixture
+    def locked(self, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+        real_open = SQLiteBackend._open
+        state = {"failures_left": 0, "calls": 0}
+
+        def flaky_open(self):
+            state["calls"] += 1
+            if state["failures_left"]:
+                state["failures_left"] -= 1
+                raise sqlite3.OperationalError("database is locked")
+            return real_open(self)
+
+        monkeypatch.setattr(SQLiteBackend, "_open", flaky_open)
+        return clock, state
+
+    def test_open_succeeds_after_lock_is_released(self, db_path, locked):
+        clock, state = locked
+        state["failures_left"] = 3
+        backend = SQLiteBackend(db_path)
+        # Down: writes refused (the producer keeps the original), reads miss.
+        assert backend.set("h1", make_entry()) is False
+        assert backend.get("h1") is None
+        # Retries happen only when due (1s, 2s, ...): no busy loop.
+        calls = state["calls"]
+        for _ in range(50):
+            backend.get("h1")
+        assert state["calls"] == calls
+        for _ in range(3):
+            clock[0] += 60
+            backend.get("h1")
+        assert backend.set("h1", make_entry()) is True
+        assert backend.get("h1") is not None
+        assert state["calls"] == 4
+
+    def test_backoff_is_bounded_while_lock_is_held(self, db_path, locked):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        clock, state = locked
+        state["failures_left"] = 10**6
+        backend = SQLiteBackend(db_path)
+        start = state["calls"]
+        # Ten minutes of traffic, one op per second: attempts follow the
+        # doubling backoff capped at _REOPEN_BACKOFF_MAX, not one per op.
+        for _ in range(600):
+            clock[0] += 1
+            assert backend.set("h1", make_entry()) is False
+        attempts = state["calls"] - start
+        assert 600 / sqlite_mod._REOPEN_BACKOFF_MAX <= attempts <= 20
+
+    def test_non_lock_error_still_raises(self, db_path, monkeypatch):
+        def broken_open(self):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(SQLiteBackend, "_open", broken_open)
+        with pytest.raises(sqlite3.OperationalError):
+            SQLiteBackend(db_path)
+
+    def test_factory_keeps_sqlite_backend_when_locked(self, db_path, locked, monkeypatch):
+        from headroom.cache.compression_store import _create_default_ccr_backend
+
+        _, state = locked
+        state["failures_left"] = 1
+        monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.delenv("HEADROOM_COMPRESS_SESSION_STORE", raising=False)
+        monkeypatch.setenv("HEADROOM_CCR_SQLITE_PATH", str(db_path))
+        assert isinstance(_create_default_ccr_backend(), SQLiteBackend)

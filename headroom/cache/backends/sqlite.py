@@ -73,6 +73,14 @@ class StoreUnavailableError(sqlite3.OperationalError):
     """
 
 
+def is_lock_error(error: BaseException) -> bool:
+    """``database is locked`` (SQLITE_BUSY/LOCKED) or ``locking protocol``
+    (SQLITE_PROTOCOL): another process holds the file. Transient, unlike a
+    permission or path error, so opening it again later can succeed."""
+    msg = str(error).lower()
+    return "locked" in msg or "locking protocol" in msg
+
+
 def default_db_path() -> Path:
     """Resolve the database path (env override, else workspace root)."""
     env = os.environ.get("HEADROOM_CCR_SQLITE_PATH", "").strip()
@@ -106,9 +114,26 @@ class SQLiteBackend:
         self._unreadable_warned = WarnOnce(
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
-        self._conn: sqlite3.Connection | None = self._open()
         self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
         self._next_reopen_at = 0.0
+        self._conn: sqlite3.Connection | None = None
+        try:
+            self._conn = self._open()
+        except sqlite3.OperationalError as e:
+            if not is_lock_error(e):
+                raise
+            # Another process holds the file (typically the previous revision
+            # during a rolling deploy). Start down and let ``_connection()``
+            # retry with backoff instead of giving up on disk for the life of
+            # the process; writes report False meanwhile, so producers keep
+            # their originals.
+            logger.warning(
+                "CCR SQLite store %s is locked by another process (%s); starting "
+                "without it and retrying the open with backoff.",
+                self._path,
+                e,
+            )
+            self._schedule_reopen(time.monotonic())
 
     @staticmethod
     def _ensure_private(path: Path) -> None:
@@ -170,6 +195,12 @@ class SQLiteBackend:
             self._conn = self._open()
         except Exception as e:  # noqa: BLE001 - any open failure keeps the store down
             self._schedule_reopen(now)
+            logger.warning(
+                "CCR SQLite store %s reopen failed (%s); next attempt in %.0fs.",
+                self._path,
+                e,
+                self._next_reopen_at - now,
+            )
             raise StoreUnavailableError(f"CCR SQLite store {self._path} reopen failed: {e}") from e
         self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
         self._next_reopen_at = 0.0

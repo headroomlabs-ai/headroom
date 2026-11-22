@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 from ..fileperms import connect_private_sqlite
+from .backends.sqlite import is_lock_error
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ CREATE INDEX IF NOT EXISTS idx_results_expires ON results (expires);
 """
 #: Expired rows are deleted every this many writes, and on open.
 _PURGE_EVERY = 1000
+#: While another process holds the file at startup, retry the open after this
+#: many seconds, doubling per failure up to the cap.
+_OPEN_RETRY_INITIAL = 1.0
+_OPEN_RETRY_MAX = 60.0
 
 
 class ResultStore:
@@ -56,30 +61,76 @@ class ResultStore:
         self._lock = threading.Lock()
         self._writes = 0
         self._warned = False
-        self._db = connect_private_sqlite(
-            path, what="compression cache", check_same_thread=False, isolation_level=None
+        self._retry_in = _OPEN_RETRY_INITIAL
+        self._retry_at = 0.0
+        self._db: sqlite3.Connection | None = None
+        try:
+            self._db = self._open()
+        except sqlite3.OperationalError as exc:
+            if not is_lock_error(exc):
+                raise
+            # Another process holds the file (typically the previous revision
+            # during a rolling deploy): run memory-only for now and retry the
+            # open with backoff instead of giving up on disk for good.
+            self._schedule_retry(time.monotonic(), exc)
+
+    def _open(self) -> sqlite3.Connection:
+        db = connect_private_sqlite(
+            self._path, what="compression cache", check_same_thread=False, isolation_level=None
         )
-        self._db.execute("PRAGMA busy_timeout=5000")
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.executescript(_SCHEMA)
-        # Sessions that ended while the proxy was down go now.
-        self._db.execute("DELETE FROM results WHERE expires <= ?", (time.time(),))
+        try:
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
+            db.executescript(_SCHEMA)
+            # Sessions that ended while the proxy was down go now.
+            db.execute("DELETE FROM results WHERE expires <= ?", (time.time(),))
+        except BaseException:
+            db.close()
+            raise
+        return db
+
+    def _schedule_retry(self, now: float, exc: Exception) -> None:
+        self._retry_at = now + self._retry_in
+        logger.warning(
+            "compression cache: cannot open %s yet (%s); keeping results in memory "
+            "and retrying in %.0fs.",
+            self._path,
+            exc,
+            self._retry_in,
+        )
+        self._retry_in = min(self._retry_in * 2, _OPEN_RETRY_MAX)
+
+    def _connection(self) -> sqlite3.Connection | None:
+        """The open database, opening it if a retry is due; ``None`` (a miss)
+        while it is not open. Caller holds ``_lock``."""
+        if self._db is None:
+            now = time.monotonic()
+            if now < self._retry_at:
+                return None
+            try:
+                self._db = self._open()
+            except (OSError, sqlite3.Error) as exc:
+                self._schedule_retry(now, exc)
+                return None
+            logger.warning("compression cache: opened %s; results go to disk again.", self._path)
+        return self._db
 
     def get(self, key: str) -> tuple[str, float, str] | None:
         now = time.time()
         try:
             with self._lock:
-                row = self._db.execute(
+                db = self._connection()
+                if db is None:
+                    return None
+                row = db.execute(
                     "SELECT text, ratio, strategy, expires FROM results "
                     "WHERE k = ? AND expires > ?",
                     (key, now),
                 ).fetchone()
                 # Keep what a live session still reads; refresh at most every half ttl.
                 if row is not None and row[3] - now < self._ttl / 2:
-                    self._db.execute(
-                        "UPDATE results SET expires = ? WHERE k = ?", (now + self._ttl, key)
-                    )
+                    db.execute("UPDATE results SET expires = ? WHERE k = ?", (now + self._ttl, key))
         except sqlite3.Error as exc:
             self._failed("read", exc)
             return None
@@ -89,14 +140,17 @@ class ResultStore:
         now = time.time()
         try:
             with self._lock:
-                self._db.execute(
+                db = self._connection()
+                if db is None:
+                    return
+                db.execute(
                     "INSERT OR REPLACE INTO results (k, text, ratio, strategy, expires) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (key, text, ratio, strategy, now + self._ttl),
                 )
                 self._writes += 1
                 if self._writes % _PURGE_EVERY == 0:
-                    self._db.execute("DELETE FROM results WHERE expires <= ?", (now,))
+                    db.execute("DELETE FROM results WHERE expires <= ?", (now,))
         except sqlite3.Error as exc:
             self._failed("write", exc)
 
@@ -114,7 +168,9 @@ class ResultStore:
     def _run(self, sql: str, args: tuple[object, ...]) -> None:
         try:
             with self._lock:
-                self._db.execute(sql, args)
+                db = self._connection()
+                if db is not None:
+                    db.execute(sql, args)
         except sqlite3.Error as exc:
             self._failed("write", exc)
 

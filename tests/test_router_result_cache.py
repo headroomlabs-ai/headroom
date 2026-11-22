@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -681,3 +682,69 @@ def test_compress_over_capacity_batch_then_repeat_evicted_original():
         assert retrieved.original_content == originals[evicted_idx]["content"]
     finally:
         reset_compression_store()
+
+
+class TestLockedAtStartup:
+    """Another process holds the file when the proxy starts (a rolling deploy):
+    the store runs memory-only and opens the file once it is free, instead of
+    staying memory-only for the life of the process."""
+
+    @pytest.fixture
+    def locked(self, monkeypatch):
+        import headroom.cache.result_store as rs
+
+        clock = [1000.0]
+        monkeypatch.setattr(rs.time, "monotonic", lambda: clock[0])
+        real_open = ResultStore._open
+        state = {"failures_left": 0, "calls": 0}
+
+        def flaky_open(self):
+            state["calls"] += 1
+            if state["failures_left"]:
+                state["failures_left"] -= 1
+                raise sqlite3.OperationalError("locking protocol")
+            return real_open(self)
+
+        monkeypatch.setattr(ResultStore, "_open", flaky_open)
+        return clock, state
+
+    def test_opens_after_lock_is_released(self, tmp_path, locked, monkeypatch):
+        clock, state = locked
+        state["failures_left"] = 3
+        monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_PATH", str(tmp_path / "c.db"))
+        store = open_result_store(ttl_seconds=600)
+        assert store is not None
+        store.put("k", "text", 0.5, "s")
+        assert store.get("k") is None
+        calls = state["calls"]
+        for _ in range(50):
+            store.get("k")
+        assert state["calls"] == calls  # no attempt before the backoff is due
+        for _ in range(3):
+            clock[0] += 60
+            store.get("k")
+        store.put("k", "text", 0.5, "s")
+        assert store.get("k") == ("text", 0.5, "s")
+        assert state["calls"] == 4
+
+    def test_backoff_is_bounded_while_lock_is_held(self, tmp_path, locked):
+        import headroom.cache.result_store as rs
+
+        clock, state = locked
+        state["failures_left"] = 10**6
+        store = ResultStore(tmp_path / "c.db", ttl_seconds=600)
+        start = state["calls"]
+        for _ in range(600):
+            clock[0] += 1
+            store.put("k", "text", 0.5, "s")
+            assert store.get("k") is None
+        attempts = state["calls"] - start
+        assert 600 / rs._OPEN_RETRY_MAX <= attempts <= 20
+
+    def test_non_lock_error_falls_back_to_memory(self, tmp_path, monkeypatch):
+        def broken_open(self):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(ResultStore, "_open", broken_open)
+        monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_PATH", str(tmp_path / "c.db"))
+        assert open_result_store(ttl_seconds=600) is None
