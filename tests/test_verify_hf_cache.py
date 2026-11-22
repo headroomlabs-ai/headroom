@@ -159,6 +159,92 @@ def test_the_model_check_mirrors_the_runtime_resolution(tmp_path):
     )
 
 
+def test_the_model_check_honors_the_effective_tokenizer_revision(tmp_path, monkeypatch):
+    """`HEADROOM_HF_TOKENIZER_REVISIONS` moves the snapshot the loader asks for.
+
+    Seeding the shipped pin while the operator overrides the revision leaves the
+    runtime requesting an absent snapshot and falling back to estimation, so a
+    verifier that reads the pin table prints OK over a cache the loader cannot
+    use. It must name the effective SHA, and pass once that snapshot exists.
+    """
+    from headroom.tokenizers.huggingface import _revision_for, get_tokenizer_name
+
+    repo = get_tokenizer_name("Qwen/Qwen2.5-7B")
+    shipped = _TOKENIZER_REVISIONS[repo]
+    override = "a" * 40
+    monkeypatch.setenv("HEADROOM_HF_TOKENIZER_REVISIONS", f"{repo}={override}")
+    assert _revision_for(repo) == override, "premise: the runtime uses the override"
+
+    _seed(tmp_path, repo, shipped, "tokenizer.json")
+    result = _invoke(str(tmp_path), "--no-kompress", "--model", "Qwen/Qwen2.5-7B")
+    assert result.exit_code == 1, result.output
+    assert override in result.output, result.output
+    assert "OK" not in result.output
+
+    _seed(tmp_path, repo, override, "tokenizer.json")
+    result = _invoke(str(tmp_path), "--no-kompress", "--model", "Qwen/Qwen2.5-7B")
+    assert result.exit_code == 0, result.output
+    assert "OK" in result.output
+
+
+def test_the_verifier_checks_the_revision_the_offline_loader_requests(tmp_path, monkeypatch):
+    """Execute the loader and require the verifier to check what it asked for.
+
+    The revision, not just the repository: an override the verifier ignored is
+    the same silent-estimation bug one level down.
+    """
+    import sys
+    import types
+
+    import headroom.tokenizers.huggingface as hf_mod
+
+    repo = hf_mod.get_tokenizer_name("Qwen/Qwen2.5-7B")
+    override = "b" * 40
+    monkeypatch.setenv("HEADROOM_HF_TOKENIZER_REVISIONS", f"{repo}={override}")
+    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "5")
+
+    requested: list[tuple[str, object]] = []
+
+    class _Auto:
+        @staticmethod
+        def from_pretrained(name, **kwargs):
+            requested.append((name, kwargs.get("revision")))
+            raise OSError("stop after recording the request")
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=_Auto))
+    hf_mod._load_tokenizer.cache_clear()
+    try:
+        counter = hf_mod.HuggingFaceTokenizer("Qwen/Qwen2.5-7B")
+        counter.count_text("hello")
+    finally:
+        hf_mod._load_tokenizer.cache_clear()
+
+    assert requested, "the runtime never asked the Hub for anything"
+    name, revision = requested[0]
+    assert revision == override, f"runtime asked for revision {revision!r}"
+
+    _seed(tmp_path, repo, _TOKENIZER_REVISIONS[repo], "tokenizer.json")
+    assert check(tmp_path, model="Qwen/Qwen2.5-7B", require_kompress=False), (
+        "the shipped pin is not the snapshot this loader requested"
+    )
+    _seed(tmp_path, name, override, "tokenizer.json")
+    assert check(tmp_path, model="Qwen/Qwen2.5-7B", require_kompress=False) == []
+
+
+def test_a_disabled_pin_does_not_verify_a_floating_snapshot(tmp_path, monkeypatch):
+    """`HEADROOM_HF_PIN=off` means the loader floats; a fixed snapshot proves nothing."""
+    from headroom.tokenizers.huggingface import get_tokenizer_name
+
+    repo = get_tokenizer_name("qwen2.5-7b")
+    monkeypatch.setenv("HEADROOM_HF_PIN", "off")
+    _seed(tmp_path, repo, _TOKENIZER_REVISIONS[repo], "tokenizer.json")
+
+    missing = check(tmp_path, model="qwen2.5-7b", require_kompress=False)
+    assert any("pinning disabled" in entry for entry in missing), missing
+
+
 def test_the_documented_warm_step_seeds_what_the_runtime_requests(tmp_path, monkeypatch):
     """The guide's warm snippet and `--model` must agree with the runtime.
 

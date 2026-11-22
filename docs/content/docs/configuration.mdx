@@ -562,6 +562,12 @@ headroom verify-hf-cache /srv/hf-cache --model qwen2.5-7b
 runtime resolves it to — the same `get_tokenizer_name` mapping the warm step uses, so the two
 cannot disagree. `--tokenizer-repo` names a repository outright when you want that instead.
 
+The revision is resolved the same way, including an operator override from
+`HEADROOM_HF_TOKENIZER_REVISIONS`: if the override names a snapshot you have not seeded, the
+verifier reports it `MISSING` instead of passing a cache the runtime cannot load. With
+`HEADROOM_HF_PIN=off` the loader floats on `main`, so there is no fixed snapshot to verify and
+the check says so rather than reporting `OK`.
+
 It exits non-zero and prints `MISSING …` for every artifact the target host would lack. Two
 things it checks that are easy to miss:
 
