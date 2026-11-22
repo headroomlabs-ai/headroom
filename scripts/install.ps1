@@ -100,19 +100,20 @@ $markerEnd
 "@
 
     $profileDir = Split-Path -Parent $profilePath
-    if (-not (Test-Path $profileDir)) {
+    # -LiteralPath: a profile name may hold [ ], which -Path treats as wildcards.
+    if (-not (Test-Path -LiteralPath $profileDir)) {
         New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
     }
-    if (-not (Test-Path $profilePath)) {
+    if (-not (Test-Path -LiteralPath $profilePath)) {
         New-Item -ItemType File -Force -Path $profilePath | Out-Null
     }
 
     # Get-Content -Raw yields AutomationNull for an empty file (the one just
     # created above on a first install), and `AutomationNull -notmatch` returns
     # an empty, falsy array, so the block was never written. Cast to [string].
-    $existing = [string](Get-Content -Raw -Path $profilePath)
+    $existing = [string](Get-Content -Raw -LiteralPath $profilePath)
     if ($existing -notmatch [regex]::Escape($markerStart)) {
-        Add-Content -Path $profilePath -Value "`n$block"
+        Add-Content -LiteralPath $profilePath -Value "`n$block"
     }
 }
 
