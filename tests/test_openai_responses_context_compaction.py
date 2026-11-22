@@ -683,6 +683,41 @@ def _responses_headline(hook: Any, payload: dict[str, Any]) -> tuple[int, int, d
     return headline_tokens_saved(tokens_saved, tags), ledger, working
 
 
+@pytest.mark.parametrize("hook_system", ["Keep citations.", "Cite."])
+def test_steering_appended_to_client_instructions_is_not_the_hooks_to_remove(
+    monkeypatch, hook_system: str
+) -> None:
+    # The shaper has already appended its block to the client's instructions.
+    # The hook sees only the client's text; handing that back unchanged forwards
+    # the shaped instructions byte for byte and books nothing, and a real cut is
+    # booked against the client's text with the block kept.
+    from headroom.proxy.output_verbosity_policy import steering_text
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    shaped = f"Keep citations.\n\n{steering_text(2)}"
+    seen: list[Any] = []
+
+    def hook(ctx: Any) -> None:
+        seen.append(ctx.system)
+        ctx.system = hook_system
+
+    headline, ledger, working = _responses_headline(
+        hook,
+        {
+            "model": "gpt-5.5",
+            "instructions": shaped,
+            "input": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert seen == ["Keep citations."]
+    assert working["instructions"] == f"{hook_system}\n\n{steering_text(2)}"
+    cut = len("Keep citations.".split()) - len(hook_system.split())
+    assert (headline, ledger) == (cut, cut)
+
+
 @pytest.mark.parametrize("added_words", [600, 5])
 def test_message_growth_is_netted_against_a_system_cut(added_words: int) -> None:
     # The hook shortens `instructions` and appends message text. With more text

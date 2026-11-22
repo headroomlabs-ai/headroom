@@ -188,16 +188,20 @@ def _leading_system_item(items: Any) -> dict[str, Any] | None:
     return None
 
 
-def _is_steering_only(instructions: Any) -> bool:
-    """Do ``instructions`` hold only the block the output shaper created?"""
+def _split_steering(instructions: Any) -> tuple[Any, str | None]:
+    """``instructions`` as (the client's part, the output shaper's tail block).
+
+    The shaper appends its block after the client's text, or sends it alone.
+    Without exactly one block at the tail, all of it is the client's and the
+    block is None; with only the block, the client's part is None.
+    """
     if not isinstance(instructions, str):
-        return False
+        return instructions, None
     text = instructions.strip()
-    return (
-        text.startswith(STEERING_SENTINEL)
-        and text.endswith(STEERING_SUFFIX)
-        and text.count(STEERING_SENTINEL) == 1
-    )
+    start = text.rfind(STEERING_SENTINEL)
+    if start < 0 or not text.endswith(STEERING_SUFFIX) or text.count(STEERING_SENTINEL) != 1:
+        return instructions, None
+    return text[:start].rstrip() or None, text[start:]
 
 
 def _system_item_index(items: Any, item: dict[str, Any]) -> int | None:
@@ -254,10 +258,9 @@ def _write_responses_system(
             return True
         logger.warning("turn hook rewrote a system prompt whose input item is gone; not sent")
         return False
-    instructions = body.get("instructions")
-    if _is_steering_only(instructions):
-        if system is not None:
-            body["instructions"] = f"{system}\n\n{instructions}"
+    _client, steering = _split_steering(body.get("instructions"))
+    if steering is not None:
+        body["instructions"] = steering if system is None else f"{system}\n\n{steering}"
     elif system is None:
         body.pop("instructions", None)
     else:
@@ -3452,13 +3455,15 @@ class OpenAIHandlerMixin:
             _system_item = (
                 None if working.get("previous_response_id") else _leading_system_item(_msgs_before)
             )
-            _instructions = working.get("instructions")
-            _steering_only = _is_steering_only(_instructions)
-            _system_in_item = _system_item is not None and (not _instructions or _steering_only)
+            # Steering the shaper appended is not the client's either: the hook
+            # sees and is measured against the client's part, and the block is
+            # kept on write (_write_responses_system).
+            _instructions, _ = _split_steering(working.get("instructions"))
+            _system_in_item = _system_item is not None and not _instructions
             if _system_in_item:
                 _system_before = copy.deepcopy(_system_item.get("content"))
             else:
-                _system_before = None if _steering_only else _instructions
+                _system_before = _instructions
             _req_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
