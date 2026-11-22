@@ -242,6 +242,12 @@ def _build_env(home: Path, tmp_path: Path) -> dict[str, str]:
     # redirect. Keep the PATH update ephemeral (Process scope) so running these
     # tests never leaks the throwaway shim dir into the developer's real PATH.
     env["HEADROOM_INSTALL_PATH_SCOPE"] = "Process"
+    # The PowerShell installer's Ensure-ProfileBlock appends a PATH block to
+    # $PROFILE, which PowerShell resolves from the Documents known folder (often
+    # OneDrive-redirected), not from HOME/USERPROFILE, and `-NoProfile` does not
+    # change it. Point it at a throwaway file so these tests never edit the
+    # developer's real PowerShell profile.
+    env["HEADROOM_INSTALL_PROFILE_PATH"] = str(tmp_path / "profile" / "profile.ps1")
     return env
 
 
@@ -801,6 +807,75 @@ def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> No
         # that a failing test cannot leave the developer's PATH polluted.
         if _read_user_path_entry() != before:
             _restore_user_path_entry(before)
+
+
+def _real_powershell_profile(powershell: str) -> Path:
+    """Resolve $PROFILE as the developer's own shell would, outside any test env."""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", "$PROFILE"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return Path(result.stdout.strip())
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_installer_does_not_touch_real_profile(tmp_path: Path) -> None:
+    """The installer must not edit the developer's real PowerShell profile.
+
+    $PROFILE is resolved from the Documents known folder, which a HOME/USERPROFILE
+    override does not redirect, so running the installer against a throwaway home
+    used to append a ``headroom docker-native`` PATH block, pointing at the temp
+    install dir, to the developer's actual profile. ``_build_env`` now sets
+    ``HEADROOM_INSTALL_PROFILE_PATH``; the block must land there and the real
+    profile must be byte-for-byte unchanged across the run.
+    """
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+
+    real_profile = _real_powershell_profile(powershell)
+    before = real_profile.read_bytes() if real_profile.exists() else None
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=REPO_ROOT,
+        )
+
+        test_profile = Path(env["HEADROOM_INSTALL_PROFILE_PATH"])
+        assert test_profile.exists(), "installer did not write the redirected profile"
+        test_profile_text = test_profile.read_text(encoding="utf-8")
+        assert "# >>> headroom docker-native >>>" in test_profile_text
+        assert str(home / ".local" / "bin") in test_profile_text
+
+        after = real_profile.read_bytes() if real_profile.exists() else None
+        assert after == before, f"installer modified the real PowerShell profile: {real_profile}"
+    finally:
+        _cleanup_fake_docker(env)
+        # A passing run never touches the real profile; this only fires if the guard regresses,
+        # so that a failing test cannot leave the developer's profile polluted.
+        current = real_profile.read_bytes() if real_profile.exists() else None
+        if current != before:
+            if before is None:
+                real_profile.unlink()
+            else:
+                real_profile.write_bytes(before)
 
 
 @pytest.mark.skipif(
