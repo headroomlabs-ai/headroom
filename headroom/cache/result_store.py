@@ -111,7 +111,8 @@ class ResultStore:
             try:
                 self._db = self._open()
             except (OSError, sqlite3.Error) as exc:
-                self._schedule_retry(now, exc)
+                # From when the open gave up: it can wait out busy_timeout first.
+                self._schedule_retry(time.monotonic(), exc)
                 return None
             logger.warning("compression cache: opened %s; results go to disk again.", self._path)
         return self._db

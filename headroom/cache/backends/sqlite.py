@@ -200,12 +200,15 @@ class SQLiteBackend:
         try:
             self._conn = self._open()
         except Exception as e:  # noqa: BLE001 - any open failure keeps the store down
-            self._schedule_reopen(now)
+            delay = self._reopen_backoff
+            # From when the open gave up, not when it started: it can wait out
+            # busy_timeout first, which would leave a deadline already past.
+            self._schedule_reopen(time.monotonic())
             logger.warning(
                 "CCR SQLite store %s reopen failed (%s); next attempt in %.0fs.",
                 self._path,
                 e,
-                self._next_reopen_at - now,
+                delay,
             )
             raise StoreUnavailableError(f"CCR SQLite store {self._path} reopen failed: {e}") from e
         self._reopen_backoff = _REOPEN_BACKOFF_INITIAL

@@ -696,12 +696,13 @@ class TestLockedAtStartup:
         clock = [1000.0]
         monkeypatch.setattr(rs.time, "monotonic", lambda: clock[0])
         real_open = ResultStore._open
-        state = {"failures_left": 0, "calls": 0}
+        state = {"failures_left": 0, "calls": 0, "open_seconds": 0}
 
         def flaky_open(self):
             state["calls"] += 1
             if state["failures_left"]:
                 state["failures_left"] -= 1
+                clock[0] += state["open_seconds"]  # waited on busy_timeout
                 raise sqlite3.OperationalError("locking protocol")
             return real_open(self)
 
@@ -740,6 +741,21 @@ class TestLockedAtStartup:
             assert store.get("k") is None
         attempts = state["calls"] - start
         assert 600 / rs._OPEN_RETRY_MAX <= attempts <= 20
+
+    def test_backoff_runs_from_the_end_of_a_slow_open(self, tmp_path, locked):
+        clock, state = locked
+        state["failures_left"] = 10**6
+        store = ResultStore(tmp_path / "c.db", ttl_seconds=600)  # retry due in 1s
+        state["open_seconds"] = 5  # each retry waits out busy_timeout
+        clock[0] += 1
+        store.get("k")  # fails 5s later; the next one is due 2s after that
+        calls = state["calls"]
+        clock[0] += 1
+        store.get("k")
+        assert state["calls"] == calls
+        clock[0] += 1
+        store.get("k")
+        assert state["calls"] == calls + 1
 
     def test_non_lock_error_falls_back_to_memory(self, tmp_path, monkeypatch):
         def broken_open(self):
