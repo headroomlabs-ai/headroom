@@ -5,6 +5,8 @@
     "npm-sdk": "0.44.0",
     "npm-openclaw": "0.44.0",
     "npm-opencode": "0.44.0",
+    "npm-pi-extension": "0.44.0",
     "agent-hooks-plugin": "0.44.0"
+
   }
 }

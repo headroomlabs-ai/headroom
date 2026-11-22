@@ -564,25 +564,33 @@ def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> l
             cron_path.write_text(content)
             records.append(ArtifactRecord(kind="cron", path=str(cron_path)))
         else:
-            current = run(
-                ["crontab", "-l"],
-                capture_output=True,
-                text=True,
+            current = run(["crontab", "-l"], capture_output=True)
+            stdout = (
+                current.stdout.encode("utf-8", errors="surrogateescape")
+                if isinstance(current.stdout, str)
+                else bytes(current.stdout)
             )
-            existing = current.stdout if current.returncode == 0 else ""
-            marker_start = f"# >>> headroom {manifest.profile} >>>"
-            marker_end = f"# <<< headroom {manifest.profile} <<<"
-            pattern = re.compile(
-                re.escape(marker_start) + r".*?" + re.escape(marker_end), re.DOTALL
+            current_stderr = getattr(current, "stderr", b"")
+            stderr = (
+                current_stderr.encode("utf-8", errors="surrogateescape")
+                if isinstance(current_stderr, str)
+                else bytes(current_stderr or b"")
             )
-            merged = pattern.sub("", existing).strip()
-            new_content = (merged + "\n\n" + content).strip() + "\n"
-            run(
-                ["crontab", "-"],
-                input=new_content,
-                text=True,
-                check=True,
-            )
+            if current.returncode == 0:
+                existing = stdout
+            elif current.returncode == 1 and b"no crontab for" in stderr.lower():
+                existing = b""
+            else:
+                detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+                raise click.ClickException(
+                    f"Could not read the current crontab: {detail or 'unknown error'}"
+                )
+            marker_start = re.escape(f"# >>> headroom {manifest.profile} >>>").encode()
+            marker_end = re.escape(f"# <<< headroom {manifest.profile} <<<").encode()
+            pattern = re.compile(marker_start + rb".*?" + marker_end, re.DOTALL)
+            merged = pattern.sub(b"", existing)
+            separator = b"" if not merged or merged.endswith(b"\n") else b"\n"
+            run(["crontab", "-"], input=merged + separator + content.encode(), check=True)
             records.append(ArtifactRecord(kind="crontab", path=f"user:{manifest.profile}"))
         return records
 

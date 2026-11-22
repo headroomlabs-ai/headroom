@@ -87,7 +87,8 @@ Zero code changes. [Agent compatibility](#agent-compatibility) ·
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app.
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language.
-- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|droid|zcode` in one command; undo with `headroom unwrap <tool>`.
+- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|pi|omp|droid|zcode` in one command; undo with `headroom unwrap <tool>`.
+
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client.
 - **Cross-agent memory** — one shared store across Claude, Codex, Gemini and Grok, with automatic dedup.
 - **`headroom learn`** — mines failed sessions and writes corrections to `CLAUDE.local.md` (default, gitignored), `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` or `GROK.md`.
@@ -291,8 +292,10 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Goose | ✅ | starts proxy + launches |
 | OpenHands | ✅ | starts proxy + launches |
 | Mistral Vibe | ✅ | starts proxy + launches |
+| Pi | ✅ | starts proxy + launches; install `headroom-pi` first |
 | Oh My Pi | ✅ | Anthropic + OpenAI/Codex · injects config · starts proxy + launches |
 | Factory Droid | ✅ | routes via `FACTORY_API_BASE_URL`; Anthropic-model turns compressed, other Factory traffic passed through |
+
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |
@@ -300,7 +303,24 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 [^third-party-upstream]: `headroom wrap` routes OpenAI-compatible traffic to the default upstream (`https://api.openai.com/v1`). For a third-party OpenAI-compatible provider (DeepSeek, Together, OpenRouter, a self-hosted gateway), pass `--openai-api-url https://api.deepseek.com/v1` — or set `OPENAI_TARGET_API_URL` before wrapping — otherwise your provider key is sent to OpenAI and rejected with `401 Incorrect API key provided`. See [OpenCode + DeepSeek](https://docs.headroomlabs.ai/docs/opencode-deepseek).
 
 Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
-`headroom mcp install`. Undo durable wrapping with `headroom unwrap <tool>`
+`headroom mcp install`. ### Durable Pi / Oh My Pi setup
+
+The first durable Pi/OMP release is global/current-user only; project-local durable setup is not supported. Packed-host CI covers Pi `0.80.10`, `0.82.1`, and `0.84.1`, plus OMP `17.1.8`. The durable lifecycle gate covers exact Headroom/extension pins `0.34.0` and `0.35.0`, including idempotent reruns, upgrade, rollback, ownership-aware removal, and wrapper coexistence.
+
+```bash
+headroom init -g pi
+headroom init -g omp
+
+# explicit removal
+headroom init -g remove pi
+headroom init -g remove omp
+```
+
+Both hosts share a loopback proxy, config, and scheduled task, and fail open when that proxy is unavailable. Durable init installs the extension version exactly matching the released Headroom CLI; it never installs `latest`. A source/dev build therefore cannot durable-init an unpublished extension version. To roll back, install the older released CLI and rerun both init commands, for example `uv tool install --force "headroom-ai==0.34.0"` followed by the commands above.
+
+Pi and OMP native extension compression is provider-independent. `headroom wrap omp` remains a separate Anthropic inference-routing layer; durable init/removal never changes its `models.yml` or backup bytes.
+
+Undo durable wrapping with `headroom unwrap <tool>`
 (`claude`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`,
 `zcode`). Registry authors should use the canonical [`server.json`](https://github.com/headroomlabs-ai/headroom/blob/main/server.json)
 rather than reconstructing the `headroom mcp serve` contract from prose.
