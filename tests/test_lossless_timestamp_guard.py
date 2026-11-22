@@ -64,6 +64,17 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
             for m in range(60)
         ),
         _ruby_logger_log(),
+        "\n".join(
+            f"[Wed Sep 02 14:{m:02d}:10.123456 2026] [core:error] [pid 3570:tid 4328] "
+            f"[client 10.0.0.7:51{m:02d}] AH00128: File does not exist: /var/www/item{m}"
+            for m in range(60)
+        ),
+        "\n".join(f"Wed Sep  2 14:{m:02d}:10 2026 worker {m} started" for m in range(60)),
+        "\n".join(
+            f"02-Sep-2026 14:{m:02d}:10.123 SEVERE [http-nio-8080-exec-{m}] "
+            "org.apache.catalina.core.StandardWrapperValve.invoke Servlet.service() failed"
+            for m in range(60)
+        ),
     ],
     ids=[
         "iso-datetime",
@@ -76,6 +87,9 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
         "access-log",
         "access-log-longest-host",
         "ruby-logger",
+        "apache-error",
+        "ctime",
+        "tomcat",
     ],
 )
 def test_timestamped_logs_are_never_folded(sample: str) -> None:
@@ -90,8 +104,10 @@ def test_timestamped_logs_are_never_folded(sample: str) -> None:
         ("logs/controller.log", "E0902 14:30:{s:02d}.000000       1 reflector.go:100] list failed"),
         ("/var/log/nginx/access.log", '10.0.0.7 - - [02/Sep/2026:14:30:{s:02d} +0000] "GET /" 500'),
         ("log/production.log", "I, [2026-09-02T14:30:{s:02d}.000000 #1]  INFO -- : 200 OK"),
+        ("/var/log/apache2/error.log", "[Wed Sep 02 14:30:{s:02d}.123456 2026] [core:error] AH01"),
+        ("logs/catalina.out", "02-Sep-2026 14:30:{s:02d}.123 SEVERE [main] startup failed"),
     ],
-    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger"],
+    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger", "apache-error", "tomcat"],
 )
 def test_grep_rows_over_those_logs_still_fold(path: str, row: str) -> None:
     """``grep -n`` output starts with the file path, so it is not a log row."""
