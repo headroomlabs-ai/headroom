@@ -11,6 +11,8 @@ import random
 
 import pytest
 
+from headroom.pricing.cache_ttl import CACHE_WRITE_MULTIPLIERS
+from headroom.pricing.counterfactual import resolve_rates
 from headroom.proxy.cost import CostTracker
 from tests._pricing_models import anthropic_pricing_model
 
@@ -175,3 +177,128 @@ def test_the_list_price_fallback_is_tier_aware_too() -> None:
     expected = _LONG_CONTEXT_TOKENS * long
     assert tracker.totals()[1] == pytest.approx(expected)
     assert tracker.stats()["total_input_cost_usd"] == pytest.approx(expected)
+
+
+# --- Cached input and mixed-provenance tiers ---------------------------------
+#
+# The tests above cover uncached traffic and the no-breakdown fallback. These
+# pin the branches in between: cache reads, the 5m/1h write split across BOTH
+# tiers of one model, and a tier that carries measured AND estimated turns.
+
+_TIERED_CATALOG = {
+    "tiered": {
+        "input_cost_per_token": 1e-6,
+        "input_cost_per_token_above_200k_tokens": 2e-6,
+        "cache_read_input_token_cost": 1e-7,
+        "cache_read_input_token_cost_above_200k_tokens": 2e-7,
+        "cache_creation_input_token_cost": 1.25e-6,
+        "cache_creation_input_token_cost_above_200k_tokens": 2.5e-6,
+        "cache_creation_input_token_cost_above_1hr": 2e-6,
+        "output_cost_per_token": 5e-6,
+    }
+}
+
+_BASE_INPUT = 1e-6
+_LONG_INPUT = 2e-6
+_BASE_READ = 1e-7
+_LONG_READ = 2e-7
+_BASE_WRITE_5M = 1.25e-6
+_LONG_WRITE_5M = 2.5e-6
+_BASE_WRITE_1H = 2e-6
+# No catalog publishes a 1h + long-context rate, so that tier derives it from
+# its own base input price and the structural TTL multiplier.
+_LONG_WRITE_1H = _LONG_INPUT * CACHE_WRITE_MULTIPLIERS["1h"]
+
+
+@pytest.fixture
+def tiered_catalog(monkeypatch: pytest.MonkeyPatch):
+    """A deterministic catalog with a 200k tier and both write TTLs."""
+    from types import SimpleNamespace
+
+    resolve_rates.cache_clear()
+    monkeypatch.setattr(
+        "headroom.pricing.counterfactual._litellm",
+        lambda: SimpleNamespace(model_cost=_TIERED_CATALOG),
+    )
+    monkeypatch.setattr(
+        "headroom.pricing.litellm_pricing.resolve_litellm_model", lambda model: model
+    )
+    yield "tiered"
+    resolve_rates.cache_clear()
+
+
+def test_cached_long_context_turn_prices_reads_and_both_write_ttls(tiered_catalog: str) -> None:
+    """A warm long-context turn, next to a base-tier one on the same model."""
+    model = tiered_catalog
+    tracker = CostTracker()
+    tracker.record_tokens(
+        model,
+        tokens_saved=0,
+        tokens_sent=150_000,
+        cache_read_tokens=100_000,
+        cache_write_tokens=40_000,
+        cache_write_5m_tokens=40_000,
+        uncached_tokens=10_000,
+    )
+    tracker.record_tokens(
+        model,
+        tokens_saved=0,
+        tokens_sent=260_000,
+        cache_read_tokens=200_000,
+        cache_write_tokens=50_000,
+        cache_write_5m_tokens=40_000,
+        cache_write_1h_tokens=10_000,
+        uncached_tokens=10_000,
+    )
+
+    base_turn = 100_000 * _BASE_READ + 40_000 * _BASE_WRITE_5M + 10_000 * _BASE_INPUT
+    long_turn = (
+        200_000 * _LONG_READ
+        + 40_000 * _LONG_WRITE_5M
+        + 10_000 * _LONG_WRITE_1H
+        + 10_000 * _LONG_INPUT
+    )
+    expected = base_turn + long_turn
+
+    stats = tracker.stats()
+    assert tracker.totals() == (410_000, pytest.approx(expected))
+    assert stats["total_input_cost_usd"] == pytest.approx(expected)
+    # Each TTL and tier is actually applied, not collapsed onto one rate.
+    assert long_turn > (200_000 * _BASE_READ + 50_000 * _BASE_WRITE_5M + 10_000 * _BASE_INPUT)
+
+
+def test_estimated_spend_is_not_erased_by_a_later_measured_turn(tiered_catalog: str) -> None:
+    """A tier can carry both provenances; dropping the estimate makes spend fall."""
+    model = tiered_catalog
+    tracker = CostTracker()
+    # Measured short turn.
+    tracker.record_tokens(model, tokens_saved=0, tokens_sent=100_000, uncached_tokens=100_000)
+    after_measured_short = tracker.totals()[1]
+    assert after_measured_short == pytest.approx(100_000 * _BASE_INPUT)
+
+    # Estimated long turn: no usage breakdown, list-priced at its own tier.
+    tracker.record_tokens(model, tokens_saved=0, tokens_sent=250_000)
+    after_estimated_long = tracker.totals()[1]
+    assert after_estimated_long == pytest.approx(after_measured_short + 250_000 * _LONG_INPUT)
+
+    # Measured long turn. If the estimate were dropped here, spend would FALL
+    # from $0.60 to $0.52; both turns were billed, so it must rise.
+    tracker.record_tokens(model, tokens_saved=0, tokens_sent=210_000, uncached_tokens=210_000)
+    after_measured_long = tracker.totals()[1]
+
+    assert after_measured_long == pytest.approx(after_estimated_long + 210_000 * _LONG_INPUT)
+    assert after_measured_long > after_estimated_long
+    assert tracker.stats()["total_input_cost_usd"] == pytest.approx(after_measured_long)
+
+
+def test_totals_and_stats_agree_on_passthrough_traffic(tiered_catalog: str) -> None:
+    """passthrough: labels are not billable requests, on both findings."""
+    model = tiered_catalog
+    tracker = CostTracker()
+    tracker.record_tokens("passthrough:count_tokens", tokens_saved=10, tokens_sent=90)
+    tracker.record_tokens(model, tokens_saved=0, tokens_sent=1_000, uncached_tokens=1_000)
+
+    stats = tracker.stats()
+    assert tracker.totals() == (stats["total_input_tokens"], stats["total_input_cost_usd"])
+    # The probe's tokens are not forwarded input and are excluded from both.
+    assert tracker.totals()[0] == 1_000

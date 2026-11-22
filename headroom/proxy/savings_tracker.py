@@ -661,6 +661,33 @@ def estimate_request_savings_usd(
     }
 
 
+def _long_context_suffix(info: dict[str, Any], billed_tokens: int) -> str:
+    """``*_above_<N>k_tokens`` field suffix when this request pays the upper tier.
+
+    Above a model's long-context threshold the provider re-prices the WHOLE
+    request — cache reads and writes included — so the base rates applied here
+    under-priced every such turn. That mattered beyond accuracy: ``record_request``
+    reconciles this per-request delta against ``CostTracker.totals()``, which IS
+    tier-aware, and takes the larger. A base-rate delta therefore lost to the
+    tracker total and the premium was booked against the NEXT request's model and
+    timestamp in the history.
+
+    The tier is read from the catalog row through
+    :func:`headroom.pricing.counterfactual.long_context_tier` rather than parsed
+    here, so there is one definition of which rows carry a tier (200K for Sonnet,
+    100K for Haiku 5.5, 272K for GPT-5.x).
+    """
+    try:
+        from headroom.pricing.counterfactual import long_context_tier
+
+        tier = long_context_tier(info)
+    except Exception:
+        return ""
+    if tier and billed_tokens > tier[0]:
+        return tier[1]
+    return ""
+
+
 def _estimate_input_cost_usd(
     model: str,
     input_tokens: int,
@@ -707,14 +734,23 @@ def _estimate_input_cost_usd(
             _log_unpriced_model_once(model, "input_cost_per_token")
             return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
+        # Above the row's threshold every slice bills at the upper tier.
+        tier_suffix = _long_context_suffix(info, chargeable_tokens)
+        if tier_suffix:
+            tiered_input = info.get(f"input_cost_per_token{tier_suffix}")
+            # Only a PRESENT tier rate overrides: a missing one falls back to the
+            # base rate, while an explicit 0.0 (a free tier) is authoritative.
+            if tiered_input is not None:
+                input_cost_per_token = tiered_input
+
         if use_breakdown:
             cache_read_cost = info.get(
-                "cache_read_input_token_cost",
-                input_cost_per_token,
+                f"cache_read_input_token_cost{tier_suffix}",
+                info.get("cache_read_input_token_cost", input_cost_per_token),
             )
             cache_write_cost = info.get(
-                "cache_creation_input_token_cost",
-                input_cost_per_token,
+                f"cache_creation_input_token_cost{tier_suffix}",
+                info.get("cache_creation_input_token_cost", input_cost_per_token),
             )
             return (
                 float(cache_read) * float(cache_read_cost)

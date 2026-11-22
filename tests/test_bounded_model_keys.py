@@ -10,6 +10,7 @@ from headroom.proxy.persistent_metrics import (
     MAX_TRACKED_MODELS,
 )
 from headroom.proxy.savings_tracker import SavingsTracker
+from tests._pricing_models import anthropic_pricing_model
 
 _NAMES = MAX_TRACKED_MODELS + 50
 
@@ -104,6 +105,33 @@ def test_priced_request_after_saturation_keeps_aggregate_dollars():
     assert tracker.totals() == (100_000, 0.25)
     assert tracker.totals()[1] == tracker.period_cost_breakdown()["total_usd"]
     assert tracker.stats()["total_input_cost_usd"] == 0.25
+
+
+def test_folded_long_context_request_keeps_base_rate_flat_savings():
+    """Folding a label must not change what a saved token is worth.
+
+    ``_book_folded_usd`` prices input spend at the request's OWN context tier
+    (``other`` has no catalog price, so it is priced at record time). The flat
+    list-price savings accumulator shares that lookup, so reading savings from
+    it billed long-context compression at the premium while the same request
+    kept under the label cap was priced at the base rate.
+    """
+    model = anthropic_pricing_model("input_cost_per_token_above_200k_tokens")
+    kwargs = {"tokens_saved": 10_000, "tokens_sent": 250_000, "uncached_tokens": 250_000}
+
+    control = CostTracker()
+    control.record_tokens(model, **kwargs)
+    tracker = CostTracker()
+    _saturate_with_unpriced_names(tracker)
+    tracker.record_tokens(model, **kwargs)
+
+    assert tracker._requests_by_model["other"] == 1
+    # Input spend stays tier-priced on both sides...
+    assert tracker.totals() == control.totals()
+    assert tracker.stats()["total_input_cost_usd"] == control.stats()["total_input_cost_usd"]
+    # ...and flat savings stay at the base rate, folded or not.
+    assert control.stats()["savings_usd"] > 0
+    assert tracker.stats()["savings_usd"] == control.stats()["savings_usd"]
 
 
 def test_overflow_conserves_every_priced_stats_dollar_figure():

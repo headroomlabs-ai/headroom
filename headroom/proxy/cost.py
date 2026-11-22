@@ -1013,6 +1013,14 @@ class CostTracker:
         self._api_cache_write_by_tier: dict[tuple[str, bool], int] = {}
         self._api_cache_write_1h_by_tier: dict[tuple[str, bool], int] = {}
         self._api_uncached_by_tier: dict[tuple[str, bool], int] = {}
+        # Of ``_tokens_sent_by_tier``: the part from turns the provider gave no
+        # usage breakdown for, which is priced at list on ``tokens_sent`` rather
+        # than from the cache buckets. Held apart from the measured buckets
+        # because a tier can carry BOTH kinds of turn: charging a tier's measured
+        # breakdown used to discard its estimated tokens entirely, so a later
+        # measured turn could make cumulative spend fall. These are always added,
+        # so reported spend only ever rises.
+        self._api_estimated_input_by_tier: dict[tuple[str, bool], int] = {}
         # Priced dollars of requests whose model label was folded into ``other``:
         # the read-time pass prices by label, and ``other`` has no price, so
         # those dollars are priced once here, at record time.
@@ -1055,6 +1063,7 @@ class CostTracker:
         self._api_cache_write_by_tier.clear()
         self._api_cache_write_1h_by_tier.clear()
         self._api_uncached_by_tier.clear()
+        self._api_estimated_input_by_tier.clear()
         self._folded_input_usd = 0.0
         self._folded_output_usd = 0.0
         self._folded_savings_usd = 0.0
@@ -1312,6 +1321,13 @@ class CostTracker:
             self._api_cache_write_1h_by_tier.get(tier, 0) + write_1h_eff
         )
         self._api_uncached_by_tier[tier] = self._api_uncached_by_tier.get(tier, 0) + uncached_tokens
+        # Same condition the budget record below uses to stamp an entry
+        # ``estimated``: no provider breakdown at all, so ``tokens_sent`` stands
+        # in for the billed input.
+        if not (uncached_tokens or cache_read_tokens or cache_write_tokens):
+            self._api_estimated_input_by_tier[tier] = (
+                self._api_estimated_input_by_tier.get(tier, 0) + tokens_sent
+            )
         if key == OTHER_MODEL and model != OTHER_MODEL:
             self._book_folded_usd(
                 model,
@@ -1586,13 +1602,17 @@ class CostTracker:
         ``(cost_usd, billed_input_tokens)`` — the second figure is the token
         count those dollars were charged on, which ``stats()`` accumulates.
 
-        Each tier is repriced at ITS rates. Both branches here used to price
+        Each tier is repriced at ITS rates; both branches here used to price
         every token at the base rate because the aggregates were keyed by model
         alone, so a long-context request cost less in /stats than the same
-        request booked against the budget (#4960). A request with no provider
-        cache breakdown still falls back to the model's list price on
-        ``tokens_sent``, now per tier, so the fallback is not blind to the tier
-        either.
+        request booked against the budget (#4960).
+
+        Turns with no provider usage breakdown are priced at list on their sent
+        count and are accumulated SEPARATELY (``_api_estimated_input_by_tier``)
+        rather than standing in for the whole tier. Charging a tier's measured
+        breakdown used to discard the estimated turns that shared it, so a later
+        measured request could make cumulative spend fall; adding both keeps the
+        reported figure monotonic, which the savings history depends on.
 
         Shared by ``totals()`` (the per-request metrics path) and ``stats()`` so
         the two cannot drift.
@@ -1622,11 +1642,13 @@ class CostTracker:
                     + uncached * uncached_price
                 )
                 billed_tokens += cr + cw + uncached
-            else:
-                # No cache data from API — fall back to list price
-                sent = self._tokens_sent_by_tier.get(tier, 0)
-                cost += sent * uncached_price
-                billed_tokens += sent
+            # Turns with no usage breakdown, priced at list on their sent count.
+            # Added on TOP of whatever measured breakdown this tier also has;
+            # see the docstring for why they cannot be an either/or fallback.
+            estimated = self._api_estimated_input_by_tier.get(tier, 0)
+            if estimated > 0:
+                cost += estimated * uncached_price
+                billed_tokens += estimated
         return cost, billed_tokens
 
     def _book_folded_usd(
@@ -1658,7 +1680,15 @@ class CostTracker:
                 )
             else:
                 self._folded_input_usd += tokens_sent * uncached_price
-            self._folded_savings_usd += tokens_saved * uncached_price
+        # Flat list-price savings stay at the BASE rate, matching the
+        # tracked-model `savings_usd` that budget enforcement reads. Folding a
+        # label must not change what a compressed-away token is worth, and this
+        # accumulator shares the tier-aware lookup above, so reading savings from
+        # it billed long-context compression at the premium instead.
+        if tokens_saved > 0:
+            base_prices = self._get_cache_prices(model)
+            if base_prices:
+                self._folded_savings_usd += tokens_saved * base_prices[3]
         out_price = self._get_output_price(model, long_context=long_context)
         if out_price:
             self._folded_output_usd += max(0, output) * out_price
@@ -1744,6 +1774,12 @@ class CostTracker:
 
         This loop is over models, not records, so it is bounded by how many
         models a deployment talks to.
+
+        ``passthrough:`` labels are skipped, exactly as ``stats()`` does: those
+        are non-billable pseudo-requests (count_tokens probes, a batch dispatch
+        marker) whose tokens were never sent to a model, so both findings report
+        the same figures for the same traffic. Including them here while
+        ``stats()`` excluded them was one of the ways the two disagreed.
         """
         total_input_tokens = 0
         cost_with_headroom = 0.0
