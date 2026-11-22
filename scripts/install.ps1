@@ -87,7 +87,10 @@ function Ensure-ProfileBlock {
 
     $markerStart = '# >>> headroom docker-native >>>'
     $markerEnd = '# <<< headroom docker-native <<<'
-    $escapedPathEntry = $PathEntry.Replace("'", "''")
+    # EscapeSingleQuotedStringContent also doubles the typographic single quotes
+    # PowerShell accepts as string delimiters (a home like O<U+2019>Connor), which a
+    # plain .Replace("'", "''") misses, leaving a profile that does not parse.
+    $escapedPathEntry = [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($PathEntry)
     $block = @"
 $markerStart
 if (-not ((`$env:Path -split ';') -contains '$escapedPathEntry')) {
