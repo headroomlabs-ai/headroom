@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Collection
 from typing import Any
 
@@ -119,6 +120,14 @@ def _bounded(text: str) -> str:
     return collapsed[: _RECEIPT_BOUND - 1].rstrip() + "\u2026"
 
 
+# The ``view`` helpers for the native memory tool report a backend failure
+# without the bare ``Error:`` prefix every other handler uses, e.g.
+# ``Error searching memories: backend down``, ``Error getting recent
+# memories: ...`` and ``Error listing memories: ...`` (GH #4888). A receipt
+# that only looked for ``Error:`` called those ``ok``.
+_NATIVE_VIEW_FAILURE = re.compile(r"^Error(?: \w+){1,4} memor(?:y|ies):", re.IGNORECASE)
+
+
 def _native_outcome(content: str) -> str:
     """One bounded phrase for a native memory tool's plain-text result.
 
@@ -127,8 +136,13 @@ def _native_outcome(content: str) -> str:
     successful one are both strings here. The outcome is kept, bounded, rather
     than reduced to a bare ``done`` that hides the failure.
     """
+    view_failure = _NATIVE_VIEW_FAILURE.match(content)
+    if view_failure:
+        detail = _bounded(content[view_failure.end() :].strip())
+        return f"error: {detail}" if detail else "error"
     if content.startswith("Error:"):
-        return "error: " + _bounded(content[len("Error:") :].strip())
+        detail = _bounded(content[len("Error:") :].strip())
+        return f"error: {detail}" if detail else "error"
     if content.startswith("No replacement was performed"):
         return "not applied"
     return "ok"

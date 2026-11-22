@@ -618,6 +618,39 @@ class TestNativeMemoryReceipts:
         )
         assert text == "[headroom memory] memory str_replace not applied"
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Error searching memories: backend down",
+            "Error getting recent memories: backend down",
+            "Error listing memories: backend down",
+        ],
+    )
+    def test_native_view_backend_failures_are_not_ok(self, content: str) -> None:
+        """The ``view`` helpers drop the bare ``Error:`` prefix (GH #4888).
+
+        ``_semantic_search``, ``_get_recent_memories`` and
+        ``_list_all_memories`` answer ``Error searching/getting recent/listing
+        memories: ...``, so a receipt matching only ``Error:`` reported those
+        backend failures as ``ok``.
+        """
+        text = self._runs(content, "view")
+        assert text == "[headroom memory] memory view error: backend down"
+        assert "ok" not in text
+
+    def test_native_view_backend_failure_is_bounded(self) -> None:
+        text = self._runs("Error listing memories: " + "x" * 300, "view")
+        assert text is not None
+        assert text.startswith("[headroom memory] memory view error: x")
+        assert len(text) <= len("[headroom memory] memory view error: ") + 60
+        assert "x" * 300 not in text
+
+    def test_native_view_success_is_still_ok(self) -> None:
+        assert (
+            self._runs("Showing up to 20 memories:\n\n     1\ta memory", "view")
+            == "[headroom memory] memory view ok"
+        )
+
     def test_native_success_and_failure_differ(self) -> None:
         assert self._runs("File created successfully at: /memories/a.txt", "create") != self._runs(
             "Error: path is required", "create"
@@ -670,6 +703,52 @@ class TestNativeMemoryReceipts:
             "content": json.dumps(payload),
         }
         assert format_receipt([call], [result]) == f"[headroom memory] {expected}"
+
+
+class TestNativeFailureSourceToReceipt:
+    """The receipt reads the strings the real view helpers emit on failure.
+
+    Source-tied on purpose: a change to the helpers' failure prose that the
+    formatter no longer recognises fails here, not only in a literal-string
+    test (GH #4888).
+    """
+
+    @pytest.mark.asyncio
+    async def test_view_helper_failures_reach_the_receipt_as_errors(self, tmp_path: Any) -> None:
+        from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        class _DownBackend:
+            async def search_memories(self, **kwargs: Any) -> Any:
+                raise RuntimeError("backend down")
+
+        handler = MemoryHandler(
+            MemoryConfig(
+                enabled=False,
+                use_native_tool=True,
+                native_memory_dir=str(tmp_path / "native"),
+            ),
+            agent_type="codex",
+        )
+        backend = _DownBackend()
+        produced = [
+            await handler._semantic_search("x", "u1", backend=backend),
+            await handler._get_recent_memories("u1", backend=backend),
+            await handler._list_all_memories("u1", backend=backend),
+        ]
+        assert all(text.startswith("Error") for text in produced)
+
+        for content in produced:
+            call = {
+                "type": "tool_use",
+                "id": "toolu_native",
+                "name": "memory",
+                "input": {"command": "view", "path": "/memories/"},
+            }
+            result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
+            text = format_receipt([call], [result])
+            assert text == "[headroom memory] memory view error: backend down"
+            assert "ok" not in text
 
 
 class TestStreamingMemoryContinuation:
