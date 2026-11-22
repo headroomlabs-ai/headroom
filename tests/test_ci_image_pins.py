@@ -127,3 +127,22 @@ def test_bind_security_probe_image_is_pinned_by_digest() -> None:
     probes = re.findall(r"curlimages/curl:\S+", script)
     assert probes
     assert all("@sha256:" in probe for probe in probes), probes
+
+
+def _native_paths() -> list[str]:
+    """The ``native`` path filter in ci.yml: what reruns the Docker E2E jobs."""
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    step = next(s for s in workflow["jobs"]["changes"]["steps"] if "filters" in s.get("with", {}))
+    return yaml.safe_load(step["with"]["filters"])["native"]
+
+
+@pytest.mark.parametrize("dependency_file", ["pyproject.toml", "uv.lock"])
+def test_a_change_to_the_root_image_dependencies_reruns_the_docker_e2e(
+    dependency_file: str,
+) -> None:
+    # The root image installs what these files resolve (uv export --frozen), so
+    # a change to either alone must rebuild and smoke-test it.
+    assert dependency_file in (ROOT / "Dockerfile").read_text()
+    assert dependency_file in _native_paths()
