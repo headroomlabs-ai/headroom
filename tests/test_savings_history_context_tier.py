@@ -14,6 +14,8 @@ own request.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from headroom.pricing.counterfactual import resolve_rates
@@ -100,3 +102,58 @@ def test_history_books_a_late_premium_on_the_request_that_earned_it(
     assert (
         cheap_model_step["total_input_cost_usd"] - long_model_step["total_input_cost_usd"]
     ) == pytest.approx(0.01)
+
+
+def test_row_that_advertises_a_tier_without_a_tier_price_keeps_the_base_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``None`` tier rate is an unpublished price, not a free one.
+
+    The tier suffix is discovered from the row's own
+    ``input_cost_per_token_above_<N>k_tokens`` field, but catalogs do publish
+    rows that carry the field with a ``None`` value. Taking that at face value
+    would price the request at $0 instead of the base rate it demonstrably
+    bills at.
+    """
+    from types import SimpleNamespace
+
+    catalog = {
+        "half-priced-model": {
+            "input_cost_per_token": 1e-6,
+            "input_cost_per_token_above_200k_tokens": None,
+        }
+    }
+    fake = SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
+    monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
+    monkeypatch.setattr(st, "_resolve_litellm_model", lambda model: model)
+
+    assert _estimate_input_cost_usd("half-priced-model", 250_000) == pytest.approx(0.25)
+
+
+def test_tier_lookup_failure_does_not_break_request_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier helper that raises must degrade to base rates, not drop the request.
+
+    ``record_request`` runs on the response path for every request; a catalog
+    shape this code does not expect can cost accuracy, never bookkeeping.
+    """
+    import headroom.pricing.counterfactual as counterfactual
+
+    def _boom(_info):
+        raise RuntimeError("unexpected catalog shape")
+
+    monkeypatch.setattr(counterfactual, "long_context_tier", _boom)
+
+    catalog = {
+        "long-model": {
+            "input_cost_per_token": 1e-6,
+            "input_cost_per_token_above_200k_tokens": 2e-6,
+        }
+    }
+    fake = types.SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
+    monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
+    monkeypatch.setattr(st, "_resolve_litellm_model", lambda model: model)
+
+    # Base rate, because the tier could not be read — and no exception escapes.
+    assert _estimate_input_cost_usd("long-model", 250_000) == pytest.approx(0.25)

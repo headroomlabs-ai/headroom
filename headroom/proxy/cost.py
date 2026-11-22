@@ -1568,7 +1568,7 @@ class CostTracker:
             return None
 
     def _write_cost_usd(
-        self, model: str, w5m_price: float, w1h_price: float, *, long_context: bool | None = None
+        self, model: str, w5m_price: float, w1h_price: float, *, long_context: bool
     ) -> float:
         """Dollar cost of ``model``'s cache writes, split by the TTL they used.
 
@@ -1583,16 +1583,14 @@ class CostTracker:
         savings percentages are taken against, quietly flattered every ratio on
         a session using the extended TTL.
 
-        ``long_context`` scopes the read to one billed context tier's writes.
-        ``None`` reads the whole-model totals (the all-tiers view).
+        ``long_context`` scopes the read to one billed context tier's writes: this
+        is only ever called per tier, because a write priced at the base rate in
+        one tier and the long-context rate in the other belongs to neither
+        whole-model total.
         """
-        if long_context is None:
-            total = max(0, self._api_cache_write_by_model.get(model, 0))
-            w1h = min(max(0, self._api_cache_write_1h_by_model.get(model, 0)), total)
-        else:
-            tier = (model, long_context)
-            total = max(0, self._api_cache_write_by_tier.get(tier, 0))
-            w1h = min(max(0, self._api_cache_write_1h_by_tier.get(tier, 0)), total)
+        tier = (model, long_context)
+        total = max(0, self._api_cache_write_by_tier.get(tier, 0))
+        w1h = min(max(0, self._api_cache_write_1h_by_tier.get(tier, 0)), total)
         w5m = total - w1h
         return w5m * w5m_price + w1h * w1h_price
 
