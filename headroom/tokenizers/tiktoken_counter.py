@@ -16,6 +16,7 @@ import threading
 from functools import lru_cache
 from typing import Any
 
+from ..offline import OfflineEgressBlocked, guard_egress, note_refusal
 from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
 logger = logging.getLogger(__name__)
@@ -31,8 +32,60 @@ class TiktokenLoadError(RuntimeError):
     """
 
 
+class TiktokenVocabNotCached(TiktokenLoadError):
+    """Raised when ``HEADROOM_OFFLINE`` refused a cold-cache vocab download.
+
+    A :class:`TiktokenLoadError`, so every caller that already falls back to
+    estimation on a stalled download does the same here. Unlike a timeout it
+    is not remembered: pre-seeding ``TIKTOKEN_CACHE_DIR`` or turning the switch
+    off makes the next load succeed.
+    """
+
+
 # Encoding names whose bounded load already timed out — don't block on them again.
 _load_failed: set[str] = set()
+
+# Marks the thread running one of Headroom's own vocab loads, so the read_file
+# guard below refuses Headroom's downloads and leaves a host application's own
+# tiktoken use alone (HEADROOM_OFFLINE governs what Headroom dials, not its host).
+_headroom_load = threading.local()
+_read_file_guard_lock = threading.Lock()
+_read_file_guard_installed = False
+
+
+def _install_read_file_guard() -> bool:
+    """Route tiktoken's one network read through :func:`guard_egress`.
+
+    ``tiktoken.get_encoding`` is not a client Headroom builds, so no guard can
+    dominate the socket from the outside, and a guard before the call would
+    also refuse the cache hit an air-gapped deployment pre-seeds. Inside
+    tiktoken, ``load.read_file_cached`` returns a cached vocab when there is
+    one and calls ``load.read_file`` only on a miss, so wrapping ``read_file``
+    refuses exactly the download. Installed once, on the first Headroom load.
+
+    Returns False when this tiktoken has no ``load.read_file``; the caller then
+    refuses the load outright under the switch rather than risk the fetch.
+    """
+    global _read_file_guard_installed
+    with _read_file_guard_lock:
+        if _read_file_guard_installed:
+            return True
+        try:
+            import tiktoken.load as tiktoken_load
+
+            original = tiktoken_load.read_file
+        except (ImportError, AttributeError):
+            return False
+
+        def _guarded_read_file(blobpath: str, *args: Any, **kwargs: Any) -> bytes:
+            encoding_name = getattr(_headroom_load, "encoding", None)
+            if encoding_name is not None and "://" in str(blobpath):
+                guard_egress(f"tiktoken {encoding_name} vocabulary download", str(blobpath))
+            return original(blobpath, *args, **kwargs)
+
+        tiktoken_load.read_file = _guarded_read_file
+        _read_file_guard_installed = True
+        return True
 
 
 def _load_timeout_seconds() -> float:
@@ -113,19 +166,32 @@ def _get_encoding(encoding_name: str):
     callers fall back to estimation rather than hang the request (GH #956). The
     first timed-out encoding is remembered so later calls fail fast instead of
     re-blocking on every request.
+
+    Under ``HEADROOM_OFFLINE`` a cached vocab still loads, and a cold cache
+    raises :class:`TiktokenVocabNotCached` instead of downloading. The refusal
+    is logged once per encoding through :func:`note_refusal`.
     """
     import tiktoken
 
     if encoding_name in _load_failed:
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
 
+    try:
+        if not _install_read_file_guard():
+            guard_egress(f"tiktoken {encoding_name} vocabulary load (no cache-only path)")
+    except OfflineEgressBlocked as blocked:
+        raise _not_cached(encoding_name, blocked) from blocked
+
     box: dict[str, Any] = {}
 
     def _load() -> None:
+        _headroom_load.encoding = encoding_name
         try:
             box["enc"] = tiktoken.get_encoding(encoding_name)
         except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
             box["err"] = exc
+        finally:
+            _headroom_load.encoding = None
 
     worker = threading.Thread(target=_load, name=f"tiktoken-load-{encoding_name}", daemon=True)
     worker.start()
@@ -142,8 +208,21 @@ def _get_encoding(encoding_name: str):
         )
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} load timed out")
     if "err" in box:
-        raise box["err"]
+        err = box["err"]
+        if isinstance(err, OfflineEgressBlocked):
+            raise _not_cached(encoding_name, err) from err
+        raise err
     return box["enc"]
+
+
+def _not_cached(encoding_name: str, blocked: OfflineEgressBlocked) -> TiktokenVocabNotCached:
+    """Report an offline refusal once and translate it to "model unavailable"."""
+    note_refusal(blocked, logger)
+    return TiktokenVocabNotCached(
+        f"tiktoken encoding {encoding_name!r} is not cached and HEADROOM_OFFLINE "
+        "forbids downloading it; token counts fall back to estimation. Pre-populate "
+        "TIKTOKEN_CACHE_DIR to keep exact counts offline."
+    )
 
 
 def load_encoding(encoding_name: str) -> Any:

@@ -1681,9 +1681,18 @@ def payload_tokens(text: str) -> int:
     global _payload_encoder
     if _payload_encoder is None:
         try:
-            import tiktoken
+            from headroom.tokenizers.tiktoken_counter import (
+                TiktokenVocabNotCached,
+                load_encoding,
+            )
 
-            _payload_encoder = tiktoken.get_encoding("cl100k_base")
+            # The bounded, offline-aware loader: a bare tiktoken.get_encoding
+            # downloads a cold vocab with no timeout, even under HEADROOM_OFFLINE.
+            _payload_encoder = load_encoding("cl100k_base")
+        except TiktokenVocabNotCached:
+            # Refused offline. Not remembered, so a vocab pre-seeded later, or
+            # the switch turned off, gives this counter its BPE unit back.
+            pass
         except Exception:
             _payload_encoder = False
     if _payload_encoder:

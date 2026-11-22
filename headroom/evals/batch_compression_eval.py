@@ -47,6 +47,7 @@ from headroom.evals.metrics import (
     compute_semantic_similarity,
 )
 from headroom.offline import guard_egress
+from headroom.tokenizers.tiktoken_counter import TiktokenLoadError, load_encoding
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 
 logger = logging.getLogger(__name__)
@@ -1353,11 +1354,10 @@ def evaluate_token_counting_accuracy(
         # the actual token count from the response. For now, we compare
         # against a reference tokenizer.
         try:
-            import tiktoken
-
-            enc = tiktoken.get_encoding("cl100k_base")
+            # Bounded and offline-aware, unlike a bare tiktoken.get_encoding.
+            enc = load_encoding("cl100k_base")
             actual = len(enc.encode(text))
-        except ImportError:
+        except (ImportError, TiktokenLoadError):
             # Fallback: assume estimate is close
             actual = len(text) // 4
 
