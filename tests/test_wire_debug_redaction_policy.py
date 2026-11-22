@@ -123,3 +123,13 @@ def test_wire_debug_keeps_routing_and_identity_headers_readable() -> None:
         "model",
     ):
         assert not should_redact_key(key), key
+
+
+def test_wire_debug_keeps_codex_auth_routing_metadata_readable() -> None:
+    metadata = {"auth_mode": "chatgpt", "is_chatgpt_auth": True, "x-auth-token": "t"}
+
+    assert redact_for_wire_debug(metadata) == {
+        "auth_mode": "chatgpt",
+        "is_chatgpt_auth": True,
+        "x-auth-token": WIRE_DEBUG_REDACTED,
+    }

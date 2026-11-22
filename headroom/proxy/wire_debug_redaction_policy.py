@@ -89,9 +89,10 @@ _SECRET_KEY_SUBSTRINGS = (
 _SECRET_EXACT_KEYS = frozenset({"x_ms_client_principal", "x_forwarded_client_cert"})
 
 # Usage counters (``token_count``, ``max_tokens``) are numbers, not secrets,
-# and ``key_id`` names a key without being one.
+# ``key_id`` names a key without being one, and ``auth_mode`` /
+# ``is_chatgpt_auth`` are the routing enum and flag the Codex captures record.
 _COUNTER_SUFFIXES = ("_count", "_tokens")
-_READABLE_KEYS = frozenset({"key_id"})
+_READABLE_KEYS = frozenset({"key_id", "auth_mode", "is_chatgpt_auth"})
 
 
 def should_redact_key(key: str) -> bool:
