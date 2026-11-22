@@ -1,4 +1,4 @@
-"""Allow-list of request headers that may reach a log line or a debug file.
+"""Allow-list of headers that may reach a log line or a debug file.
 
 Any header not named here is dropped, not redacted: a new or unknown header
 never reaches a log, whatever its name. The list is a code constant on
@@ -41,6 +41,23 @@ LOGGABLE_HEADER_NAMES: frozenset[str] = frozenset(
         "x-stainless-runtime",
         "x-stainless-runtime-version",
         "x-stainless-timeout",
+        # Upstream response headers the wire capture needs to explain retries
+        # and rate limits.
+        "retry-after",
+        "retry-after-ms",
+        "request-id",
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+        "anthropic-ratelimit-requests-limit",
+        "anthropic-ratelimit-requests-remaining",
+        "anthropic-ratelimit-requests-reset",
+        "anthropic-ratelimit-tokens-limit",
+        "anthropic-ratelimit-tokens-remaining",
+        "anthropic-ratelimit-tokens-reset",
     }
 )
 

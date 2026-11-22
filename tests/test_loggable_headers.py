@@ -123,6 +123,30 @@ def test_codex_wire_debug_file_holds_only_allow_listed_headers(
     _assert_only_allow_listed(path.read_text(encoding="utf-8"))
 
 
+def test_codex_wire_debug_keeps_upstream_retry_and_rate_limit_headers(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HEADROOM_CODEX_WIRE_DEBUG", "1")
+    monkeypatch.setenv("HEADROOM_CODEX_WIRE_DEBUG_DIR", str(tmp_path))
+    response_headers = {
+        "retry-after": "7",
+        "retry-after-ms": "7000",
+        "x-ratelimit-remaining-tokens": "0",
+        "anthropic-ratelimit-tokens-reset": "2026-11-22T10:00:00Z",
+    }
+    path = capture_codex_wire_debug(
+        "http_stream_upstream_response_headers",
+        transport="http_sse",
+        direction="upstream_to_headroom",
+        headers={**response_headers, "set-cookie": "FAKECOOKIE"},
+        status_code=429,
+    )
+    assert path is not None
+    headers = json.loads(path.read_text(encoding="utf-8"))["headers"]
+    assert {k: headers.get(k) for k in response_headers} == response_headers
+    assert "FAKECOOKIE" not in json.dumps(headers)
+
+
 def test_allow_list_names_no_secret_header() -> None:
     flagged = {name for name in LOGGABLE_HEADER_NAMES if should_redact_key(name)}
     # Only names the policy masks on purpose; anything new here is a secret.
