@@ -227,3 +227,31 @@ def test_owner_only_write_closes_and_keeps_the_file_when_chmod_fails(
 
     assert len(os.listdir("/dev/fd")) == open_before
     assert dump.read_text(encoding="utf-8") == '{"previous": true}'
+
+
+def test_dumped_headers_hold_no_credential_value() -> None:
+    from headroom.proxy.handlers._debug_dump import redact_dump_headers
+
+    headers = {
+        "Authorization": "Bearer FAKE-AUTH-VALUE",
+        "cookie": "sid=FAKE-COOKIE-VALUE",
+        "x-headroom-proxy-token": "FAKE-PROXY-TOKEN",
+        "proxy-authorization": "Basic FAKE-PROXY-AUTH",
+        "anthropic-version": "2023-06-01",
+    }
+
+    dumped = json.dumps(redact_dump_headers(headers))
+
+    for value in headers.values():
+        if value != "2023-06-01":
+            assert value not in dumped
+    assert "2023-06-01" in dumped
+
+
+def test_query_log_keeps_names_and_drops_values() -> None:
+    from headroom.proxy.query_log_policy import redact_query_string_for_log
+
+    rendered = redact_query_string_for_log("key=abc&beta=true")
+
+    assert "abc" not in rendered
+    assert "key=" in rendered and "beta=" in rendered
