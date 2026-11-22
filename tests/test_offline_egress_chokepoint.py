@@ -997,6 +997,47 @@ class TestTiktokenVocabOffline:
         assert tiktoken.get_encoding(_FAKE_ENCODING).encode("a") == [0]
         assert vocab_downloads == [_FAKE_VOCAB_URL]
 
+    def test_a_tiktoken_without_read_file_fails_closed_offline(
+        self,
+        offline: None,
+        no_dns: None,
+        no_sockets: None,
+        tiktoken_cache: Path,
+        vocab_downloads: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If a future tiktoken drops ``load.read_file``, the download can no
+        longer be told apart from a cache hit, so offline refuses the load."""
+        import tiktoken.load
+
+        from headroom.tokenizers import tiktoken_counter
+        from headroom.tokenizers.tiktoken_counter import TiktokenVocabNotCached, load_encoding
+
+        monkeypatch.setattr(tiktoken_counter, "_read_file_guard_installed", False)
+        monkeypatch.delattr(tiktoken.load, "read_file")
+        _seed(tiktoken_cache, _FAKE_VOCAB_URL, _FAKE_VOCAB)
+        with pytest.raises(TiktokenVocabNotCached) as excinfo:
+            load_encoding(_FAKE_ENCODING)
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+        assert vocab_downloads == []
+
+    def test_a_tiktoken_without_read_file_still_loads_online(
+        self,
+        tiktoken_cache: Path,
+        vocab_downloads: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import tiktoken.load
+
+        from headroom.tokenizers import tiktoken_counter
+        from headroom.tokenizers.tiktoken_counter import load_encoding
+
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        monkeypatch.setattr(tiktoken_counter, "_read_file_guard_installed", False)
+        monkeypatch.delattr(tiktoken.load, "read_file")
+        _seed(tiktoken_cache, _FAKE_VOCAB_URL, _FAKE_VOCAB)
+        assert load_encoding(_FAKE_ENCODING).encode("a") == [0]
+
     def test_the_claude_token_counter_falls_back_to_estimation(
         self, offline: None, no_sockets: None, tiktoken_cache: Path, vocab_downloads: list[str]
     ) -> None:
