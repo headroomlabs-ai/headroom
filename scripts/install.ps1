@@ -92,7 +92,10 @@ $markerEnd
         New-Item -ItemType File -Force -Path $PROFILE | Out-Null
     }
 
-    $existing = Get-Content -Raw -Path $PROFILE
+    # Get-Content -Raw yields AutomationNull for an empty file (the one just
+    # created above on a first install), and `AutomationNull -notmatch` returns
+    # an empty, falsy array, so the block was never written. Cast to [string].
+    $existing = [string](Get-Content -Raw -Path $PROFILE)
     if ($existing -notmatch [regex]::Escape($markerStart)) {
         Add-Content -Path $PROFILE -Value "`n$block"
     }
