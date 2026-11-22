@@ -522,7 +522,7 @@ class TestMultiWorkerSafety:
         clock = [1000.0]
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
 
-        def broken_open():
+        def broken_open(*_args):
             raise sqlite3.OperationalError("unable to open database file")
 
         monkeypatch.setattr(b, "_open", broken_open)
@@ -555,7 +555,7 @@ class TestMultiWorkerSafety:
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
         attempts = []
 
-        def broken_open():
+        def broken_open(*_args):
             attempts.append(clock[0])
             raise sqlite3.OperationalError("unable to open database file")
 
@@ -588,7 +588,7 @@ class TestMultiWorkerSafety:
         clock = [1000.0]
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
 
-        def broken_open():
+        def broken_open(*_args):
             raise sqlite3.OperationalError("unable to open database file")
 
         monkeypatch.setattr(b, "_open", broken_open)
@@ -750,7 +750,7 @@ class TestProducerDuringOutage:
         clock = [1000.0]
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
 
-        def broken_open():
+        def broken_open(*_args):
             raise sqlite3.OperationalError("unable to open database file")
 
         monkeypatch.setattr(backend, "_open", broken_open)
@@ -838,13 +838,13 @@ class TestLockedAtStartup:
         real_open = SQLiteBackend._open
         state = {"failures_left": 0, "calls": 0, "open_seconds": 0}
 
-        def flaky_open(self):
+        def flaky_open(self, *args):
             state["calls"] += 1
             if state["failures_left"]:
                 state["failures_left"] -= 1
                 clock[0] += state["open_seconds"]  # waited on busy_timeout
                 raise sqlite3.OperationalError("database is locked")
-            return real_open(self)
+            return real_open(self, *args)
 
         monkeypatch.setattr(SQLiteBackend, "_open", flaky_open)
         return clock, state
@@ -897,6 +897,27 @@ class TestLockedAtStartup:
         clock[0] += 1
         backend.get("h1")
         assert state["calls"] == calls + 1
+
+    def test_retry_gives_up_fast_on_a_held_write_lock(self, db_path):
+        # A real lock: the retry runs inline in a read or write, so it must not
+        # wait out the full busy_timeout (5s) the way ordinary operations do.
+        backend = SQLiteBackend(db_path)
+        backend._conn.close()
+        backend._conn = None  # down, with a retry due now
+        holder = sqlite3.connect(db_path, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            start = time.monotonic()
+            assert backend.get("h1") is None
+            assert backend.set("h1", make_entry()) is False
+            assert time.monotonic() - start < 2
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        backend._next_reopen_at = 0.0
+        assert backend.set("h1", make_entry()) is True
+        # The short wait covers the reopen only; operations wait as before.
+        assert backend._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
 
     def test_non_lock_error_still_raises(self, db_path, monkeypatch):
         def broken_open(self):

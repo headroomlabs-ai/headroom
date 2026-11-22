@@ -63,6 +63,12 @@ _MAX_REPORTED_UNREADABLE = 1000
 # hammering a still-broken path on every call.
 _REOPEN_BACKOFF_INITIAL = 1.0
 _REOPEN_BACKOFF_MAX = 60.0
+#: How long an operation waits on another writer's lock (``busy_timeout``).
+_BUSY_TIMEOUT_MS = 5000
+#: The same wait for a reopen. It runs inline in whatever read or write found
+#: the retry due, possibly on the event loop, so it gives up quickly and the
+#: store stays down until the next attempt instead of stalling the caller.
+_REOPEN_BUSY_TIMEOUT_MS = 250
 
 
 class StoreUnavailableError(sqlite3.OperationalError):
@@ -149,14 +155,14 @@ class SQLiteBackend:
         """
         ensure_private_file(path, what="CCR store")
 
-    def _open(self) -> sqlite3.Connection:
+    def _open(self, busy_timeout_ms: int = _BUSY_TIMEOUT_MS) -> sqlite3.Connection:
         self._ensure_private(self._path)
         conn = sqlite3.connect(self._path, check_same_thread=False)
         try:
             # Wait for competing writers instead of failing with SQLITE_BUSY —
             # multiple proxy workers share this file, and writes are frequent
             # but tiny, so contention resolves in milliseconds.
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(_SCHEMA)
@@ -169,6 +175,7 @@ class SQLiteBackend:
                 (time.time(),),
             )
             conn.commit()
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         except BaseException:
             # Close a half-set-up handle now, not at GC: a locked store is
             # retried with backoff, and each failed open would leak one.
@@ -198,7 +205,7 @@ class SQLiteBackend:
         if now < self._next_reopen_at:
             raise StoreUnavailableError(f"CCR SQLite store {self._path} is unavailable")
         try:
-            self._conn = self._open()
+            self._conn = self._open(_REOPEN_BUSY_TIMEOUT_MS)
         except Exception as e:  # noqa: BLE001 - any open failure keeps the store down
             delay = self._reopen_backoff
             # From when the open gave up, not when it started: it can wait out

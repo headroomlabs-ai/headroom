@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -698,13 +699,13 @@ class TestLockedAtStartup:
         real_open = ResultStore._open
         state = {"failures_left": 0, "calls": 0, "open_seconds": 0}
 
-        def flaky_open(self):
+        def flaky_open(self, *args):
             state["calls"] += 1
             if state["failures_left"]:
                 state["failures_left"] -= 1
                 clock[0] += state["open_seconds"]  # waited on busy_timeout
                 raise sqlite3.OperationalError("locking protocol")
-            return real_open(self)
+            return real_open(self, *args)
 
         monkeypatch.setattr(ResultStore, "_open", flaky_open)
         return clock, state
@@ -756,6 +757,28 @@ class TestLockedAtStartup:
         clock[0] += 1
         store.get("k")
         assert state["calls"] == calls + 1
+
+    def test_retry_gives_up_fast_on_a_held_write_lock(self, tmp_path):
+        # A real lock: the retry runs inline in a cache lookup, so it must not
+        # wait out the full busy_timeout (5s) the way ordinary operations do.
+        store = ResultStore(tmp_path / "c.db", ttl_seconds=600)
+        store._db.close()
+        store._db = None  # down, with a retry due now
+        holder = sqlite3.connect(tmp_path / "c.db", isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            start = time.monotonic()
+            assert store.get("k") is None
+            store.put("k", "text", 0.5, "s")
+            assert time.monotonic() - start < 2
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        store._retry_at = 0.0
+        store.put("k", "text", 0.5, "s")
+        assert store.get("k") == ("text", 0.5, "s")
+        # The short wait covers the open only; operations wait as before.
+        assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
 
     def test_non_lock_error_falls_back_to_memory(self, tmp_path, monkeypatch):
         def broken_open(self):

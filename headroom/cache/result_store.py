@@ -48,6 +48,11 @@ _PURGE_EVERY = 1000
 #: many seconds, doubling per failure up to the cap.
 _OPEN_RETRY_INITIAL = 1.0
 _OPEN_RETRY_MAX = 60.0
+#: How long an operation waits on another writer's lock (``busy_timeout``).
+_BUSY_TIMEOUT_MS = 5000
+#: The same wait for a retried open. It runs inline in the cache lookup that
+#: found the retry due, so it gives up quickly and the lookup misses instead.
+_RETRY_BUSY_TIMEOUT_MS = 250
 
 
 class ResultStore:
@@ -74,17 +79,18 @@ class ResultStore:
             # open with backoff instead of giving up on disk for good.
             self._schedule_retry(time.monotonic(), exc)
 
-    def _open(self) -> sqlite3.Connection:
+    def _open(self, busy_timeout_ms: int = _BUSY_TIMEOUT_MS) -> sqlite3.Connection:
         db = connect_private_sqlite(
             self._path, what="compression cache", check_same_thread=False, isolation_level=None
         )
         try:
-            db.execute("PRAGMA busy_timeout=5000")
+            db.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
             db.executescript(_SCHEMA)
             # Sessions that ended while the proxy was down go now.
             db.execute("DELETE FROM results WHERE expires <= ?", (time.time(),))
+            db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         except BaseException:
             db.close()
             raise
@@ -109,7 +115,7 @@ class ResultStore:
             if now < self._retry_at:
                 return None
             try:
-                self._db = self._open()
+                self._db = self._open(_RETRY_BUSY_TIMEOUT_MS)
             except (OSError, sqlite3.Error) as exc:
                 # From when the open gave up: it can wait out busy_timeout first.
                 self._schedule_retry(time.monotonic(), exc)
