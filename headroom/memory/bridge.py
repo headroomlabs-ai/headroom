@@ -77,16 +77,21 @@ _HTML_BLOCKS = (
 )
 
 
-def _markdown_structure(lines: list[str]) -> tuple[list[tuple[int, str]], int | None]:
-    """Return real headings and the opener of an unterminated block."""
+def _markdown_structure(
+    lines: list[str],
+) -> tuple[list[tuple[int, str]], int | None, set[int]]:
+    """Return real headings, an unterminated opener, and type-6 block ends."""
     headings: list[tuple[int, str]] = []
     block: tuple[re.Pattern[str], int, bool] | None = None
+    type_6_ends: set[int] = set()
 
     for index, original_line in enumerate(lines):
         line = original_line.removesuffix("\r")
         if block is not None:
-            end_pattern, _, _ = block
+            end_pattern, _, is_type_6 = block
             if end_pattern.search(line):
+                if is_type_6:
+                    type_6_ends.add(index)
                 block = None
             continue
 
@@ -108,7 +113,9 @@ def _markdown_structure(lines: list[str]) -> tuple[list[tuple[int, str]], int | 
             if heading_match := _HEADING_RE.match(line):
                 headings.append((index, heading_match.group(2).strip()))
 
-    return headings, block[1] if block is not None and not block[2] else None
+    if block is not None and block[2]:
+        type_6_ends.add(len(lines))
+    return headings, block[1] if block is not None and not block[2] else None, type_6_ends
 
 
 def _merge_bullets_into_markdown(
@@ -121,7 +128,7 @@ def _merge_bullets_into_markdown(
     land under a later section or a sub-heading.
     """
     lines = existing_content.split("\n")
-    headings, unterminated_block = _markdown_structure(lines)
+    headings, unterminated_block, type_6_ends = _markdown_structure(lines)
     inserts: dict[int, list[str]] = defaultdict(list)
     appended: list[str] = []
 
@@ -141,6 +148,11 @@ def _merge_bullets_into_markdown(
         while end > start and not lines[end - 1].strip():
             end -= 1
         line_suffix = "\r" if lines[end - 1].endswith("\r") else ""
+        if end in type_6_ends:
+            if end < len(lines):
+                end += 1
+            else:
+                inserts[end].append(line_suffix)
         inserts[end].extend(f"{bullet}{line_suffix}" for bullet in bullets)
 
     merged: list[str] = []
