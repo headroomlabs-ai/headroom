@@ -31,7 +31,6 @@ import logging
 from collections.abc import MutableMapping
 from typing import Any
 
-from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 # _DEFAULT_CLOUD_URL and guard_egress stay importable from this module.
@@ -144,10 +143,14 @@ class CompressionMiddleware(CompressBackend):
                 if result and result.get("tokens_saved", 0) > 0 and "messages" in result:
                     body_json["messages"] = result["messages"]
                     full_body = json.dumps(body_json).encode("utf-8")
-                    scope = {**scope, "headers": list(scope.get("headers", []))}
-                    headers = MutableHeaders(scope=scope)
-                    if "content-length" in headers:
-                        headers["content-length"] = str(len(full_body))
+                    content_length = str(len(full_body)).encode("ascii")
+                    scope = {
+                        **scope,
+                        "headers": [
+                            (name, content_length if name.lower() == b"content-length" else value)
+                            for name, value in scope.get("headers", [])
+                        ],
+                    }
                     tokens_saved = result["tokens_saved"]
                     tokens_before = result.get("tokens_before", 0)
                     tokens_after = result.get("tokens_after", 0)
