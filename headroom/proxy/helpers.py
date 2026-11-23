@@ -3873,6 +3873,8 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "glob",
         "grep",
         "task",
+        # The subagent tool: ``task`` in some clients, ``Agent`` in others.
+        "agent",
         "todowrite",
         "todoread",
         "webfetch",
