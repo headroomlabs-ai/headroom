@@ -18,7 +18,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from headroom.providers.proxy_targets import select_passthrough_base_url
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 
@@ -237,54 +236,67 @@ def test_no_route_forwards_to_a_loopback_upstream() -> None:
     assert reached == [], f"routes forwarded to a loopback upstream: {reached}"
 
 
-class _StubProxy:
-    """Minimal stand-in for the proxy object `select_passthrough_base_url` reads."""
-
-    class provider_runtime:  # noqa: N801
-        @staticmethod
-        def model_metadata_provider(headers: object) -> str:
-            return "openai"
-
-        @staticmethod
-        def api_target(name: str) -> str:
-            return "https://api.openai.com"
-
-
-def test_passthrough_base_url_ignores_an_unsafe_azure_override() -> None:
-    headers = {"api-key": "x", "x-headroom-base-url": "http://169.254.169.254"}
-
-    resolved = select_passthrough_base_url(_StubProxy(), headers)
-
-    assert "169.254.169.254" not in resolved
-
-
-def test_passthrough_base_url_still_honours_a_safe_azure_override(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("auth", [{"api-key": "x"}, {"Authorization": "Bearer client-token"}])
+def test_alpha_search_dials_the_override_it_checked(
+    monkeypatch: pytest.MonkeyPatch, auth: dict[str, str]
 ) -> None:
-    """Legitimate BYOK must keep working -- this is not a blanket block."""
+    """One resolution, and its answer is the destination.
 
-    def public_resolution(*args: object, **kwargs: object) -> list[object]:
+    The name resolves publicly once and then stops resolving. A second lookup
+    after the route's check must not happen: when it did, its failure sent the
+    caller's request and credential to the configured provider instead.
+    """
+    from fastapi.responses import JSONResponse
+
+    from headroom.proxy.server import HeadroomProxy
+
+    lookups: list[object] = []
+
+    def resolve_once(host: object, *args: object, **kwargs: object) -> list[object]:
+        lookups.append(host)
+        if len(lookups) > 1:
+            raise socket.gaierror("no longer resolves")
         return [(None, None, None, None, ("20.10.10.10", 443))]
 
-    monkeypatch.setattr(socket, "getaddrinfo", public_resolution)
-    headers = {
-        "api-key": "x",
-        "x-headroom-base-url": "https://my-resource.openai.azure.com/",
-    }
+    forwarded: list[str] = []
 
-    resolved = select_passthrough_base_url(_StubProxy(), headers)
+    async def fake_passthrough(self, request, base_url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        forwarded.append(base_url)
+        return JSONResponse({})
 
-    assert resolved == "https://my-resource.openai.azure.com"
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_once)
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+    headers = {**auth, "x-headroom-base-url": "https://my-resource.openai.azure.com/"}
+    with TestClient(_app()) as client:
+        response = client.post("/v1/alpha/search", headers=headers, json={"q": "x"})
+
+    assert response.status_code == 200
+    assert forwarded == ["https://my-resource.openai.azure.com"]
+    assert lookups == ["my-resource.openai.azure.com"]
 
 
-def test_operator_allowlist_still_permits_an_internal_azure_endpoint(
+def test_operator_allowlist_still_permits_an_internal_override_on_alpha_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """On-prem/split-horizon deployments opt in explicitly rather than being stuck."""
-    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "gateway.internal")
-    headers = {"api-key": "x", "x-headroom-base-url": "https://gateway.internal/v1"}
+    from fastapi.responses import JSONResponse
 
-    assert select_passthrough_base_url(_StubProxy(), headers) == "https://gateway.internal/v1"
+    from headroom.proxy.server import HeadroomProxy
+
+    forwarded: list[str] = []
+
+    async def fake_passthrough(self, request, base_url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        forwarded.append(base_url)
+        return JSONResponse({})
+
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "gateway.internal")
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+    headers = {"api-key": "x", "x-headroom-base-url": "https://gateway.internal/v1"}
+    with TestClient(_app()) as client:
+        response = client.post("/v1/alpha/search", headers=headers, json={"q": "x"})
+
+    assert response.status_code == 200
+    assert forwarded == ["https://gateway.internal/v1"]
 
 
 def test_slow_resolution_is_bounded_and_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
