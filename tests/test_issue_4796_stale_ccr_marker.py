@@ -20,6 +20,7 @@ from headroom.cache.compression_store import (
     clear_request_compression_store,
     set_request_compression_store,
 )
+from headroom.exceptions import StorageError
 from headroom.transforms.content_router import (
     CompressionCache,
     CompressionStrategy,
@@ -213,6 +214,30 @@ def test_sqlite_probe_failure_keeps_a_cached_result(tmp_path):
         clear_request_compression_store()
 
 
+def test_a_successful_zero_exists_is_a_definite_miss_despite_a_failing_write():
+    """The liveness answer is the probe's, not the guard's overall state.
+
+    A Redis that refuses writes (``maxmemory`` + ``noeviction``) still answers
+    ``EXISTS``: a successful 0 is a real miss and must not be reported as
+    unknown just because the write kind is failing.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    redis = pytest.importorskip("redis")
+    from headroom.cache.backends.redis import RedisBackend
+
+    class RefusesWrites(fakeredis.FakeRedis):
+        def set(self, *args, **kwargs):
+            raise redis.ResponseError("OOM command not allowed")
+
+    backend = RedisBackend("redis://localhost", client=RefusesWrites())
+    store = CompressionStore(max_entries=4, backend=backend)
+    with pytest.raises(StorageError):
+        store.store("an original " * 40, "a compressed view")
+
+    assert store.all_live(["abc123def456"]) is False
+    assert backend.available() is False, "the failed write is still recorded"
+
+
 def test_every_marker_shape_is_read_for_its_hash():
     assert _ccr_marker_hashes(
         "a <<ccr:abcdef012345>> b <<ccr:1234567890ab,base64,2.0KB>> "
@@ -297,3 +322,44 @@ def test_an_evicted_original_makes_the_router_recompress(ccr_store, monkeypatch)
     # The fresh result is cached in turn, so the next apply reuses it.
     assert tool_output(router.apply(payload("a"), Tokenizer())) == again
     assert len(calls) == 4
+
+
+def test_markers_are_checked_against_the_router_effective_store():
+    """An explicit store's markers must not be looked up in the empty default.
+
+    A request served by ``compression_store=explicit`` writes its originals
+    there; the process default can be empty. Checking the default would evict
+    a result whose marker is live in the store that actually backs the request.
+    """
+    explicit = CompressionStore(max_entries=4, backend=InMemoryBackend())
+    fallback = CompressionStore(max_entries=4, backend=InMemoryBackend())
+    set_request_compression_store(fallback)
+    try:
+        router = ContentRouter(ContentRouterConfig(ccr_inject_marker=False))
+        calls: list[str] = []
+
+        def compress(content, context="", bias=1.0, **kwargs):
+            calls.append(content)
+            compressed = f"compressed copy {len(calls)}"
+            hash_key = explicit.store(content, compressed)
+            return SimpleNamespace(
+                original=content,
+                compressed=f"{compressed} <<ccr:{hash_key}>>",
+                compression_ratio=0.1,
+                strategy_used=CompressionStrategy.KOMPRESS,
+                strategy_chain=[],
+            )
+
+        router.compress = compress
+
+        first = tool_output(router.apply(payload("e"), Tokenizer(), compression_store=explicit))
+        hash_key = MARKER_RE.search(first).group(1)
+        assert explicit.exists(hash_key)
+        assert fallback.exists(hash_key) is False, "the default store never saw it"
+
+        again = tool_output(router.apply(payload("e"), Tokenizer(), compression_store=explicit))
+        assert again == first
+        assert len(calls) == 1, "the effective store still resolves the marker"
+        assert router._cache.stats["cache_hits"] == 1
+    finally:
+        clear_request_compression_store()

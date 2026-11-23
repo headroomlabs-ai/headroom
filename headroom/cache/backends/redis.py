@@ -80,9 +80,15 @@ class RedisBackend:
         """
         return self._guard.available
 
-    def live(self, hash_key: str) -> bool:
-        """Whether the key is there; Redis expires each key with its own TTL."""
-        return self.exists(hash_key)
+    def live(self, hash_key: str) -> bool | None:
+        """Whether the key is there; Redis expires each key with its own TTL.
+
+        ``None`` only when the probe could not run (read failing or skipped in
+        back-off). A successful ``EXISTS`` returning 0 is a definite miss, even
+        if another kind of call — a write, say — is failing right now.
+        """
+        count = self._guard.call("read", lambda: self._client.exists(self._key(hash_key)), None)
+        return None if count is None else bool(count)
 
     def clear(self) -> None:
         keys = self._scan()

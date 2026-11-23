@@ -176,8 +176,13 @@ def _ccr_marker_hashes(text: str) -> set[str]:
     return {match.group(1).lower() for match in _CCR_MARKER_HASH_RE.finditer(text)}
 
 
-def _ccr_markers_live(text: str) -> bool:
+def _ccr_markers_live(text: str, store: Any = None) -> bool:
     """Whether every retrieval marker in ``text`` still resolves.
+
+    ``store`` must be the store the markers were written to: a request may be
+    served by an explicit ``compression_store`` while the process default is
+    empty, and checking the default would then evict a valid result. ``None``
+    resolves the request-scoped store as before.
 
     A marker is a pointer, so it is only as good as the CCR entry behind it.
     Nothing to check (no marker) is live by definition. A store that is absent
@@ -189,9 +194,10 @@ def _ccr_markers_live(text: str) -> bool:
     if not hashes:
         return True
     try:
-        from ..cache.compression_store import get_compression_store
+        if store is None:
+            from ..cache.compression_store import get_compression_store
 
-        store = get_compression_store()
+            store = get_compression_store()
         # ``None`` means the store could not answer: an outage is not an
         # eviction, and dropping the result would throw away data that is
         # still retrievable once the store comes back.
@@ -1980,14 +1986,17 @@ class CompressionCache:
         # new. Order: _disk_read_lock, then _lock, then the store's lock.
         self._disk_read_lock = threading.Lock()
 
-    def get(self, key: str) -> tuple[str, float, str] | None:
+    def get(self, key: str, compression_store: Any = None) -> tuple[str, float, str] | None:
         """Get cached compression result.  Thread-safe.
 
         Returns (compressed_text, ratio, strategy) or None if not found/expired.
         Use is_skipped() first to check if content is known non-compressible.
+
+        ``compression_store`` is the effective store for this request: markers
+        are checked against it, not against the process default.
         """
         t0 = time.perf_counter_ns()
-        self._drop_if_a_marker_died(key)
+        self._drop_if_a_marker_died(key, compression_store)
         with self._lock:
             hit = self._memory_hit_locked(key, t0)
             if hit is not None:
@@ -2028,7 +2037,7 @@ class CompressionCache:
             self._record_lookup(t0)
         return found
 
-    def _drop_if_a_marker_died(self, key: str) -> None:
+    def _drop_if_a_marker_died(self, key: str, compression_store: Any = None) -> None:
         """Forget a result whose CCR originals are gone (#4796).
 
         The CCR entry behind a marker can disappear long before this result
@@ -2047,7 +2056,7 @@ class CompressionCache:
             if entry is None or not entry[5]:
                 return
             compressed = entry[0]
-        if _ccr_markers_live(compressed):
+        if _ccr_markers_live(compressed, compression_store):
             return
         with self._lock:
             entry = self._results.get(key)
@@ -7289,7 +7298,7 @@ class ContentRouter(Transform):
                 continue
 
             # Tier 2: result cache — reuse compressed output
-            cached = self._cache.get(content_key)
+            cached = self._cache.get(content_key, kwargs.get("compression_store"))
             if cached is not None and not self._cached_markers_retrievable(
                 content_key,
                 compression_store=kwargs.get("compression_store"),
@@ -8676,7 +8685,7 @@ class ContentRouter(Transform):
             return None, False
 
         # Tier 2: result cache — reuse compressed output
-        cached = self._cache.get(content_key)
+        cached = self._cache.get(content_key, compression_store)
         if cached is not None and not self._cached_markers_retrievable(
             content_key,
             compression_store=compression_store,

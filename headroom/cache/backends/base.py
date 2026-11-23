@@ -105,8 +105,12 @@ class CompressionStoreBackend(Protocol):
     #     difference.
     #     """
     #
-    # def live(self, hash_key: str) -> bool:
+    # def live(self, hash_key: str) -> bool | None:
     #     """Whether the entry is present and unexpired, without loading it.
+    #
+    #     ``None`` when the probe could not run (failed or skipped): a missing
+    #     entry and an unreachable store must not read the same, or a caller
+    #     that discards data on a miss would evict on an outage.
     #
     #     ``CompressionStore.all_live`` falls back to ``get`` + ``is_expired``,
     #     which deserializes the whole original (megabytes for a large tool

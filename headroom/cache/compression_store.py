@@ -667,28 +667,33 @@ class CompressionStore:
         apart from a miss by a caller that would otherwise discard its own
         data: a Redis or SQLite read failure degrades to "entry not found", so
         an outage is indistinguishable from an eviction by the return value
-        alone. Availability is read *after* the lookups, so the state reflects
-        whether they actually reached the store.
+        alone. A key-only ``live`` probe reports that itself; the
+        ``get`` fallback asks ``available`` after the lookups, so its state
+        reflects whether they actually reached the store.
         """
         with self._lock:
-            live = True
             for hash_key in hash_keys:
                 # ``live`` is the key-only probe: the entry's original can be
-                # megabytes, and only its presence and TTL matter here. A
-                # backend that can fail answers ``None`` there, which is
+                # megabytes, and only its presence and TTL matter here. The
+                # probe answers ``None`` when it could not run, which is
                 # carried out as-is: a failed probe must not read as a miss.
                 probe = getattr(self._backend, "live", None)
-                if probe is None:
-                    entry = self._backend.get(hash_key)
-                    live = entry is not None and not entry.is_expired()
-                else:
+                if probe is not None:
                     live = probe(hash_key)
                     if live is None:
                         return None
-                if not live:
+                    if not live:
+                        # The probe succeeded, so this is a definite miss even
+                        # if some other call (a write) is failing.
+                        return False
+                    continue
+                entry = self._backend.get(hash_key)
+                if entry is None or entry.is_expired():
                     break
-        if live:
-            return True
+            else:
+                return True
+        # Only the ``get`` fallback is ambiguous: both backends report a failed
+        # read as "not found", so ask whether the backend could answer at all.
         available = getattr(self._backend, "available", None)
         if available is not None and available() is False:
             return None
