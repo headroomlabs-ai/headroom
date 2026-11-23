@@ -644,9 +644,12 @@ def _fallback_cache_rates(model: str, provider: str | None, base: float) -> Cach
     A model newer than the bundled price table still reports its cache reads and
     writes, and those are billed at its family's ratios. Pricing every removed
     token at ``base`` as if it were uncached overstates a warm turn's prefix
-    savings about tenfold on Anthropic. ``None`` when the family is unknown.
+    savings about tenfold on Anthropic. A gateway alias is placed by the model it
+    maps to, not by its own name. ``None`` when the family is unknown.
     """
-    family = _cache_family(model, provider)
+    from headroom.pricing.litellm_pricing import alias_target
+
+    family = _cache_family(alias_target(model), provider)
     return None if family is None else _ratio_rates(base, family, BASIS_FALLBACK_PROVIDER_RATIO)
 
 

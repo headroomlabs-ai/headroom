@@ -92,6 +92,11 @@ def _static_alias_map() -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items() if k and v}
 
 
+def alias_target(model: str) -> str:
+    """The model ``HEADROOM_MODEL_ALIAS_MAP`` maps ``model`` to, or ``model`` itself."""
+    return _static_alias_map().get(model, model)
+
+
 def _reduce_to_priced_key(target: str) -> str | None:
     """Reduce a gateway target to a priced litellm.model_cost key, or None."""
     if not LITELLM_AVAILABLE or litellm is None:
@@ -124,7 +129,7 @@ def resolve_litellm_model(model: str) -> str:
     priced: str | None = None
     alias = _static_alias_map()
     if alias:
-        priced = _reduce_to_priced_key(alias.get(model, model))
+        priced = _reduce_to_priced_key(alias_target(model))
     resolved = priced if priced is not None else _resolve_litellm_model_uncached(model)
     remember_bounded(_resolved_model_cache, model, resolved, _RESOLVED_MODEL_CACHE_MAXSIZE)
     return resolved

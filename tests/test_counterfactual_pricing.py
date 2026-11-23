@@ -413,6 +413,36 @@ def test_catalogued_model_without_cache_rates_behind_the_openai_wire(
     assert priced.usd == pytest.approx(3_650 * 2.5e-06 * read_multiplier)
 
 
+def test_alias_to_an_unlisted_model_takes_its_targets_cache_family(monkeypatch):
+    """A vendor-looking alias for an unlisted Claude model gets Claude's read discount."""
+    from headroom.pricing import litellm_pricing
+
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_ALIAS_MAP", '{"gpt-team-default": "claude-not-yet-in-catalog-9"}'
+    )
+    litellm_pricing._resolved_model_cache.clear()
+    resolve_rates.cache_clear()
+    mix = CacheMix.from_usage(cache_read_tokens=15_000, uncached_input_tokens=500)
+    try:
+        by_name, by_alias = (
+            price_savings(
+                3_650,
+                model=model,
+                mix=mix,
+                region=Region.PREFIX,
+                provider="openai",
+                fallback_rate_per_token=_FALLBACK,
+            )
+            for model in ("claude-not-yet-in-catalog-9", "gpt-team-default")
+        )
+    finally:
+        litellm_pricing._resolved_model_cache.clear()
+        resolve_rates.cache_clear()
+
+    assert by_alias.basis == by_name.basis == BASIS_FALLBACK_PROVIDER_RATIO
+    assert by_alias.usd == pytest.approx(by_name.usd) == pytest.approx(0.001095)
+
+
 def test_a_total_reports_its_weakest_contributing_basis():
     """One unpriced request must not launder a total into looking catalog-grade."""
     assert weakest_basis(BASIS_CATALOG, BASIS_NO_MIX) == BASIS_NO_MIX
