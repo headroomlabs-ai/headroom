@@ -3,9 +3,10 @@ name: CodeQL Weekly Triage
 # Gives code scanning alerts an owner and a cadence. Alert #63 was found by
 # CodeQL the day it was introduced and then sat open for five months because
 # nobody was assigned to look (INC-2026-001). Every Monday this opens one issue,
-# assigned to the security owner, listing the open critical/high alerts; the
-# owner fixes or dismisses each with a reason and closes the issue. The issue
-# history is the record that triage happened.
+# assigned to the security owner, with the count of open critical/high alerts
+# and a link to code scanning (the public issue never names an alert's rule or
+# location); the owner fixes or dismisses each with a reason and closes the
+# issue. The issue history is the record that triage happened.
 
 on:
   schedule:

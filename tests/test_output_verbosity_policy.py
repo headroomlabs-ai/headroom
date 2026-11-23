@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
+from headroom.proxy import output_verbosity_policy
 from headroom.proxy.output_verbosity_policy import (
     STEERING_SENTINEL,
     STEERING_SUFFIX,
+    register_verbosity_text,
     replace_or_append_steering_block,
     steering_text,
 )
@@ -69,3 +73,26 @@ def test_replace_or_append_is_idempotent_when_block_matches() -> None:
     updated, changed = replace_or_append_steering_block(f"System.\n\n{block}", block)
     assert changed is False
     assert updated == f"System.\n\n{block}"
+
+
+def test_registered_text_replaces_a_level_wrapped_as_usual(monkeypatch) -> None:
+    monkeypatch.setattr(
+        output_verbosity_policy, "VERBOSITY_LEVELS", dict(output_verbosity_policy.VERBOSITY_LEVELS)
+    )
+    register_verbosity_text(4, "Extension wording.")
+    assert steering_text(4) == f"{STEERING_SENTINEL}\nExtension wording.\n{STEERING_SUFFIX}"
+    assert "Never restate code" in (steering_text(3) or "")
+
+
+@pytest.mark.parametrize(
+    ("level", "text"),
+    [(5, "x"), (0, "x"), (4, "  "), (4, f"a {STEERING_SENTINEL} b"), (4, f"a {STEERING_SUFFIX}")],
+)
+def test_register_rejects_unknown_levels_and_unsafe_text(monkeypatch, level, text) -> None:
+    monkeypatch.setattr(
+        output_verbosity_policy, "VERBOSITY_LEVELS", dict(output_verbosity_policy.VERBOSITY_LEVELS)
+    )
+    before = dict(output_verbosity_policy.VERBOSITY_LEVELS)
+    with pytest.raises(ValueError):
+        register_verbosity_text(level, text)
+    assert output_verbosity_policy.VERBOSITY_LEVELS == before
