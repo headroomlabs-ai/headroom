@@ -129,10 +129,15 @@ class WebSocketSessionRegistry:
         active session at a time.
         """
         existing = self._sessions.get(handle.session_id)
+        if existing is handle:
+            # Same handle re-registered: keep the tasks attached to it. The
+            # call is already a no-op for the session, and clearing here would
+            # drop live task references and under-count the Prometheus gauge.
+            return
         if existing is not None:
-            # Re-registration: release any tasks we were tracking on the
-            # old handle before replacing it.
-            self._active_relay_tasks -= len(existing.relay_tasks)
+            # Re-registration with a new handle: release any tasks we were
+            # tracking on the old handle before replacing it.
+            self._active_relay_tasks = max(0, self._active_relay_tasks - len(existing.relay_tasks))
             existing.relay_tasks.clear()
         self._sessions[handle.session_id] = handle
         self._active_relay_tasks += len(handle.relay_tasks)
