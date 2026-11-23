@@ -346,6 +346,9 @@ def test_unknown_anthropic_model_prices_cold_writes_at_the_write_premium():
         ("not-a-real-model-xyz", "copilot"),
         # Open-weights gpt-oss is not billed by OpenAI, whatever serves it.
         ("ollama/gpt-oss:20b", "ollama"),
+        # An OpenAI-compatible server labels every request "openai".
+        ("gpt-oss-120b", "openai"),
+        ("qwen3-coder-next", "openai"),
     ],
 )
 def test_unknown_model_of_an_unknown_family_stays_at_the_labelled_blended_rate(model, provider):

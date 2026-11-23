@@ -134,15 +134,17 @@ _MODEL_CACHE_FAMILIES: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 #: Wire-provider labels that are not keys of :data:`CACHE_ECONOMICS` but bill
-#: like one. Copilot is absent on purpose: it fronts several model families. A
-#: plain ``openai`` label also covers OpenAI-compatible servers; that is a guess
-#: for them, and the basis says so.
+#: like one. Copilot is absent on purpose: it fronts several model families.
 _PROVIDER_CACHE_FAMILIES = {
-    "openai_responses": "openai",
     "azure": "openai",
     "google": "gemini",
     "vertex_ai": "gemini",
 }
+
+#: Wire protocols every OpenAI-compatible server speaks (vLLM, Ollama, LM
+#: Studio, OpenRouter...). A request label of one of these says nothing about
+#: who bills the model, so only the model name or the catalog can place it.
+_COMPATIBLE_WIRES = frozenset({"openai", "openai_responses"})
 
 
 def weakest_basis(*bases: str | None) -> str:
@@ -581,7 +583,7 @@ def resolve_rates(
         # the provider ratio table if we can identify the provider.
         # Model-only cost consumers do not have a request provider to pass.
         # Prefer explicit routing context, otherwise use the catalog identity.
-        family = _cache_family(model, provider or info.get("litellm_provider"))
+        family = _cache_family(model, provider, info.get("litellm_provider"))
         if family is not None:
             return _ratio_rates(base, family, BASIS_PROVIDER_RATIO)
 
@@ -596,15 +598,25 @@ def resolve_rates(
     )
 
 
-def _cache_family(model: str, provider: Any) -> str | None:
-    """The :data:`CACHE_ECONOMICS` key whose cache billing ``model`` follows, if known."""
+def _cache_family(model: str, provider: Any, catalog_provider: Any = None) -> str | None:
+    """The :data:`CACHE_ECONOMICS` key whose cache billing ``model`` follows, if known.
+
+    The model name decides first. Then the request's wire ``provider``, unless
+    it is a protocol any OpenAI-compatible server speaks. Then the catalog row's
+    own ``catalog_provider``, which names the vendor that bills the model.
+    """
     name = model.lower() if isinstance(model, str) else ""
     for pattern, family in _MODEL_CACHE_FAMILIES:
         if pattern.search(name):
             return family
-    key = provider.split(":")[-1].strip().lower() if isinstance(provider, str) else ""
-    key = _PROVIDER_CACHE_FAMILIES.get(key, key)
-    return key if key in CACHE_ECONOMICS else None
+    for label, is_wire in ((provider, True), (catalog_provider, False)):
+        key = label.split(":")[-1].strip().lower() if isinstance(label, str) else ""
+        if is_wire and key in _COMPATIBLE_WIRES:
+            continue
+        key = _PROVIDER_CACHE_FAMILIES.get(key, key)
+        if key in CACHE_ECONOMICS:
+            return key
+    return None
 
 
 def _ratio_rates(base: float, family: str, basis: str) -> CacheRates:
