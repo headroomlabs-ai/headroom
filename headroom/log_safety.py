@@ -13,6 +13,7 @@ Content is logged only when the operator opts in to it explicitly with
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import logging
 import math
@@ -272,6 +273,77 @@ def safe_id(value: object) -> str:
     if len(text) <= _ID_MAX_CHARS:
         return text
     return f"{text[:_ID_MAX_CHARS]}…(+{len(text) - _ID_MAX_CHARS} chars)"
+
+
+# Control characters a log line must not carry raw: every C0 control but tab
+# (line breaks end a record; ESC starts a terminal escape sequence), DEL, and
+# the non-ASCII characters ``str.splitlines`` also breaks on.
+_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+_LOG_TOKEN_UNSAFE = re.compile(r"[\s\x00-\x1f\x7f\x85\\]")
+_TRACEBACK_INDENT = "    "
+# The record layout of proxy.log and the proxy's stderr; `headroom perf` parses it.
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+
+def _escape_char(match: re.Match[str]) -> str:
+    char = match.group()
+    return "\\x20" if char == " " else char.encode("unicode_escape").decode("ascii")
+
+
+def escape_controls(text: str) -> str:
+    """``text`` with line breaks and other control characters (not tab) escaped."""
+    return _CONTROL.sub(_escape_char, text)
+
+
+def log_token(value: object) -> str:
+    """Render a client-supplied value as one bounded, unquoted ``key=value`` token.
+
+    For machine-parsed lines (``PERF``) where ``safe_id``'s quotes would change
+    the value a reader groups by. Backslash, whitespace and control characters
+    are escaped, so the value can neither end the record nor add a
+    ``key=value`` pair of its own, and the escaping is unambiguous; it is cut
+    to a fixed length.
+    """
+    text = _LOG_TOKEN_UNSAFE.sub(_escape_char, str(value))
+    if len(text) <= _ID_MAX_CHARS:
+        return text
+    return f"{text[:_ID_MAX_CHARS]}…(+{len(text) - _ID_MAX_CHARS}chars)"
+
+
+class SingleLineFormatting(logging.Formatter):
+    """Formatter behaviour that keeps one log record on one line.
+
+    A message can carry request-derived text (a model id, a path, an upstream
+    error). A line break in it would end the record and let the rest pose as a
+    record of its own, for a reader or for ``headroom perf``; an ESC would drive
+    the terminal that shows it. The message and string arguments are escaped
+    before the format string is applied, so a subclass's own decoration (for
+    example uvicorn's coloured level prefix) is kept. A traceback or stack,
+    multi-line by nature, stays readable but indented, so no line of it can
+    start like a record.
+
+    Put it first in the bases of any ``logging.Formatter`` subclass.
+    """
+
+    def formatMessage(self, record: logging.LogRecord) -> str:  # noqa: N802 — stdlib name
+        safe = copy.copy(record)
+        safe.message = escape_controls(record.message)
+        if isinstance(record.args, tuple):
+            safe.args = tuple(
+                escape_controls(arg) if isinstance(arg, str) else arg for arg in record.args
+            )
+        return super().formatMessage(safe)
+
+    def format(self, record: logging.LogRecord) -> str:
+        head, sep, tail = super().format(record).partition("\n")
+        if not sep:
+            return head
+        lines = (escape_controls(line) for line in tail.split("\n"))
+        return head + "\n" + "\n".join(_TRACEBACK_INDENT + line for line in lines)
+
+
+class SingleLineFormatter(SingleLineFormatting, logging.Formatter):
+    """``logging.Formatter`` that keeps one record on one line (proxy.log, stderr)."""
 
 
 def _builtin_repr(value: object) -> str:
