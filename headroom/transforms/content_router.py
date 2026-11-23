@@ -850,7 +850,7 @@ def _strip_cd_prefix(command: str) -> str:
 def _is_read_command(command: str) -> bool:
     """True when a shell command's output is essentially raw FILE CONTENT the agent
     will read/edit from — ``cat``/``head``/``tail``/``nl``/``less``/``more`` of a file,
-    or ``sed -n`` range-printing.
+    ``sed -n`` range-printing, or ``git show REV:PATH`` of a versioned file.
 
     Such reads must NOT be lossy-compressed: the agent needs the exact bytes to produce
     a precise patch. Lossy-compressing them was observed (SWE-bench, mini-swe-agent) to
@@ -999,6 +999,8 @@ def _segment_is_read(c: str) -> bool:
             if tok in {"-c", "-lc", "-lic", "-ic"} and j + 1 < len(rest):
                 return _is_read_command(" ".join(rest[j + 1 :]).strip("'\""))
         return False
+    if prog == "git":
+        return _git_show_reads_file(rest)
     is_read = prog in _READ_VERBS or (
         # Quiet mode prints selected file contents; bare sed is a stream editor.
         prog == "sed" and _sed_is_quiet_read(rest)
@@ -1007,6 +1009,20 @@ def _segment_is_read(c: str) -> bool:
         return False
     # Lockfiles are tool-regenerated, not byte-patched — never protect (keep compressible).
     return not _LOCKFILE_RE.search(c)
+
+
+def _git_show_reads_file(rest: list[str]) -> bool:
+    """Recognize a blob read without qualifying commit or path-filtered diffs."""
+    try:
+        args = shlex.split(_strip_shell_comment(" ".join(rest)))
+    except ValueError:
+        return False
+    if args and args[0] == "--no-pager":
+        args = args[1:]
+    if len(args) != 2 or args[0] != "show" or args[1].startswith("-"):
+        return False
+    _, separator, path = args[1].partition(":")
+    return bool(separator and path and not _LOCKFILE_RE.search(path))
 
 
 def _strip_shell_comment(command: str) -> str:

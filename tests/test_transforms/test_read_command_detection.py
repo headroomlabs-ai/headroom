@@ -42,6 +42,9 @@ from headroom.transforms.content_router import (
         "cd /repo && cat foo.py",
         "sudo cat foo.py",
         "rtk cat foo.py",
+        "git show HEAD:src/foo.py",
+        "git --no-pager show HEAD:src/foo.py | cat -n",
+        "git show 'release:src/file name.py'",
         'bash -lc "cat foo.py"',
         # The `-c` argument is not the first token after the shell.
         'bash --norc -lc "cat foo.py"',
@@ -110,6 +113,9 @@ def test_chained_reads_are_detected(command: str) -> None:
         "sed -- -n foo.py",  # Option parsing ends at --.
         # Lockfiles are regenerated, never byte-patched.
         "cat uv.lock",
+        "git show HEAD:uv.lock",
+        "git show HEAD -- src/foo.py",  # A patch, not the file's contents.
+        "git show HEAD:src/foo.py > copy.py",
         # `-n` from a sibling segment must not qualify a bare `sed`.
         "sed 's/a/b/' foo.py && ls -n",
         # A segment that is only an env assignment resolves to no program.
