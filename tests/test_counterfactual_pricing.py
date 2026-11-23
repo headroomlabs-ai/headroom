@@ -33,6 +33,7 @@ from headroom.pricing.counterfactual import (  # noqa: E402
     BASIS_FALLBACK_PROVIDER_RATIO,
     BASIS_LIST,
     BASIS_NO_MIX,
+    BASIS_PROVIDER_RATIO,
     BASIS_UNPRICED,
     CacheMix,
     Region,
@@ -363,6 +364,45 @@ def test_unknown_model_of_an_unknown_family_stays_at_the_labelled_blended_rate(m
 
     assert priced.basis == BASIS_LIST
     assert priced.usd == pytest.approx(0.024)
+
+
+@pytest.mark.parametrize(
+    ("model", "alias_map", "catalog_key", "catalog_provider", "read_multiplier"),
+    [
+        # An opaque gateway alias: the family comes from the catalog key it maps to.
+        (
+            "production-chat",
+            '{"production-chat": "openrouter/openai/gpt-headroom-test"}',
+            "openrouter/openai/gpt-headroom-test",
+            "openrouter",
+            0.5,
+        ),
+        # A priced model behind the OpenAI wire: the catalog row names the vendor.
+        ("headroom-test-model", "", "headroom-test-model", "anthropic", 0.1),
+    ],
+)
+def test_catalogued_model_without_cache_rates_behind_the_openai_wire(
+    monkeypatch, model, alias_map, catalog_key, catalog_provider, read_multiplier
+):
+    import litellm
+
+    from headroom.pricing import litellm_pricing
+
+    row = {"input_cost_per_token": 2.5e-06, "litellm_provider": catalog_provider}
+    monkeypatch.setattr(litellm, "model_cost", {**litellm.model_cost, catalog_key: row})
+    monkeypatch.setenv("HEADROOM_MODEL_ALIAS_MAP", alias_map)
+    litellm_pricing._resolved_model_cache.clear()
+    resolve_rates.cache_clear()
+    try:
+        priced = price_savings(
+            3_650, model=model, mix=_warm_gpt(), region=Region.PREFIX, provider="openai"
+        )
+    finally:
+        litellm_pricing._resolved_model_cache.clear()
+        resolve_rates.cache_clear()
+
+    assert priced.basis == BASIS_PROVIDER_RATIO
+    assert priced.usd == pytest.approx(3_650 * 2.5e-06 * read_multiplier)
 
 
 def test_a_total_reports_its_weakest_contributing_basis():

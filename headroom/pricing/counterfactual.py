@@ -583,7 +583,7 @@ def resolve_rates(
         # the provider ratio table if we can identify the provider.
         # Model-only cost consumers do not have a request provider to pass.
         # Prefer explicit routing context, otherwise use the catalog identity.
-        family = _cache_family(model, provider, info.get("litellm_provider"))
+        family = _cache_family(resolved_model, provider, info.get("litellm_provider"))
         if family is not None:
             return _ratio_rates(base, family, BASIS_PROVIDER_RATIO)
 
