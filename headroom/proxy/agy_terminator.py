@@ -513,8 +513,10 @@ async def _resolve_tunnel_target(host: str, port: int, self_port: int | None) ->
     Other loopback ports are deliberately still reachable: a local process could
     open them directly, so refusing them buys no security and would break plain
     local tunnelling. The check runs on the *resolved* addresses, not the literal
-    (a name resolving to 127.0.0.1 is the same self-connect), and the vetted
-    address is what we connect to, so no second lookup can substitute another.
+    (a name resolving to 127.0.0.1 is the same self-connect), normalizes
+    IPv4-mapped IPv6 addresses via ``ipv4_mapped`` before both link-local and
+    self-connect checks (independent of interpreter version), and returns the
+    vetted address we connect to so no second lookup can substitute another.
     """
     loop = asyncio.get_running_loop()
     infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -522,9 +524,15 @@ async def _resolve_tunnel_target(host: str, port: int, self_port: int | None) ->
         raise ValueError(f"no address for {host}")
     for info in infos:
         addr = ipaddress.ip_address(info[4][0])
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
         if addr.is_link_local:
             raise ValueError(f"{host} resolves to link-local {addr}")
-        if addr.is_loopback and self_port is not None and port == self_port:
+        if (
+            (addr.is_loopback or addr.is_unspecified)
+            and self_port is not None
+            and port == self_port
+        ):
             raise ValueError("self-connect to the terminator's own port")
     return str(ipaddress.ip_address(infos[0][4][0]))
 

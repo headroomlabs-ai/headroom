@@ -1341,6 +1341,111 @@ async def test_blind_tunnel_refuses_link_local_metadata_host() -> None:
     assert b"403" in response, f"expected 403 for link-local target, got {response!r}"
 
 
+@pytest.mark.asyncio
+async def test_resolve_tunnel_target_normalizes_ipv4_mapped_ipv6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IPv4-mapped IPv6 addresses must be normalized before link-local and self-loop checks.
+
+    Older Python 3.11 patch levels (before the CPython gh-103365 backport) report
+    ``is_link_local == False`` and ``is_loopback == False`` on ``IPv6Address``
+    wrappers like ``::ffff:169.254.169.254`` and ``::ffff:127.0.0.1``. Verify both
+    real resolution and pre-backport ``IPv6Address`` semantics so this guard cannot
+    regress on any supported interpreter.
+    """
+    import ipaddress
+
+    import headroom.proxy.agy_terminator as _mod
+    from headroom.proxy.agy_terminator import _resolve_tunnel_target
+
+    # Real runtime checks + passing control (different loopback port stays allowed).
+    with pytest.raises(ValueError, match="link-local"):
+        await _resolve_tunnel_target("::ffff:169.254.169.254", 80, None)
+    with pytest.raises(ValueError, match="self-connect"):
+        await _resolve_tunnel_target("::ffff:127.0.0.1", 43210, 43210)
+    with pytest.raises(ValueError, match="self-connect"):
+        await _resolve_tunnel_target("0.0.0.0", 43210, 43210)
+    with pytest.raises(ValueError, match="self-connect"):
+        await _resolve_tunnel_target("::ffff:0.0.0.0", 43210, 43210)
+    assert await _resolve_tunnel_target("127.0.0.1", 43211, 43210) == "127.0.0.1"
+
+    # Deterministic pre-gh-103365 IPv6Address wrapper simulation: is_link_local,
+    # is_loopback, and is_unspecified return False on the IPv6Address itself while
+    # remaining True on .ipv4_mapped.
+    class _LegacyIPv6Address(ipaddress.IPv6Address):
+        @property
+        def is_link_local(self) -> bool:
+            return False
+
+        @property
+        def is_loopback(self) -> bool:
+            return False
+
+        @property
+        def is_unspecified(self) -> bool:
+            return False
+
+    real_ip_address = ipaddress.ip_address
+
+    def _legacy_ip_address(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+        addr = real_ip_address(value)  # type: ignore[arg-type]
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return _LegacyIPv6Address(str(addr))
+        return addr
+
+    monkeypatch.setattr(_mod.ipaddress, "ip_address", _legacy_ip_address)
+
+    with pytest.raises(ValueError, match="link-local"):
+        await _resolve_tunnel_target("::ffff:169.254.169.254", 80, None)
+    with pytest.raises(ValueError, match="self-connect"):
+        await _resolve_tunnel_target("::ffff:127.0.0.1", 43210, 43210)
+    with pytest.raises(ValueError, match="self-connect"):
+        await _resolve_tunnel_target("::ffff:0.0.0.0", 43210, 43210)
+
+
+@pytest.mark.asyncio
+async def test_blind_tunnel_refuses_ipv4_mapped_ipv6_self_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real CONNECT ::ffff:127.0.0.1:<terminator-port> must return 403, not 200."""
+    import ipaddress
+
+    import headroom.proxy.agy_terminator as _mod
+
+    class _LegacyIPv6Address(ipaddress.IPv6Address):
+        @property
+        def is_loopback(self) -> bool:
+            return False
+
+        @property
+        def is_link_local(self) -> bool:
+            return False
+
+        @property
+        def is_unspecified(self) -> bool:
+            return False
+
+    real_ip_address = ipaddress.ip_address
+
+    def _legacy_ip_address(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+        addr = real_ip_address(value)  # type: ignore[arg-type]
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return _LegacyIPv6Address(str(addr))
+        return addr
+
+    monkeypatch.setattr(_mod.ipaddress, "ip_address", _legacy_ip_address)
+
+    async with AgyCONNECTTerminator(dispatch_port=1) as term:
+        _, port = term.address
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(f"CONNECT ::ffff:127.0.0.1:{port} HTTP/1.1\r\n\r\n".encode())
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(64), timeout=5)
+        writer.close()
+
+    assert b"403" in response, f"expected 403 for IPv4-mapped self-connect, got {response!r}"
+
+
 @pytest.mark.parametrize(
     ("proxy_url", "expected_port"),
     [
