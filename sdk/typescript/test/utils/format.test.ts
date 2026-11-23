@@ -2166,3 +2166,159 @@ describe("Gemini turns keep their part order through the round trip", () => {
     expect(openAIToGemini(geminiToOpenAI(contents))).toEqual(contents);
   });
 });
+
+describe("Gemini text parts stay apart in a turn that function responses split", () => {
+  // A user turn holding a functionResponse goes out as several OpenAI messages. The text
+  // parts of such a turn must come back as the parts they were, not joined by a newline.
+  it("keeps two text parts ahead of a functionResponse and a file apart", () => {
+    const contents = [
+      { role: "model", parts: [{ functionCall: { name: "render", args: {} } }] },
+      {
+        role: "user",
+        parts: [
+          { text: "Chart" },
+          { text: "CPU utilization" },
+          { functionResponse: { name: "render", response: { ok: true } } },
+          { fileData: { mimeType: "image/png", fileUri: "https://example.com/chart.png" } },
+        ],
+      },
+    ];
+    // Through JSON, as the proxy round trip does.
+    expect(openAIToGemini(JSON.parse(JSON.stringify(geminiToOpenAI(contents))))).toEqual(contents);
+  });
+
+  it("keeps adjacent text parts apart with no media in the turn, before and after the response", () => {
+    const contents = [
+      { role: "model", parts: [{ functionCall: { id: "call_1", name: "render", args: {} } }] },
+      {
+        role: "user",
+        parts: [
+          { text: "Chart" },
+          { text: "CPU utilization" },
+          { functionResponse: { id: "call_1", name: "render", response: { ok: true } } },
+          { text: "Compare it" },
+          { text: "with last week." },
+        ],
+      },
+    ];
+    expect(openAIToGemini(JSON.parse(JSON.stringify(geminiToOpenAI(contents))))).toEqual(contents);
+  });
+
+  it("sends the text parts of a split turn as separate blocks of one message", () => {
+    // Wire-shape guard: the two texts stay two blocks (a joined string could not be split
+    // again), and the turn still goes out as one message per run and per functionResponse.
+    const openai = geminiToOpenAI([
+      {
+        role: "user",
+        parts: [
+          { text: "Chart" },
+          { text: "CPU utilization" },
+          { functionResponse: { name: "render", response: { ok: true } } },
+          { fileData: { mimeType: "image/png", fileUri: "https://example.com/chart.png" } },
+        ],
+      },
+    ]);
+    expect(openai).toEqual([
+      { role: "user", content: [{ type: "text", text: "Chart" }, { type: "text", text: "CPU utilization" }] },
+      {
+        role: "tool",
+        content: '{"ok":true}',
+        tool_call_id: "gemini_render",
+        _headroomGemini: { call: { name: "render" }, sameTurn: true },
+      },
+      {
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "https://example.com/chart.png", mime_type: "image/png" } }],
+        _headroomGemini: { sameTurn: true },
+      },
+    ]);
+  });
+
+  it("still joins a text-block array that did not come from a split Gemini turn", () => {
+    // Guard: an unmarked OpenAI user message keeps the long-standing conversion.
+    expect(
+      openAIToGemini([{ role: "user", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }]),
+    ).toEqual([{ role: "user", parts: [{ text: "a\nb" }] }]);
+  });
+});
+
+describe("Gemini round trip returns generated conversations as sent", () => {
+  // Each test above is one mix of part kinds. This walks 2,000 seeded mixes of all of them, so
+  // a new way of splitting, joining or reordering a turn fails here first. The one rewrite an
+  // exact round trip still makes is the long-standing join of a turn that is nothing but plain
+  // text parts (a model turn may also end in function calls).
+  let state = 20261123;
+  const rnd = () => {
+    // mulberry32: seeded, so a failing conversation can be replayed by its index.
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const chance = (p: number) => rnd() < p;
+  const pick = <T,>(xs: T[]): T => xs[Math.floor(rnd() * xs.length)];
+  let serial = 0;
+  const signed = (part: any) => (chance(0.25) ? { ...part, thoughtSignature: `sig-${serial++}` } : part);
+  const text = () => signed(chance(0.15) ? { text: pick(["Chart", "CPU utilization", "ok"]), thought: true } : { text: pick(["Chart", "CPU utilization", "ok"]) });
+  const media = () => {
+    const part: any = chance(0.5)
+      ? { inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }
+      : { fileData: { mimeType: pick(["image/png", "video/mp4"]), fileUri: `https://example.com/f${serial++}` } };
+    if (chance(0.4)) (part.inlineData ?? part.fileData).displayName = "file.bin";
+    if (chance(0.3)) part.videoMetadata = { startOffset: "0s", fps: 2 };
+    return part;
+  };
+  const carried = (role: string) =>
+    role === "user"
+      ? { toolResponse: { name: "google_search", response: { results: [] } } }
+      : pick([
+          signed({ executableCode: { language: "PYTHON", code: "print(1)" } }),
+          { codeExecutionResult: { outcome: "OUTCOME_OK", output: "1\n" } },
+          { toolCall: { name: "google_search", args: { query: "q" } } },
+        ]);
+  const conversation = () => {
+    const pending: any[] = [];
+    return Array.from({ length: 1 + Math.floor(rnd() * 4) }, () => {
+      const role = chance(0.5) ? "user" : "model";
+      const parts = Array.from({ length: 1 + Math.floor(rnd() * 5) }, () => {
+        const roll = rnd();
+        if (roll < 0.4) return text();
+        if (roll < 0.55) return media();
+        if (roll > 0.85) return carried(role);
+        if (role === "model") {
+          const call: any = { name: pick(["render", "read"]), args: { n: serial } };
+          if (chance(0.6)) call.id = `call_${serial++}`;
+          pending.push(call);
+          return signed({ functionCall: call });
+        }
+        const call = pending.length > 0 && chance(0.8) ? pending.shift() : { name: pick(["render", "read"]) };
+        const answer: any = { name: call.name, response: { ok: true, n: serial++ } };
+        if (call.id !== undefined && chance(0.8)) answer.id = call.id;
+        if (chance(0.3)) answer.parts = [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }];
+        return { functionResponse: answer };
+      });
+      return { role, parts };
+    });
+  };
+  const plain = (p: any) => Object.keys(p).length === 1 && p.text !== undefined;
+  const expected = (turns: any[]) =>
+    turns.map((turn) => {
+      const content = turn.parts.filter((p: any) => !p.functionCall);
+      const calls = turn.parts.filter((p: any) => p.functionCall);
+      const textOnly =
+        content.length > 1 &&
+        content.every(plain) &&
+        turn.parts.slice(content.length).every((p: any) => p.functionCall) &&
+        (turn.role === "model" || calls.length === 0);
+      return textOnly ? { role: turn.role, parts: [{ text: content.map((p: any) => p.text).join("\n") }, ...calls] } : turn;
+    });
+
+  it("puts every part of 2,000 seeded conversations back where it was", () => {
+    for (let i = 0; i < 2000; i++) {
+      const contents = conversation();
+      const back = openAIToGemini(JSON.parse(JSON.stringify(geminiToOpenAI(contents))));
+      expect(back, `conversation ${i}: ${JSON.stringify(contents)}`).toEqual(expected(contents));
+    }
+  });
+});

@@ -888,10 +888,12 @@ function geminiPartToBlock(p: any): any | null {
 }
 
 // Text-only blocks collapse to one joined string, as they always did. A turn with media, a
-// carried part or a block-level extra keeps one block per part: joining would drop them.
-function geminiBlocksToContent(blocks: any[]): string | any[] {
+// carried part or a block-level extra keeps one block per part: joining would drop them. So
+// does a turn that goes out as several messages (`splitTurn`): its text parts are separate
+// parts of a larger turn, and a joined string could not be split again.
+function geminiBlocksToContent(blocks: any[], splitTurn = false): string | any[] {
   const plain = blocks.every((b) => b.type === "text" && !(GEMINI_EXTRAS_KEY in b));
-  return plain ? blocks.map((b) => b.text).join("\n") : blocks;
+  return plain && (!splitTurn || blocks.length === 1) ? blocks.map((b) => b.text).join("\n") : blocks;
 }
 
 // The OpenAI blocks the reverse conversion rebuilds Gemini parts from.
@@ -934,11 +936,12 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
       // OpenAI has no single message for this turn: each functionResponse is a tool message
       // and the parts between them are user messages. They go out in source order, and every
       // message after the turn's first carries `sameTurn`, so the reverse conversion rebuilds
-      // one turn with each part where it was.
+      // one turn with each part where it was. Such a turn never joins its text parts.
       const first = result.length;
+      const splitTurn = parts.some((p: any) => p.functionResponse);
       let run: any[] = [];
       const flushRun = () => {
-        if (run.length > 0) result.push({ role: "user", content: geminiBlocksToContent(run) });
+        if (run.length > 0) result.push({ role: "user", content: geminiBlocksToContent(run, splitTurn) });
         run = [];
       };
       for (const p of parts) {
@@ -1033,7 +1036,7 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
     else result.push({ role: "user", parts });
   };
 
-  for (const msg of messages) {
+  for (const [index, msg] of messages.entries()) {
     if (msg.role === "system") {
       // Gemini system is top-level; if in messages, convert to user
       result.push({ role: "user", parts: [{ text: msg.content }] });
@@ -1041,11 +1044,14 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
     }
 
     if (msg.role === "user") {
-      // A turn keeps one part per block whenever a block is more than plain text (media, a
+      // A message keeps one part per block whenever a block is more than plain text (media, a
       // carried part, extras such as a `thoughtSignature`), so nothing is merged into its
-      // neighbours. Text-only turns keep collapsing to one joined part.
+      // neighbours. So does a message of a turn that went out as several (it is marked
+      // `sameTurn`, or the next message is): geminiToOpenAI never joins the text parts of
+      // such a turn. Any other text-only content keeps collapsing to one joined part.
       const blocks = Array.isArray(msg.content) ? msg.content.filter(isGeminiBlock) : [];
-      if (blocks.some((p) => p.type !== "text" || GEMINI_EXTRAS_KEY in p)) {
+      const splitTurn = geminiExtras(msg).sameTurn || geminiExtras(messages[index + 1]).sameTurn;
+      if (blocks.length > 0 && (splitTurn || blocks.some((p) => p.type !== "text" || GEMINI_EXTRAS_KEY in p))) {
         pushUserParts(msg, blocks.map(geminiPartFromBlock));
         continue;
       }

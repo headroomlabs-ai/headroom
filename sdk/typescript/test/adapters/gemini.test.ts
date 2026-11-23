@@ -394,3 +394,40 @@ describe("Gemini withHeadroom keeps part order", () => {
     expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
   });
 });
+
+describe("Gemini withHeadroom keeps text parts apart", () => {
+  it("hands back a turn of two texts, a functionResponse and a file with all four parts", async () => {
+    const mockModel = { generateContent: vi.fn().mockResolvedValue({}) };
+    // The proxy copies messages and their blocks; echo them after a JSON round trip.
+    mockFetch.mockImplementation(async (_url: string, opts: any) => ({
+      ok: true,
+      json: async () => ({
+        messages: JSON.parse(opts.body).messages,
+        tokens_before: 500,
+        tokens_after: 400,
+        tokens_saved: 100,
+        compression_ratio: 0.8,
+        transforms_applied: ["smart_crusher"],
+        ccr_hashes: [],
+      }),
+    }));
+    const contents = [
+      { role: "user", parts: [{ text: "Render the CPU chart." }] },
+      { role: "model", parts: [{ functionCall: { name: "render", args: {} } }] },
+      {
+        role: "user",
+        parts: [
+          { text: "Chart" },
+          { text: "CPU utilization" },
+          { functionResponse: { name: "render", response: { ok: true } } },
+          { fileData: { mimeType: "image/png", fileUri: "https://example.com/chart.png" } },
+        ],
+      },
+    ];
+
+    const wrapped = withHeadroom(mockModel, { baseUrl: "http://test:8787" });
+    await wrapped.generateContent({ contents });
+
+    expect(mockModel.generateContent).toHaveBeenCalledWith({ contents });
+  });
+});
