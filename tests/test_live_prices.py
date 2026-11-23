@@ -7,6 +7,7 @@ proxy now merges LiteLLM's current table in the background.
 
 from __future__ import annotations
 
+import copy
 import http.client
 import io
 import json
@@ -41,8 +42,17 @@ NEW_ROW = {
 
 @pytest.fixture
 def isolated_catalog(monkeypatch):
+    """Undo a merge: the price table and the provider name sets litellm keeps."""
     monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
+    name_sets = {name: set(v) for name, v in vars(litellm).items() if isinstance(v, set)}
+    by_provider = {k: copy.copy(v) for k, v in litellm.models_by_provider.items()}
     yield
+    for name, saved in name_sets.items():
+        live = getattr(litellm, name)
+        live.clear()
+        live.update(saved)
+    litellm.models_by_provider.clear()
+    litellm.models_by_provider.update(by_provider)
     live_prices._clear_price_caches()
 
 
@@ -91,6 +101,31 @@ def test_refresh_keeps_headroom_deepseek_off_peak_rates(monkeypatch, isolated_ca
 
     for key in (model, f"deepseek/{model}"):
         assert litellm.model_cost[key]["input_cost_per_token"] == ours["input_cost_per_token"]
+
+
+def test_refresh_drops_a_rate_upstream_retired(monkeypatch, isolated_catalog):
+    retired = "input_cost_per_token_above_200k_tokens"
+    litellm.model_cost[NEW_MODEL] = {**NEW_ROW, retired: 8e-06}
+    table = dict(litellm.model_cost)
+    table[NEW_MODEL] = NEW_ROW
+    _serve(monkeypatch, table)
+
+    live_prices.refresh_litellm_prices()
+
+    assert retired not in litellm.model_cost[NEW_MODEL]
+
+
+def test_refresh_prices_an_alias_at_its_target_rate(monkeypatch, isolated_catalog):
+    alias = "claude-headroom-test-latest"
+    table = dict(litellm.model_cost)
+    table[NEW_MODEL] = NEW_ROW
+    table[alias] = {"alias_of": NEW_MODEL}
+    _serve(monkeypatch, table)
+
+    live_prices.refresh_litellm_prices()
+
+    assert litellm.model_cost[alias]["cache_read_input_token_cost"] == 2e-07
+    assert "alias_of" not in litellm.model_cost[alias]
 
 
 def test_a_truncated_download_keeps_the_bundled_table(monkeypatch, isolated_catalog):

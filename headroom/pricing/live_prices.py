@@ -23,6 +23,7 @@ import http.client
 import json
 import logging
 import os
+import threading
 import urllib.request
 from typing import Any
 
@@ -93,20 +94,49 @@ def _clear_price_caches() -> None:
     _resolve_litellm_model.cache_clear()
 
 
+#: Longest ``alias_of`` chain followed; deeper (or cyclic) aliases are dropped.
+_MAX_ALIAS_DEPTH = 4
+
+
+def _resolve_aliases(models: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Rows with each ``alias_of`` row replaced by its target's prices.
+
+    Current tables publish aliases such as ``bedrock/claude-opus-latest`` as a
+    row holding only ``alias_of``; older litellm releases cannot follow it, so
+    the row would carry no price. An alias whose target is missing is left out,
+    keeping whatever the bundled table had for that name.
+    """
+    resolved: dict[str, dict[str, Any]] = {}
+    for key, row in models.items():
+        target, depth = row, 0
+        while "alias_of" in target and depth < _MAX_ALIAS_DEPTH:
+            nxt = models.get(target["alias_of"])
+            if not isinstance(nxt, dict):
+                break
+            target, depth = nxt, depth + 1
+        if "alias_of" in target:
+            continue
+        own = {k: v for k, v in row.items() if k != "alias_of"}
+        resolved[key] = {**target, **own} if target is not row else dict(row)
+    return resolved
+
+
 def merge_litellm_prices(models: dict[str, Any]) -> int:
     """Merge ``models`` into LiteLLM's table and drop stale caches.
 
-    Each fetched row is laid over the current one, Headroom's own rows (DeepSeek
-    off-peak rates) are laid back on top, and only rows that differ are applied,
-    in one ``dict.update``: request threads iterating ``litellm.model_cost``
-    never see it change size mid-merge. Returns how many rows changed.
+    Each fetched row replaces the current one whole, so a rate upstream has
+    retired (a dropped long-context tier) goes with it. Alias rows are resolved
+    to their target's prices. Headroom's own rows (DeepSeek off-peak rates) are
+    laid back on top, and only rows that differ are applied, in one
+    ``dict.update``: request threads iterating ``litellm.model_cost`` never see
+    it change size mid-merge. Returns how many rows changed.
     """
     from headroom.pricing.litellm_pricing import deepseek_rows, litellm
 
     if litellm is None:
         return 0
     current = litellm.model_cost
-    rows = {key: {**current.get(key, {}), **row} for key, row in models.items()}
+    rows = _resolve_aliases(models)
     rows.update(deepseek_rows({**current, **rows}))
     changed = {key: row for key, row in rows.items() if current.get(key) != row}
     if not changed:
@@ -148,15 +178,41 @@ def refresh_litellm_prices() -> int | None:
     return changed
 
 
+async def _refresh_in_daemon_thread() -> None:
+    """Run one refresh on a daemon thread and wait for it.
+
+    Not asyncio.to_thread: the interpreter joins executor threads at exit,
+    so a download in flight at shutdown would hold the process up to the fetch
+    timeout after the task was cancelled. A daemon thread is simply abandoned.
+    """
+    loop = asyncio.get_running_loop()
+    finished = loop.create_future()
+
+    def finish() -> None:
+        if not finished.done():
+            finished.set_result(None)
+
+    def run() -> None:
+        try:
+            refresh_litellm_prices()
+        except Exception:  # a thread boundary: report it, the next run tries again
+            logger.exception("event=price_table_refresh_crashed url=%s", LITELLM_PRICES_URL)
+        finally:
+            try:
+                loop.call_soon_threadsafe(finish)
+            except RuntimeError:  # the loop closed during shutdown; nobody is waiting
+                pass
+
+    threading.Thread(target=run, name="headroom-price-refresh", daemon=True).start()
+    await finished
+
+
 async def refresh_periodically(interval: float = REFRESH_INTERVAL_SECONDS) -> None:
-    """Refresh now and then every ``interval`` seconds until cancelled."""
+    """Refresh now and then every interval seconds until cancelled."""
     if not is_price_refresh_enabled():
         return
     while True:
-        try:
-            await asyncio.to_thread(refresh_litellm_prices)
-        except Exception:  # a background task boundary: report it and keep the schedule
-            logger.exception("event=price_table_refresh_crashed url=%s", LITELLM_PRICES_URL)
+        await _refresh_in_daemon_thread()
         await asyncio.sleep(interval)
 
 
