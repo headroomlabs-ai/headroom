@@ -126,17 +126,22 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
 
     Each fetched row replaces the current one whole, so a rate upstream has
     retired (a dropped long-context tier) goes with it. Alias rows are resolved
-    to their target's prices. Headroom's own rows (DeepSeek off-peak rates) are
-    laid back on top, and only rows that differ are applied, in one
-    ``dict.update``: request threads iterating ``litellm.model_cost`` never see
-    it change size mid-merge. Returns how many rows changed.
+    to their target's prices, after Headroom's own rows (DeepSeek off-peak
+    rates) are laid on, so aliases inherit those too. Only rows that differ
+    are applied, in one ``dict.update``: request threads iterating
+    ``litellm.model_cost`` never see it change size mid-merge. Returns how
+    many rows changed.
     """
     from headroom.pricing.litellm_pricing import deepseek_rows, litellm
 
     if litellm is None:
         return 0
     current = litellm.model_cost
-    rows = _resolve_aliases(models)
+    # Headroom's rows go on before aliases resolve, so an alias such as
+    # deepseek/deepseek-flash-latest takes the off-peak rate of its target,
+    # and again after, for any of them the fetched table does not list.
+    ours = {key: row for key, row in deepseek_rows(models).items() if key in models}
+    rows = _resolve_aliases({**models, **ours})
     rows.update(deepseek_rows({**current, **rows}))
     changed = {key: row for key, row in rows.items() if current.get(key) != row}
     if not changed:

@@ -7,10 +7,12 @@ proxy now merges LiteLLM's current table in the background.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import http.client
 import io
 import json
+import threading
 import urllib.request
 
 import pytest
@@ -126,6 +128,46 @@ def test_refresh_prices_an_alias_at_its_target_rate(monkeypatch, isolated_catalo
 
     assert litellm.model_cost[alias]["cache_read_input_token_cost"] == 2e-07
     assert "alias_of" not in litellm.model_cost[alias]
+
+
+def test_a_deepseek_alias_takes_headroom_off_peak_rate(monkeypatch, isolated_catalog):
+    model, ours = next(iter(_DEEPSEEK_V4_PRICING.items()))
+    target = f"deepseek/{model}"
+    alias = "deepseek/deepseek-headroom-test-latest"
+    table = dict(litellm.model_cost)
+    table[target] = {**table.get(target, {}), "input_cost_per_token": 1.0}  # upstream peak
+    table[alias] = {"alias_of": target}
+    _serve(monkeypatch, table)
+
+    live_prices.refresh_litellm_prices()
+
+    for field in ("input_cost_per_token", "output_cost_per_token"):
+        assert litellm.model_cost[alias][field] == litellm.model_cost[target][field]
+    assert litellm.model_cost[alias]["input_cost_per_token"] == ours["input_cost_per_token"]
+
+
+def test_cancelling_the_refresh_does_not_wait_for_a_stuck_download(monkeypatch):
+    monkeypatch.setenv("HEADROOM_PRICE_REFRESH", "on")
+    started, release = threading.Event(), threading.Event()
+
+    def stuck_refresh():
+        started.set()
+        release.wait(30)
+
+    monkeypatch.setattr(live_prices, "refresh_litellm_prices", stuck_refresh)
+
+    async def run_and_cancel():
+        task = asyncio.create_task(live_prices.refresh_periodically())
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+
+    try:
+        asyncio.run(run_and_cancel())
+        workers = [t for t in threading.enumerate() if t.name == "headroom-price-refresh"]
+        assert workers and all(t.daemon for t in workers)  # abandoned at exit, never joined
+    finally:
+        release.set()
 
 
 def test_a_truncated_download_keeps_the_bundled_table(monkeypatch, isolated_catalog):
