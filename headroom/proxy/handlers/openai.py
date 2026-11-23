@@ -2766,7 +2766,10 @@ class OpenAIHandlerMixin:
                 if isinstance(call_id, str) and call_id in read_command_by_call_id:
                     # Finalize by CONTENT (same gate as ContentRouter.apply):
                     # protect unless the output is confidently non-code DATA.
-                    if _read_output_should_be_protected(_responses_part_text(item.get("output"))):
+                    if _read_output_should_be_protected(
+                        _responses_part_text(item.get("output")),
+                        command=read_command_by_call_id[call_id],
+                    ):
                         read_protected_call_ids.add(call_id)
                         continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:

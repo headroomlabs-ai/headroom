@@ -847,7 +847,7 @@ def _strip_cd_prefix(command: str) -> str:
     return c
 
 
-def _is_read_command(command: str) -> bool:
+def _is_read_command(command: str, *, git_tree_operand: str | None = None) -> bool:
     """True when a shell command's output is essentially raw FILE CONTENT the agent
     will read/edit from — ``cat``/``head``/``tail``/``nl``/``less``/``more`` of a file,
     ``sed -n`` range-printing, or ``git show REV:PATH`` of a versioned file.
@@ -887,7 +887,10 @@ def _is_read_command(command: str) -> bool:
     # unprotect the read next to it.
     if re.search(r"(^|\s)<<", c):
         return False
-    return any(_segment_is_read(seg) for seg in _command_segments(c))
+    segments = _command_segments(c)
+    if git_tree_operand is not None and len(segments) != 1:
+        return False
+    return any(_segment_is_read(seg, git_tree_operand=git_tree_operand) for seg in segments)
 
 
 # Separators that start a NEW command. A pipeline (`|`) deliberately does NOT:
@@ -906,19 +909,19 @@ def _command_segments(command: str) -> list[str]:
     quotes (``sed -n '/a;b/p' foo.py``) are part of an argument, not a new command.
     """
     masked = _mask_quoted(command)
-    segments: list[str] = []
+    segments: list[tuple[int, int]] = []
     start = 0
     for m in _CMD_SEPARATOR_RE.finditer(masked):
         if m.group() == "\n" and masked[start : m.start()].rstrip().endswith("|"):
             continue
-        segments.append(command[start : m.start()])
+        segments.append((start, m.start()))
         start = m.end()
-    segments.append(command[start:])
-    return [seg.strip() for seg in segments if seg.strip()]
+    segments.append((start, len(command)))
+    return [command[begin:end].strip() for begin, end in segments if masked[begin:end].strip()]
 
 
 def _mask_quoted(command: str) -> str:
-    """Return ``command`` with quoted, escaped and commented characters replaced by ``_``.
+    """Mask quoted and escaped characters with underscores and comments with spaces.
 
     The result has the same length, so match positions map back onto ``command``.
     Shell operators inside quotes (``sed -n '/x >/p' foo.py``), after a backslash, or
@@ -962,7 +965,7 @@ def _mask_quoted(command: str) -> str:
         elif char == "#" and word_start:
             # Comment to end of line; the newline itself stays visible.
             while i < n and command[i] != "\n":
-                out[i] = "_"
+                out[i] = " "
                 i += 1
             word_start = True
             continue
@@ -972,7 +975,7 @@ def _mask_quoted(command: str) -> str:
     return "".join(out)
 
 
-def _segment_is_read(c: str) -> bool:
+def _segment_is_read(c: str, *, git_tree_operand: str | None = None) -> bool:
     """:func:`_is_read_command` for ONE command (no ``;``/``&&``/``||`` chaining)."""
     # A redirect or `tee` in THIS segment means the segment writes a file rather than
     # reading one (`cat a.py > copy.py`, `cat a.py | tee copy.py`). Checked on the whole
@@ -999,10 +1002,14 @@ def _segment_is_read(c: str) -> bool:
         # `bash -lc "cat …"` (Codex): the real command is the -c argument.
         for j, tok in enumerate(rest):
             if tok in {"-c", "-lc", "-lic", "-ic"} and j + 1 < len(rest):
-                return _is_read_command(" ".join(rest[j + 1 :]).strip("'\""))
+                return _is_read_command(
+                    " ".join(rest[j + 1 :]).strip("'\""), git_tree_operand=git_tree_operand
+                )
         return False
     if prog == "git":
-        return _git_show_reads_file(rest)
+        return _git_show_reads_file(rest, git_tree_operand=git_tree_operand)
+    if git_tree_operand is not None:
+        return False
     is_read = prog in _READ_VERBS or (
         # Quiet mode prints selected file contents; bare sed is a stream editor.
         prog == "sed" and _sed_is_quiet_read(rest)
@@ -1013,7 +1020,7 @@ def _segment_is_read(c: str) -> bool:
     return not _LOCKFILE_RE.search(c)
 
 
-def _git_show_reads_file(rest: list[str]) -> bool:
+def _git_show_reads_file(rest: list[str], *, git_tree_operand: str | None = None) -> bool:
     """Recognize a blob read without qualifying commit or path-filtered diffs."""
     try:
         args = shlex.split(_strip_shell_comment(" ".join(rest)))
@@ -1028,6 +1035,8 @@ def _git_show_reads_file(rest: list[str]) -> bool:
         show_args.pop()
     blob_args = [arg for arg in show_args if arg not in {"--no-color", "--color=never"}]
     if len(blob_args) != 1 or blob_args[0].startswith("-"):
+        return False
+    if git_tree_operand is not None and blob_args[0] != git_tree_operand:
         return False
     # Index entries can have an explicit stage and reflog selectors can contain
     # a timestamp. Neither is part of the path.
@@ -1614,7 +1623,7 @@ def _codex_exec_envelope_outputs(text: str) -> list[str] | None:
     return outputs if outputs and len(outputs) == len(envelopes) else None
 
 
-def _read_output_should_be_protected(text: Any) -> bool:
+def _read_output_should_be_protected(text: Any, *, command: str = "") -> bool:
     """Finalize read-protection by CONTENT — protect by default, release only DATA.
 
     ``_is_read_command`` says "this came from a cat/sed/head file read (and isn't a
@@ -1629,12 +1638,13 @@ def _read_output_should_be_protected(text: Any) -> bool:
     """
     if not isinstance(text, str) or not text:
         return False
-    if re.match(r"tree [^\r\n]*:[^\r\n]*\r?\n\r?\n", text):
-        # git show also reads trees, whose output is a directory listing.
+    tree = re.match(r"tree ([^\r\n]*:[^\r\n]*)\r?\n\r?\n", text)
+    if tree and _is_read_command(command, git_tree_operand=tree[1]):
+        # A git tree listing echoes the exact operand in its header.
         return False
     outputs = _codex_exec_envelope_outputs(text)
     if outputs is not None:
-        return any(_read_output_should_be_protected(output) for output in outputs)
+        return any(_read_output_should_be_protected(output, command=command) for output in outputs)
     try:
         detection = _detect_content(text)
     except Exception:
@@ -2788,7 +2798,7 @@ class _PerRequestRuntimeState:
     # blast radius is a genuine file read losing its protection rather than
     # a compression-policy misapplication.
     protect_read_tool_ids: set[str] = field(default_factory=set)
-    protect_read_msg_indices: set[int] = field(default_factory=set)
+    protect_read_msg_indices: dict[int, str] = field(default_factory=dict)
     # ``time.perf_counter()`` origin shared by every kompress call this
     # request makes. ``HEADROOM_COMPRESSION_DEADLINE_MS`` is a deadline on
     # kompress inference, but each ``compress()`` call started its own clock,
@@ -3214,11 +3224,11 @@ class ContentRouter(Transform):
         self._get_local_runtime_state().protect_read_tool_ids = value
 
     @property
-    def _protect_read_msg_indices(self) -> set[int]:
+    def _protect_read_msg_indices(self) -> dict[int, str]:
         return self._runtime_state_var.get().protect_read_msg_indices
 
     @_protect_read_msg_indices.setter
-    def _protect_read_msg_indices(self, value: set[int]) -> None:
+    def _protect_read_msg_indices(self, value: dict[int, str]) -> None:
         self._get_local_runtime_state().protect_read_msg_indices = value
 
     def _record_freeze_pin(self, content: str, cached_ratio: float) -> None:
@@ -6640,7 +6650,7 @@ class ContentRouter(Transform):
         # mark the observation's message index so it is passed verbatim — so
         # cat/sed/head code reads are protected on ANY model/harness, not just
         # those that emit tool-call/tool_result blocks.
-        self._protect_read_msg_indices: set[int] = set()
+        self._protect_read_msg_indices = {}
         if read_protection_enabled():
             for _idx, _m in enumerate(messages):
                 if _m.get("role") != "user":
@@ -6654,7 +6664,7 @@ class ContentRouter(Transform):
                     if _rj == "user":
                         break
                 if _cmd and _is_read_command(_cmd):
-                    self._protect_read_msg_indices.add(_idx)
+                    self._protect_read_msg_indices[_idx] = _cmd
 
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)
@@ -7097,16 +7107,15 @@ class ContentRouter(Transform):
             # `role:user` string), so we key off the OUTCOME — "a read command
             # produced code output" — not the role. Link via the observation's
             # tool_call_id/tool_use_id (tool-based) OR the preceding fenced
-            # command's message index (text-based); a given harness populates
-            # exactly one, so ORing them is shape-agnostic and collision-free.
+            # command's message index (text-based).
             # (Anthropic tool_result BLOCKS carry list content and are protected
             # in the block path; this covers STRING-content observations.)
             if role in ("user", "tool", "function"):
                 _tcid = message.get("tool_call_id") or message.get("tool_use_id") or ""
-                _is_read_obs = _tcid in getattr(self, "_protect_read_tool_ids", ()) or i in getattr(
-                    self, "_protect_read_msg_indices", ()
-                )
-                if _is_read_obs and _read_output_should_be_protected(content):
+                _read_cmd = getattr(self, "_protect_read_msg_indices", {}).get(i, "")
+                if _tcid in getattr(self, "_protect_read_tool_ids", ()):
+                    _read_cmd = getattr(self, "_tool_call_commands", {}).get(_tcid, "")
+                if _read_cmd and _read_output_should_be_protected(content, command=_read_cmd):
                     _exp = self._experimental_compress_read(content, context)
                     if _exp is not None:
                         result_slots[i] = {**message, "content": _exp}
@@ -8244,7 +8253,9 @@ class ContentRouter(Transform):
                 # re-reads of the same file are losslessly de-duplicated either way.
                 if tool_use_id in getattr(
                     self, "_protect_read_tool_ids", ()
-                ) and _read_output_should_be_protected(_tr_text):
+                ) and _read_output_should_be_protected(
+                    _tr_text, command=getattr(self, "_tool_call_commands", {}).get(tool_use_id, "")
+                ):
                     _exp = self._experimental_compress_read(_tr_text, context or "")
                     if _exp is not None:
                         new_blocks.append({**block, "content": _exp})

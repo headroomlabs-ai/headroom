@@ -96,6 +96,7 @@ def test_chained_reads_are_detected(command: str) -> None:
         # `head` here truncates grep output, it does not read bar.py.
         "grep -n x foo.py | head -40",
         "grep -n x foo.py |\ncat",
+        "printf 'derived output\\n' | # explanation\ncat",
         # Writes are never reads.
         "cat > foo.py",
         # The write lives in the read segment itself — a pipeline is one segment,
@@ -144,14 +145,27 @@ def test_non_reads_are_not_detected(command: str) -> None:
         "git show HEAD:src/foo.py\nwc -l src/foo.py",
         "wc -l src/foo.py\ngit show HEAD:src/foo.py",
         "git show HEAD:src/foo.py |\ncat -n",
+        "git show HEAD:src/foo.py | # line numbers\ncat -n",
     ],
 )
 def test_git_reads_in_multiline_commands_are_detected(command: str) -> None:
     assert _is_read_command(command) is True
 
 
-def test_git_tree_listing_is_not_protected() -> None:
-    assert not _read_output_should_be_protected("tree HEAD:src\n\napp.py\nmodels/\n")
+@pytest.mark.parametrize("command", ["git show HEAD:src", "git show HEAD:src\n# List paths"])
+def test_git_tree_listing_is_not_protected(command: str) -> None:
+    assert not _read_output_should_be_protected(
+        "tree HEAD:src\n\napp.py\nmodels/\n", command=command
+    )
+
+
+@pytest.mark.parametrize(
+    "command", ["cat notes.txt", "git show HEAD:notes.txt", "git show HEAD:src; cat notes.txt"]
+)
+def test_file_can_start_with_a_git_tree_header(command: str) -> None:
+    assert _read_output_should_be_protected(
+        "tree HEAD:src\n\nKeep this note unchanged.\n", command=command
+    )
 
 
 @pytest.mark.parametrize(
@@ -244,6 +258,46 @@ def test_quiet_sed_output_reaches_read_protection(flag: str, comment: str, monke
         )
     )
     result = router.apply(messages, EstimatingTokenCounter(), protect_recent=0)
+    assert "router:shell_small_result_verbatim" not in result.transforms_applied
+    assert "router:read_protected" in result.transforms_applied
+    assert result.messages[2]["content"] == content
+
+
+def test_cat_note_with_tree_header_reaches_read_protection(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    monkeypatch.setenv("HEADROOM_SHELL_RESULT_MIN_CHARS", "2000")
+    content = "tree t:src\n\n" + "".join(
+        f"Step {i}: Preserve this deployment note exactly for the follow-up.\n" for i in range(40)
+    )
+    messages = [
+        {"role": "user", "content": "Read the deployment note."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "read-note",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": json.dumps({"command": "cat notes.txt"}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "read-note", "content": content},
+    ]
+    router = ContentRouter(
+        ContentRouterConfig(
+            enable_code_aware=False,
+            enable_kompress=False,
+            protect_analysis_context=False,
+            protect_recent_reads_fraction=0.0,
+        )
+    )
+
+    result = router.apply(messages, EstimatingTokenCounter(), protect_recent=0)
+
     assert "router:shell_small_result_verbatim" not in result.transforms_applied
     assert "router:read_protected" in result.transforms_applied
     assert result.messages[2]["content"] == content
