@@ -284,9 +284,16 @@ def destination_listed(
 # sits in ::/8) -- judging the IPv6 form rejected every IPv4-only upstream on a
 # DNS64 network. The local-use prefix (RFC 8215, 64:ff9b:1::/48) is not
 # unwrapped: where its IPv4 bits sit depends on the operator's prefix length,
-# so it stays rejected as non-global. 6to4, Teredo and IPv4-mapped forms are
-# already caught by the `is_global` test below.
+# so it stays rejected as non-global. Teredo and IPv4-mapped forms are caught
+# by the `is_global` test below.
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+# 6to4 (RFC 3056) embeds an IPv4 address in bits 16-47 and a relay delivers to
+# it, so `2002:a9fe:a9fe::` reaches 169.254.169.254. Only Python releases that
+# carry the 2024 `ipaddress` table fix call 2002::/16 non-global; older 3.11
+# patch releases call it global, so the guard cannot lean on `is_global` here.
+# The mechanism is deprecated (RFC 7526) and no API upstream is reached through
+# it, so the whole prefix is refused on every Python.
+_SIX_TO_FOUR_PREFIX = ipaddress.IPv6Network("2002::/16")
 
 
 def _nat64_embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
@@ -307,6 +314,8 @@ def _is_internal_address(ip: str) -> bool:
         embedded = _nat64_embedded_ipv4(addr)
         if embedded is not None:
             return _is_internal_address(str(embedded))
+        if addr in _SIX_TO_FOUR_PREFIX:
+            return True
     if (
         addr.is_private
         or addr.is_loopback
@@ -319,8 +328,8 @@ def _is_internal_address(ip: str) -> bool:
     # Anything not globally routable. This is what catches RFC 6598 shared
     # address space (100.64.0.0/10) -- which `is_private` does not flag, and
     # which reaches ISP and cloud-internal infrastructure -- along with
-    # benchmarking (198.18/15), TEST-NET, 240/4, 6to4 and Teredo tunnels that
-    # embed an internal IPv4, and any future special-use range the stdlib
+    # benchmarking (198.18/15), TEST-NET, 240/4, Teredo tunnels that embed an
+    # internal IPv4, and any future special-use range the stdlib
     # learns about.
     if not addr.is_global:
         return True
