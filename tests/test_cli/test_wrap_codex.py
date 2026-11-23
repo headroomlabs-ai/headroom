@@ -2261,6 +2261,75 @@ def test_stop_local_proxy_for_unwrap_refuses_unidentified_listener(
     kill_proxy.assert_not_called()
 
 
+@pytest.mark.parametrize("bad_pid", [-1, 0, 1, True, "abc", None, 3.5])
+def test_kill_proxy_by_pid_never_signals_unsafe_pid(
+    monkeypatch: pytest.MonkeyPatch, bad_pid: object
+) -> None:
+    """A listener-supplied PID of -1/0/1 must never reach os.kill or taskkill."""
+    calls: list[object] = []
+    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(("kill", pid)))
+    monkeypatch.setattr(wrap_mod.subprocess, "run", lambda *a, **k: calls.append(("run", a)))
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
+    for plat in ("win32", "linux"):
+        monkeypatch.setattr(wrap_mod.sys, "platform", plat)
+        assert wrap_mod._kill_proxy_by_pid(bad_pid, 8787) is False  # type: ignore[arg-type]
+    assert calls == []
+
+
+def test_kill_proxy_by_pid_never_signals_own_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(pid))
+    monkeypatch.setattr(wrap_mod.subprocess, "run", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
+    assert wrap_mod._kill_proxy_by_pid(wrap_mod.os.getpid(), 8787) is False
+    assert calls == []
+
+
+@pytest.mark.parametrize("bad_pid", [-1, 0, 1])
+def test_stop_local_proxy_for_unwrap_ignores_self_declared_unsafe_pid(
+    monkeypatch: pytest.MonkeyPatch, bad_pid: int
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": bad_pid})
+    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(pid))
+    monkeypatch.setattr(wrap_mod.subprocess, "run", lambda *a, **k: calls.append(a))
+
+    assert wrap_mod._stop_local_proxy_for_unwrap(8787) == "no_pid"
+    assert calls == []
+
+
+@pytest.mark.parametrize("body", [b"[]", b'"ok"', b"1", b"null"])
+def test_query_proxy_config_non_dict_health_is_unidentified(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    import io
+
+    from headroom.providers.copilot import wrap as copilot_wrap
+
+    monkeypatch.setattr(
+        copilot_wrap.urllib.request,
+        "urlopen",
+        lambda url, timeout=2: io.BytesIO(body),
+    )
+    assert wrap_mod._query_proxy_config(8787) is None
+
+
+def test_kill_proxy_by_pid_positive_control_signals_real_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(("kill", pid)))
+    monkeypatch.setattr(
+        wrap_mod.subprocess, "run", lambda args, **k: calls.append(("run", args[-1]))
+    )
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+    pid = wrap_mod.os.getpid() + 1
+    assert wrap_mod._kill_proxy_by_pid(pid, 8787) is True
+    assert calls[0][1] in (pid, str(pid))
+
+
 def test_unwrap_codex_is_safe_noop_with_explicit_codex_home(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

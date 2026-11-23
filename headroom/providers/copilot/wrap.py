@@ -39,6 +39,8 @@ def query_proxy_config(port: int) -> dict[str, Any] | None:
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
         return None
 
+    if not isinstance(payload, dict):
+        return None
     config = payload.get("config")
     if not isinstance(config, dict):
         return None

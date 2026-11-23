@@ -4606,7 +4606,14 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
 
     Sends SIGTERM first, falls back to SIGKILL after 5 seconds.
     Returns True if the port is free afterwards, False otherwise.
+
+    The PID usually comes from a ``/health`` body the listener wrote itself, so
+    it is untrusted. Never signal a non-int or ``pid <= 1`` (``-1`` addresses
+    every process the user may signal, ``0`` the caller's process group) or this
+    process.
     """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+        return False
     if sys.platform == "win32":
         # ``os.kill(..., SIGTERM)`` only targets one Windows process.  The
         # native proxy launcher can own a serving child, so terminating the
@@ -4683,6 +4690,8 @@ def _stop_local_proxy_for_unwrap(port: int) -> str:
     try:
         pid = int(proxy_pid)
     except (TypeError, ValueError):
+        return "no_pid"
+    if pid <= 1:
         return "no_pid"
 
     return "stopped" if _kill_proxy_by_pid(pid, port) else "failed"
