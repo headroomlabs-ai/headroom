@@ -66,7 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.ref_name }}
+          # The exact pushed commit, not the branch tip: if the branch moves
+          # meanwhile, the push below fails as non-fast-forward instead of
+          # landing a patch made for an older tree.
+          ref: ${{ github.sha }}
           # No credential is ever written to this job's .git/config. The job runs
           # branch-supplied scripts.
           persist-credentials: false
@@ -125,13 +128,49 @@ jobs:
       # A fresh checkout: nothing from the `sync` job's runner state is carried here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: version-sync-patch
           path: ${{ runner.temp }}
+
+      # No token in this step. The patch was produced by branch code, so it is
+      # untrusted input: it may change only the files scripts/version-sync.py
+      # writes. Keep this list in step with that script.
+      - name: Apply the patch to the files version-sync writes
+        run: |
+          git apply --index --binary "${RUNNER_TEMP}/sync.patch"
+          allowed=(
+            .claude-plugin/marketplace.json
+            .github/plugin/marketplace.json
+            .releasemetadata
+            plugins/headroom-agent-hooks/.claude-plugin/plugin.json
+            plugins/headroom-agent-hooks/.github/plugin/plugin.json
+            plugins/headroom-skill/.claude-plugin/plugin.json
+            plugins/headroom-skill/.github/plugin/plugin.json
+            plugins/headroom-snip/.claude-plugin/plugin.json
+            plugins/openclaw/package.json
+            plugins/opencode/package.json
+            pyproject.toml
+            sdk/typescript/package.json
+            server.json
+            uv.lock
+          )
+          # NUL-separated and with renames split into delete + add, so every
+          # path the patch touches is listed verbatim (no quoting, no rename
+          # hiding its source).
+          while IFS= read -r -d '' path; do
+            ok=0
+            for name in "${allowed[@]}"; do
+              if [ "$path" = "$name" ]; then ok=1; fi
+            done
+            if [ "$ok" -ne 1 ]; then
+              printf '::error::version-sync patch changes %q, which it does not own; refusing to push it\n' "$path"
+              exit 1
+            fi
+          done < <(git diff --cached --no-renames --name-only -z)
 
       - name: Commit and push the synced metadata
         env:
@@ -143,14 +182,6 @@ jobs:
           # to this step, in a job that never runs branch code.
           SYNC_TOKEN: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          # The patch was produced by branch code, so it is untrusted input.
-          # Pushed with this token it must not be a way to change workflows,
-          # which a plain branch push may not be allowed to do.
-          if git apply --numstat "${RUNNER_TEMP}/sync.patch" | cut -f3- | grep -q '^\.github/'; then
-            echo "::error::version-sync patch touches .github/; refusing to push it"
-            exit 1
-          fi
-          git apply --index --binary "${RUNNER_TEMP}/sync.patch"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Hooks off: nothing in this clone may run code while the token is set.
@@ -164,7 +195,8 @@ jobs:
           echo "::add-mask::${auth}"
           # This push re-triggers this workflow. version-sync.py is idempotent, so
           # the next run finds no diff and exits in `sync` without pushing — the
-          # loop terminates after one no-op run.
+          # loop terminates after one no-op run. HEAD is the pushed commit plus
+          # the sync commit, so a branch that moved since fails non-fast-forward.
           GIT_CONFIG_COUNT=1 \
           GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
           GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" \

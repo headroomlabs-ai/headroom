@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1917,9 +1918,151 @@ def test_metadata_sync_never_runs_branch_code_where_the_release_token_is() -> No
                 if line.strip().startswith("git ") or "@github.com" in line
             ), run
             assert "x-access-token:${SYNC_TOKEN}@" not in run
-            # The patch comes from branch code; it may not carry workflow changes.
-            assert run.index("'^\\.github/'") < run.index("git apply --index"), run
     assert holders == 1, "expected exactly one job that holds the release token"
+
+
+def _metadata_sync_push_steps() -> dict[str, str]:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+    )
+    return {s["name"]: s["run"] for s in workflow["jobs"]["push"]["steps"] if "run" in s}
+
+
+_APPLY_STEP = "Apply the patch to the files version-sync writes"
+_PUSH_STEP = "Commit and push the synced metadata"
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _allowed_paths() -> list[str]:
+    run = _metadata_sync_push_steps()[_APPLY_STEP]
+    block = run.split("allowed=(", 1)[1].split(")", 1)[0]
+    return block.split()
+
+
+def _run_step(script: str, repo: Path, tmp: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    base = {"PATH": os.environ["PATH"], "HOME": str(tmp), "RUNNER_TEMP": str(tmp)}
+    return subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=repo,
+        env={**base, **env},
+        capture_output=True,
+        text=True,
+    )
+
+
+def _repo_with_allowed_files(path: Path) -> Path:
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "t@example.invalid")
+    _git(path, "config", "user.name", "t")
+    for name in [*_allowed_paths(), ".github/workflows/ci.yml"]:
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_text("v1\n", encoding="utf-8")
+    _git(path, "add", "-A")
+    _git(path, "commit", "-q", "-m", "base")
+    return path
+
+
+def _patch(repo: Path, change: str) -> str:
+    """Make ``change`` in ``repo``, return it as a binary patch, and undo it."""
+    if change == "bump":
+        (repo / "pyproject.toml").write_text("v2\n", encoding="utf-8")
+        (repo / ".github/plugin/marketplace.json").write_text("v2\n", encoding="utf-8")
+    elif change == "non-ascii workflow":
+        (repo / ".github/workflows/\u00e9.yml").write_text("on: push\n", encoding="utf-8")
+    elif change == "rename into workflows":
+        (repo / "server.json").rename(repo / ".github/workflows/server.yml")
+    elif change == "edit workflow":
+        (repo / ".github/workflows/ci.yml").write_text("v2\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    patch = _git(repo, "diff", "--cached", "--binary")
+    _git(repo, "reset", "-q", "--hard")
+    _git(repo, "clean", "-qfd")
+    return patch
+
+
+@pytest.mark.parametrize(
+    ("change", "accepted"),
+    [
+        ("bump", True),
+        ("non-ascii workflow", False),
+        ("rename into workflows", False),
+        ("edit workflow", False),
+    ],
+)
+def test_metadata_sync_applies_only_patches_to_version_files(
+    tmp_path: Path, change: str, accepted: bool
+) -> None:
+    """The patch comes from branch code; the token job may push only version files."""
+    repo = _repo_with_allowed_files(tmp_path / "repo")
+    (tmp_path / "sync.patch").write_text(_patch(repo, change), encoding="utf-8")
+
+    result = _run_step(_metadata_sync_push_steps()[_APPLY_STEP], repo, tmp_path)
+
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+    if not accepted:
+        assert "refusing to push it" in result.stdout
+
+
+def test_metadata_sync_allowlist_covers_what_version_sync_writes(tmp_path: Path) -> None:
+    repo = _repo_with_allowed_files(tmp_path / "repo")
+    (repo / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n', encoding="utf-8")
+    for name in _allowed_paths():
+        if name.endswith(".json") or name == ".releasemetadata":
+            source = ROOT / name
+            (repo / name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    (repo / "uv.lock").write_text((ROOT / "uv.lock").read_text(encoding="utf-8"), encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "real files")
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/version-sync.py"),
+            "--root",
+            str(repo),
+            "--version",
+            "99.0.0",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    changed = _git(repo, "status", "--porcelain", "--untracked-files=all").splitlines()
+    assert changed, "version-sync changed nothing"
+    assert {line[3:] for line in changed} <= set(_allowed_paths())
+
+
+def test_metadata_sync_push_step_commits_without_hooks(tmp_path: Path) -> None:
+    origin = tmp_path / "origin.git"
+    repo = _repo_with_allowed_files(tmp_path / "repo")
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "origin", "HEAD:refs/heads/release-please--branches--main")
+    (tmp_path / "sync.patch").write_text(_patch(repo, "bump"), encoding="utf-8")
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {tmp_path / 'hook-ran'}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    steps = _metadata_sync_push_steps()
+    assert _run_step(steps[_APPLY_STEP], repo, tmp_path).returncode == 0
+
+    result = _run_step(
+        steps[_PUSH_STEP],
+        repo,
+        tmp_path,
+        SYNC_TOKEN="not-a-real-token",
+        GITHUB_REF_NAME="release-please--branches--main",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (tmp_path / "hook-ran").exists()
+    log = _git(origin, "log", "--format=%s", "release-please--branches--main")
+    assert log.splitlines()[0] == "chore: sync generated version metadata"
 
 
 @pytest.mark.parametrize(
