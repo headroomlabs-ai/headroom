@@ -1181,6 +1181,9 @@ class PrometheusMetrics:
                 project=project,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
+                # Carried through so the durable input cost prices 1h writes at
+                # the rate they billed, not at the 5m one.
+                cache_write_1h_tokens=cache_write_1h_tokens,
                 uncached_input_tokens=uncached_input_tokens,
                 cache_inferred=cache_inferred,
                 total_input_tokens=total_input_tokens,

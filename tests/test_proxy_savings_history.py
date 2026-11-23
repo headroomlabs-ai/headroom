@@ -23,6 +23,25 @@ from headroom.proxy.savings_tracker import HEADROOM_SAVINGS_PATH_ENV_VAR, Saving
 from headroom.proxy.server import ProxyConfig, create_app
 
 
+def _route_shared_resolver_at(fake_litellm, monkeypatch, name_map=None):
+    """Point headroom.pricing's shared rate resolver at this test's fake catalog.
+
+    ``_estimate_input_cost_usd`` prices through
+    :func:`headroom.pricing.counterfactual.resolve_rates` — one definition of the
+    long-context tier and the 5m/1h write rates — so a fake catalog installed only
+    on this module's ``litellm`` global would be bypassed by it.
+    """
+    from headroom.pricing.counterfactual import resolve_rates
+
+    monkeypatch.setattr("headroom.pricing.counterfactual._litellm", lambda: fake_litellm)
+    monkeypatch.setattr(
+        "headroom.pricing.litellm_pricing.resolve_litellm_model",
+        name_map if name_map is not None else (lambda model: model),
+    )
+    resolve_rates.cache_clear()
+    return resolve_rates
+
+
 def _record_request(
     client: TestClient,
     *,
@@ -433,6 +452,13 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
     )
     monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
     monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+    _route_shared_resolver_at(
+        fake_litellm,
+        monkeypatch,
+        name_map=lambda model: (
+            "anthropic/claude-sonnet-4-6" if model == "claude-sonnet-4-6" else model
+        ),
+    )
 
     assert savings_tracker_module._resolve_litellm_model("gpt-4o") == "gpt-4o"
     assert (
@@ -597,6 +623,13 @@ def test_input_cost_counts_cache_reads_when_uncached_input_is_zero(monkeypatch):
     )
     monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
     monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+    _route_shared_resolver_at(
+        fake_litellm,
+        monkeypatch,
+        name_map=lambda model: (
+            "anthropic/claude-sonnet-4-6" if model == "claude-sonnet-4-6" else model
+        ),
+    )
 
     cost = savings_tracker_module._estimate_input_cost_usd(
         "claude-sonnet-4-6",
@@ -1077,6 +1110,7 @@ def test_savings_tracker_rollup_carries_exact_cache_read_cost_per_provider(tmp_p
     )
     monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
     monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+    _route_shared_resolver_at(fake_litellm, monkeypatch)
     tracker = SavingsTracker(
         path=str(tmp_path / "proxy_savings.json"),
         max_history_points=100,

@@ -661,62 +661,29 @@ def estimate_request_savings_usd(
     }
 
 
-def _long_context_suffix(info: dict[str, Any], billed_tokens: int) -> str:
-    """``*_above_<N>k_tokens`` field suffix when this request pays the upper tier.
-
-    Above a model's long-context threshold the provider re-prices the WHOLE
-    request — cache reads and writes included — so the base rates applied here
-    under-priced every such turn. That mattered beyond accuracy: ``record_request``
-    reconciles this per-request delta against ``CostTracker.totals()``, which IS
-    tier-aware, and takes the larger. A base-rate delta therefore lost to the
-    tracker total and the premium was booked against the NEXT request's model and
-    timestamp in the history.
-
-    The tier is read from the catalog row through
-    :func:`headroom.pricing.counterfactual.long_context_tier` rather than parsed
-    here, so there is one definition of which rows carry a tier (200K for Sonnet,
-    100K for Haiku 5.5, 272K for GPT-5.x).
-    """
-    try:
-        from headroom.pricing.counterfactual import long_context_tier
-
-        tier = long_context_tier(info)
-    except Exception:
-        return ""
-    if tier and billed_tokens > tier[0]:
-        return tier[1]
-    return ""
-
-
-def _slice_rate(info: dict[str, Any], field: str, tier_suffix: str, default: float) -> float:
-    """One cache slice's rate at ``tier_suffix``, tolerating unpublished prices.
-
-    A catalog row can carry a field with an explicit ``None`` (litellm does this
-    for rates it does not know), and ``dict.get(key, fallback)`` returns that
-    ``None`` rather than the fallback. Multiplying it raised, and the caller's
-    ``except`` then priced the WHOLE request at the blended fallback rate — far
-    worse than the base rate this falls back to. Falls through tier → base →
-    ``default`` (a cache read/write billed like a plain input token).
-    """
-    for key in (f"{field}{tier_suffix}" if tier_suffix else None, field):
-        if key is None:
-            continue
-        value = info.get(key)
-        if value is not None:
-            return float(value)
-    return float(default)
-
-
 def _estimate_input_cost_usd(
     model: str,
     input_tokens: int,
     *,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
     uncached_input_tokens: int = 0,
     cache_inferred: bool = False,
 ) -> float:
     """Estimate input spend in USD for a request.
+
+    Prices each bucket at the rate it is actually BILLED at, which needs two
+    things the catalog's base row does not carry: the request's long-context tier
+    (above the model's threshold the provider re-prices the whole request, cache
+    slices included) and the TTL of its cache writes (1h writes bill 2x base on
+    Anthropic, 5m at 1.25x).
+
+    Both come from :func:`headroom.pricing.counterfactual.resolve_rates`, the one
+    place cache rates are resolved, so this estimate cannot drift from the cost
+    tracker beside it. That matters: ``record_request`` reconciles the two with
+    ``max()``, so a base-rate estimate lost to a tier-aware total and the premium
+    was booked against the NEXT request's model and timestamp.
 
     Uses provider cache pricing when a complete cache breakdown is available and
     otherwise falls back to list-price input tokens. Inferred cache writes are
@@ -725,6 +692,10 @@ def _estimate_input_cost_usd(
     total_input_tokens = _coerce_int(input_tokens)
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = 0 if cache_inferred else _coerce_int(cache_write_tokens)
+    # 1h writes are a SLICE of the write total, not a peer of it; clamping keeps a
+    # malformed usage frame from manufacturing 5m tokens (and refunding money).
+    write_1h = min(max(_coerce_int(cache_write_1h_tokens), 0), cache_write)
+    write_5m = cache_write - write_1h
     uncached = _coerce_int(uncached_input_tokens)
 
     # Prefer the breakdown when callers supply segmented token counts.
@@ -736,53 +707,43 @@ def _estimate_input_cost_usd(
     if chargeable_tokens <= 0:
         return 0.0
 
-    litellm = _get_litellm_module()
-    # Keep exact provider pricing authoritative when available.
-    # `litellm` can be present but lack an entry for the resolved model,
-    # in which case we fall back to a blended rate instead of zeroing usage.
-    if litellm is None:
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
-
+    fallback = float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+    # No litellm at all (a stripped install, Python 3.14 before the wheel lands):
+    # nothing to resolve rates from, so the blended fallback stands. The resolver
+    # below would otherwise reach for its own handle and price against a catalog
+    # this process does not have.
+    if _get_litellm_module() is None:
+        return fallback
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
-        input_cost_per_token = info.get("input_cost_per_token")
-        # A missing key means the model is unknown → fall back to a blended rate.
-        # A present 0.0 means the model is free and must cost $0, not the fallback.
-        if input_cost_per_token is None:
-            _log_unpriced_model_once(model, "input_cost_per_token")
-            return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        from headroom.pricing.counterfactual import long_context_threshold, resolve_rates
 
-        # Above the row's threshold every slice bills at the upper tier.
-        tier_suffix = _long_context_suffix(info, chargeable_tokens)
-        if tier_suffix:
-            tiered_input = info.get(f"input_cost_per_token{tier_suffix}")
-            # Only a PRESENT tier rate overrides: a missing one falls back to the
-            # base rate, while an explicit 0.0 (a free tier) is authoritative.
-            if tiered_input is not None:
-                input_cost_per_token = tiered_input
-
-        if use_breakdown:
-            cache_read_cost = _slice_rate(
-                info, "cache_read_input_token_cost", tier_suffix, input_cost_per_token
-            )
-            cache_write_cost = _slice_rate(
-                info, "cache_creation_input_token_cost", tier_suffix, input_cost_per_token
-            )
-            return (
-                float(cache_read) * float(cache_read_cost)
-                + float(cache_write) * float(cache_write_cost)
-                + float(uncached) * float(input_cost_per_token)
-            )
-
-        return float(total_input_tokens) * float(input_cost_per_token)
+        # `chargeable_tokens` — not `input_tokens` — is what the provider tiers on.
+        rates = resolve_rates(
+            model,
+            long_context=chargeable_tokens > long_context_threshold(model),
+            for_billing=False,
+        )
     except Exception as exc:
         logger.debug(
             "Input cost priced at the fallback rate for model=%s: %s",
             safe_id(model),
             describe_exception(exc),
         )
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        return fallback
+    # Only an UNRESOLVABLE model falls back. A row that prices input at 0.0 is a
+    # free model and must cost $0 — `not rates.uncached` would have inflated it
+    # to the blended fallback rate.
+    if rates is None:
+        _log_unpriced_model_once(model, "input_cost_per_token")
+        return fallback
+    if not use_breakdown:
+        return float(total_input_tokens) * float(rates.uncached)
+    return (
+        float(cache_read) * float(rates.read)
+        + float(write_5m) * float(rates.write_5m)
+        + float(write_1h) * float(rates.write_1h)
+        + float(uncached) * float(rates.uncached)
+    )
 
 
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
@@ -1223,6 +1184,11 @@ class SavingsTracker:
         project: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        # The 1h slice of ``cache_write_tokens``. It bills 2x base on Anthropic
+        # against 1.25x for 5m, so pricing every write at the 5m rate under-billed
+        # each long-TTL turn — and the resulting shortfall was booked against the
+        # NEXT request when it lost the ``max()`` reconciliation below.
+        cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
         # True when the write count duplicates uncached input rather than a
         # separately billed provider bucket.
@@ -1354,6 +1320,7 @@ class SavingsTracker:
             delta_input_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
+            cache_write_1h_tokens=cache_write_1h_tokens,
             uncached_input_tokens=uncached_input_tokens,
             cache_inferred=cache_inferred,
         )
@@ -1569,6 +1536,7 @@ class SavingsTracker:
                 input_tokens,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
+                cache_write_1h_tokens=_coerce_int(metrics.get("cache_write_1h_tokens")),
                 uncached_input_tokens=uncached_input_tokens,
                 cache_inferred=cache_inferred,
             ),

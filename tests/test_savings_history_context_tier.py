@@ -27,6 +27,12 @@ _CATALOG = {
     "long-model": {
         "input_cost_per_token": 1e-6,
         "input_cost_per_token_above_200k_tokens": 2e-6,
+        # Publishes a write premium, so the resolver has a 5m/1h trade to derive:
+        # 5m at the long tier is $2.50/M, and 1h derives to $4/M from that tier's
+        # $2/M input. A row with no write fields bills writes at the input rate,
+        # which would hide the TTL bug this file pins.
+        "cache_creation_input_token_cost": 1.25e-6,
+        "cache_creation_input_token_cost_above_200k_tokens": 2.5e-6,
         "output_cost_per_token": 1e-5,
     },
     "cheap-model": {
@@ -50,6 +56,29 @@ def tiered_pricing(monkeypatch: pytest.MonkeyPatch) -> dict:
         "headroom.pricing.litellm_pricing.resolve_litellm_model", lambda model: model
     )
     yield _CATALOG
+    resolve_rates.cache_clear()
+
+
+@pytest.fixture
+def catalog_pricing(monkeypatch: pytest.MonkeyPatch):
+    """Point the shared rate resolver at a catalog for the rest of the test.
+
+    ``_estimate_input_cost_usd`` now prices through
+    :func:`headroom.pricing.counterfactual.resolve_rates` — the same resolver the
+    cost tracker uses — so a test has to swap the catalog there, not on this
+    module's own litellm handle.
+    """
+
+    def _apply(catalog: dict) -> dict:
+        fake = types.SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
+        resolve_rates.cache_clear()
+        monkeypatch.setattr("headroom.pricing.counterfactual._litellm", lambda: fake)
+        monkeypatch.setattr(
+            "headroom.pricing.litellm_pricing.resolve_litellm_model", lambda model: model
+        )
+        return catalog
+
+    yield _apply
     resolve_rates.cache_clear()
 
 
@@ -105,7 +134,7 @@ def test_history_books_a_late_premium_on_the_request_that_earned_it(
 
 
 def test_row_that_advertises_a_tier_without_a_tier_price_keeps_the_base_rate(
-    monkeypatch: pytest.MonkeyPatch,
+    catalog_pricing,
 ) -> None:
     """A ``None`` tier rate is an unpublished price, not a free one.
 
@@ -115,23 +144,20 @@ def test_row_that_advertises_a_tier_without_a_tier_price_keeps_the_base_rate(
     would price the request at $0 instead of the base rate it demonstrably
     bills at.
     """
-    from types import SimpleNamespace
-
-    catalog = {
-        "half-priced-model": {
-            "input_cost_per_token": 1e-6,
-            "input_cost_per_token_above_200k_tokens": None,
+    catalog_pricing(
+        {
+            "half-priced-model": {
+                "input_cost_per_token": 1e-6,
+                "input_cost_per_token_above_200k_tokens": None,
+            }
         }
-    }
-    fake = SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
-    monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
-    monkeypatch.setattr(st, "_resolve_litellm_model", lambda model: model)
+    )
 
     assert _estimate_input_cost_usd("half-priced-model", 250_000) == pytest.approx(0.25)
 
 
 def test_tier_lookup_failure_does_not_break_request_recording(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, catalog_pricing
 ) -> None:
     """A tier helper that raises must degrade to base rates, not drop the request.
 
@@ -144,19 +170,18 @@ def test_tier_lookup_failure_does_not_break_request_recording(
         raise RuntimeError("unexpected catalog shape")
 
     monkeypatch.setattr(counterfactual, "long_context_tier", _boom)
-
-    catalog = {
-        "long-model": {
-            "input_cost_per_token": 1e-6,
-            "input_cost_per_token_above_200k_tokens": 2e-6,
+    catalog_pricing(
+        {
+            "long-model": {
+                "input_cost_per_token": 1e-6,
+                "input_cost_per_token_above_200k_tokens": 2e-6,
+            }
         }
-    }
-    fake = types.SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
-    monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
-    monkeypatch.setattr(st, "_resolve_litellm_model", lambda model: model)
+    )
 
-    # Base rate, because the tier could not be read — and no exception escapes.
-    assert _estimate_input_cost_usd("long-model", 250_000) == pytest.approx(0.25)
+    # Unpriceable once the resolver raises, so the blended fallback ($3/M):
+    # accuracy is what an unexpected row shape can cost, never bookkeeping.
+    assert _estimate_input_cost_usd("long-model", 250_000) == pytest.approx(0.75)
 
 
 def test_rollup_read_cost_probe_stays_on_the_base_tier(tiered_pricing: dict, tmp_path) -> None:
@@ -193,27 +218,22 @@ def test_rollup_read_cost_probe_stays_on_the_base_tier(tiered_pricing: dict, tmp
     assert bucket["cache_read_cost_usd_delta"] == pytest.approx(0.001)
 
 
-def test_unpublished_cache_rates_fall_back_to_the_base_rate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_unpublished_cache_rates_fall_back_to_the_base_rate(catalog_pricing) -> None:
     """A `None` cache rate must not throw the request onto the blended fallback.
 
     ``dict.get(key, fallback)`` returns a published ``None`` rather than the
     fallback, so multiplying it raised inside the try block and the whole
     request — input tokens included — was priced at $3/M.
     """
-    from types import SimpleNamespace
-
-    catalog = {
-        "half-priced-model": {
-            "input_cost_per_token": 1e-5,
-            "cache_read_input_token_cost": None,
-            "cache_creation_input_token_cost": None,
+    catalog_pricing(
+        {
+            "half-priced-model": {
+                "input_cost_per_token": 1e-5,
+                "cache_read_input_token_cost": None,
+                "cache_creation_input_token_cost": None,
+            }
         }
-    }
-    fake = SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
-    monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
-    monkeypatch.setattr(st, "_resolve_litellm_model", lambda model: model)
+    )
 
     assert _estimate_input_cost_usd("half-priced-model", 0, cache_read_tokens=1_000) == (
         pytest.approx(0.01)
@@ -221,3 +241,50 @@ def test_unpublished_cache_rates_fall_back_to_the_base_rate(
     assert _estimate_input_cost_usd("half-priced-model", 0, cache_write_tokens=1_000) == (
         pytest.approx(0.01)
     )
+
+
+def test_one_hour_cache_writes_are_priced_at_their_own_ttl(tiered_pricing: dict, tmp_path) -> None:
+    """A 1h write bills 2x base; the savings history has to carry that TTL.
+
+    Long-context 5m writes are $2.50/M here and 1h writes $4/M, so a 250k 1h turn
+    costs $1.00. Pricing it at the 5m rate reported $0.625, and because
+    ``record_request`` reconciles the estimate against ``CostTracker.totals()``
+    with ``max()``, the missing $0.375 landed on the next request's model and
+    timestamp instead — which is what this pins.
+    """
+    cost_tracker = CostTracker()
+    tracker = SavingsTracker(path=tmp_path / "savings.json", save_flush_every=1)
+
+    def record(model: str, *, uncached: int = 0, write: int = 0, write_1h: int = 0) -> None:
+        # Metrics first, cost second: the order outcome.py records in.
+        total_tokens, total_cost = cost_tracker.totals()
+        tracker.record_request(
+            model=model,
+            input_tokens=uncached + write,
+            tokens_saved=0,
+            cache_write_tokens=write,
+            cache_write_1h_tokens=write_1h,
+            uncached_input_tokens=uncached,
+            output_tokens=1_000,
+            total_input_tokens=total_tokens,
+            total_input_cost_usd=total_cost,
+        )
+        cost_tracker.record_tokens(
+            model,
+            tokens_saved=0,
+            tokens_sent=uncached + write,
+            cache_write_tokens=write,
+            cache_write_1h_tokens=write_1h,
+            uncached_tokens=uncached,
+            output_tokens=1_000,
+        )
+
+    record("long-model", write=250_000, write_1h=250_000)  # $1.00 at the 1h rate
+    record("cheap-model", uncached=1_000)  # $0.01
+
+    history = [entry for entry in tracker._state["history"] if entry["total_input_cost_usd"]]
+    assert [entry["model"] for entry in history] == ["long-model", "cheap-model"]
+    assert [entry["total_input_cost_usd"] for entry in history] == [
+        pytest.approx(1.00),
+        pytest.approx(1.01),
+    ]

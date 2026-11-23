@@ -22,6 +22,17 @@ from headroom.proxy.savings_tracker import (
 )
 
 
+def _route_shared_resolver_at(fake_litellm, monkeypatch) -> None:
+    """Install the fake catalog on the resolver the estimator now prices through."""
+    from headroom.pricing.counterfactual import resolve_rates
+
+    monkeypatch.setattr("headroom.pricing.counterfactual._litellm", lambda: fake_litellm)
+    monkeypatch.setattr(
+        "headroom.pricing.litellm_pricing.resolve_litellm_model", lambda model: model
+    )
+    resolve_rates.cache_clear()
+
+
 def _fake_litellm(model_cost: dict) -> types.SimpleNamespace:
     # cost_per_token succeeding makes _resolve_litellm_model return the name as-is.
     return types.SimpleNamespace(
@@ -57,11 +68,9 @@ def test_compression_savings_uses_real_price_for_paid_model(monkeypatch):
 
 
 def test_input_cost_zero_for_free_model(monkeypatch):
-    monkeypatch.setattr(
-        st,
-        "_get_litellm_module",
-        lambda: _fake_litellm({"free-model": {"input_cost_per_token": 0.0}}),
-    )
+    fake = _fake_litellm({"free-model": {"input_cost_per_token": 0.0}})
+    monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
+    _route_shared_resolver_at(fake, monkeypatch)
     assert _estimate_input_cost_usd("free-model", 500_000) == 0.0
 
 
