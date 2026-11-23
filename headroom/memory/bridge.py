@@ -54,21 +54,39 @@ logger = logging.getLogger(__name__)
 # Same heading rule as the bridge parsers, so exported bullets re-import under their topic.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_HTML_BLOCK_TAGS = (
+    "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
+    "dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|"
+    "frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|"
+    "menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|"
+    "summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul"
+)
+_HTML_BLOCKS = (
+    (
+        re.compile(r" {0,3}<(?:pre|script|style|textarea)(?=[\t\n\v\f\r >]|$)", re.I),
+        re.compile(r"</(?:pre|script|style|textarea)>", re.I),
+    ),
+    (re.compile(r" {0,3}<!--"), re.compile(r"-->")),
+    (re.compile(r" {0,3}<\?"), re.compile(r"\?>")),
+    (re.compile(r" {0,3}<![A-Za-z]"), re.compile(r">")),
+    (re.compile(r" {0,3}<!\[CDATA\["), re.compile(r"]]>")),
+    (
+        re.compile(rf" {{0,3}}</?(?:{_HTML_BLOCK_TAGS})(?=[\t\n\v\f\r ]|/?>|$)", re.I),
+        re.compile(r"^[ \t]*$"),
+    ),
+)
 
 
 def _markdown_structure(lines: list[str]) -> tuple[list[tuple[int, str]], int | None]:
     """Return real headings and the opener of an unterminated block."""
     headings: list[tuple[int, str]] = []
-    block: tuple[str, int, int] | None = None
+    block: tuple[re.Pattern[str], int, bool] | None = None
 
     for index, original_line in enumerate(lines):
         line = original_line.removesuffix("\r")
         if block is not None:
-            marker, length, _ = block
-            if (marker == "<!--" and "-->" in line) or (
-                marker != "<!--"
-                and re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{length},}}[ \t]*", line)
-            ):
+            end_pattern, _, _ = block
+            if end_pattern.search(line):
                 block = None
             continue
 
@@ -77,18 +95,20 @@ def _markdown_structure(lines: list[str]) -> tuple[list[tuple[int, str]], int | 
             fence_match.group(1).startswith("`") and "`" in fence_match.group(2)
         ):
             marker = fence_match.group(1)
-            block = (marker[0], len(marker), index)
+            end_pattern = re.compile(rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$")
+            block = (end_pattern, index, False)
             continue
 
-        if re.match(r" {0,3}<!--", line):
-            if "-->" not in line:
-                block = ("<!--", 0, index)
-            continue
+        for html_type, (start_pattern, end_pattern) in enumerate(_HTML_BLOCKS):
+            if start_pattern.match(line):
+                if not end_pattern.search(line):
+                    block = (end_pattern, index, html_type == len(_HTML_BLOCKS) - 1)
+                break
+        else:
+            if heading_match := _HEADING_RE.match(line):
+                headings.append((index, heading_match.group(2).strip()))
 
-        if heading_match := _HEADING_RE.match(line):
-            headings.append((index, heading_match.group(2).strip()))
-
-    return headings, block[2] if block is not None else None
+    return headings, block[1] if block is not None and not block[2] else None
 
 
 def _merge_bullets_into_markdown(

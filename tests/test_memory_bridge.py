@@ -381,6 +381,21 @@ class TestMarkdownSectionMerge:
                 id="unterminated-html-comment",
             ),
             pytest.param(
+                "## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n",
+                "## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n- new\n",
+                id="html-pre-block",
+            ),
+            pytest.param(
+                "## Facts\n- a\n<script>\n# not a heading\n</script>\n## Updates\n- b\n",
+                "## Facts\n- a\n<script>\n# not a heading\n</script>\n- new\n## Updates\n- b\n",
+                id="html-script-block",
+            ),
+            pytest.param(
+                "## Facts\n- a\n<div>\n## Example\n</div>\n\n## Updates\n- b\n",
+                "## Facts\n- a\n<div>\n## Example\n</div>\n- new\n\n## Updates\n- b\n",
+                id="html-div-block",
+            ),
+            pytest.param(
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n## Real Updates\n- real\n",
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n- new\n"
                 "## Real Updates\n- real\n",
