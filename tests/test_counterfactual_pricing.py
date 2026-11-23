@@ -377,6 +377,14 @@ def test_unknown_model_of_an_unknown_family_stays_at_the_labelled_blended_rate(m
             "openrouter",
             0.5,
         ),
+        # A vendor-looking alias follows its target, not the name the client sends.
+        (
+            "claude-team-default",
+            '{"claude-team-default": "openrouter/openai/gpt-headroom-test"}',
+            "openrouter/openai/gpt-headroom-test",
+            "openrouter",
+            0.5,
+        ),
         # A priced model behind the OpenAI wire: the catalog row names the vendor.
         ("headroom-test-model", "", "headroom-test-model", "anthropic", 0.1),
     ],
