@@ -843,3 +843,11 @@ class TestGenericMarkerPatternIsLinear:
         injector = CCRToolInjector()
         text = "x" * 6000 + f"\n[Content COMPRESSED by custom tool, ref hash={h}]"
         assert injector.scan_for_markers([{"role": "tool", "content": text}]) == [h]
+
+    def test_diff_compressor_marker_is_detected(self):
+        """The diff compressor's retrieval marker reaches only the generic fallback."""
+        h = "0123456789abcdef01234567"
+        diff = "diff --git a/x.py b/x.py\n@@ -1,3 +1,3 @@\n-a\n+b\n"
+        text = f"{diff}[412 lines compressed to 37. Retrieve full diff: hash={h}]"
+        messages = [{"role": "user", "content": [{"type": "tool_result", "content": text}]}]
+        assert CCRToolInjector().scan_for_markers(messages) == [h]
