@@ -65,11 +65,13 @@ describe("Headroom OpenCode transport", () => {
     const proxyUrl = "http://127.0.0.1:8787/v1";
     installHeadroomTransport({ proxyUrl });
 
+    const env = { ...process.env };
+    delete env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
     const code = "process.stdout.write(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL); process.stderr.write('diagnostic')";
     const command = `"${process.execPath}" -e "${code}"`;
     for (const pending of [
-      promisify(childProcess.exec)(command),
-      promisify(childProcess.execFile)(process.execPath, ["-e", code]),
+      promisify(childProcess.exec)(command, { env }),
+      promisify(childProcess.execFile)(process.execPath, ["-e", code], { env }),
     ]) {
       expect(pending.child.pid).toBeGreaterThan(0);
       await expect(pending).resolves.toEqual({ stdout: proxyUrl, stderr: "diagnostic" });
