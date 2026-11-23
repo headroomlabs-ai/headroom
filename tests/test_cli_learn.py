@@ -963,7 +963,9 @@ def test_verbosity_apply_reads_an_unparseable_pin_as_the_default_level(
 
     proxy = _FakeProxy({"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "high"}})
 
-    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy, level=3)
+    # Any learned level other than the default, or there is nothing to report.
+    learned = 4 if DEFAULT_VERBOSITY_LEVEL != 4 else 3
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy, level=learned)
 
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
     assert f"it stays at level {DEFAULT_VERBOSITY_LEVEL}: HEADROOM_VERBOSITY_LEVEL" in output
