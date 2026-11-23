@@ -132,7 +132,7 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
     ``litellm.model_cost`` never see it change size mid-merge. Returns how
     many rows changed.
     """
-    from headroom.pricing.litellm_pricing import deepseek_rows, litellm
+    from headroom.pricing.litellm_pricing import deepseek_rows, litellm, mirrored_rows
 
     if litellm is None:
         return 0
@@ -143,6 +143,9 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
     ours = {key: row for key, row in deepseek_rows(models).items() if key in models}
     rows = _resolve_aliases({**models, **ours})
     rows.update(deepseek_rows({**current, **rows}))
+    # A bare row Headroom copied from a prefixed one follows that row, unless
+    # the fetched table now lists the bare name itself.
+    rows.update({k: v for k, v in mirrored_rows(rows).items() if k not in models})
     changed = {key: row for key, row in rows.items() if current.get(key) != row}
     if not changed:
         return 0

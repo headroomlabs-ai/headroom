@@ -145,6 +145,12 @@ def _resolve_litellm_model_uncached(model: str) -> str:
     return resolve_litellm_model_name(model, is_known_model)
 
 
+#: Bare names Claude Code sends that LiteLLM lists only under a provider prefix.
+_PREFIXED_SOURCES = {"MiniMax-M3": "minimax/MiniMax-M3"}
+#: The bare rows :func:`_register_minimax_pricing` made from their prefixed row.
+_mirrored_bare_rows: set[str] = set()
+
+
 def _register_minimax_pricing() -> None:
     """Pre-register MiniMax-M3 in litellm.model_cost from `minimax/MiniMax-M3`.
 
@@ -155,15 +161,29 @@ def _register_minimax_pricing() -> None:
     `estimate_cost()` succeeds even if (a) the resolver cache is cold,
     or (b) LiteLLM drops the prefixed entry in a future release.
     Pricing mirrors the upstream DB (input $0.60/M, output $2.40/M,
-    cache read $0.12/M as of 2026-06). Re-check after LiteLLM updates.
+    cache read $0.12/M as of 2026-06). Each bare row made here is recorded,
+    so a price refresh keeps it in step with its prefixed row
+    (:func:`mirrored_rows`).
     """
     if not LITELLM_AVAILABLE:
         return
-    source_key = "minimax/MiniMax-M3"
-    if source_key not in litellm.model_cost:
-        return
-    if "MiniMax-M3" not in litellm.model_cost:
-        litellm.model_cost["MiniMax-M3"] = dict(litellm.model_cost[source_key])
+    for bare, source in _PREFIXED_SOURCES.items():
+        if source in litellm.model_cost and bare not in litellm.model_cost:
+            litellm.model_cost[bare] = dict(litellm.model_cost[source])
+            _mirrored_bare_rows.add(bare)
+
+
+def mirrored_rows(model_cost: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Copies of ``model_cost``'s prefixed rows for the bare rows Headroom made.
+
+    A bare row that LiteLLM's table supplied itself was never made by Headroom
+    and is not mirrored, so its own rates stand.
+    """
+    return {
+        bare: dict(model_cost[source])
+        for bare in _mirrored_bare_rows
+        if (source := _PREFIXED_SOURCES[bare]) in model_cost
+    }
 
 
 _register_minimax_pricing()

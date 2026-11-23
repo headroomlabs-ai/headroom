@@ -146,6 +146,49 @@ def test_a_deepseek_alias_takes_headroom_off_peak_rate(monkeypatch, isolated_cat
     assert litellm.model_cost[alias]["input_cost_per_token"] == ours["input_cost_per_token"]
 
 
+MINIMAX_BARE, MINIMAX_PREFIXED = "MiniMax-M3", "minimax/MiniMax-M3"
+
+
+@pytest.fixture
+def minimax_prefixed_only(monkeypatch, isolated_catalog):
+    """Startup on a table listing MiniMax-M3 only under ``minimax/`` at $0.60/M input."""
+    from headroom.pricing import litellm_pricing
+
+    monkeypatch.setattr(litellm_pricing, "_mirrored_bare_rows", set())
+    litellm.model_cost.pop(MINIMAX_BARE, None)
+    litellm.model_cost[MINIMAX_PREFIXED] = {**NEW_ROW, "input_cost_per_token": 6e-07}
+
+
+def _refresh_minimax_prefixed_to_1_20(monkeypatch):
+    table = {k: v for k, v in litellm.model_cost.items() if k != MINIMAX_BARE}
+    table[MINIMAX_PREFIXED] = {**NEW_ROW, "input_cost_per_token": 1.2e-06}
+    _serve(monkeypatch, table)
+    live_prices.refresh_litellm_prices()
+
+
+def test_a_bare_row_headroom_made_follows_its_refreshed_prefixed_row(
+    monkeypatch, minimax_prefixed_only
+):
+    from headroom.pricing.litellm_pricing import _register_minimax_pricing, get_model_pricing
+
+    _register_minimax_pricing()
+    _refresh_minimax_prefixed_to_1_20(monkeypatch)
+
+    for name in (MINIMAX_BARE, MINIMAX_PREFIXED):
+        assert get_model_pricing(name).input_cost_per_1m == pytest.approx(1.20)
+
+
+def test_a_bare_row_litellm_supplied_keeps_its_own_rate(monkeypatch, minimax_prefixed_only):
+    from headroom.pricing.litellm_pricing import _register_minimax_pricing, get_model_pricing
+
+    litellm.model_cost[MINIMAX_BARE] = {**NEW_ROW, "input_cost_per_token": 9e-07}
+    _register_minimax_pricing()
+    _refresh_minimax_prefixed_to_1_20(monkeypatch)
+
+    assert get_model_pricing(MINIMAX_BARE).input_cost_per_1m == pytest.approx(0.90)
+    assert get_model_pricing(MINIMAX_PREFIXED).input_cost_per_1m == pytest.approx(1.20)
+
+
 def test_cancelling_the_refresh_does_not_wait_for_a_stuck_download(monkeypatch):
     monkeypatch.setenv("HEADROOM_PRICE_REFRESH", "on")
     monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
