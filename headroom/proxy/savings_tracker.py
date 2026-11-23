@@ -621,8 +621,9 @@ def estimate_request_savings_usd(
             region=region,
             long_context=long_tier,
             provider=provider,
-            # Matches the blended rate the flat estimators fall back to, so an
-            # unpriceable model reports the same dollars it always has.
+            # The blended rate the flat estimators fall back to. For a model the
+            # catalog lacks, it is split by the model family's cache ratios when
+            # the request reported a cache breakdown, and charged flat otherwise.
             fallback_rate_per_token=DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
         )
 

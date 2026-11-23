@@ -84,6 +84,10 @@ _BASIS_NOTES = {
         "Some models publish no cache pricing; their savings use a "
         "provider-level ratio rather than a per-model rate."
     ),
+    "fallback+provider-ratio": (
+        "Some models are missing from the price table; their savings use a "
+        "default rate split by their provider's cache ratios."
+    ),
 }
 
 

@@ -104,6 +104,7 @@ class Region(str, Enum):
 BASIS_CATALOG = "catalog"
 BASIS_CATALOG_TTL_RATIO = "catalog+ttl-ratio"
 BASIS_PROVIDER_RATIO = "provider-ratio"
+BASIS_FALLBACK_PROVIDER_RATIO = "fallback+provider-ratio"
 BASIS_LIST = "list"
 BASIS_NO_MIX = "no-mix"
 BASIS_UNPRICED = "unpriced"
@@ -115,9 +116,32 @@ _BASIS_RANK: dict[str, int] = {
     BASIS_UNPRICED: 0,
     BASIS_NO_MIX: 1,
     BASIS_LIST: 2,
-    BASIS_PROVIDER_RATIO: 3,
-    BASIS_CATALOG_TTL_RATIO: 4,
-    BASIS_CATALOG: 5,
+    BASIS_FALLBACK_PROVIDER_RATIO: 3,
+    BASIS_PROVIDER_RATIO: 4,
+    BASIS_CATALOG_TTL_RATIO: 5,
+    BASIS_CATALOG: 6,
+}
+
+#: Model-name markers of each cache-pricing family, checked before the wire
+#: provider: Claude reaches us over the Anthropic, Bedrock, OpenAI-compatible and
+#: Copilot wires alike, and what it is billed for caching follows the model.
+_MODEL_CACHE_FAMILIES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"claude"), "anthropic"),
+    (re.compile(r"gemini"), "gemini"),
+    (re.compile(r"grok"), "xai"),
+    # Open-weights gpt-oss is served by vLLM, Ollama and others, not billed by OpenAI.
+    (re.compile(r"(^|[/.:])(gpt-(?!oss)|o[1-9]|codex|chatgpt)"), "openai"),
+)
+
+#: Wire-provider labels that are not keys of :data:`CACHE_ECONOMICS` but bill
+#: like one. Copilot is absent on purpose: it fronts several model families. A
+#: plain ``openai`` label also covers OpenAI-compatible servers; that is a guess
+#: for them, and the basis says so.
+_PROVIDER_CACHE_FAMILIES = {
+    "openai_responses": "openai",
+    "azure": "openai",
+    "google": "gemini",
+    "vertex_ai": "gemini",
 }
 
 
@@ -463,7 +487,10 @@ def resolve_rates(
        charge them a premium their invoice never shows.
     3. **Provider ratio** — :data:`CACHE_ECONOMICS`, for a model the catalog
        prices for input but not for cache.
-    4. ``None`` — model unknown to the catalog. The caller falls back to list.
+    4. ``None`` — model unknown to the catalog. :func:`price_savings` then uses
+       its fallback rate, split by the model family's cache ratios when the
+       request reported a cache breakdown (``fallback+provider-ratio``), else
+       flat (``list``).
 
     A model whose input price is legitimately ``0.0`` (a free or local model)
     returns all-zero rates rather than ``None``: free must cost nothing, not
@@ -554,23 +581,9 @@ def resolve_rates(
         # the provider ratio table if we can identify the provider.
         # Model-only cost consumers do not have a request provider to pass.
         # Prefer explicit routing context, otherwise use the catalog identity.
-        resolved_provider = provider or info.get("litellm_provider") or ""
-        provider_key = (
-            resolved_provider.split(":")[-1].strip().lower()
-            if isinstance(resolved_provider, str)
-            else ""
-        )
-        econ = CACHE_ECONOMICS.get(provider_key)
-        if econ:
-            return CacheRates(
-                read=base * float(econ["read_multiplier"]),
-                write_5m=base * float(econ["write_multiplier"]),
-                write_1h=base * float(econ["write_multiplier"]),
-                uncached=base,
-                basis=BASIS_PROVIDER_RATIO,
-                read_is_catalog=read_is_catalog,
-                write_is_catalog=write_is_catalog,
-            )
+        family = _cache_family(model, provider or info.get("litellm_provider"))
+        if family is not None:
+            return _ratio_rates(base, family, BASIS_PROVIDER_RATIO)
 
     return CacheRates(
         read=read,
@@ -581,6 +594,48 @@ def resolve_rates(
         read_is_catalog=read_is_catalog,
         write_is_catalog=write_is_catalog,
     )
+
+
+def _cache_family(model: str, provider: Any) -> str | None:
+    """The :data:`CACHE_ECONOMICS` key whose cache billing ``model`` follows, if known."""
+    name = model.lower() if isinstance(model, str) else ""
+    for pattern, family in _MODEL_CACHE_FAMILIES:
+        if pattern.search(name):
+            return family
+    key = provider.split(":")[-1].strip().lower() if isinstance(provider, str) else ""
+    key = _PROVIDER_CACHE_FAMILIES.get(key, key)
+    return key if key in CACHE_ECONOMICS else None
+
+
+def _ratio_rates(base: float, family: str, basis: str) -> CacheRates:
+    """Rates for every bucket derived from ``base`` by ``family``'s cache ratios.
+
+    A family that bills a write premium (Anthropic, Bedrock) has a 1h write at
+    its structural multiple; one that does not has no 5m/1h trade to price.
+    """
+    econ = CACHE_ECONOMICS[family]
+    write = base * float(econ["write_multiplier"])
+    return CacheRates(
+        read=base * float(econ["read_multiplier"]),
+        write_5m=write,
+        write_1h=base * CACHE_WRITE_MULTIPLIERS["1h"] if write > base else write,
+        uncached=base,
+        basis=basis,
+        read_is_catalog=False,
+        write_is_catalog=False,
+    )
+
+
+def _fallback_cache_rates(model: str, provider: str | None, base: float) -> CacheRates | None:
+    """Cache-aware rates around a blended ``base`` for a model the catalog lacks.
+
+    A model newer than the bundled price table still reports its cache reads and
+    writes, and those are billed at its family's ratios. Pricing every removed
+    token at ``base`` as if it were uncached overstates a warm turn's prefix
+    savings about tenfold on Anthropic. ``None`` when the family is unknown.
+    """
+    family = _cache_family(model, provider)
+    return None if family is None else _ratio_rates(base, family, BASIS_FALLBACK_PROVIDER_RATIO)
 
 
 def long_context_premium_avoided_usd(
@@ -702,8 +757,10 @@ def price_savings(
     The single entry point every savings surface should call. ``region`` decides
     the apportionment (see :func:`split_tokens`), ``mix`` supplies the observed
     cache breakdown, and ``fallback_rate_per_token`` is the blended rate used
-    when the model cannot be priced at all — the MCP tool path, which never
-    learns the agent's upstream model, depends on it.
+    when the catalog does not know the model — the MCP tool path, which never
+    learns the agent's upstream model, depends on it. With a cache breakdown and
+    a recognisable model family, that rate is split by the family's cache ratios
+    (:func:`_fallback_cache_rates`) rather than charged flat.
 
     Never raises: a savings figure must not be able to fail a request.
     """
@@ -726,8 +783,11 @@ def price_savings(
     if rates is None:
         if fallback_rate_per_token is None:
             return PricedSavings(usd=0.0, usd_list=0.0, basis=BASIS_UNPRICED, tokens=tokens)
-        flat = float(tokens) * float(fallback_rate_per_token)
-        return PricedSavings(usd=flat, usd_list=flat, basis=BASIS_LIST, tokens=tokens)
+        if mix.has_signal():
+            rates = _fallback_cache_rates(model, provider, float(fallback_rate_per_token))
+        if rates is None:
+            flat = float(tokens) * float(fallback_rate_per_token)
+            return PricedSavings(usd=flat, usd_list=flat, basis=BASIS_LIST, tokens=tokens)
 
     usd_list = float(tokens) * rates.uncached
 
@@ -755,6 +815,7 @@ def price_savings(
 __all__ = [
     "BASIS_CATALOG",
     "BASIS_CATALOG_TTL_RATIO",
+    "BASIS_FALLBACK_PROVIDER_RATIO",
     "BASIS_LIST",
     "BASIS_NO_MIX",
     "BASIS_PROVIDER_RATIO",

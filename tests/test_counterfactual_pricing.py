@@ -30,6 +30,7 @@ importorskip_no_env_leak("litellm")
 from headroom.pricing.counterfactual import (  # noqa: E402
     BASIS_CATALOG,
     BASIS_CATALOG_TTL_RATIO,
+    BASIS_FALLBACK_PROVIDER_RATIO,
     BASIS_LIST,
     BASIS_NO_MIX,
     BASIS_UNPRICED,
@@ -281,6 +282,80 @@ def test_unknown_model_with_a_fallback_uses_the_blended_rate():
         8_000,
         model="not-a-real-model-xyz",
         fallback_rate_per_token=3.0 / 1_000_000,
+    )
+
+    assert priced.basis == BASIS_LIST
+    assert priced.usd == pytest.approx(0.024)
+
+
+_FALLBACK = 3.0 / 1_000_000
+
+
+def _warm_gpt() -> CacheMix:
+    """OpenAI reports reads and uncached input; it bills no cache writes."""
+    return CacheMix.from_usage(cache_read_tokens=180_000, uncached_input_tokens=2_500)
+
+
+@pytest.mark.parametrize(
+    ("model", "provider", "mix", "read_multiplier"),
+    [
+        # Claude Code on a model newer than the bundled price table.
+        ("claude-not-yet-in-catalog-9", "anthropic", _warm_anthropic, 0.1),
+        # Claude reached over the OpenAI wire: the model decides, not the wire.
+        ("claude-not-yet-in-catalog-9", "openai", _warm_anthropic, 0.1),
+        # Codex speaks the Responses API, which is not a CACHE_ECONOMICS key.
+        ("gpt-not-yet-in-catalog-9", "openai_responses", _warm_gpt, 0.5),
+    ],
+)
+def test_unknown_model_with_a_cache_breakdown_prices_reads_at_its_family_ratio(
+    model, provider, mix, read_multiplier
+):
+    """A warm turn's deferred tool schemas were cache reads, not list-price input."""
+    priced = price_savings(
+        8_000,
+        model=model,
+        mix=mix(),
+        region=Region.PREFIX,
+        provider=provider,
+        fallback_rate_per_token=_FALLBACK,
+    )
+
+    assert priced.basis == BASIS_FALLBACK_PROVIDER_RATIO
+    assert priced.usd == pytest.approx(8_000 * _FALLBACK * read_multiplier)
+    assert priced.usd_list == pytest.approx(8_000 * _FALLBACK)
+
+
+def test_unknown_anthropic_model_prices_cold_writes_at_the_write_premium():
+    """Removed content on a cold turn would have been written to the cache."""
+    priced = price_savings(
+        8_000,
+        model="claude-not-yet-in-catalog-9",
+        mix=_cold_anthropic(),
+        region=Region.LIVE_ZONE,
+        provider="anthropic",
+        fallback_rate_per_token=_FALLBACK,
+    )
+
+    assert priced.basis == BASIS_FALLBACK_PROVIDER_RATIO
+    assert priced.usd == pytest.approx(8_000 * _FALLBACK * 1.25)
+
+
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        ("not-a-real-model-xyz", "copilot"),
+        # Open-weights gpt-oss is not billed by OpenAI, whatever serves it.
+        ("ollama/gpt-oss:20b", "ollama"),
+    ],
+)
+def test_unknown_model_of_an_unknown_family_stays_at_the_labelled_blended_rate(model, provider):
+    priced = price_savings(
+        8_000,
+        model=model,
+        mix=_warm_anthropic(),
+        region=Region.PREFIX,
+        provider=provider,
+        fallback_rate_per_token=_FALLBACK,
     )
 
     assert priced.basis == BASIS_LIST
