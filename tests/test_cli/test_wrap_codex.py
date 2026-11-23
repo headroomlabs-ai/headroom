@@ -2330,20 +2330,91 @@ def test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy(
         victim.wait()
 
 
-def test_pids_from_netstat_reads_listeners_whatever_the_locale() -> None:
+def test_pids_from_netstat_reads_probed_listeners_whatever_the_locale() -> None:
     output = """
   Proto  Lokale Adresse         Remoteadresse          Status           PID
   TCP    0.0.0.0:8787           0.0.0.0:0              ABHOEREN         4242
-  TCP    [::]:8787              [::]:0                 ABHOEREN         4243
+  TCP    127.0.0.1:8787         0.0.0.0:0              ABHOEREN         4244
+  TCP    192.168.1.5:8787       0.0.0.0:0              ABHOEREN         555
   TCP    127.0.0.1:8787         127.0.0.1:50000        HERGESTELLT      777
   TCP    0.0.0.0:18787          0.0.0.0:0              ABHOEREN         999
 """
-    assert wrap_mod._pids_from_netstat(output, 8787) == {4242, 4243}
+    assert wrap_mod._pids_from_netstat(output, 8787) == {4242, 4244}
 
 
-def test_pids_from_ss() -> None:
-    output = 'LISTEN 0 2048 127.0.0.1:8787 0.0.0.0:* users:(("python3",pid=4242,fd=7))\n'
-    assert wrap_mod._pids_from_ss(output) == {4242}
+def test_pids_from_ss_reads_probed_listeners() -> None:
+    output = (
+        'LISTEN 0 2048 127.0.0.1:8787 0.0.0.0:* users:(("python3",pid=4242,fd=7))\n'
+        'LISTEN 0 2048 192.168.1.5:8787 0.0.0.0:* users:(("nginx",pid=555,fd=3))\n'
+    )
+    assert wrap_mod._pids_from_ss(output, 8787) == {4242}
+
+
+def test_pids_from_lsof_reads_probed_ipv4_listeners() -> None:
+    output = "p4242\nf7\ntIPv4\nn127.0.0.1:8787\np555\nf3\ntIPv6\nn[::1]:8787\np999\nf4\ntIPv4\nn*:8787\n"
+    assert wrap_mod._pids_from_lsof(output, 8787) == {4242, 999}
+
+
+def _listen(host: str, port: int = 0) -> tuple[subprocess.Popen[str], int]:
+    """A child process listening on ``host``:``port``; returns it and the port."""
+    family = "socket.AF_INET6" if ":" in host else "socket.AF_INET"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import socket, sys, time\n"
+            f"s = socket.socket({family})\n"
+            f"try:\n    s.bind(({host!r}, {port})); s.listen()\n"
+            "except OSError:\n    print(-1, flush=True); sys.exit()\n"
+            "print(s.getsockname()[1], flush=True); time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None
+    return child, int(child.stdout.readline())
+
+
+def test_only_the_listener_the_probe_reaches_is_confirmed() -> None:
+    """An IPv6-only server sharing the port with a 127.0.0.1 listener is not the proxy."""
+    children: list[subprocess.Popen[str]] = []
+    try:
+        for _ in range(5):
+            ipv6, port = _listen("::1")
+            children.append(ipv6)
+            if port == -1:
+                pytest.skip("no IPv6 loopback")
+            ipv4, ipv4_port = _listen("127.0.0.1", port)
+            children.append(ipv4)
+            if ipv4_port == port:
+                break
+        else:
+            pytest.skip("could not bind one port on both loopbacks")
+        listeners = wrap_mod._listening_pids(port)
+        if listeners is None:
+            pytest.skip("no psutil, lsof, ss or netstat to list listeners")
+        assert ipv4.pid in listeners
+        assert ipv6.pid not in listeners
+        assert wrap_mod._is_headroom_proxy_pid(ipv6.pid, port) is False
+        assert wrap_mod._is_headroom_proxy_pid(ipv4.pid, port) is True
+    finally:
+        for child in children:
+            child.kill()
+            child.wait()
+
+
+def test_kill_proxy_by_pid_rechecks_the_pid_before_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the PID stops being the listener after SIGTERM, it is not SIGKILLed."""
+    calls = _record_signals(monkeypatch)
+    monkeypatch.setattr(wrap_mod.sys, "platform", "linux")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    answers = iter([True, False])
+    monkeypatch.setattr(wrap_mod, "_is_headroom_proxy_pid", lambda pid, port: next(answers))
+
+    assert wrap_mod._kill_proxy_by_pid(4242, 8787) is False
+    assert calls == [("kill", 4242)]
 
 
 def test_stop_local_proxy_for_unwrap_ignores_unconfirmed_pid(

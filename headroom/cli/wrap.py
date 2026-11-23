@@ -4601,8 +4601,19 @@ def _detect_running_proxy_backend(port: int) -> str | None:
     return _copilot_detect_running_proxy_backend(port)
 
 
+# ``_check_proxy`` and ``/health`` reach the proxy on 127.0.0.1, so only a
+# listener that this address reaches counts: bound to 127.0.0.1 or to every
+# IPv4 interface. A listener on another address (``[::1]``, a LAN IP) with the
+# same port is a different server that the probe never spoke to.
+_PROBED_HOSTS = ("127.0.0.1", "0.0.0.0", "*")
+
+
+def _reaches_probe(address: str, port: int) -> bool:
+    return address in {f"{host}:{port}" for host in _PROBED_HOSTS}
+
+
 def _pids_from_netstat(output: str, port: int) -> set[int]:
-    """Listening PIDs for ``port`` in Windows ``netstat -ano -p TCP`` output.
+    """Listening PIDs for 127.0.0.1:``port`` in Windows ``netstat -ano -p TCP`` output.
 
     A listening row has a foreign address ending in ``:0``; the State column
     is localised, so it is not read.
@@ -4613,7 +4624,7 @@ def _pids_from_netstat(output: str, port: int) -> set[int]:
         if (
             len(cols) == 5
             and cols[0].upper() == "TCP"
-            and cols[1].rsplit(":", 1)[-1] == str(port)
+            and _reaches_probe(cols[1], port)
             and cols[2].endswith(":0")
             and cols[4].isdecimal()
         ):
@@ -4621,13 +4632,35 @@ def _pids_from_netstat(output: str, port: int) -> set[int]:
     return pids
 
 
-def _pids_from_ss(output: str) -> set[int]:
-    """PIDs in ``ss -ltnpH`` output (``users:(("python",pid=123,fd=3))``)."""
-    return {int(match) for match in re.findall(r"\bpid=(\d+)", output)}
+def _pids_from_ss(output: str, port: int) -> set[int]:
+    """Listening PIDs for 127.0.0.1:``port`` in ``ss -4ltnpH`` output."""
+    pids: set[int] = set()
+    for line in output.splitlines():
+        cols = line.split()
+        if len(cols) >= 6 and _reaches_probe(cols[3], port):
+            pids.update(int(pid) for pid in re.findall(r"\bpid=(\d+)", line))
+    return pids
+
+
+def _pids_from_lsof(output: str, port: int) -> set[int]:
+    """Listening PIDs for 127.0.0.1:``port`` in ``lsof -F ptn`` output."""
+    pids: set[int] = set()
+    pid = kind = None
+    for line in output.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p":
+            pid = int(value) if value.isdecimal() else None
+        elif tag == "f":
+            kind = None
+        elif tag == "t":
+            kind = value
+        elif tag == "n" and pid is not None and kind == "IPv4" and _reaches_probe(value, port):
+            pids.add(pid)
+    return pids
 
 
 def _listening_pids(port: int) -> set[int] | None:
-    """PIDs with a TCP socket listening on ``port``; None if no tool could tell."""
+    """PIDs listening where the probe connects (127.0.0.1:``port``); None if unknown."""
     try:
         import psutil  # type: ignore[import-untyped]  # optional dependency
     except ImportError:
@@ -4636,20 +4669,19 @@ def _listening_pids(port: int) -> set[int] | None:
         try:
             return {
                 conn.pid
-                for conn in psutil.net_connections(kind="tcp")
-                if conn.status == psutil.CONN_LISTEN and conn.laddr.port == port and conn.pid
+                for conn in psutil.net_connections(kind="tcp4")
+                if conn.status == psutil.CONN_LISTEN
+                and conn.pid
+                and _reaches_probe(f"{conn.laddr.ip}:{conn.laddr.port}", port)
             }
         except psutil.AccessDenied:
             pass  # macOS needs root for this; use the OS tools below
     if sys.platform == "win32":
-        tools = [(["netstat", "-ano", "-p", "TCP"], lambda out: _pids_from_netstat(out, port))]
+        tools = [(["netstat", "-ano", "-p", "TCP"], _pids_from_netstat)]
     else:
         tools = [
-            (
-                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-                lambda out: {int(pid) for pid in out.split() if pid.isdecimal()},
-            ),
-            (["ss", "-ltnpH", f"sport = :{port}"], _pids_from_ss),
+            (["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "ptn"], _pids_from_lsof),
+            (["ss", "-4ltnpH", f"sport = :{port}"], _pids_from_ss),
         ]
     for command, parse in tools:
         try:
@@ -4658,7 +4690,7 @@ def _listening_pids(port: int) -> set[int] | None:
             continue
         # lsof exits 1 when nothing matches; that is an answer, not a failure.
         if result.returncode in (0, 1):
-            return parse(result.stdout)
+            return parse(result.stdout, port)
     return None
 
 
@@ -4735,7 +4767,10 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
         if not _check_proxy(port):
             return True
 
-    # SIGTERM didn't work — escalate to SIGKILL (Unix) or terminate (Windows)
+    # SIGTERM didn't work — escalate to SIGKILL (Unix) or terminate (Windows).
+    # Check again first: the PID may have exited and been reused meanwhile.
+    if not _is_headroom_proxy_pid(pid, port):
+        return False
     try:
         _kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
         os.kill(pid, _kill_signal)
