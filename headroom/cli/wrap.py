@@ -66,7 +66,12 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
-from headroom.cli.port_discovery import proxy_port_option, warn_codex_provider_port_change
+from headroom.cli.port_discovery import (
+    DEFAULT_PROXY_PORT,
+    PORT_ENV,
+    proxy_port_option,
+    warn_codex_provider_port_change,
+)
 from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
@@ -4601,18 +4606,67 @@ def _detect_running_proxy_backend(port: int) -> str | None:
     return _copilot_detect_running_proxy_backend(port)
 
 
+def _argv_serves_proxy_port(argv: list[str], environ: dict[str, str], port: int) -> bool:
+    """True if ``argv`` is ``headroom proxy`` (console script or ``-m``) bound to ``port``."""
+    names = [Path(arg.strip('"')).name.lower() for arg in argv]
+    is_proxy = any(
+        (argv[i : i + 3] == ["-m", "headroom.cli", "proxy"])
+        or (names[i] in ("headroom", "headroom.exe") and argv[i + 1 : i + 2] == ["proxy"])
+        for i in range(len(argv))
+    )
+    if not is_proxy:
+        return False
+    bound = environ.get(PORT_ENV, str(DEFAULT_PROXY_PORT))
+    for i, arg in enumerate(argv):
+        if arg in ("--port", "-p") and i + 1 < len(argv):
+            bound = argv[i + 1]
+        elif arg.startswith("--port="):
+            bound = arg.split("=", 1)[1]
+    return bound == str(port)
+
+
+def _health_pid(raw: object) -> int | None:
+    """The PID in a ``/health`` body (an int or a decimal string), else None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdecimal():
+        return int(raw)
+    return None
+
+
+def _is_headroom_proxy_pid(pid: int, port: int) -> bool:
+    """True if ``pid`` is a Headroom proxy process serving ``port``.
+
+    The PID comes from the ``/health`` body of whatever listens on the port,
+    so it is untrusted: it must be a plain PID other than ours, and that
+    process's command line must be ``headroom proxy`` for this port.
+    """
+    if pid <= 1 or pid == os.getpid():
+        return False
+    from headroom.install.runtime import _read_proc_metadata
+
+    metadata = _read_proc_metadata(pid)
+    if metadata is None:
+        return False
+    argv, environ = metadata
+    return _argv_serves_proxy_port(argv, environ, port)
+
+
 def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     """Terminate a proxy process by PID and wait for the port to free up.
 
     Sends SIGTERM first, falls back to SIGKILL after 5 seconds.
-    Returns True if the port is free afterwards, False otherwise.
-
-    The PID usually comes from a ``/health`` body the listener wrote itself, so
-    it is untrusted. Never signal a non-int or ``pid <= 1`` (``-1`` addresses
-    every process the user may signal, ``0`` the caller's process group) or this
-    process.
+    Returns True if the port is free afterwards, False otherwise, including
+    when ``pid`` cannot be confirmed as the Headroom proxy on ``port`` (then
+    nothing is signalled).
     """
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+    if not _is_headroom_proxy_pid(pid, port):
+        click.echo(
+            f"  Warning: PID {pid} reported on port {port} is not a Headroom proxy "
+            "for that port; not stopping it."
+        )
         return False
     if sys.platform == "win32":
         # ``os.kill(..., SIGTERM)`` only targets one Windows process.  The
@@ -4683,18 +4737,11 @@ def _stop_local_proxy_for_unwrap(port: int) -> str:
     if running_config is None:
         return "unidentified"
 
-    proxy_pid = running_config.get("pid")
+    proxy_pid = _health_pid(running_config.get("pid"))
     if proxy_pid is None:
         return "no_pid"
 
-    try:
-        pid = int(proxy_pid)
-    except (TypeError, ValueError):
-        return "no_pid"
-    if pid <= 1:
-        return "no_pid"
-
-    return "stopped" if _kill_proxy_by_pid(pid, port) else "failed"
+    return "stopped" if _kill_proxy_by_pid(proxy_pid, port) else "failed"
 
 
 def _manifest_targets_claude(manifest: Any) -> bool:
@@ -5416,13 +5463,17 @@ def _ensure_proxy_unlocked(
                         f"  Proxy on port {port} is running Headroom {running_version}; "
                         f"restarting with {_HEADROOM_VERSION}..."
                     )
-                    proxy_pid = running_config.get("pid") if running_config is not None else None
+                    proxy_pid = (
+                        _health_pid(running_config.get("pid"))
+                        if running_config is not None
+                        else None
+                    )
                     if proxy_pid is None:
                         raise click.ClickException(
                             f"Proxy on port {port} is stale but did not expose a PID. "
                             "Stop it manually and retry."
                         )
-                    if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                    if not helpers._kill_proxy_by_pid(proxy_pid, port):
                         raise click.ClickException(
                             f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
                             "Stop it manually and retry."
@@ -5471,9 +5522,9 @@ def _ensure_proxy_unlocked(
                         learn = learn or bool(running_config.get("learn"))
                         code_graph = code_graph or bool(running_config.get("code_graph"))
 
-                        proxy_pid = running_config.get("pid")
+                        proxy_pid = _health_pid(running_config.get("pid"))
                         if proxy_pid is not None:
-                            if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                            if not helpers._kill_proxy_by_pid(proxy_pid, port):
                                 raise click.ClickException(
                                     f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
                                     "Stop it manually and retry."
@@ -5516,14 +5567,14 @@ def _ensure_proxy_unlocked(
                             f"  Proxy on port {port} has incompatible routing config "
                             f"({keys_str}); restarting with the requested config..."
                         )
-                        proxy_pid = running_config.get("pid")
+                        proxy_pid = _health_pid(running_config.get("pid"))
                         if proxy_pid is None:
                             raise click.ClickException(
                                 f"Proxy on port {port} has incompatible routing config "
                                 f"({keys_str}) but did not expose a PID. "
                                 "Stop it manually and retry."
                             )
-                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                        if not helpers._kill_proxy_by_pid(proxy_pid, port):
                             raise click.ClickException(
                                 f"Failed to stop incompatible proxy (PID {proxy_pid}) "
                                 f"on port {port}. Stop it manually and retry."

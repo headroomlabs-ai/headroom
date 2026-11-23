@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -2261,41 +2263,86 @@ def test_stop_local_proxy_for_unwrap_refuses_unidentified_listener(
     kill_proxy.assert_not_called()
 
 
-@pytest.mark.parametrize("bad_pid", [-1, 0, 1, True, "abc", None, 3.5])
+def _record_signals(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    calls: list[object] = []
+    real_run = subprocess.run
+
+    def run(args: list[str], **kwargs: Any) -> Any:
+        if args[0] == "taskkill":
+            calls.append(("run", args))
+            return None
+        return real_run(args, **kwargs)  # process lookups (ps, powershell) stay real
+
+    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(("kill", pid)))
+    monkeypatch.setattr(wrap_mod.subprocess, "run", run)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+    return calls
+
+
+@pytest.mark.parametrize("bad_pid", [-1, 0, 1, True])
 def test_kill_proxy_by_pid_never_signals_unsafe_pid(
-    monkeypatch: pytest.MonkeyPatch, bad_pid: object
+    monkeypatch: pytest.MonkeyPatch, bad_pid: int
 ) -> None:
     """A listener-supplied PID of -1/0/1 must never reach os.kill or taskkill."""
-    calls: list[object] = []
-    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(("kill", pid)))
-    monkeypatch.setattr(wrap_mod.subprocess, "run", lambda *a, **k: calls.append(("run", a)))
-    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
+    calls = _record_signals(monkeypatch)
     for plat in ("win32", "linux"):
         monkeypatch.setattr(wrap_mod.sys, "platform", plat)
-        assert wrap_mod._kill_proxy_by_pid(bad_pid, 8787) is False  # type: ignore[arg-type]
+        assert wrap_mod._kill_proxy_by_pid(bad_pid, 8787) is False
     assert calls == []
 
 
 def test_kill_proxy_by_pid_never_signals_own_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[object] = []
-    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(pid))
-    monkeypatch.setattr(wrap_mod.subprocess, "run", lambda *a, **k: calls.append(a))
-    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
+    calls = _record_signals(monkeypatch)
     assert wrap_mod._kill_proxy_by_pid(wrap_mod.os.getpid(), 8787) is False
     assert calls == []
 
 
-@pytest.mark.parametrize("bad_pid", [-1, 0, 1])
-def test_stop_local_proxy_for_unwrap_ignores_self_declared_unsafe_pid(
-    monkeypatch: pytest.MonkeyPatch, bad_pid: int
+def test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[object] = []
-    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": bad_pid})
-    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(pid))
-    monkeypatch.setattr(wrap_mod.subprocess, "run", lambda *a, **k: calls.append(a))
+    """A /health body naming another real process of the user must not get it killed."""
+    calls = _record_signals(monkeypatch)
+    real_platform = sys.platform
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        for plat in ("win32", "linux", real_platform):
+            monkeypatch.setattr(wrap_mod.sys, "platform", plat)
+            assert wrap_mod._kill_proxy_by_pid(victim.pid, 8787) is False
+        assert calls == []
+        assert victim.poll() is None
+    finally:
+        monkeypatch.undo()  # os.kill is recorded above; really stop the child
+        victim.kill()
+        victim.wait()
 
-    assert wrap_mod._stop_local_proxy_for_unwrap(8787) == "no_pid"
+
+@pytest.mark.parametrize(
+    ("argv", "environ", "port", "expected"),
+    [
+        (["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8787"], {}, 8787, True),
+        (["/home/u/.local/bin/headroom", "proxy", "--port=9000"], {}, 9000, True),
+        (["headroom", "proxy"], {}, 8787, True),
+        (["headroom", "proxy"], {"HEADROOM_PORT": "9000"}, 9000, True),
+        (["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8788"], {}, 8787, False),
+        (["/usr/bin/python3", "-c", "import time"], {}, 8787, False),
+        (["vim", "proxy", "--port", "8787"], {}, 8787, False),
+    ],
+)
+def test_argv_serves_proxy_port(
+    argv: list[str], environ: dict[str, str], port: int, expected: bool
+) -> None:
+    assert wrap_mod._argv_serves_proxy_port(argv, environ, port) is expected
+
+
+def test_stop_local_proxy_for_unwrap_ignores_unconfirmed_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _record_signals(monkeypatch)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": -1})
+
+    assert wrap_mod._stop_local_proxy_for_unwrap(8787) == "failed"
     assert calls == []
 
 
@@ -2315,19 +2362,22 @@ def test_query_proxy_config_non_dict_health_is_unidentified(
     assert wrap_mod._query_proxy_config(8787) is None
 
 
-def test_kill_proxy_by_pid_positive_control_signals_real_pid(
+def test_kill_proxy_by_pid_positive_control_signals_confirmed_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, object]] = []
-    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(("kill", pid)))
-    monkeypatch.setattr(
-        wrap_mod.subprocess, "run", lambda args, **k: calls.append(("run", args[-1]))
-    )
-    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
-    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+    from headroom.install import runtime
+
+    calls = _record_signals(monkeypatch)
     pid = wrap_mod.os.getpid() + 1
+    monkeypatch.setattr(
+        runtime,
+        "_read_proc_metadata",
+        lambda p: (
+            (["python", "-m", "headroom.cli", "proxy", "--port", "8787"], {}) if p == pid else None
+        ),
+    )
     assert wrap_mod._kill_proxy_by_pid(pid, 8787) is True
-    assert calls[0][1] in (pid, str(pid))
+    assert calls[0] == ("kill", pid)
 
 
 def test_unwrap_codex_is_safe_noop_with_explicit_codex_home(
