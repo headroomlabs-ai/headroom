@@ -234,24 +234,34 @@ def _detect_system_bundle() -> Path:
     )
 
 
+_TLS_SERVER_AUTH_OID = "1.3.6.1.5.5.7.3.1"
+
+
 def _windows_trust_pem() -> bytes:
-    """Collect CA:TRUE certs from the Windows system trust stores as PEM bytes.
+    """Collect TLS server-auth CA:TRUE roots from the Windows ROOT store as PEM bytes.
 
     Windows has no single on-disk CA bundle file, so ``_SYSTEM_BUNDLE_CANDIDATES``
-    never matches there. ``ssl.enum_certificates`` (Windows-only) enumerates the
-    ROOT and CA stores but returns *all* certs including leaf certs, so the
-    result is run through the same ``_parse_ca_certs_from_pem`` CA:TRUE filter
-    used for corporate bundles — never trust a non-CA cert as an anchor.
+    never matches there. ``ssl.enum_certificates("ROOT")`` (Windows-only) enumerates
+    trusted root anchors; intermediate CAs from ``"CA"`` are intentionally excluded
+    so non-anchor issuers are never promoted to trust roots. Each entry must be
+    ``x509_asn`` encoded, permitted for TLS server authentication (``trust is True``
+    or containing ``1.3.6.1.5.5.7.3.1``), and pass the ``_parse_ca_certs_from_pem``
+    ``CA:TRUE`` filter.
     """
     blocks: list[bytes] = []
     try:
-        for store in ("ROOT", "CA"):
-            for der, _enc, _trust in ssl.enum_certificates(store):  # type: ignore[attr-defined,unused-ignore]
-                try:
-                    blocks.append(ssl.DER_cert_to_PEM_cert(der).encode("ascii"))
-                except ValueError:
-                    # A single malformed DER entry must not abort the whole store.
-                    logger.debug("event=windows_der_skip reason=bad_der")
+        for der, encoding, trust in ssl.enum_certificates("ROOT"):  # type: ignore[attr-defined,unused-ignore]
+            if encoding != "x509_asn":
+                continue
+            if trust is not True and (
+                not isinstance(trust, set) or _TLS_SERVER_AUTH_OID not in trust
+            ):
+                continue
+            try:
+                blocks.append(ssl.DER_cert_to_PEM_cert(der).encode("ascii"))
+            except ValueError:
+                # A single malformed DER entry must not abort the whole store.
+                logger.debug("event=windows_der_skip reason=bad_der")
     except OSError as exc:
         # ssl.enum_certificates wraps the Win32 cert-store API; surface a clear
         # cause instead of an opaque traceback at `wrap agy` launch.
@@ -259,7 +269,7 @@ def _windows_trust_pem() -> bytes:
     ca_pem = b"".join(_parse_ca_certs_from_pem(b"".join(blocks)))
     if not ca_pem:
         # An empty system-trust component would silently leave the combined
-        # bundle trusting only the headroom MITM root — fail loud, never ship a
+        # bundle trusting only the headroom MITM root - fail loud, never ship a
         # trust bundle with no system anchors.
         raise RuntimeError(
             "Windows system trust store yielded no CA anchors; refusing to build "

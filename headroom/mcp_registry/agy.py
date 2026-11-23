@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -231,10 +234,37 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write JSON with LF newlines, preserving existing file mode."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    existing_mode: int | None = None
+    try:
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        existing_mode = None
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if existing_mode is not None:
+            try:
+                os.chmod(tmp_name, existing_mode)
+            except OSError:
+                pass
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
@@ -271,7 +301,11 @@ def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
     if tuple(existing.args) != tuple(requested.args):
         parts.append(f"args {list(existing.args)} -> {list(requested.args)}")
     if dict(existing.env) != dict(requested.env):
-        parts.append(f"env {dict(existing.env)} -> {dict(requested.env)}")
+        # Never echo env values into conflict messages (stdout/logs): user MCP
+        # entries often store API keys or tokens in env.
+        existing_keys = sorted(existing.env)
+        requested_keys = sorted(requested.env)
+        parts.append(f"env keys {existing_keys} -> {requested_keys}")
     if not parts:
         return "spec differs in unidentified field(s)"
     return "; ".join(parts)

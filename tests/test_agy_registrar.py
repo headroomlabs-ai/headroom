@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from headroom.mcp_registry.agy import AgyRegistrar
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
 
@@ -311,3 +313,62 @@ class TestUnregisterServer:
         reg.register_server(_SPEC)
         assert reg.unregister_server("headroom") is True
         assert reg.unregister_server("headroom") is False
+
+
+class TestRegistrarSafety:
+    def test_conflict_detail_redacts_env_values(self, tmp_path: Path) -> None:
+        """Conflict messages must never echo user env values (potential credentials)."""
+        secret = "sk-user-super-secret-token-999"
+        _write_config(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "headroom": {
+                        "command": "headroom",
+                        "args": ["mcp", "serve"],
+                        "env": {"API_TOKEN": secret},
+                    }
+                }
+            },
+        )
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC, force=False)
+        assert result.status == RegisterStatus.MISMATCH
+        assert "API_TOKEN" in result.detail
+        assert secret not in result.detail
+
+    def test_failed_write_preserves_existing_config_and_cleans_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write error mid-serialization must leave the shared mcp_config.json intact."""
+        import headroom.mcp_registry.agy as agy_mod
+
+        original = {
+            "mcpServers": {
+                "ide-server": {"command": "/usr/local/bin/ide-mcp"},
+            }
+        }
+        _write_config(tmp_path, original)
+        config_path = tmp_path / ".gemini" / "config" / "mcp_config.json"
+        before_bytes = config_path.read_bytes()
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(agy_mod.json, "dump", _boom)
+
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.FAILED
+        assert config_path.read_bytes() == before_bytes
+        leftover_tmps = list(config_path.parent.glob("*.tmp"))
+        assert leftover_tmps == []
+
+    @pytest.mark.windows_newline
+    def test_write_json_uses_lf_newlines(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.REGISTERED
+        raw = (tmp_path / ".gemini" / "config" / "mcp_config.json").read_bytes()
+        assert b"\n" in raw
+        assert b"\r\n" not in raw

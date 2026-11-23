@@ -176,8 +176,8 @@ signals extend that to the user's normal runtime.
   process-scoped and never in the OS trust store; the **upstream** (Google-facing) leg keeps
   **full** certificate verification against system roots — MITM on the agy-facing side never
   implies trust-anything upstream.
-- **Stability:** fail-open — any compression/dispatch error forwards the original bytes so
-  `agy` never breaks; fail-fast on security-critical setup (CA generation, port bind).
+- **Stability:** fail-open on compression errors inside `handle_google_cloudcode_stream` (forward original bytes so `agy` never breaks); fail-fast on security-critical setup (CA generation, port bind).
+  If the local dispatch listener becomes unreachable after startup, `_handle_mitm` closes the tunnel cleanly rather than bypassing MITM or dialing allowlisted upstream hosts directly from the terminator.
 
 ## Alternatives considered
 
@@ -283,9 +283,11 @@ Platform specifics:
 - Atomic bundle writes use `os.replace`; `_write_secure` ORs in `os.O_BINARY`
   (0 on POSIX) so PEM bytes are written verbatim, not CRLF-translated, on Windows.
 - System trust source: POSIX/macOS read the detected on-disk CA bundle; Windows has
-  no single bundle file, so `_system_trust_pem()` enumerates the ROOT+CA cert stores
-  via stdlib `ssl.enum_certificates`, run through the same CA:TRUE filter (no leaf
-  trusted as an anchor; no `certifi` dependency).
+  no single bundle file, so `_system_trust_pem()` enumerates the `ROOT` store
+  via stdlib `ssl.enum_certificates("ROOT")`, filtering to `x509_asn` certs
+  permitted for TLS server authentication (`trust is True` or containing OID
+  `1.3.6.1.5.5.7.3.1`), and runs them through the same `CA:TRUE` filter (no
+  intermediate-store promotion, no leaf trusted as an anchor, no `certifi` dependency).
 - Loopback sockets set `SO_REUSEADDR` only on POSIX; on Windows that flag would let
   another local process bind the same port and intercept decrypted traffic, so Windows
   uses `SO_EXCLUSIVEADDRUSE` instead.

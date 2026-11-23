@@ -609,6 +609,17 @@ async def _handle_blind_tunnel(
             if parsed.scheme == "https":
                 proxy_ssl_context = ssl.create_default_context()
                 proxy_ssl_context.set_alpn_protocols(["http/1.1"])
+                # Load any CA:TRUE corporate roots from SSL_CERT_FILE /
+                # NODE_EXTRA_CA_CERTS so an https:// corporate proxy signed by a
+                # private CA configured only via NODE_EXTRA_CA_CERTS verifies.
+                # Headroom's own MITM root CA is never loaded here.
+                from headroom.proxy.agy_ca import _collect_corporate_ca_pems
+
+                corp_pems = _collect_corporate_ca_pems()
+                if corp_pems:
+                    proxy_ssl_context.load_verify_locations(
+                        cadata=b"".join(corp_pems).decode("ascii")
+                    )
 
             target_reader, target_writer = await _connect_via_upstream_proxy(
                 proxy_host,

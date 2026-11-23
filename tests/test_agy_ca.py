@@ -427,6 +427,54 @@ def test_windows_trust_pem_filters_non_ca(monkeypatch: pytest.MonkeyPatch) -> No
     assert leaf_cert.serial_number not in present, "leaf cert must be filtered out"
 
 
+def test_windows_trust_pem_root_store_only_and_server_auth_trust(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows trust export must read ROOT only and honor TLS serverAuth trust OIDs."""
+    root_all_cert = x509.load_pem_x509_certificate(_make_cert(is_ca=True))
+    root_tls_cert = x509.load_pem_x509_certificate(_make_cert(is_ca=True))
+    root_codesign_cert = x509.load_pem_x509_certificate(_make_cert(is_ca=True))
+    root_non_asn_cert = x509.load_pem_x509_certificate(_make_cert(is_ca=True))
+    intermediate_cert = x509.load_pem_x509_certificate(_make_cert(is_ca=True))
+
+    stores_queried: list[str] = []
+
+    def fake_enum(store: str) -> list[tuple[bytes, str, bool | set[str]]]:
+        stores_queried.append(store)
+        if store == "ROOT":
+            return [
+                (root_all_cert.public_bytes(serialization.Encoding.DER), "x509_asn", True),
+                (
+                    root_tls_cert.public_bytes(serialization.Encoding.DER),
+                    "x509_asn",
+                    {"1.3.6.1.5.5.7.3.1"},
+                ),
+                (
+                    root_codesign_cert.public_bytes(serialization.Encoding.DER),
+                    "x509_asn",
+                    {"1.3.6.1.5.5.7.3.3"},
+                ),
+                (root_non_asn_cert.public_bytes(serialization.Encoding.DER), "pkcs7_asn", True),
+            ]
+        return [(intermediate_cert.public_bytes(serialization.Encoding.DER), "x509_asn", True)]
+
+    monkeypatch.setattr("ssl.enum_certificates", fake_enum, raising=False)
+
+    result = _windows_trust_pem()
+    assert stores_queried == ["ROOT"]
+
+    marker = b"-----BEGIN CERTIFICATE-----"
+    present = {
+        x509.load_pem_x509_certificate(marker + block).serial_number
+        for block in result.split(marker)[1:]
+    }
+    assert root_all_cert.serial_number in present
+    assert root_tls_cert.serial_number in present
+    assert root_codesign_cert.serial_number not in present
+    assert root_non_asn_cert.serial_number not in present
+    assert intermediate_cert.serial_number not in present
+
+
 def test_windows_trust_pem_enum_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failure reading the Windows trust store surfaces as a clear RuntimeError.
 

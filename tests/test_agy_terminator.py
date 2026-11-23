@@ -1807,6 +1807,54 @@ async def test_blind_tunnel_https_upstream_proxy_tls_context(
 
 
 @pytest.mark.asyncio
+async def test_blind_tunnel_https_upstream_proxy_loads_node_extra_ca_certs(
+    tmp_path: object,
+    tmp_ca: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Corporate root CA provided only in NODE_EXTRA_CA_CERTS is loaded into proxy TLS context."""
+    import unittest.mock as mock
+    from pathlib import Path
+
+    import headroom.proxy.agy_terminator as _mod
+    from headroom.proxy.agy_terminator import _handle_blind_tunnel
+
+    _, _, corp_ca_pem = tmp_ca
+    corp_ca_file = Path(str(tmp_path)) / "corp-root.pem"
+    corp_ca_file.write_bytes(corp_ca_pem)
+
+    monkeypatch.setattr(_mod, "_is_loopback", lambda host: False)
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy.corp.example:9443")
+    monkeypatch.setenv("NODE_EXTRA_CA_CERTS", str(corp_ca_file))
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+
+    mock_ctx = mock.MagicMock(spec=ssl.SSLContext)
+
+    async def _fake_open_connection(
+        host: str, port: int, **_: object
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        raise OSError("stop before real I/O")
+
+    with (
+        mock.patch.object(_mod.ssl, "create_default_context", lambda: mock_ctx),
+        mock.patch.object(_mod.asyncio, "open_connection", _fake_open_connection),
+    ):
+        client_reader = asyncio.StreamReader()
+        client_reader.feed_eof()
+        await asyncio.wait_for(
+            _handle_blind_tunnel(
+                client_reader, _SpliceCompatWriter(), "target.example.com", 443, None
+            ),
+            timeout=5.0,
+        )
+
+    mock_ctx.set_alpn_protocols.assert_called_once_with(["http/1.1"])
+    mock_ctx.load_verify_locations.assert_called_once()
+    cadata = mock_ctx.load_verify_locations.call_args.kwargs["cadata"]
+    assert corp_ca_pem.decode("ascii").strip() in cadata
+
+
+@pytest.mark.asyncio
 async def test_blind_tunnel_http_upstream_proxy_dials_without_tls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
