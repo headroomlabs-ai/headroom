@@ -312,6 +312,41 @@ def test_readyz_upstream_check_failure_returns_503(monkeypatch):
     assert "connection refused" in data["checks"]["upstream"]["error"]
 
 
+@pytest.mark.parametrize(
+    ("openai_url", "anthropic_url", "expected_probe"),
+    [
+        (None, None, "https://api.anthropic.com"),
+        ("https://llm.example/v1", None, "https://llm.example"),
+        ("https://llm.example/v1", "https://claude.example/v1", "https://claude.example"),
+    ],
+)
+def test_readyz_probes_the_configured_primary_upstream(
+    monkeypatch, openai_url, anthropic_url, expected_probe
+):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
+    monkeypatch.delenv("ANTHROPIC_TARGET_API_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_FOUNDRY_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        openai_api_url=openai_url,
+        anthropic_api_url=anthropic_url,
+    )
+    with TestClient(create_app(config)) as client:
+        probe = AsyncMock(return_value=SimpleNamespace(status_code=200))
+        monkeypatch.setattr(client.app.state.proxy.http_client, "head", probe)
+        response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["checks"]["upstream"]["url"] == expected_probe
+    probe.assert_awaited_once_with(expected_probe, timeout=5.0)
+
+
 def test_health_includes_upstream_check_result(monkeypatch):
     """/health always returns 200 but exposes the upstream check result."""
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")

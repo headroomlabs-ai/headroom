@@ -4324,9 +4324,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     def _upstream_target_url() -> str:
         """Return the primary upstream base URL to probe."""
-        # Use the resolved API target from the provider runtime so we respect
-        # any overrides set by ProxyConfig.anthropic_api_url / env vars.
-        return proxy.provider_runtime.api_targets.anthropic
+        overrides = config.provider_api_overrides
+        targets = proxy.provider_runtime.api_targets
+        # An OpenAI-compatible gateway may be the only configured upstream.
+        if overrides.openai and not overrides.anthropic:
+            return targets.openai
+        return targets.anthropic
 
     async def _check_upstream() -> None:
         """Probe the upstream API endpoint and update the cached result.
