@@ -668,6 +668,7 @@ def _estimate_input_cost_usd(
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     uncached_input_tokens: int = 0,
+    cache_inferred: bool = False,
 ) -> float:
     """Estimate input spend in USD for a request.
 
@@ -678,6 +679,13 @@ def _estimate_input_cost_usd(
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
+    # An inferred write is the same tokens as ``uncached`` (OpenAI-style traffic
+    # has no provider write counter, so Headroom derives ``cache_write_tokens``
+    # from the uncached slice). It carries no provider write premium and must not
+    # be priced on top of ``uncached`` — mirror ``CacheMix.normalized()``, which
+    # drops every write bucket when ``inferred_write`` is set.
+    if cache_inferred:
+        cache_write = 0
 
     # Prefer the breakdown when callers supply segmented token counts.
     # Never add `input_tokens` on top of the breakdown to avoid double-counting.
@@ -1511,6 +1519,7 @@ class SavingsTracker:
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,
+                cache_inferred=cache_inferred,
             ),
         )
         # Cache-aware, like every other savings figure as of v6. ``tokens_saved``
