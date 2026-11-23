@@ -109,16 +109,11 @@ def _receipt_frames(index: int, text: str) -> list[bytes]:
     ]
 
 
-_RECEIPT_BOUND = 60
-
-
-def _bounded(text: str) -> str:
-    """One line, at most ``_RECEIPT_BOUND`` characters, for a receipt."""
-    collapsed = " ".join(text.split())
-    if len(collapsed) <= _RECEIPT_BOUND:
-        return collapsed
-    return collapsed[: _RECEIPT_BOUND - 1].rstrip() + "\u2026"
-
+# The failure phrase a receipt carries. Handler message bodies, and the
+# exception text they embed, stay on the model's side of the proxy: the receipt
+# lands in assistant history and in the client's SSE stream, so it names the
+# outcome only (GH #4888 review).
+_FAILURE_RECEIPT = "error"
 
 # The ``view`` helpers for the native memory tool report a backend failure
 # without the bare ``Error:`` prefix every other handler uses, e.g.
@@ -129,20 +124,19 @@ _NATIVE_VIEW_FAILURE = re.compile(r"^Error(?: \w+){1,4} memor(?:y|ies):", re.IGN
 
 
 def _native_outcome(content: str) -> str:
-    """One bounded phrase for a native memory tool's plain-text result.
+    """One fixed phrase for a native memory tool's plain-text result.
 
     Native handlers answer with prose, not JSON (``Error: ...`` or a sentence
     like "File created successfully at: ..."), so a failed create and a
-    successful one are both strings here. The outcome is kept, bounded, rather
-    than reduced to a bare ``done`` that hides the failure.
+    successful one are both strings here. A failure is reported as a bare
+    ``error``: the handler's text can carry a backend exception, and a receipt
+    is visible to the client and recorded in history.
     """
-    view_failure = _NATIVE_VIEW_FAILURE.match(content)
-    if view_failure:
-        detail = _bounded(content[view_failure.end() :].strip())
-        return f"error: {detail}" if detail else "error"
-    if content.startswith("Error:"):
-        detail = _bounded(content[len("Error:") :].strip())
-        return f"error: {detail}" if detail else "error"
+    if _NATIVE_VIEW_FAILURE.match(content) or content.startswith("Error:"):
+        return _FAILURE_RECEIPT
+    if content.startswith("No replacement was performed"):
+        return "not applied"
+    return "ok"
     if content.startswith("No replacement was performed"):
         return "not applied"
     return "ok"
@@ -168,7 +162,7 @@ def _receipt_status(payload: Any) -> str:
     if status == "ok":
         return f"ok {payload.get('count', '')}".strip()
     if status == "error":
-        return f"error {payload.get('error', '')}".strip()
+        return _FAILURE_RECEIPT
     return str(status) if status else "done"
 
 

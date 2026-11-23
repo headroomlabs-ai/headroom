@@ -100,6 +100,16 @@ SAVE = {
     "input": {"content": "deploy region is ap-southeast-1"},
 }
 BASH = {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "ls"}}
+NATIVE_VIEW = {
+    "type": "tool_use",
+    "id": "toolu_native",
+    "name": "memory",
+    "input": {"command": "view", "path": "/memories/"},
+}
+
+
+def _native_result(content: str) -> dict[str, Any]:
+    return {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
 
 
 class TestMemoryToolStreamFilter:
@@ -226,6 +236,10 @@ def _proxy(upstream_bodies: list[bytes], tool_results: list[dict[str, Any]]) -> 
 
 
 async def _client_view(proxy: HeadroomProxy, **kwargs: Any) -> list[dict[str, Any]]:
+    return _events(await _client_raw(proxy, **kwargs))
+
+
+async def _client_raw(proxy: HeadroomProxy, **kwargs: Any) -> bytes:
     result = await proxy._stream_response(
         url="https://api.anthropic.com/v1/messages",
         headers={"x-api-key": "sk-test"},
@@ -247,8 +261,7 @@ async def _client_view(proxy: HeadroomProxy, **kwargs: Any) -> list[dict[str, An
         memory_user_id="user-1",
         **kwargs,
     )
-    raw = b"".join([chunk async for chunk in result.body_iterator])
-    return _events(raw)
+    return b"".join([chunk async for chunk in result.body_iterator])
 
 
 SAVE_RESULT = [
@@ -598,18 +611,13 @@ class TestNativeMemoryReceipts:
 
     def test_native_validation_error_is_not_a_success_receipt(self) -> None:
         text = self._runs("Error: file_text is required (the memory content)", "create")
-        assert (
-            text
-            == "[headroom memory] memory create error: file_text is required (the memory content)"
-        )
+        assert text == "[headroom memory] memory create error"
         assert "ok" not in text
 
-    def test_native_backend_failure_is_bounded(self) -> None:
+    def test_native_failure_keeps_handler_text_out_of_the_receipt(self) -> None:
         text = self._runs("Error: " + "x" * 300, "create")
-        assert text is not None
-        assert text.startswith("[headroom memory] memory create error: x")
-        assert len(text) <= len("[headroom memory] memory create error: ") + 60
-        assert "x" * 300 not in text
+        assert text == "[headroom memory] memory create error"
+        assert "x" not in text
 
     def test_native_unsuccessful_replacement_is_not_ok(self) -> None:
         text = self._runs(
@@ -635,15 +643,14 @@ class TestNativeMemoryReceipts:
         backend failures as ``ok``.
         """
         text = self._runs(content, "view")
-        assert text == "[headroom memory] memory view error: backend down"
+        assert text == "[headroom memory] memory view error"
         assert "ok" not in text
+        assert "backend down" not in text
 
-    def test_native_view_backend_failure_is_bounded(self) -> None:
-        text = self._runs("Error listing memories: " + "x" * 300, "view")
-        assert text is not None
-        assert text.startswith("[headroom memory] memory view error: x")
-        assert len(text) <= len("[headroom memory] memory view error: ") + 60
-        assert "x" * 300 not in text
+    def test_native_view_backend_failure_keeps_the_exception_out(self) -> None:
+        text = self._runs("Error listing memories: internal-backend-marker", "view")
+        assert text == "[headroom memory] memory view error"
+        assert "internal-backend-marker" not in text
 
     def test_native_view_success_is_still_ok(self) -> None:
         assert (
@@ -685,7 +692,7 @@ class TestNativeMemoryReceipts:
             ),
             ({"status": "not_found"}, "memory_delete not_found"),
             ({"status": "ok", "count": 2}, "memory_search ok 2"),
-            ({"status": "error", "error": "backend down"}, "memory_save error backend down"),
+            ({"status": "error", "error": "backend down"}, "memory_save error"),
             ({"status": "queued"}, "memory_save queued"),
             ({"status": ""}, "memory_save done"),
         ],
@@ -713,14 +720,14 @@ class TestNativeFailureSourceToReceipt:
     test (GH #4888).
     """
 
-    @pytest.mark.asyncio
-    async def test_view_helper_failures_reach_the_receipt_as_errors(self, tmp_path: Any) -> None:
+    @staticmethod
+    async def _view_failures(tmp_path: Any) -> list[str]:
+        """What the three view helpers return when the backend raises."""
         from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
-        from headroom.proxy.memory_tool_stream import format_receipt
 
         class _DownBackend:
             async def search_memories(self, **kwargs: Any) -> Any:
-                raise RuntimeError("backend down")
+                raise RuntimeError("internal-backend-marker")
 
         handler = MemoryHandler(
             MemoryConfig(
@@ -731,24 +738,52 @@ class TestNativeFailureSourceToReceipt:
             agent_type="codex",
         )
         backend = _DownBackend()
-        produced = [
+        return [
             await handler._semantic_search("x", "u1", backend=backend),
             await handler._get_recent_memories("u1", backend=backend),
             await handler._list_all_memories("u1", backend=backend),
         ]
+
+    @pytest.mark.asyncio
+    async def test_view_helper_failures_reach_the_receipt_as_errors(self, tmp_path: Any) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        produced = await self._view_failures(tmp_path)
         assert all(text.startswith("Error") for text in produced)
 
         for content in produced:
-            call = {
-                "type": "tool_use",
-                "id": "toolu_native",
-                "name": "memory",
-                "input": {"command": "view", "path": "/memories/"},
-            }
-            result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
-            text = format_receipt([call], [result])
-            assert text == "[headroom memory] memory view error: backend down"
+            text = format_receipt([NATIVE_VIEW], [_native_result(content)])
+            assert text == "[headroom memory] memory view error"
             assert "ok" not in text
+            assert "internal-backend-marker" not in text
+
+    @pytest.mark.asyncio
+    async def test_backend_text_reaches_neither_the_stream_nor_the_history(
+        self, tmp_path: Any
+    ) -> None:
+        """A raising backend leaves no marker in the SSE or in tracked history."""
+        produced = await self._view_failures(tmp_path)
+        proxy = _proxy(
+            [_sse([TEXT, NATIVE_VIEW, BASH], "tool_use")],
+            [_native_result(produced[0])],
+        )
+        proxy._config.memory_tool_receipts = "text"
+        proxy.ccr_response_handler = _StubCCRHandler()
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+
+        raw = await _client_raw(proxy, server_memory_tool_names=frozenset({"memory"}))
+        events = _events(raw)
+
+        receipt = "[headroom memory] memory view error"
+        assert any(
+            e["type"] == "content_block_delta" and e["delta"].get("text") == receipt for e in events
+        )
+        assert b"internal-backend-marker" not in raw
+
+        finalized = proxy._finalize_stream_response.await_args.kwargs["parsed_response"]
+        history = [b.get("text") for b in finalized["content"] if b["type"] == "text"]
+        assert "internal-backend-marker" not in json.dumps(history)
+        assert receipt in history
 
 
 class TestStreamingMemoryContinuation:
