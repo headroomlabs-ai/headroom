@@ -102,7 +102,7 @@ def _write_thread_db(
 
 def test_discover_dangling_homes_only_returns_codex_homes(tmp_path: Path) -> None:
     candidate = tmp_path / "headroom-codex-home-abc"
-    candidate.mkdir()
+    candidate.mkdir(mode=0o700)
     (candidate / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
     (tmp_path / "headroom-codex-home-empty").mkdir()
     (tmp_path / "other").mkdir()
@@ -142,13 +142,41 @@ def test_discover_dangling_homes_skips_group_or_world_writable_homes(tmp_path: P
     assert discover_dangling_homes(tmp_path) == [candidate]
 
 
+def test_discover_dangling_homes_on_windows_only_searches_the_user_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows has no owner check here, so shared roots such as C:\\tmp are not searched."""
+    monkeypatch.setattr(codex_recovery.os, "name", "nt")
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "env-tmp"))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "user-tmp"))
+
+    assert [root.name for root in codex_recovery._temp_roots()] == ["user-tmp"]
+
+
+def test_recovery_refuses_a_source_owned_by_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-swapped"
+    target.mkdir()
+    source.mkdir()
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    (source / "config.toml").write_text('[mcp_servers.x]\ncommand = "true"\n', encoding="utf-8")
+    own_uid = source.lstat().st_uid
+    monkeypatch.setattr(codex_recovery.os, "getuid", lambda: own_uid + 1, raising=False)
+
+    with pytest.raises(ValueError, match="not owned by the current user"):
+        recover_codex_home(source=source, target=target)
+    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+
+
 def test_discover_dangling_homes_uses_newest_state_not_directory_mtime(
     tmp_path: Path,
 ) -> None:
     newest_state = tmp_path / "headroom-codex-home-newest-state"
     newest_directory = tmp_path / "headroom-codex-home-newest-directory"
-    newest_state.mkdir()
-    newest_directory.mkdir()
+    newest_state.mkdir(mode=0o700)
+    newest_directory.mkdir(mode=0o700)
     newest_state_file = newest_state / "history.jsonl"
     newest_directory_file = newest_directory / "history.jsonl"
     newest_state_file.write_text('{"session_id":"newest"}\n', encoding="utf-8")
@@ -171,6 +199,8 @@ def test_discover_dangling_homes_searches_tmpdir_and_python_temp_root(
     python_candidate = python_root / "headroom-codex-home-python"
     env_candidate.mkdir(parents=True)
     python_candidate.mkdir(parents=True)
+    env_candidate.chmod(0o700)  # not group-writable under a 002 umask
+    python_candidate.chmod(0o700)
     (env_candidate / "history.jsonl").write_text("{}\n", encoding="utf-8")
     (python_candidate / "history.jsonl").write_text("{}\n", encoding="utf-8")
     os.utime(env_candidate / "history.jsonl", ns=(100, 100))

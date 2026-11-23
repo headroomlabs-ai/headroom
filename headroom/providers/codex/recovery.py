@@ -49,35 +49,53 @@ class CodexHistoryAudit:
     history_without_rollout: tuple[str, ...]
 
 
+def _owned_by_current_user(path: Path) -> bool:
+    """On POSIX, whether the current user owns ``path`` itself (not a link target)."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return True  # Windows: no POSIX owner to compare
+    return bool(path.lstat().st_uid == getuid())
+
+
 def _is_trusted_owner(path: Path) -> bool:
     """On POSIX, require the current user as owner and no group/world write bit.
 
     A shared temp root lets another local user plant a directory with the Headroom
     prefix; merging it would write that user's config into the active Codex home.
     """
-    getuid = getattr(os, "getuid", None)
-    if getuid is None:
-        return True  # Windows: no POSIX owner or mode bits to check
-    metadata = path.lstat()
-    return metadata.st_uid == getuid() and not metadata.st_mode & 0o022
+    if not _owned_by_current_user(path):
+        return False
+    return os.name == "nt" or not path.lstat().st_mode & 0o022
+
+
+def _temp_roots() -> list[Path]:
+    """Temp directories an older Headroom may have left a Codex home in.
+
+    On Windows only the per-user temp dir: ``Path("/tmp")`` there is
+    ``C:\\tmp``, which any user can create, and ownership is not checked.
+    """
+    roots = [Path(tempfile.gettempdir())]
+    if os.name == "nt":
+        return roots
+    if env_tmpdir := os.environ.get("TMPDIR"):
+        roots.append(Path(env_tmpdir))
+    roots.extend((Path("/tmp"), Path("/private/tmp")))
+    roots.extend(Path("/private/var/folders").glob("*/*/T"))
+    return roots
 
 
 def discover_dangling_homes(temp_root: Path | None = None) -> list[Path]:
     """Find non-empty Headroom temporary Codex homes, newest first."""
-    if temp_root is not None:
-        roots = [temp_root]
-    else:
-        roots = [Path(tempfile.gettempdir())]
-        if env_tmpdir := os.environ.get("TMPDIR"):
-            roots.append(Path(env_tmpdir))
-        roots.extend((Path("/tmp"), Path("/private/tmp")))
-        roots.extend(Path("/private/var/folders").glob("*/*/T"))
+    roots = [temp_root] if temp_root is not None else _temp_roots()
     candidates: list[Path] = []
     seen: set[Path] = set()
     for root in roots:
         try:
-            paths = root.glob(f"{_TEMP_HOME_PREFIX}*")
-            for path in paths:
+            paths = list(root.glob(f"{_TEMP_HOME_PREFIX}*"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
                 resolved = path.resolve()
                 if (
                     resolved not in seen
@@ -88,8 +106,8 @@ def discover_dangling_homes(temp_root: Path | None = None) -> list[Path]:
                 ):
                     seen.add(resolved)
                     candidates.append(path)
-        except OSError:
-            continue
+            except OSError:  # removed or unreadable since the listing
+                continue
     return sorted(candidates, key=_latest_state_mtime_ns, reverse=True)
 
 
@@ -750,6 +768,10 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     target = target.expanduser().resolve()
     if not source.is_dir() or source == target:
         raise ValueError("source must be an existing Codex home different from target")
+    if not _owned_by_current_user(source):
+        # Checked again here, on the resolved path: the directory chosen at a
+        # prompt could have been replaced by then.
+        raise ValueError(f"source Codex home {source} is not owned by the current user")
     if source in target.parents or target in source.parents or target == Path(target.anchor):
         raise ValueError("source and target Codex homes must not overlap")
     _reject_target_symlink_traversal(source, target)
