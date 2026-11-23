@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from types import MethodType, SimpleNamespace
 
+import pytest
+
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -100,7 +102,14 @@ def test_responses_view_tool_read_stays_verbatim():
     assert new_payload["input"][1]["output"] == _FILE_CONTENT
 
 
-def test_responses_bash_read_command_stays_verbatim_when_protect_reads(monkeypatch):
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nl -ba .overlay/ROADMAP.md | sed -n '1,75p'",
+        "git show --no-color HEAD:.overlay/ROADMAP.md -- | nl -ba",
+    ],
+)
+def test_responses_bash_read_command_stays_verbatim_when_protect_reads(monkeypatch, command):
     """HEADROOM_PROTECT_READS=1 must cover bash file reads on the Responses path too."""
     monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
     handler = _handler_with_router(_lossy_router())
@@ -111,7 +120,7 @@ def test_responses_bash_read_command_stays_verbatim_when_protect_reads(monkeypat
                 "type": "function_call",
                 "call_id": "call_bash",
                 "name": "bash",
-                "arguments": ('{"command": "nl -ba .overlay/ROADMAP.md | sed -n \'1,75p\'"}'),
+                "arguments": json.dumps({"command": command}),
             },
             {
                 "type": "function_call_output",

@@ -894,13 +894,13 @@ def _is_read_command(command: str) -> bool:
 # downstream stages consume the previous stage's output, not a file, so
 # `grep -n x a.py | head -40` is derived search output (compressible), while
 # `cat a.py | head -40` is a file read (caught via the first stage).
-_CMD_SEPARATOR_RE = re.compile(r"\|\||&&|;")
+_CMD_SEPARATOR_RE = re.compile(r"\|\||&&|;|\n")
 
 
 def _command_segments(command: str) -> list[str]:
     """Split a shell string into the independently-executed commands in it.
 
-    Splits on ``;``, ``&&`` and ``||`` — never on a single ``|``. Pipelines are kept
+    Splits on command-ending newlines, ``;``, ``&&`` and ``||``. Pipelines are kept
     whole so the segment's own writes (``cat a.py | tee b.py``) stay visible; the
     reduction to the first stage happens in :func:`_segment_is_read`. Separators inside
     quotes (``sed -n '/a;b/p' foo.py``) are part of an argument, not a new command.
@@ -909,6 +909,8 @@ def _command_segments(command: str) -> list[str]:
     segments: list[str] = []
     start = 0
     for m in _CMD_SEPARATOR_RE.finditer(masked):
+        if m.group() == "\n" and masked[start : m.start()].rstrip().endswith("|"):
+            continue
         segments.append(command[start : m.start()])
         start = m.end()
     segments.append(command[start:])
@@ -1019,10 +1021,18 @@ def _git_show_reads_file(rest: list[str]) -> bool:
         return False
     if args and args[0] == "--no-pager":
         args = args[1:]
-    if len(args) != 2 or args[0] != "show" or args[1].startswith("-"):
+    if not args or args[0] != "show":
         return False
-    _, separator, path = args[1].partition(":")
-    return bool(separator and path and not _LOCKFILE_RE.search(path))
+    show_args = args[1:]
+    if show_args and show_args[-1] == "--":
+        show_args.pop()
+    blob_args = [arg for arg in show_args if arg not in {"--no-color", "--color=never"}]
+    if len(blob_args) != 1 or blob_args[0].startswith("-"):
+        return False
+    # Index entries can have an explicit stage and reflog selectors can contain
+    # a timestamp. Neither is part of the path.
+    blob = re.fullmatch(r"(?:[^:]*@\{[^}]+\}:|:[0-3]:|[^:]*:)(.+)", blob_args[0])
+    return bool(blob and not _LOCKFILE_RE.search(blob[1]))
 
 
 def _strip_shell_comment(command: str) -> str:
@@ -1618,6 +1628,9 @@ def _read_output_should_be_protected(text: Any) -> bool:
     separate object carve-out is needed here.
     """
     if not isinstance(text, str) or not text:
+        return False
+    if re.match(r"tree [^\r\n]*:[^\r\n]*\r?\n\r?\n", text):
+        # git show also reads trees, whose output is a directory listing.
         return False
     outputs = _codex_exec_envelope_outputs(text)
     if outputs is not None:
