@@ -4425,13 +4425,20 @@ def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     return max(counts, default=0)
 
 
-def _normalize_proxy_api_url(url: object, *, strip_provider_v1: bool = True) -> str | None:
-    """Normalize configured upstream URLs for running-proxy comparisons."""
+def _normalize_proxy_api_url(
+    url: object, *, strip_provider_v1: bool = True, keep_versioned_v1: bool = False
+) -> str | None:
+    """Normalize configured upstream URLs for running-proxy comparisons.
+
+    OpenAI bases need ``keep_versioned_v1``, as in ``resolve_api_targets``.
+    """
+    from headroom.providers.registry import _normalize_api_url
+
     if not isinstance(url, str):
         return None
     normalized = url.strip().rstrip("/")
-    if strip_provider_v1 and normalized.endswith("/v1"):
-        normalized = normalized[:-3]
+    if strip_provider_v1:
+        normalized = _normalize_api_url(normalized, default="", keep_versioned_v1=keep_versioned_v1)
     return normalized or None
 
 
@@ -4467,7 +4474,9 @@ def _require_no_proxy_openai_upstream(port: int, openai_api_url: str) -> dict[st
             "so wrap can start it."
         )
     running_url = running_config.get("openai_api_url")
-    if _normalize_proxy_api_url(running_url) != _normalize_proxy_api_url(openai_api_url):
+    if _normalize_proxy_api_url(running_url, keep_versioned_v1=True) != _normalize_proxy_api_url(
+        openai_api_url, keep_versioned_v1=True
+    ):
         raise click.ClickException(
             f"The Headroom proxy on port {port} forwards OpenAI-compatible traffic to "
             f"{running_url or 'https://api.openai.com/v1'}, not {openai_api_url}. "
@@ -4552,12 +4561,15 @@ def _proxy_routing_mismatches(
     requested_api_urls = requested_api_urls or {}
     for key in _PROXY_ROUTING_URL_KEYS:
         strip_provider_v1 = key not in {"augment_api_url", "factory_api_url"}
+        keep_versioned_v1 = key == "openai_api_url"
         if _normalize_proxy_api_url(
             running_config.get(key),
             strip_provider_v1=strip_provider_v1,
+            keep_versioned_v1=keep_versioned_v1,
         ) != _normalize_proxy_api_url(
             requested_api_urls.get(key),
             strip_provider_v1=strip_provider_v1,
+            keep_versioned_v1=keep_versioned_v1,
         ):
             mismatches.append(key)
     return mismatches

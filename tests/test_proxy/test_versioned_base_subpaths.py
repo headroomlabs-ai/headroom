@@ -188,3 +188,81 @@ def test_batch_passthrough_creates_under_the_base_version() -> None:
 
     assert response.status_code == 200, response.text
     assert seen == [f"POST {ARK_BASE}/batches"]
+
+
+_MESSAGES_BODY = {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hi"}],
+}
+_ANTHROPIC_HEADERS = {"x-api-key": "synthetic", "anthropic-version": "2023-06-01"}
+_VERTEX_MODEL = "/v1/projects/p/locations/us-central1/publishers"
+
+
+@pytest.mark.parametrize(
+    ("target", "method", "path", "headers", "body"),
+    [
+        ("anthropic_api_url", "POST", "/v1/messages", _ANTHROPIC_HEADERS, _MESSAGES_BODY),
+        # Labelled, model-metadata and unrouted passthrough all share one join.
+        (
+            "anthropic_api_url",
+            "POST",
+            "/v1/messages/count_tokens",
+            _ANTHROPIC_HEADERS,
+            _MESSAGES_BODY,
+        ),
+        ("anthropic_api_url", "GET", "/v1/models", _ANTHROPIC_HEADERS, None),
+        ("anthropic_api_url", "GET", "/v1/unrouted", _ANTHROPIC_HEADERS, None),
+        ("gemini_api_url", "GET", "/v1/unrouted", {"x-goog-api-key": "synthetic"}, None),
+        (
+            "vertex_api_url",
+            "POST",
+            f"{_VERTEX_MODEL}/google/models/gemini-2.5-flash:generateContent",
+            {"authorization": "Bearer synthetic"},
+            {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+        ),
+        (
+            "vertex_api_url",
+            "POST",
+            f"{_VERTEX_MODEL}/mistralai/models/m:rawPredict",
+            {"authorization": "Bearer synthetic"},
+            {"messages": []},
+        ),
+    ],
+)
+def test_native_provider_paths_keep_v1_on_a_versioned_base(
+    target: str, method: str, path: str, headers: dict[str, str], body: dict[str, Any] | None
+) -> None:
+    # Only OpenAI-compatible bases stand in for /v1; native paths are literal.
+    base = "https://gateway.example/api/v3"
+    seen: list[str] = []
+    with _make_proxy_client(**{target: base}) as client:
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=_batch_upstream(seen))
+        client.request(method, path, headers=headers, json=body)
+
+    assert seen[:1] == [f"{method} {base}{path}"]
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/unrouted"])
+def test_openai_passthrough_still_drops_v1_when_both_targets_share_a_base(path: str) -> None:
+    base = "https://gateway.example/api/v3"
+    seen: list[str] = []
+    with _make_proxy_client(openai_api_url=base, anthropic_api_url=base) as client:
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=_batch_upstream(seen))
+        client.get(path, headers={"authorization": "Bearer x"})
+        client.get(path, headers=_ANTHROPIC_HEADERS)
+
+    assert seen == [f"GET {base}{path.removeprefix('/v1')}", f"GET {base}{path}"]
+
+
+def test_messages_with_a_custom_versioned_base_keeps_v1() -> None:
+    seen: list[str] = []
+    with _make_proxy_client() as client:
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=_batch_upstream(seen))
+        client.post(
+            "/v1/messages",
+            headers={**_ANTHROPIC_HEADERS, "x-headroom-base-url": "https://1.1.1.1/api/v3"},
+            json=_MESSAGES_BODY,
+        )
+
+    assert seen[:1] == ["POST https://1.1.1.1/api/v3/v1/messages"]

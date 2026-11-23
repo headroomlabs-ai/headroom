@@ -98,7 +98,7 @@ def build_anthropic_upstream_url(base_url: str, path: str, raw_query: str = "") 
     safer than normalizing them through a mapping.
     """
 
-    url = build_copilot_upstream_url(base_url, path)
+    url = build_copilot_upstream_url(base_url, path, openai_compatible=False)
     if raw_query:
         return f"{url}?{raw_query}"
     return url

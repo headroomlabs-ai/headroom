@@ -535,7 +535,9 @@ class GeminiHandlerMixin:
                     ":generateContent", ":streamGenerateContent"
                 )
             passthrough_base = upstream_base_url or self.GEMINI_API_URL
-            passthrough_url = build_copilot_upstream_url(passthrough_base, passthrough_path)
+            passthrough_url = build_copilot_upstream_url(
+                passthrough_base, passthrough_path, openai_compatible=False
+            )
             if is_streaming:
                 passthrough_url = _stream_url(passthrough_url)
             elif request.url.query:
@@ -637,7 +639,9 @@ class GeminiHandlerMixin:
                 ":streamGenerateContent"
             )
             if upstream_base_url:
-                url = build_copilot_upstream_url(upstream_base_url, request.url.path)
+                url = build_copilot_upstream_url(
+                    upstream_base_url, request.url.path, openai_compatible=False
+                )
                 if is_streaming:
                     url = url.replace(":generateContent", ":streamGenerateContent")
                 if request.url.query:
@@ -975,7 +979,9 @@ class GeminiHandlerMixin:
         # routes use the request's full path under the Vertex base URL;
         # native Gemini uses the public Gemini API shape.
         if upstream_base_url:
-            url = build_copilot_upstream_url(upstream_base_url, request.url.path)
+            url = build_copilot_upstream_url(
+                upstream_base_url, request.url.path, openai_compatible=False
+            )
             if is_streaming:
                 url = url.replace(":generateContent", ":streamGenerateContent")
             if request.url.query:
@@ -1560,7 +1566,9 @@ class GeminiHandlerMixin:
             # All content has non-text parts, skip compression entirely
             # Just forward the countTokens request as-is
             if upstream_base_url:
-                url = build_copilot_upstream_url(upstream_base_url, request.url.path)
+                url = build_copilot_upstream_url(
+                    upstream_base_url, request.url.path, openai_compatible=False
+                )
                 if request.url.query:
                     url = f"{url}?{request.url.query}"
             else:
@@ -1657,7 +1665,9 @@ class GeminiHandlerMixin:
 
         # Build URL
         if upstream_base_url:
-            url = build_copilot_upstream_url(upstream_base_url, request.url.path)
+            url = build_copilot_upstream_url(
+                upstream_base_url, request.url.path, openai_compatible=False
+            )
             if request.url.query:
                 url = f"{url}?{request.url.query}"
         else:

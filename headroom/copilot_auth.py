@@ -1432,8 +1432,12 @@ def _ends_in_version_segment(base_url: str) -> bool:
     return re.search(r"/v[0-9]+$", urlparse(base_url).path) is not None
 
 
-def build_copilot_upstream_url(base_url: str, path: str) -> str:
-    """Build an upstream URL, respecting versioned bases and Copilot's path layout."""
+def build_copilot_upstream_url(base_url: str, path: str, *, openai_compatible: bool = True) -> str:
+    """Build an upstream URL, respecting versioned bases and Copilot's path layout.
+
+    Pass ``openai_compatible=False`` for native Anthropic, Gemini and Vertex paths:
+    their ``/v1`` is literal, whatever version the configured base ends in.
+    """
 
     normalized_base = base_url.rstrip("/")
     normalized_path = path if path.startswith("/") else f"/{path}"
@@ -1464,7 +1468,11 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
         # Custom OpenAI-compatible bases can already carry a vendor API version.
         # Checked only here: a Copilot override such as GITHUB_COPILOT_API_URL may
         # end in /vN, and its native paths above must reach it unchanged.
-        if _ends_in_version_segment(normalized_base) and normalized_path.startswith("/v1/"):
+        if (
+            openai_compatible
+            and _ends_in_version_segment(normalized_base)
+            and normalized_path.startswith("/v1/")
+        ):
             normalized_path = normalized_path[3:]
     return f"{normalized_base}{normalized_path}"
 
