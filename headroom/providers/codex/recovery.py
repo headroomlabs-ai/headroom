@@ -49,6 +49,19 @@ class CodexHistoryAudit:
     history_without_rollout: tuple[str, ...]
 
 
+def _is_trusted_owner(path: Path) -> bool:
+    """On POSIX, require the current user as owner and no group/world write bit.
+
+    A shared temp root lets another local user plant a directory with the Headroom
+    prefix; merging it would write that user's config into the active Codex home.
+    """
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return True  # Windows: no POSIX owner or mode bits to check
+    metadata = path.lstat()
+    return metadata.st_uid == getuid() and not metadata.st_mode & 0o022
+
+
 def discover_dangling_homes(temp_root: Path | None = None) -> list[Path]:
     """Find non-empty Headroom temporary Codex homes, newest first."""
     if temp_root is not None:
@@ -70,6 +83,7 @@ def discover_dangling_homes(temp_root: Path | None = None) -> list[Path]:
                     resolved not in seen
                     and path.is_dir()
                     and not path.is_symlink()
+                    and _is_trusted_owner(path)
                     and any(path.iterdir())
                 ):
                     seen.add(resolved)

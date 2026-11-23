@@ -114,6 +114,34 @@ def test_discover_dangling_homes_only_returns_codex_homes(tmp_path: Path) -> Non
     assert discover_dangling_homes(tmp_path) == [candidate]
 
 
+def test_discover_dangling_homes_skips_homes_owned_by_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "headroom-codex-home-planted"
+    candidate.mkdir()
+    candidate.chmod(0o755)  # independent of the runner's umask (002 would add group write)
+    (candidate / "config.toml").write_text('[mcp_servers.x]\ncommand = "true"\n', encoding="utf-8")
+
+    # Positive control: an owned home that others cannot write is still found.
+    assert discover_dangling_homes(tmp_path) == [candidate]
+
+    # Simulated foreign owner: the current uid is not the directory's uid.
+    own_uid = candidate.lstat().st_uid
+    monkeypatch.setattr(codex_recovery.os, "getuid", lambda: own_uid + 1, raising=False)
+    assert discover_dangling_homes(tmp_path) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_discover_dangling_homes_skips_group_or_world_writable_homes(tmp_path: Path) -> None:
+    candidate = tmp_path / "headroom-codex-home-writable"
+    candidate.mkdir()
+    (candidate / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
+    candidate.chmod(0o777)
+    assert discover_dangling_homes(tmp_path) == []
+    candidate.chmod(0o755)
+    assert discover_dangling_homes(tmp_path) == [candidate]
+
+
 def test_discover_dangling_homes_uses_newest_state_not_directory_mtime(
     tmp_path: Path,
 ) -> None:
