@@ -228,6 +228,30 @@ class TestStreamingMetricsTrackerAddChunk:
 
         assert tracker._content == "Hello"
 
+    @pytest.mark.parametrize("wrapper", ["message", "generation", "dict"])
+    def test_structured_stream_counts_text_instead_of_block_metadata(self, mock_provider, wrapper):
+        from headroom.integrations.langchain.streaming import StreamingMetricsTracker
+
+        tracker = StreamingMetricsTracker(provider=mock_provider)
+        blocks = [
+            {"type": "reasoning", "reasoning": "compare the options"},
+            {"type": "text", "text": "Hello ", "index": 1},
+            "world",
+            {"type": "tool_call_chunk", "name": "lookup", "args": "{}"},
+        ]
+        message = AIMessageChunk(content=blocks)
+        if wrapper == "generation":
+            chunk = ChatGenerationChunk(message=message)
+        elif wrapper == "dict":
+            chunk = {"content": blocks}
+        else:
+            chunk = message
+        tracker.add_chunk(chunk)
+        metrics = tracker.finish()
+
+        assert tracker.content == "Hello world"
+        assert (metrics.output_tokens, metrics.content_length, metrics.chunk_count) == (2, 11, 1)
+
     def test_add_chunk_handles_empty_content(self, mock_provider):
         """Handle chunk with empty content."""
         from headroom.integrations.langchain.streaming import StreamingMetricsTracker

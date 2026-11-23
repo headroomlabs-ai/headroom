@@ -148,29 +148,28 @@ class StreamingMetricsTracker:
         Returns:
             Extracted content string.
         """
-        # AIMessageChunk
         if hasattr(chunk, "content"):
             content = chunk.content
-            if isinstance(content, str):
-                return content
-            return str(content) if content else ""
-
-        # ChatGenerationChunk
-        if hasattr(chunk, "message") and hasattr(chunk.message, "content"):
+        elif hasattr(chunk, "message") and hasattr(chunk.message, "content"):
             content = chunk.message.content
-            if isinstance(content, str):
-                return content
+        elif isinstance(chunk, dict):
+            content = chunk.get("content")
+        else:
+            return chunk if isinstance(chunk, str) else ""
+
+        if not isinstance(content, list):
             return str(content) if content else ""
 
-        # dict
-        if isinstance(chunk, dict):
-            return str(chunk.get("content", ""))
-
-        # string
-        if isinstance(chunk, str):
-            return chunk
-
-        return ""
+        # Structured streams carry reasoning and tool metadata beside visible text.
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
 
     def finish(self) -> StreamingMetrics:
         """Mark streaming as complete and return final metrics.
