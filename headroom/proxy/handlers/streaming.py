@@ -293,7 +293,6 @@ class StreamingMixin:
             meta = response.get("usageMetadata") if isinstance(response, dict) else None
         return meta if isinstance(meta, dict) else None
 
-
     def _parse_sse_usage_from_buffer(
         self, stream_state: dict[str, Any], provider: str
     ) -> dict[str, int] | None:
