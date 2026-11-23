@@ -98,6 +98,6 @@ def test_reexec_still_execs_for_a_real_cli_launch(monkeypatch: pytest.MonkeyPatc
 
     assert len(calls) == 1
     _executable, argv = calls[0]
-    assert argv[1:] == ["-m", "headroom.cli", "proxy", "--port", "8787"]
+    assert argv[1:] == ["-P", "-m", "headroom.cli", "proxy", "--port", "8787"]
     for key, value in proxy_cli._MALLOC_TUNING.items():
         assert proxy_cli.os.environ[key] == value
