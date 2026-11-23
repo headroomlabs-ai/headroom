@@ -59,3 +59,67 @@ def test_verified_dispatch_keeps_original_cloudcode_destination(monkeypatch, pat
         "base": "https://daily-cloudcode-pa.googleapis.com",
         "auth": "Bearer cloudcode-caller",
     }
+
+
+_STREAM_ANTIGRAVITY_BODY = {
+    "project": "demo-project",
+    "model": "gemini-3-flash",
+    "requestType": "agent",
+    "request": {
+        "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+    },
+}
+
+
+def test_shared_proxy_streaming_ignores_untrusted_cloudcode_host(monkeypatch):
+    """Ordinary shared-app streaming requests must not accept Host-based Cloud Code steering."""
+
+    async def fake_stream(self, url, headers, _body, provider, model, *_args, **_kwargs):
+        return JSONResponse({"url": url, "auth": headers.get("authorization")})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+    app = create_app(ProxyConfig(optimize=False))
+    response = TestClient(app).post(
+        "/v1internal:streamGenerateContent",
+        params={"alt": "sse"},
+        headers={
+            "host": "cloudcode-pa.googleapis.com",
+            "authorization": "Bearer local-caller",
+            "x-headroom-agy-dispatch": "true",
+        },
+        json=_STREAM_ANTIGRAVITY_BODY,
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "url": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        "auth": "Bearer local-caller",
+    }
+
+
+@pytest.mark.parametrize(
+    "connect_host",
+    ["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"],
+)
+def test_verified_dispatch_streaming_preserves_cloudcode_host(monkeypatch, connect_host):
+    """Requests validated by make_host_guard preserve their original Cloud Code destination."""
+
+    async def fake_stream(self, url, headers, _body, provider, model, *_args, **_kwargs):
+        return JSONResponse({"url": url, "auth": headers.get("authorization")})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+    app = create_app(ProxyConfig(optimize=False))
+    guarded = make_host_guard(app, DEFAULT_ALLOWLIST)
+    response = TestClient(guarded).post(
+        "/v1internal:streamGenerateContent",
+        params={"alt": "sse"},
+        headers={
+            "host": connect_host,
+            "authorization": "Bearer cloudcode-caller",
+        },
+        json=_STREAM_ANTIGRAVITY_BODY,
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "url": f"https://{connect_host}/v1internal:streamGenerateContent?alt=sse",
+        "auth": "Bearer cloudcode-caller",
+    }

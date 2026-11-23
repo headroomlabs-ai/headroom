@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
+from headroom.providers.cloudcode import AGY_DISPATCH_SCOPE_KEY
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.handlers._failure_logging import log_request_failure
@@ -181,11 +182,13 @@ class GeminiHandlerMixin:
         2. Reverse-proxy path — ``CLOUDCODE_API_URL`` instance attr or DEFAULT_CLOUDCODE_API_URL.
 
         ``original_host`` carries the MITM CONNECT target (the allowlisted host agy
-        opened the tunnel to). Preserving it matters: the allowlist covers both
-        ``cloudcode-pa`` and ``daily-cloudcode-pa``, so re-originating everything to
-        the default would send a client's request — and its bearer — to a backend it
-        never selected. Requests arriving via the reverse-proxy route have no CONNECT
-        host and fall through to the default.
+        opened the tunnel to), and callers must only pass it when the request came
+        through validated AGY dispatch state (``scope[AGY_DISPATCH_SCOPE_KEY] is True``).
+        Preserving it matters: the allowlist covers both ``cloudcode-pa`` and
+        ``daily-cloudcode-pa``, so re-originating everything to the default would
+        send a client's request - and its bearer - to a backend it never selected.
+        Ordinary shared-proxy requests have no validated dispatch state and fall
+        through to the default backend.
         """
         if is_antigravity:
             override = os.environ.get("HEADROOM_ANTIGRAVITY_API_URL")
@@ -1526,6 +1529,17 @@ class GeminiHandlerMixin:
         # revert above so the per-turn tool-output bulk (which lives in preserved
         # functionResponse parts the text compressor never sees) is compressed
         # and counted even when the tiny residual text inflates and reverts.
+        #
+        # Historical prefix contract (reconciled with #3394 text replay above):
+        # `_gemini_replay_forwarded_prefix` only covers text-only messages; entries
+        # carrying `functionResponse` live in `preserved_indices` and are restored
+        # separately. Unretrieved `functionResponse` leaves stay byte-identical
+        # across turns via deterministic SHA-256[:24] markers here. When a later
+        # turn retrieves a hash, `retrieved_hashes` deliberately exempts that
+        # historical leaf so it expands back to the original (a one-time prefix
+        # invalidation at that leaf in exchange for breaking retrieval thrash,
+        # including when agy replaces large retrieve envelopes with file pointers;
+        # subsequent turns stay byte-stable again).
         fr_before = fr_after = fr_leaves = 0
         if is_antigravity and _decision.should_compress and isinstance(contents, list):
             try:
@@ -1579,11 +1593,16 @@ class GeminiHandlerMixin:
         optimized_tokens += fr_after
         tokens_saved = original_tokens - optimized_tokens
         optimization_latency = (time.time() - start_time) * 1000
-        # On the MITM path the Host header still carries the host agy CONNECTed to;
-        # keep the request on that backend instead of re-originating it.
-        base_url = self._resolve_cloudcode_base_url(
-            is_antigravity, original_host=request.headers.get("host")
+        # Cloud Code Host preservation is gated on server-created AGY dispatch
+        # state (set by make_host_guard), matching passthrough routes: ordinary
+        # shared-app requests must ignore untrusted Host headers and keep the
+        # normal Antigravity backend.
+        original_host = (
+            request.headers.get("host")
+            if request.scope.get(AGY_DISPATCH_SCOPE_KEY) is True
+            else None
         )
+        base_url = self._resolve_cloudcode_base_url(is_antigravity, original_host=original_host)
         stream_url = f"{base_url}/v1internal:streamGenerateContent"
         if request.url.query:
             stream_url = f"{stream_url}?{request.url.query}"

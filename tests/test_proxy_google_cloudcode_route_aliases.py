@@ -248,27 +248,27 @@ def test_agy_agent_model_body_routes_to_daily_endpoint(monkeypatch):
     [
         ("cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"),
         ("daily-cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"),
-        # Not an allowlisted Cloud Code host -> falls back to the default backend
-        # rather than letting a forged Host steer the upstream (SSRF).
-        ("evil-cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"),
     ],
 )
 def test_mitm_request_stays_on_the_host_the_client_connected_to(
     monkeypatch, connect_host, expected_host
 ):
-    """A MITM'd request must be re-originated to the host agy CONNECTed to.
+    """A MITM'd request validated by make_host_guard re-originates to the host agy CONNECTed to.
 
     The terminator allowlist covers both cloudcode-pa and daily-cloudcode-pa, so
     resolving every antigravity request to one default would send the client's
     request — and its bearer — to a backend it never selected.
     """
+    from headroom.proxy.agy_dispatch import make_host_guard
+    from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST
 
     async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
         return JSONResponse({"url": url, "provider": provider, "model": model})
 
     monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
 
-    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+    app = make_host_guard(create_app(ProxyConfig(optimize=False)), DEFAULT_ALLOWLIST)
+    with TestClient(app) as client:
         response = client.post(
             "/v1internal:streamGenerateContent",
             params={"alt": "sse"},
@@ -280,6 +280,36 @@ def test_mitm_request_stays_on_the_host_the_client_connected_to(
     assert (
         response.json()["url"]
         == f"https://{expected_host}/v1internal:streamGenerateContent?alt=sse"
+    )
+
+
+@pytest.mark.parametrize(
+    "forged_host",
+    [
+        "cloudcode-pa.googleapis.com",
+        "evil-cloudcode-pa.googleapis.com",
+    ],
+)
+def test_unguarded_streaming_request_ignores_untrusted_host(monkeypatch, forged_host):
+    """Ordinary shared-app streaming requests ignore Host-based Cloud Code steering."""
+
+    async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"url": url, "provider": provider, "model": model})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:streamGenerateContent",
+            params={"alt": "sse"},
+            headers={"host": forged_host},
+            json=ANTIGRAVITY_BODY,
+        )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["url"]
+        == "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     )
 
 
