@@ -2301,10 +2301,23 @@ def test_kill_proxy_by_pid_never_signals_own_process(monkeypatch: pytest.MonkeyP
 def test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A /health body naming another real process of the user must not get it killed."""
+    """A /health body naming another real process of the user must not get it killed.
+
+    The victim's command line even mentions ``headroom proxy --port 8787`` (an
+    ssh session to a dev box, say); only the listener on the port may be signalled.
+    """
     calls = _record_signals(monkeypatch)
     real_platform = sys.platform
-    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    victim = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            "ssh",
+            "devbox",
+            "headroom proxy --port 8787",
+        ]
+    )
     try:
         for plat in ("win32", "linux", real_platform):
             monkeypatch.setattr(wrap_mod.sys, "platform", plat)
@@ -2317,22 +2330,20 @@ def test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy(
         victim.wait()
 
 
-@pytest.mark.parametrize(
-    ("argv", "environ", "port", "expected"),
-    [
-        (["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8787"], {}, 8787, True),
-        (["/home/u/.local/bin/headroom", "proxy", "--port=9000"], {}, 9000, True),
-        (["headroom", "proxy"], {}, 8787, True),
-        (["headroom", "proxy"], {"HEADROOM_PORT": "9000"}, 9000, True),
-        (["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8788"], {}, 8787, False),
-        (["/usr/bin/python3", "-c", "import time"], {}, 8787, False),
-        (["vim", "proxy", "--port", "8787"], {}, 8787, False),
-    ],
-)
-def test_argv_serves_proxy_port(
-    argv: list[str], environ: dict[str, str], port: int, expected: bool
-) -> None:
-    assert wrap_mod._argv_serves_proxy_port(argv, environ, port) is expected
+def test_pids_from_netstat_reads_listeners_whatever_the_locale() -> None:
+    output = """
+  Proto  Lokale Adresse         Remoteadresse          Status           PID
+  TCP    0.0.0.0:8787           0.0.0.0:0              ABHOEREN         4242
+  TCP    [::]:8787              [::]:0                 ABHOEREN         4243
+  TCP    127.0.0.1:8787         127.0.0.1:50000        HERGESTELLT      777
+  TCP    0.0.0.0:18787          0.0.0.0:0              ABHOEREN         999
+"""
+    assert wrap_mod._pids_from_netstat(output, 8787) == {4242, 4243}
+
+
+def test_pids_from_ss() -> None:
+    output = 'LISTEN 0 2048 127.0.0.1:8787 0.0.0.0:* users:(("python3",pid=4242,fd=7))\n'
+    assert wrap_mod._pids_from_ss(output) == {4242}
 
 
 def test_stop_local_proxy_for_unwrap_ignores_unconfirmed_pid(
@@ -2362,22 +2373,36 @@ def test_query_proxy_config_non_dict_health_is_unidentified(
     assert wrap_mod._query_proxy_config(8787) is None
 
 
-def test_kill_proxy_by_pid_positive_control_signals_confirmed_proxy(
+def test_kill_proxy_by_pid_positive_control_signals_the_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from headroom.install import runtime
-
-    calls = _record_signals(monkeypatch)
-    pid = wrap_mod.os.getpid() + 1
-    monkeypatch.setattr(
-        runtime,
-        "_read_proc_metadata",
-        lambda p: (
-            (["python", "-m", "headroom.cli", "proxy", "--port", "8787"], {}) if p == pid else None
-        ),
+    """The process really listening on the port is the one that gets stopped."""
+    listener = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import socket, time\n"
+            "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()\n"
+            "print(s.getsockname()[1], flush=True); time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
     )
-    assert wrap_mod._kill_proxy_by_pid(pid, 8787) is True
-    assert calls[0] == ("kill", pid)
+    try:
+        assert listener.stdout is not None
+        port = int(listener.stdout.readline())
+        if wrap_mod._listening_pids(port) is None:
+            pytest.skip("no psutil, lsof, ss or netstat to list listeners")
+        calls = _record_signals(monkeypatch)
+        assert wrap_mod._kill_proxy_by_pid(listener.pid, port) is True
+        assert calls[0] in (
+            ("kill", listener.pid),
+            ("run", ["taskkill", "/F", "/T", "/PID", str(listener.pid)]),
+        )
+    finally:
+        monkeypatch.undo()
+        listener.kill()
+        listener.wait()
 
 
 def test_unwrap_codex_is_safe_noop_with_explicit_codex_home(

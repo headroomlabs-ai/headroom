@@ -66,12 +66,7 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
-from headroom.cli.port_discovery import (
-    DEFAULT_PROXY_PORT,
-    PORT_ENV,
-    proxy_port_option,
-    warn_codex_provider_port_change,
-)
+from headroom.cli.port_discovery import proxy_port_option, warn_codex_provider_port_change
 from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
@@ -4606,23 +4601,65 @@ def _detect_running_proxy_backend(port: int) -> str | None:
     return _copilot_detect_running_proxy_backend(port)
 
 
-def _argv_serves_proxy_port(argv: list[str], environ: dict[str, str], port: int) -> bool:
-    """True if ``argv`` is ``headroom proxy`` (console script or ``-m``) bound to ``port``."""
-    names = [Path(arg.strip('"')).name.lower() for arg in argv]
-    is_proxy = any(
-        (argv[i : i + 3] == ["-m", "headroom.cli", "proxy"])
-        or (names[i] in ("headroom", "headroom.exe") and argv[i + 1 : i + 2] == ["proxy"])
-        for i in range(len(argv))
-    )
-    if not is_proxy:
-        return False
-    bound = environ.get(PORT_ENV, str(DEFAULT_PROXY_PORT))
-    for i, arg in enumerate(argv):
-        if arg in ("--port", "-p") and i + 1 < len(argv):
-            bound = argv[i + 1]
-        elif arg.startswith("--port="):
-            bound = arg.split("=", 1)[1]
-    return bound == str(port)
+def _pids_from_netstat(output: str, port: int) -> set[int]:
+    """Listening PIDs for ``port`` in Windows ``netstat -ano -p TCP`` output.
+
+    A listening row has a foreign address ending in ``:0``; the State column
+    is localised, so it is not read.
+    """
+    pids: set[int] = set()
+    for line in output.splitlines():
+        cols = line.split()
+        if (
+            len(cols) == 5
+            and cols[0].upper() == "TCP"
+            and cols[1].rsplit(":", 1)[-1] == str(port)
+            and cols[2].endswith(":0")
+            and cols[4].isdecimal()
+        ):
+            pids.add(int(cols[4]))
+    return pids
+
+
+def _pids_from_ss(output: str) -> set[int]:
+    """PIDs in ``ss -ltnpH`` output (``users:(("python",pid=123,fd=3))``)."""
+    return {int(match) for match in re.findall(r"\bpid=(\d+)", output)}
+
+
+def _listening_pids(port: int) -> set[int] | None:
+    """PIDs with a TCP socket listening on ``port``; None if no tool could tell."""
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dependency
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            return {
+                conn.pid
+                for conn in psutil.net_connections(kind="tcp")
+                if conn.status == psutil.CONN_LISTEN and conn.laddr.port == port and conn.pid
+            }
+        except psutil.AccessDenied:
+            pass  # macOS needs root for this; use the OS tools below
+    if sys.platform == "win32":
+        tools = [(["netstat", "-ano", "-p", "TCP"], lambda out: _pids_from_netstat(out, port))]
+    else:
+        tools = [
+            (
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                lambda out: {int(pid) for pid in out.split() if pid.isdecimal()},
+            ),
+            (["ss", "-ltnpH", f"sport = :{port}"], _pids_from_ss),
+        ]
+    for command, parse in tools:
+        try:
+            result = run(command, capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        # lsof exits 1 when nothing matches; that is an answer, not a failure.
+        if result.returncode in (0, 1):
+            return parse(result.stdout)
+    return None
 
 
 def _health_pid(raw: object) -> int | None:
@@ -4637,21 +4674,16 @@ def _health_pid(raw: object) -> int | None:
 
 
 def _is_headroom_proxy_pid(pid: int, port: int) -> bool:
-    """True if ``pid`` is a Headroom proxy process serving ``port``.
+    """True if ``pid`` holds the listening socket on ``port``.
 
     The PID comes from the ``/health`` body of whatever listens on the port,
-    so it is untrusted: it must be a plain PID other than ours, and that
-    process's command line must be ``headroom proxy`` for this port.
+    so it is untrusted: it must be a plain PID other than ours that the OS
+    reports as a listener on that port. Fails closed when no tool can tell.
     """
     if pid <= 1 or pid == os.getpid():
         return False
-    from headroom.install.runtime import _read_proc_metadata
-
-    metadata = _read_proc_metadata(pid)
-    if metadata is None:
-        return False
-    argv, environ = metadata
-    return _argv_serves_proxy_port(argv, environ, port)
+    listeners = _listening_pids(port)
+    return listeners is not None and pid in listeners
 
 
 def _kill_proxy_by_pid(pid: int, port: int) -> bool:
@@ -4664,8 +4696,8 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     """
     if not _is_headroom_proxy_pid(pid, port):
         click.echo(
-            f"  Warning: PID {pid} reported on port {port} is not a Headroom proxy "
-            "for that port; not stopping it."
+            f"  Warning: PID {pid} reported on port {port} is not listening on that port; "
+            "not stopping it."
         )
         return False
     if sys.platform == "win32":
