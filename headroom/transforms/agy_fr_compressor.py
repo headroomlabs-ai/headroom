@@ -21,10 +21,22 @@ IDEMPOTENT, RECOVERABLE transform applied UNIFORMLY to every functionResponse
 leaf (historical + tail). Because headroom is an in-flight MITM that never
 rewrites agy's LOCAL history, agy re-sends the ORIGINAL bytes each turn; a
 deterministic transform (same original -> identical bytes every turn) yields a
-byte-stable compressed prefix that re-hits the Cloud Code Assist server-side
-cache. Recoverability is mandatory: the model reads functionResponse back as
-its own prior tool results, so lossy summaries would corrupt multi-turn
-reasoning.
+byte-stable compressed prefix for unretrieved leaves that re-hits the Cloud
+Code Assist server-side cache. Recoverability is mandatory: the model reads
+functionResponse back as its own prior tool results, so lossy summaries would
+corrupt multi-turn reasoning.
+
+Historical prefix reconciliation with Gemini text prefix replay (#3394):
+``_gemini_replay_forwarded_prefix`` in ``GeminiHandlerMixin`` replays frozen
+compressed text-only messages only; ``functionResponse`` entries stay in
+``preserved_indices`` and are restored separately. Unretrieved historical
+``functionResponse`` leaves remain byte-identical across turns because the
+marker is deterministic. Once a later turn retrieves a hash via
+``headroom_retrieve``, ``retrieved_hashes`` deliberately exempts that matching
+historical leaf so it expands back to the original (a one-time prefix shift at
+that leaf in exchange for breaking retrieval thrash, including when agy
+replaces large retrieve envelopes with file pointers; subsequent turns stay
+byte-stable again).
 ---------------------------------------------------------------------------
 """
 

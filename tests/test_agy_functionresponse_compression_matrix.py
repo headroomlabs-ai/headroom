@@ -392,3 +392,137 @@ def test_non_antigravity_request_functionresponse_passthrough_unchanged(
     assert _FR_CCR_MARKER_PREFIX not in fr_leaf_value
 
     reset_compression_store()
+
+
+# ---------------------------------------------------------------------------
+# Gap 6: historical prefix replay (#3394) + retrieval expansion contract
+# ---------------------------------------------------------------------------
+def test_historical_prefix_replay_and_fr_retrieval_expansion_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconcile #3394 text prefix replay with AGY historical functionResponse policy.
+
+    - Frozen text messages are replayed byte-identical across turns by
+      ``_gemini_replay_forwarded_prefix``.
+    - Unretrieved historical ``functionResponse`` leaves stay byte-identical
+      across turns via deterministic CCR markers.
+    - When a later turn retrieves hash A, historical leaf A intentionally expands
+      back to original (one-time prefix shift at that leaf to prevent retrieval
+      thrash), while frozen text and unretrieved sibling leaf B stay byte-stable.
+    """
+    from headroom.cache.compression_store import default_ccr_hash
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    monkeypatch.setenv("HEADROOM_AGY_FR_MODE", "ccr")
+    monkeypatch.setenv("HEADROOM_AGY_RETRIEVE_WIRED", "1")
+    reset_compression_store()
+
+    leaf_a = BIG_LEAF
+    leaf_b = "sibling tool output row gamma delta epsilon zeta eta theta " * 40
+    hash_a = default_ccr_hash(leaf_a)
+
+    captured_bodies: list[dict[str, Any]] = []
+    call_count = 0
+
+    async def _fake_stream(
+        proxy_self: Any,
+        url: str,
+        headers: dict,
+        body: dict,
+        provider: str,
+        model: str,
+        request_id: Any,
+        original_tokens: int,
+        optimized_tokens: int,
+        tokens_saved: int,
+        transforms_applied: list[str],
+        tags: Any,
+        optimization_latency: float,
+        *,
+        prefix_tracker: Any = None,
+        original_messages: Any = None,
+        **kwargs: Any,
+    ) -> StreamingResponse:
+        captured_bodies.append(copy.deepcopy(body))
+        if prefix_tracker is not None and original_messages is not None:
+            # Record forwarded text messages and confirm cached prefix like a real turn.
+            forwarded_msgs, _ = proxy_self._gemini_contents_to_messages(
+                body["request"]["contents"], None
+            )
+            prefix_tracker.update_from_response(
+                cache_read_tokens=4000,
+                cache_write_tokens=1000,
+                messages=forwarded_msgs,
+                original_messages=original_messages,
+            )
+        return _make_sse()
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", _fake_stream)
+
+    def _varying_text_apply(*, messages: Any, **kw: Any) -> _FakeResult:
+        nonlocal call_count
+        call_count += 1
+        # Compress first user text differently per turn unless prefix replay freezes it.
+        out = copy.deepcopy(messages)
+        out[0]["content"] = f"compressed-turn-{call_count}"
+        return _FakeResult(messages=out, tokens_before=1000, tokens_after=10)
+
+    turn1_contents = [
+        {"role": "user", "parts": [{"text": _REPEAT_UNIT}]},
+        _fr_entry(role="user", leaf=leaf_a, name="read_a"),
+        _fr_entry(role="user", leaf=leaf_b, name="read_b"),
+    ]
+    turn2_contents = copy.deepcopy(turn1_contents) + [
+        {"role": "model", "parts": [{"text": "checking results"}]},
+        {"role": "user", "parts": [{"text": "follow up without retrieve"}]},
+    ]
+    turn3_contents = copy.deepcopy(turn2_contents) + [
+        {
+            "role": "model",
+            "parts": [
+                {
+                    "functionCall": {
+                        "name": "call_mcp_tool",
+                        "args": {"tool": "headroom_retrieve", "arguments": {"hash": hash_a}},
+                    }
+                }
+            ],
+        },
+        {"role": "user", "parts": [{"text": "continue after retrieve"}]},
+    ]
+
+    with TestClient(create_app(ProxyConfig(optimize=True))) as client:
+        proxy = client.app.state.proxy  # type: ignore[attr-defined]
+        proxy.openai_pipeline.apply = _varying_text_apply  # type: ignore[method-assign]
+
+        for turn_contents in (turn1_contents, turn2_contents, turn3_contents):
+            response = client.post(
+                "/v1internal:streamGenerateContent",
+                params={"alt": "sse"},
+                headers={"User-Agent": "antigravity/1.0.5"},
+                json={"model": _MODEL, "request": {"contents": copy.deepcopy(turn_contents)}},
+            )
+            assert response.status_code == 200
+
+    t1, t2, t3 = (b["request"]["contents"] for b in captured_bodies)
+
+    # Turn 1: text compressed to turn-1 form; both FR leaves compressed to markers.
+    assert t1[0]["parts"][0]["text"] == "compressed-turn-1"
+    marker_a = _fr_leaf(t1, 1)
+    marker_b = _fr_leaf(t1, 2)
+    assert marker_a.startswith(_FR_CCR_MARKER_PREFIX)
+    assert marker_b.startswith(_FR_CCR_MARKER_PREFIX)
+
+    # Turn 2 (no retrieve): frozen text replayed byte-identical; both FR markers byte-identical.
+    assert t2[0]["parts"][0]["text"] == "compressed-turn-1"
+    assert _fr_leaf(t2, 1) == marker_a
+    assert _fr_leaf(t2, 2) == marker_b
+
+    # Turn 3 (after retrieve of hash_a): frozen text STILL replayed byte-identical and
+    # unretrieved sibling leaf_b stays marker-identical, while retrieved leaf_a
+    # intentionally expands back to original.
+    assert t3[0]["parts"][0]["text"] == "compressed-turn-1"
+    assert _fr_leaf(t3, 1) == leaf_a
+    assert _fr_leaf(t3, 2) == marker_b
+
+    reset_compression_store()

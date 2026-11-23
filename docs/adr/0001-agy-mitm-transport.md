@@ -87,10 +87,9 @@ destinations and returns the vetted address the tunnel then dials:
   itself, costing two file descriptors per nesting level until they run out;
 - **link-local addresses** — `169.254.0.0/16` carries the cloud instance-metadata service.
 
-The check runs on the resolved addresses rather than the literal, so a name that resolves to
-`127.0.0.1` is caught too, and dialling the vetted address means no second lookup can
-substitute another. Other loopback ports stay reachable on purpose: a local process can open
-them directly, so refusing them would buy nothing and break plain local tunnelling.
+The check runs on the resolved addresses rather than the literal, normalizes IPv4-mapped IPv6 addresses via `ipv4_mapped` before both link-local and self-connect checks (independent of Python patch level), and blocks unspecified addresses (`0.0.0.0`, `::`, `::ffff:0.0.0.0`) targeting the terminator's own port.
+Dialling the vetted address means no second lookup can substitute another.
+Other loopback ports stay reachable on purpose: a local process can open them directly, so refusing them would buy nothing and break plain local tunnelling.
 
 ### Upstream-origination ownership (single connection)
 The terminator (A2) is **agy-facing only**. It does **not** dial upstream for the allowlist
@@ -103,13 +102,10 @@ opens the upstream connection via `self.http_client.send(..., stream=True)`). Th
 splices the handler's `StreamingResponse` (SSE) back over the terminated socket. Exactly one
 upstream TLS session per request; the OAuth token is sent upstream once.
 
-**The request goes back to the host agy chose.** `_resolve_cloudcode_base_url` takes the
-`CONNECT` host (carried through as the `Host` header) and re-originates to that same host when
-it is allowlisted, falling back to the default backend otherwise. This matters because the
-allowlist holds two hosts: resolving every antigravity request to one default sent a request
-addressed to `cloudcode-pa.googleapis.com` — and the OAuth bearer with it — to
-`daily-cloudcode-pa.googleapis.com` instead. An explicit `HEADROOM_ANTIGRAVITY_API_URL` still
-wins over both, since an operator setting it is choosing the backend deliberately.
+**The request goes back to the host agy chose (dispatch-gated).**
+`handle_google_cloudcode_stream` passes `original_host` to `_resolve_cloudcode_base_url` only when server-created AGY dispatch state is present (`scope[AGY_DISPATCH_SCOPE_KEY] is True`, set by `make_host_guard`), matching the passthrough routes.
+Verified dispatch requests re-originate to the allowlisted host agy connected to, while ordinary shared-proxy requests ignore untrusted `Host` headers and keep the default Antigravity backend.
+An explicit `HEADROOM_ANTIGRAVITY_API_URL` still wins over both, since an operator setting it is choosing the backend deliberately.
 
 ### Module invariant (acyclic)
 `ca-lifecycle (A1) ← terminator (A2) ← dispatch (T2) → existing handler`. Imports point one
@@ -383,12 +379,11 @@ tool. Key properties:
   cold history, keep the tail verbatim) is therefore **cache-incoherent** here: the same leaf
   appears compressed in one turn and verbatim the next, so the model re-diffs it every turn.
   Compressing every leaf identically each turn keeps the cross-turn byte-image stable.
-- **Retrieved-content exemption (anti-thrash).** A leaf whose hash the model already fetched
-  this turn (a `headroom_retrieve` / `call_mcp_tool` call carrying that 24-hex hash in its
-  args) is left verbatim — otherwise the re-sent, just-expanded original would be
-  re-compressed into the same marker and the model would retrieve it forever. This mirrors
-  the retrieve-call suppression the OpenAI/Anthropic paths already do (keyed by hash, since
-  agy has no call_id).
+- **Retrieved-content exemption (anti-thrash) and historical prefix reconciliation.**
+  Main's Gemini prefix replay (`_gemini_replay_forwarded_prefix`, `#3394`) replays frozen compressed text messages only; `functionResponse` entries live in `preserved_indices` and are restored separately.
+  Unretrieved historical `functionResponse` leaves stay byte-identical across turns because their CCR marker is deterministic.
+  A leaf whose hash the model retrieved (a `headroom_retrieve` / `call_mcp_tool` call carrying that 24-hex hash in its args, or a retrieve-result envelope carrying it) is deliberately left verbatim on subsequent turns, including at its historical position.
+  This is an intentional one-time prefix shift at that retrieved leaf in exchange for breaking retrieval thrash (including when `agy` replaces a large retrieve envelope with a `saved to file://` pointer); unretrieved sibling leaves and frozen text messages remain byte-stable, and subsequent turns with the same retrieve call stay deterministic again.
 - **Envelope exemption (name-independent).** The hash-in-args exemption above recognizes the
   retrieve call by name/args; on agy the retrieve-result functionResponse carries an opaque
   name and args of just `{hash}`, so that path misses it and the retrieve *output*
