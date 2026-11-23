@@ -59,6 +59,20 @@ describe("withHeadroom (Anthropic)", () => {
     mockFetch.mockReset();
   });
 
+  it("forwards per-request SDK options after compressing messages", async () => {
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess());
+    const create = vi.fn<(params: unknown, options?: unknown) => Promise<unknown>>();
+    const wrapped = withHeadroom({ messages: { create } });
+    const options = { timeout: 1000, signal: new AbortController().signal };
+
+    await wrapped.messages.create(
+      { model: "claude-sonnet-4-5-20250929", messages: [{ role: "user", content: "input" }] },
+      options,
+    );
+
+    expect(create.mock.calls[0][1]).toBe(options);
+  });
+
   it("intercepts messages.create and compresses", async () => {
     mockFetch.mockResolvedValueOnce(mockCompressSuccess());
 
