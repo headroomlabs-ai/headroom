@@ -57,16 +57,19 @@ _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _markdown_structure(lines: list[str]) -> tuple[list[tuple[int, str]], int | None]:
-    """Return real headings and the opener of an unterminated fenced block."""
+    """Return real headings and the opener of an unterminated block."""
     headings: list[tuple[int, str]] = []
-    fence: tuple[str, int, int] | None = None
+    block: tuple[str, int, int] | None = None
 
     for index, original_line in enumerate(lines):
         line = original_line.removesuffix("\r")
-        if fence is not None:
-            character, length, _ = fence
-            if re.fullmatch(rf" {{0,3}}{re.escape(character)}{{{length},}}[ \t]*", line):
-                fence = None
+        if block is not None:
+            marker, length, _ = block
+            if (marker == "<!--" and "-->" in line) or (
+                marker != "<!--"
+                and re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{length},}}[ \t]*", line)
+            ):
+                block = None
             continue
 
         fence_match = _FENCE_RE.match(line)
@@ -74,13 +77,18 @@ def _markdown_structure(lines: list[str]) -> tuple[list[tuple[int, str]], int | 
             fence_match.group(1).startswith("`") and "`" in fence_match.group(2)
         ):
             marker = fence_match.group(1)
-            fence = (marker[0], len(marker), index)
+            block = (marker[0], len(marker), index)
+            continue
+
+        if re.match(r" {0,3}<!--", line):
+            if "-->" not in line:
+                block = ("<!--", 0, index)
             continue
 
         if heading_match := _HEADING_RE.match(line):
             headings.append((index, heading_match.group(2).strip()))
 
-    return headings, fence[2] if fence is not None else None
+    return headings, block[2] if block is not None else None
 
 
 def _merge_bullets_into_markdown(
@@ -93,7 +101,7 @@ def _merge_bullets_into_markdown(
     land under a later section or a sub-heading.
     """
     lines = existing_content.split("\n")
-    headings, unterminated_fence = _markdown_structure(lines)
+    headings, unterminated_block = _markdown_structure(lines)
     inserts: dict[int, list[str]] = defaultdict(list)
     appended: list[str] = []
 
@@ -108,8 +116,8 @@ def _merge_bullets_into_markdown(
 
         start = headings[position][0] + 1
         end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
-        if unterminated_fence is not None and start <= unterminated_fence < end:
-            end = unterminated_fence
+        if unterminated_block is not None and start <= unterminated_block < end:
+            end = unterminated_block
         while end > start and not lines[end - 1].strip():
             end -= 1
         line_suffix = "\r" if lines[end - 1].endswith("\r") else ""

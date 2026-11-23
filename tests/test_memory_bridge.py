@@ -371,6 +371,16 @@ class TestMarkdownSectionMerge:
                 id="unterminated-fence",
             ),
             pytest.param(
+                "## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n",
+                "## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n- new\n",
+                id="html-comment-heading",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<!--\n## Hidden\n",
+                "## Facts\n- a\n- new\n\n<!--\n## Hidden\n",
+                id="unterminated-html-comment",
+            ),
+            pytest.param(
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n## Real Updates\n- real\n",
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n- new\n"
                 "## Real Updates\n- real\n",
