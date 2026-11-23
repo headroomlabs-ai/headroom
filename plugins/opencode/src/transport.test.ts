@@ -5,6 +5,7 @@ import http2 from "node:http2";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { installHeadroomTransport, setHeadroomWireRoots, uninstallHeadroomTransport } from "./transport.js";
@@ -60,6 +61,21 @@ function proxyServer(pathPrefix: string = "/v1"): Promise<{
 }
 
 describe("Headroom OpenCode transport", () => {
+  it("preserves the native result and child process for promisified exec and execFile", async () => {
+    const proxyUrl = "http://127.0.0.1:8787/v1";
+    installHeadroomTransport({ proxyUrl });
+
+    const code = "process.stdout.write(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL); process.stderr.write('diagnostic')";
+    const command = `"${process.execPath}" -e "${code}"`;
+    for (const pending of [
+      promisify(childProcess.exec)(command),
+      promisify(childProcess.execFile)(process.execPath, ["-e", code]),
+    ]) {
+      expect(pending.child.pid).toBeGreaterThan(0);
+      await expect(pending).resolves.toEqual({ stdout: proxyUrl, stderr: "diagnostic" });
+    }
+  });
+
   it("routes fetch chat paths through /v1/chat/completions with proxy base and normalized-path header", async () => {
     const proxyTargets = ["http://127.0.0.1:8787", "http://127.0.0.1:8787/v1"];
     const upstreamPath = "/api/coding/paas/v4/chat/completions";

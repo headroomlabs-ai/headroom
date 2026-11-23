@@ -1,5 +1,6 @@
 // src/transport.ts
 import { createRequire, syncBuiltinESMExports } from "module";
+import { promisify } from "util";
 var nodeRequire = createRequire(import.meta.url);
 var http = nodeRequire("node:http");
 var https = nodeRequire("node:https");
@@ -124,24 +125,18 @@ function wrapSpawn(originalSpawn) {
     return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
-function wrapExec(originalExec) {
-  return function headroomExec(...args) {
+function wrapExec(original, optionsIndex) {
+  const wrap = (fn) => function headroomExec(...args) {
     const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExec, this, args);
-    }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state));
+    const forwarded = state ? injectOptionsEnv(args, optionsIndex(args), state) : args;
+    return Reflect.apply(fn, this, forwarded);
   };
-}
-function wrapExecFile(originalExecFile) {
-  return function headroomExecFile(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExecFile, this, args);
-    }
-    const optionIndex = optionsIndexAfterArgs(args);
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
-  };
+  const wrapped = wrap(original);
+  const nativePromisified = Object.getOwnPropertyDescriptor(original, promisify.custom)?.value;
+  if (typeof nativePromisified === "function") {
+    Object.defineProperty(wrapped, promisify.custom, { value: wrap(nativePromisified) });
+  }
+  return wrapped;
 }
 function wrapFork(originalFork) {
   return function headroomFork(...args) {
@@ -549,8 +544,8 @@ function installHeadroomTransport(options) {
   https.get = wrapGet(https.request);
   http2.connect = wrapHttp2Connect(state.originalHttp2Connect);
   childProcess.spawn = wrapSpawn(state.originalChildSpawn);
-  childProcess.exec = wrapExec(state.originalChildExec);
-  childProcess.execFile = wrapExecFile(state.originalChildExecFile);
+  childProcess.exec = wrapExec(state.originalChildExec, () => 1);
+  childProcess.execFile = wrapExec(state.originalChildExecFile, optionsIndexAfterArgs);
   childProcess.fork = wrapFork(state.originalChildFork);
   syncBuiltinESMExports();
   return () => uninstallHeadroomTransport();

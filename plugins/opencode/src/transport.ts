@@ -1,4 +1,5 @@
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { promisify } from "node:util";
 
 const nodeRequire = createRequire(import.meta.url);
 const http = nodeRequire("node:http") as typeof import("node:http");
@@ -222,25 +223,23 @@ function wrapSpawn(originalSpawn: ChildSpawn): ChildSpawn {
   } as ChildSpawn;
 }
 
-function wrapExec(originalExec: ChildExec): ChildExec {
-  return function headroomExec(this: unknown, ...args: unknown[]) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExec, this, args);
-    }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state));
-  } as ChildExec;
-}
-
-function wrapExecFile(originalExecFile: ChildExecFile): ChildExecFile {
-  return function headroomExecFile(this: unknown, ...args: unknown[]) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExecFile, this, args);
-    }
-    const optionIndex = optionsIndexAfterArgs(args);
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
-  } as ChildExecFile;
+function wrapExec<Exec extends ChildExec | ChildExecFile>(
+  original: Exec,
+  optionsIndex: (args: unknown[]) => number,
+): Exec {
+  const wrap = (fn: (...args: never[]) => unknown) =>
+    function headroomExec(this: unknown, ...args: unknown[]) {
+      const state = getState();
+      const forwarded = state ? injectOptionsEnv(args, optionsIndex(args), state) : args;
+      return Reflect.apply(fn, this, forwarded);
+    };
+  const wrapped = wrap(original) as Exec;
+  const nativePromisified = Object.getOwnPropertyDescriptor(original, promisify.custom)?.value;
+  if (typeof nativePromisified === "function") {
+    // Node's custom implementation returns both streams and exposes the child.
+    Object.defineProperty(wrapped, promisify.custom, { value: wrap(nativePromisified) });
+  }
+  return wrapped;
 }
 
 function wrapFork(originalFork: ChildFork): ChildFork {
@@ -850,8 +849,8 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   https.get = wrapGet(https.request) as HttpsGet;
   http2.connect = wrapHttp2Connect(state.originalHttp2Connect);
   childProcess.spawn = wrapSpawn(state.originalChildSpawn);
-  childProcess.exec = wrapExec(state.originalChildExec);
-  childProcess.execFile = wrapExecFile(state.originalChildExecFile);
+  childProcess.exec = wrapExec(state.originalChildExec, () => 1);
+  childProcess.execFile = wrapExec(state.originalChildExecFile, optionsIndexAfterArgs);
   childProcess.fork = wrapFork(state.originalChildFork);
   syncBuiltinESMExports();
 
