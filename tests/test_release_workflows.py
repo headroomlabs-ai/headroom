@@ -1805,7 +1805,7 @@ def test_release_metadata_sync_runs_on_release_please_branch() -> None:
     # Sync, then gate on the verifier, then commit — in that order.
     sync = content.index("python scripts/version-sync.py")
     verify = content.index("python scripts/verify-versions.py", sync)
-    commit = content.index("git commit", verify)
+    commit = content.index("commit --no-verify", verify)
     assert sync < verify < commit
 
     # Must no-op rather than loop when the branch is already in sync.
@@ -1863,7 +1863,7 @@ def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
     )
-    steps = workflow["jobs"]["sync"]["steps"]
+    steps = [s for job in workflow["jobs"].values() for s in job["steps"]]
 
     checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
     assert checkouts, "expected a checkout step"
@@ -1874,11 +1874,59 @@ def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -
         assert "token" not in step.get("with", {}), step
 
 
+def test_metadata_sync_never_runs_branch_code_where_the_release_token_is() -> None:
+    """Branch-supplied scripts and the release credential must not share a job.
+
+    ``release-metadata-sync`` runs ``scripts/*.py`` from a branch anyone with write
+    access can push (``release-please--branches--**``). Code that runs in a job can
+    plant ``.git/hooks/*``, ``git config`` entries or ``GITHUB_ENV`` lines that fire
+    in the job's later steps, including the one that holds the token. So: no job that
+    runs ``scripts/`` may mention the token, and the job that holds it runs no
+    branch code, disables git hooks, and keeps the token off every command line.
+    """
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+    )
+
+    def runs_branch_code(step: dict) -> bool:
+        return "scripts/" in str(step.get("run", ""))
+
+    def mentions_token(step: dict) -> bool:
+        blob = str(step.get("env", {})) + str(step.get("with", {})) + str(step.get("run", ""))
+        return any(
+            marker in blob
+            for marker in ("SYNC_TOKEN", "steps.app-token", "secrets.", "create-github-app-token")
+        ) or "create-github-app-token" in str(step.get("uses", ""))
+
+    holders = 0
+    for name, job in workflow["jobs"].items():
+        steps = job["steps"]
+        if any(runs_branch_code(s) for s in steps):
+            assert not any(mentions_token(s) for s in steps), f"job {name!r} mixes both"
+            assert job.get("permissions", {}).get("contents") == "read", name
+        holders_here = [s for s in steps if "SYNC_TOKEN" in str(s.get("env", {}))]
+        if holders_here:
+            holders += 1
+            assert len(holders_here) == 1, name
+            run = holders_here[0]["run"]
+            assert "--no-verify" in run and "core.hooksPath" in run, run
+            assert "git commit" not in run.replace("commit --no-verify", ""), run
+            assert not any(
+                "SYNC_TOKEN" in line and "GIT_CONFIG" not in line
+                for line in run.splitlines()
+                if line.strip().startswith("git ") or "@github.com" in line
+            ), run
+            assert "x-access-token:${SYNC_TOKEN}@" not in run
+            # The patch comes from branch code; it may not carry workflow changes.
+            assert run.index("'^\\.github/'") < run.index("git apply --index"), run
+    assert holders == 1, "expected exactly one job that holds the release token"
+
+
 @pytest.mark.parametrize(
     "workflow_path,job",
     [
         (".github/workflows/release-please.yml", "release-please"),
-        (".github/workflows/release-metadata-sync.yml", "sync"),
+        (".github/workflows/release-metadata-sync.yml", "push"),
     ],
 )
 def test_release_workflows_prefer_scoped_app_token(workflow_path: str, job: str) -> None:
