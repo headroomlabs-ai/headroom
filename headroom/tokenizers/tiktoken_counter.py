@@ -16,6 +16,7 @@ import threading
 from functools import lru_cache
 from typing import Any
 
+from headroom.offline import guard_egress
 from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,7 @@ def _get_encoding(encoding_name: str):
 
     def _load() -> None:
         try:
+            guard_egress("load tiktoken encoding", destination=f"tiktoken encoding {encoding_name}")
             box["enc"] = tiktoken.get_encoding(encoding_name)
         except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
             box["err"] = exc
