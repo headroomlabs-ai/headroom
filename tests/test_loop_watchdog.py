@@ -18,12 +18,15 @@ stand-in for the GIL-releasing native initialization that parks in the report
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import math
 import os
 import subprocess
 import sys
 import textwrap
+from typing import Any
 
 import pytest
 
@@ -396,5 +399,99 @@ def test_health_reports_watchdog_and_arming_flips_enabled(monkeypatch):
             assert watchdog["stall_threshold_seconds"] == pytest.approx(5.0)
             assert watchdog["current_stall_seconds"] == 0.0
             assert watchdog["stalls_total"] == 0
+    finally:
+        loop_watchdog._reset_for_test()
+
+
+def test_retry_after_startup_failure_rearms_on_the_new_loop(monkeypatch, caplog):
+    """A lifespan that fails after arming must not poison the next one.
+
+    The supervisor path (``_check_rust_core`` refusing, the observability gate,
+    any startup check between arming and the lifespan's own try/finally) can
+    raise with the watchdog already armed. The loop then closes, and a retry in
+    the same process comes up on a *new* loop. Before this was handled,
+    ``start_loop_watchdog()`` saw a live monitor, returned ``True``, and left
+    ``_heartbeat_task`` on the closed loop: the heartbeat never ticked again, so
+    the monitor read a frozen ``_last_tick``, reported a permanent stall, and
+    would never have recovered it -- a fresh lifespan served with no usable
+    diagnostics.
+    """
+    from headroom.proxy import loop_watchdog
+
+    monkeypatch.setenv("HEADROOM_LOOP_WATCHDOG_SECS", "1")
+    loop_watchdog._reset_for_test()
+
+    async def failing_startup() -> None:
+        assert loop_watchdog.start_loop_watchdog() is True
+        # A startup check raising here leaves the arming in place, no cleanup.
+        raise RuntimeError("observability check refused to start")
+
+    try:
+        with pytest.raises(RuntimeError, match="observability check refused"):
+            asyncio.run(failing_startup())
+
+        async def retry() -> dict[str, Any]:
+            assert loop_watchdog.start_loop_watchdog() is True
+            running = asyncio.get_running_loop()
+            task = loop_watchdog._heartbeat_task
+            assert task is not None
+            assert task.get_loop() is running, "heartbeat still bound to the dead loop"
+            # A healthy new loop must not be reported as stalled.
+            with caplog.at_level(logging.ERROR, logger=loop_watchdog.logger.name):
+                await asyncio.sleep(2.0)
+            return loop_watchdog.snapshot()
+
+        payload = asyncio.run(retry())
+        assert "proxy_event_loop_stall" not in caplog.text
+        assert payload["enabled"] is True
+        assert payload["current_stall_seconds"] == 0.0
+        assert payload["stalls_total"] == 0
+    finally:
+        loop_watchdog._reset_for_test()
+
+
+def test_startup_failure_after_arming_stops_the_watchdog(monkeypatch):
+    """A refused startup must not leave the monitor running.
+
+    The observability gate and the rust-core check run *after* the watchdog is
+    armed and, until this was fixed, outside the lifespan's cleanup. A refused
+    lifespan therefore leaked a monitor thread plus a heartbeat whose loop was
+    about to close.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy import loop_watchdog
+    from headroom.proxy import server as proxy_server
+    from headroom.proxy.models import ProxyConfig
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_LOOP_WATCHDOG_SECS", "5")
+    loop_watchdog._reset_for_test()
+
+    def refuse() -> None:
+        raise SystemExit("observability gate refused to start")
+
+    monkeypatch.setattr(proxy_server, "_configure_observability_or_refuse", refuse)
+
+    app = proxy_server.create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    try:
+        started = False
+        try:
+            with TestClient(app):
+                started = True
+        except BaseException:
+            # The refusal surfaces as SystemExit, wrapped by the test harness.
+            pass
+        assert not started, "lifespan started despite a refused startup check"
+        # Cleanup ran: no monitor left armed behind a closed loop.
+        assert loop_watchdog.snapshot()["enabled"] is False
     finally:
         loop_watchdog._reset_for_test()

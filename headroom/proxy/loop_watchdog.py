@@ -334,6 +334,19 @@ def _stop_current_lifecycle() -> None:
         _stall_started_at = 0.0
 
 
+def _heartbeat_is_current(loop: asyncio.AbstractEventLoop) -> bool:
+    """True when the live heartbeat is scheduled on ``loop``.
+
+    A proxy lifespan can fail *after* arming (a startup check raising) and leave
+    the watchdog armed without running its cleanup. The retry then comes up on a
+    new loop while the old heartbeat is either tied to a closed loop or simply
+    gone -- and a monitor that keeps a stale ``_last_tick`` reports a permanent
+    stall while nothing would ever recover it.
+    """
+    task = _heartbeat_task
+    return task is not None and not task.done() and task.get_loop() is loop
+
+
 def start_loop_watchdog() -> bool:
     """Arm the event-loop watchdog for the current lifespan. True when armed.
 
@@ -346,17 +359,22 @@ def start_loop_watchdog() -> bool:
     global _enabled, _threshold_seconds, _last_tick, _heartbeat_task
     global _stop, _monitor_thread, _reporter_thread, _log_queue
     with _lifecycle_lock:
-        if _monitor_thread is not None and _monitor_thread.is_alive():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("Event-loop watchdog not armed: no running event loop")
+            return False
+        # Armed and still beating on *this* loop: nothing to do.
+        if (
+            _monitor_thread is not None
+            and _monitor_thread.is_alive()
+            and _heartbeat_is_current(loop)
+        ):
             return _enabled
         secs = _resolve_secs()
         if not secs:
             _stop_current_lifecycle()
             logger.info("Event-loop watchdog disabled (%s=0)", ENV_VAR)
-            return False
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.debug("Event-loop watchdog not armed: no running event loop")
             return False
 
         _stop_current_lifecycle()

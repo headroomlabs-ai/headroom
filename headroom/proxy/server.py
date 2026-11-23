@@ -3717,44 +3717,55 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         start_loop_watchdog()
 
-        # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
-        # traffic if the Rust extension is missing unless the operator
-        # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
-        # Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md.
-        # `_check_rust_core` either returns ("loaded"|"disabled", _) or
-        # calls `sys.exit(78)` — execution past this line implies the
-        # rust_core_status is recorded.
-        _rust_core_status, _rust_core_error = _check_rust_core()
-        app.state.rust_core_status = _rust_core_status
-        app.state.rust_core_error = _rust_core_error
+        # Everything between arming and the startup try/finally below has to
+        # run the watchdog's cleanup on failure. A raise here -- a rust-core
+        # refusal, the observability gate -- otherwise leaves the monitor armed
+        # on a loop that is about to close, and a retry in the same process
+        # would inherit a heartbeat that can never tick on its new loop.
+        from headroom.proxy.loop_watchdog import stop_loop_watchdog
 
-        # Degraded mode has to mean something. Every compressor reaches
-        # `headroom._core` eventually, so leaving `optimize` on while the
-        # extension is unloadable turns each request into an ImportError
-        # instead of a proxied response. Drop to the same passthrough path
-        # `--no-optimize` uses: no savings, but the client keeps working
-        # rather than getting a connection refused (issue #2918).
-        #
-        # Safe to mutate here: `HeadroomProxy` holds this exact config
-        # object, its compressors are built lazily on first use, and
-        # `proxy.startup()` has not run yet.
-        if _rust_core_status == "disabled" and config.optimize:
-            config.optimize = False
-            logger.warning(
-                "event=proxy_optimization_disabled reason=rust_core_unavailable "
-                "detail=%r mode=passthrough; traffic is forwarded unmodified, "
-                "restore `headroom._core` to re-enable compression",
-                _rust_core_error,
-            )
+        try:
+            # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
+            # traffic if the Rust extension is missing unless the operator
+            # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
+            # Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md.
+            # `_check_rust_core` either returns ("loaded"|"disabled", _) or
+            # calls `sys.exit(78)` — execution past this line implies the
+            # rust_core_status is recorded.
+            _rust_core_status, _rust_core_error = _check_rust_core()
+            app.state.rust_core_status = _rust_core_status
+            app.state.rust_core_error = _rust_core_error
 
-        _configure_observability_or_refuse()
+            # Degraded mode has to mean something. Every compressor reaches
+            # `headroom._core` eventually, so leaving `optimize` on while the
+            # extension is unloadable turns each request into an ImportError
+            # instead of a proxied response. Drop to the same passthrough path
+            # `--no-optimize` uses: no savings, but the client keeps working
+            # rather than getting a connection refused (issue #2918).
+            #
+            # Safe to mutate here: `HeadroomProxy` holds this exact config
+            # object, its compressors are built lazily on first use, and
+            # `proxy.startup()` has not run yet.
+            if _rust_core_status == "disabled" and config.optimize:
+                config.optimize = False
+                logger.warning(
+                    "event=proxy_optimization_disabled reason=rust_core_unavailable "
+                    "detail=%r mode=passthrough; traffic is forwarded unmodified, "
+                    "restore `headroom._core` to re-enable compression",
+                    _rust_core_error,
+                )
 
-        app.state.started_at = time.time()
-        app.state.ready = False
-        app.state.startup_error = None
-        app.state.periodic_toin_stats_task = None
-        app.state.periodic_malloc_trim_task = None
-        app.state.orphan_watchdog_task = None
+            _configure_observability_or_refuse()
+
+            app.state.started_at = time.time()
+            app.state.ready = False
+            app.state.startup_error = None
+            app.state.periodic_toin_stats_task = None
+            app.state.periodic_malloc_trim_task = None
+            app.state.orphan_watchdog_task = None
+        except BaseException:
+            stop_loop_watchdog()
+            raise
 
         try:
             try:
@@ -3830,8 +3841,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         timeout,
                         exc,
                     )
-
-            from headroom.proxy.loop_watchdog import stop_loop_watchdog
 
             stop_loop_watchdog()
 
