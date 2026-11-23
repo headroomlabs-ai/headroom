@@ -51,6 +51,21 @@ def gemini_request():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_upstream_resolver(monkeypatch):
+    """Give each test its own upstream-name memory and an unbound client.
+
+    Tests stub ``getaddrinfo`` per name, so an answer remembered by one test
+    must not decide a check in the next.
+    """
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setattr(upstream_guard, "_RESOLVER", upstream_guard._Resolver())
+    token = upstream_guard._UPSTREAM_CLIENT.set(upstream_guard._INTERNAL_CLIENT)
+    yield
+    upstream_guard._UPSTREAM_CLIENT.reset(token)
+
+
+@pytest.fixture(autouse=True)
 def _undo_process_trust_injection():
     """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
 

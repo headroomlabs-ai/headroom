@@ -442,7 +442,8 @@ def test_a_long_image_compression_does_not_leave_an_expired_pin(
     assert seen["pin_at_send"], "the request was not sent"
     pin = seen["pin_at_send"][0]
     assert pin is not None and not pin.is_expired(), "the connection would find an expired pin"
-    assert seen["guard_on_loop"][-1] is False, "the renewal ran on the event-loop thread"
+    # Renewed from the answer the guard remembers, without a second lookup.
+    assert seen["lookups"] == ["gateway.example"], seen["lookups"]
 
 
 def test_a_still_valid_pin_is_not_checked_again_after_image_compression(
