@@ -25,7 +25,7 @@ def test_empty_storage_path_means_in_memory(tmp_path):
     toin = ToolIntelligenceNetwork(TOINConfig(storage_path=""))
     assert toin._backend is None
     toin.save()  # must be a no-op
-    assert not list(tmp_path.rglob("toin.json"))
+    assert not list(tmp_path.rglob("toin*.json"))
 
 
 def test_filesystem_backend_persists(tmp_path):
@@ -34,7 +34,7 @@ def test_filesystem_backend_persists(tmp_path):
     toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path)))
     assert toin._backend is not None
     toin.save()
-    assert path.exists()
+    assert path.with_name(f"{path.stem}.v3{path.suffix}").exists()
 
 
 def test_apply_stateless_persistence_forces_toin_in_memory(tmp_path, monkeypatch):
@@ -50,7 +50,7 @@ def test_apply_stateless_persistence_forces_toin_in_memory(tmp_path, monkeypatch
         # No backend -> no toin.json read or written, ever.
         assert toin._backend is None
         toin.save()  # no-op
-        assert not list(tmp_path.rglob("toin.json"))
+        assert not list(tmp_path.rglob("toin*.json"))
     finally:
         reset_toin()
 

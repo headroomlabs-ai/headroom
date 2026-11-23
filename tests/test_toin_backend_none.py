@@ -21,7 +21,8 @@ from headroom.telemetry.toin import (
 
 def _network(tmp_path, name: str = "toin.json") -> tuple[ToolIntelligenceNetwork, object]:
     path = tmp_path / name
-    return ToolIntelligenceNetwork(TOINConfig(storage_path=str(path))), path
+    written = path.with_name(f"{path.stem}.v3{path.suffix}")
+    return ToolIntelligenceNetwork(TOINConfig(storage_path=str(path))), written
 
 
 def test_backend_none_keeps_toin_in_memory(tmp_path, monkeypatch):

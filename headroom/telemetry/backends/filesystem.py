@@ -2,6 +2,13 @@
 
 Stores TOIN patterns as a JSON file with atomic writes.
 This is the default backend, matching the original toin.py behavior.
+
+When ``store_version`` is given, the store is written to a
+version-suffixed sibling (``toin.json`` -> ``toin.v3.json``) and the
+unversioned path is only read, as the pre-upgrade layout. A released
+reader that does not know the new version therefore never opens the new
+file: rolling back loads the last pre-upgrade store instead of
+reinterpreting keys under its old tenant resolver.
 """
 
 from __future__ import annotations
@@ -13,6 +20,12 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _versioned_path(path: Path, store_version: str) -> Path:
+    """Version-suffixed sibling: ``toin.json`` + ``3.0`` -> ``toin.v3.json``."""
+    major = store_version.split(".", 1)[0]
+    return path.with_name(f"{path.stem}.v{major}{path.suffix}")
 
 
 class FileSystemTOINBackend:
@@ -28,11 +41,41 @@ class FileSystemTOINBackend:
         path: Path to the JSON storage file.
         max_load_bytes: Maximum file size in bytes for loading and saving.
             None disables the limit.
+        store_version: On-disk layout version. When set, writes go to a
+            version-suffixed sibling and ``path`` is read only as the
+            pre-upgrade store. None keeps the unversioned single-file layout.
     """
 
-    def __init__(self, path: str, *, max_load_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_load_bytes: int | None = None,
+        store_version: str | None = None,
+    ) -> None:
         self._path = Path(path)
         self._max_load_bytes = max_load_bytes
+        self._pre_upgrade_path: Path | None = None
+        self._loaded_pre_upgrade = False
+        if store_version:
+            self._pre_upgrade_path = self._path
+            self._path = _versioned_path(self._path, store_version)
+
+    def _read_path(self) -> Path:
+        """Path to load: this version's store, else the pre-upgrade one."""
+        if not self._path.exists() and self._pre_upgrade_path is not None:
+            return self._pre_upgrade_path
+        return self._path
+
+    @property
+    def pre_upgrade_path(self) -> Path | None:
+        """Read-only pre-upgrade store path, or None when the layout is unversioned."""
+        return self._pre_upgrade_path
+
+    @property
+    def loaded_pre_upgrade(self) -> bool:
+        """True when the last load read the pre-upgrade file, not this layout's."""
+        return self._loaded_pre_upgrade
 
     def load(self) -> dict[str, Any]:
         """Load TOIN data from the JSON file.
@@ -40,26 +83,27 @@ class FileSystemTOINBackend:
         Returns:
             Parsed JSON data, or empty dict if file doesn't exist or is corrupt.
         """
-        if not self._path.exists():
+        read_path = self._read_path()
+        self._loaded_pre_upgrade = (
+            self._pre_upgrade_path is not None and read_path == self._pre_upgrade_path
+        )
+        if not read_path.exists():
             return {}
 
         try:
-            if (
-                self._max_load_bytes is not None
-                and self._path.stat().st_size > self._max_load_bytes
-            ):
+            if self._max_load_bytes is not None and read_path.stat().st_size > self._max_load_bytes:
                 logger.warning(
                     "TOIN data file %s exceeds the configured load limit (%d bytes); "
                     "leaving it unchanged",
-                    self._path,
+                    read_path,
                     self._max_load_bytes,
                 )
                 return {}
-            with open(self._path) as f:
+            with open(read_path) as f:
                 data: dict[str, Any] = json.load(f)
                 return data
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to load TOIN data from %s: %s", self._path, e)
+            logger.warning("Failed to load TOIN data from %s: %s", read_path, e)
             return {}
 
     def save(self, data: dict[str, Any]) -> None:

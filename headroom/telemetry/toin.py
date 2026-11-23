@@ -115,7 +115,12 @@ _AGG_KEY_SEPARATOR: Final[str] = "|"
 # *different* id later produces (``tnt-<prefix>-<digest>``). ``3.0`` adds the
 # upgrade purge in :meth:`ToolIntelligenceNetwork.import_patterns`: pools
 # living in the digested sub-space of an older file are dropped instead of
-# being handed to whichever tenant now maps there.
+# being handed to whichever tenant now maps there. The filesystem backend
+# writes ``3.0`` to a version-suffixed sibling (``toin.v3.json``) and keeps
+# the unversioned file read-only as the pre-upgrade store, so a rolled-back
+# release reads its own layout instead of re-resolving v3 keys. A custom
+# backend (``HEADROOM_TOIN_BACKEND``) must provide the same isolation,
+# e.g. a versioned key name, for its own store.
 _TOIN_STORE_VERSION: Final[str] = "3.0"
 _LAST_VERSION_WITHOUT_DIGEST_SUBSPACE: Final[str] = "2.0"
 
@@ -194,6 +199,11 @@ def get_default_toin_storage_path() -> str:
     Checks for the HEADROOM_TOIN_PATH environment variable first.
     Falls back to ``${HEADROOM_WORKSPACE_DIR}/toin.json`` (which defaults
     to ``~/.headroom/toin.json``) when unset.
+
+    This is the configured path, not the file this release writes: the
+    filesystem backend appends the layout version (``toin.v3.json``) and
+    keeps the configured file read-only as the pre-upgrade store, so a
+    rolled-back release reads its own layout.
 
     Returns:
         The path string for TOIN storage.
@@ -509,7 +519,8 @@ class TOINConfig:
     enabled: bool = True
 
     # Storage
-    # Default path is ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var)
+    # Configured path: ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var).
+    # The backend writes it version-suffixed; see get_default_toin_storage_path.
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
     max_patterns: int = DEFAULT_MAX_PATTERNS
@@ -585,6 +596,7 @@ class ToolIntelligenceNetwork:
             self._backend = FileSystemTOINBackend(
                 self._config.storage_path,
                 max_load_bytes=self._config.max_storage_bytes,
+                store_version=_TOIN_STORE_VERSION,
             )
         else:
             self._backend = None
@@ -1788,7 +1800,8 @@ class ToolIntelligenceNetwork:
         try:
             data = self._backend.load()
             if data:
-                changed = self._import_patterns(data)
+                sanitized_pre_upgrade = self._sanitize_pre_upgrade_store(data)
+                changed = self._import_patterns(data) or sanitized_pre_upgrade
                 with self._lock:
                     before = len(self._patterns)
                     self._prune_patterns_locked()
@@ -1808,6 +1821,42 @@ class ToolIntelligenceNetwork:
             # Rewrite at once: a dropped legacy query key can hold a credential,
             # and waiting for the next observation would leave it on disk.
             self.save()
+
+    def _sanitize_pre_upgrade_store(self, data: dict[str, Any]) -> bool:
+        """Remove raw query keys from the pre-upgrade file, on disk.
+
+        A store written before the digesting tenant resolver stays on disk
+        read-only as the rollback view, but it can still hold a raw query
+        string in a pool this version purges before sanitizing. Leaving it
+        there would keep a credential at rest after it was removed from
+        every pattern this version keeps, so the same sanitizing pass is
+        applied to the file itself.
+        """
+        pre_upgrade_path = getattr(self._backend, "pre_upgrade_path", None)
+        if pre_upgrade_path is None or not getattr(self._backend, "loaded_pre_upgrade", False):
+            return False
+        patterns_data = data.get("patterns", {})
+        if not isinstance(patterns_data, dict):
+            return False
+
+        rewritten = False
+        for serialized_key, pattern_dict in list(patterns_data.items()):
+            if not isinstance(pattern_dict, dict):
+                continue
+            try:
+                pattern = ToolPattern.from_dict(pattern_dict)
+                changed = self._sanitize_loaded_pattern(pattern)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if changed:
+                patterns_data[serialized_key] = pattern.to_dict()
+                rewritten = True
+
+        if rewritten:
+            from .backends import FileSystemTOINBackend
+
+            FileSystemTOINBackend(str(pre_upgrade_path)).save(data)
+        return rewritten
 
     def _maybe_auto_save(self) -> None:
         """Auto-save if enough time has passed.

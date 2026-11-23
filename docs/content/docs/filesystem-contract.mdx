@@ -44,7 +44,7 @@ Examples:
 | Resource | Default path | Legacy env var |
 |---|---|---|
 | Proxy savings ledger | `${WORKSPACE_DIR}/proxy_savings.json` | `HEADROOM_SAVINGS_PATH` |
-| TOIN telemetry JSON | `${WORKSPACE_DIR}/toin.json` | `HEADROOM_TOIN_PATH` |
+| TOIN telemetry JSON | `${WORKSPACE_DIR}/toin.v3.json` (reads `${WORKSPACE_DIR}/toin.json` once to upgrade) | `HEADROOM_TOIN_PATH` |
 | Subscription tracker state | `${WORKSPACE_DIR}/subscription_state.json` | `HEADROOM_SUBSCRIPTION_STATE_PATH` |
 | Memory SQLite | `${WORKSPACE_DIR}/memory.db` | CLI `--memory-db-path` |
 | Native memory directory | `${WORKSPACE_DIR}/memories/` | `MemoryConfig.native_memory_dir` |
@@ -56,6 +56,18 @@ Examples:
 | HTTP 400 debug dumps | `${WORKSPACE_DIR}/logs/debug_400/` | — |
 | Deployment profiles | `${WORKSPACE_DIR}/deploy/` | — |
 | Beacon lock file | `${WORKSPACE_DIR}/.beacon_lock_<port>` | — |
+
+The TOIN store is version-suffixed because its tenant keys are resolved
+by a digesting resolver: a release that predates the digest maps a tenant
+that sends a derived key literally onto that pool. Keeping the v3 layout
+in its own file means a rollback reads `toin.json` (the last pre-upgrade
+layout) instead of reinterpreting v3 keys, and that file is never written
+by the newer release. On upgrade the pre-upgrade file is left in place as
+the rollback view, with any raw query string it still held removed first
+(then it stops being updated). Rolling back therefore loses learning
+recorded after the upgrade; to keep it, back up the v3 file before
+rolling back and restore that backup after re-upgrading, or start from a
+fresh store.
 
 ### Config bucket (`HEADROOM_CONFIG_DIR`)
 

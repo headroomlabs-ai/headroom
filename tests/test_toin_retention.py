@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from headroom.proxy.tenant_key import _sanitize_tenant_key
 from headroom.telemetry.backends.filesystem import FileSystemTOINBackend
 from headroom.telemetry.models import ToolSignature
 from headroom.telemetry.toin import TOINConfig, ToolIntelligenceNetwork
@@ -67,7 +69,7 @@ def test_manual_save_can_retry_before_auto_save_interval(tmp_path):
 
     toin.save()
 
-    assert path.is_file()
+    assert _current_store_path(path).is_file()
     assert toin._dirty is False
 
 
@@ -227,12 +229,19 @@ def _record(toin: ToolIntelligenceNetwork, index: int) -> None:
     )
 
 
-def _saved_store(path, count: int) -> dict:
-    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+def _current_store_path(base: Path) -> Path:
+    """Where this version writes: the version-suffixed sibling of ``base``."""
+    return base.with_name(f"{base.stem}.v3{base.suffix}")
+
+
+def _saved_store(path: Path, count: int) -> dict:
+    """Write a store fixture at ``path`` and return its parsed content."""
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path="", auto_save_interval=0))
     for index in range(count):
         _record(toin, index)
-    toin.save()
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = toin.export_patterns()
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return data
 
 
 def _skip_warnings(caplog) -> list[logging.LogRecord]:
@@ -280,7 +289,7 @@ def test_malformed_pattern_does_not_drop_the_rest_of_the_store(tmp_path, caplog,
     # The next save used to write only the patterns read before the bad one.
     _record(toin, 99)
     toin.save()
-    saved = json.loads(path.read_text(encoding="utf-8"))["patterns"]
+    saved = json.loads(_current_store_path(path).read_text(encoding="utf-8"))["patterns"]
     assert set(keys) - {keys[1]} <= set(saved)
     assert len(saved) == 5
 
@@ -304,7 +313,7 @@ def test_foreign_store_keeps_the_healthy_entries_after_a_malformed_one(tmp_path,
     assert all("foreign-instance" in p._seen_instance_hashes for p in toin._patterns.values())
 
     toin.save()
-    saved = json.loads(path.read_text(encoding="utf-8"))["patterns"]
+    saved = json.loads(_current_store_path(path).read_text(encoding="utf-8"))["patterns"]
     assert set(saved) == set(keys[1:])
 
 
@@ -389,8 +398,11 @@ def test_pre_upgrade_pool_that_collides_with_a_digested_key_is_dropped(tmp_path,
 
     # Only the purged pool is gone when the next save rewrites the file.
     toin.save()
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == "3.0"
-    assert json.loads(path.read_text(encoding="utf-8"))["patterns"] == {}
+    current = json.loads(_current_store_path(path).read_text(encoding="utf-8"))
+    assert current["version"] == "3.0"
+    assert current["patterns"] == {}
+    # The pre-upgrade file is left as the rollback view.
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == "2.0"
 
 
 def test_a_conforming_pool_survives_the_upgrade(tmp_path) -> None:
@@ -405,6 +417,39 @@ def test_a_conforming_pool_survives_the_upgrade(tmp_path) -> None:
     toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
 
     assert len(toin._patterns) == 3
+
+
+def test_rollback_reader_cannot_resolve_v3_tenant_keys(tmp_path) -> None:
+    """A rolled-back release must not read v3 pools under its old resolver.
+
+    ``acme.corp`` records a pattern under the derived key
+    ``tnt-acmecorp-80a1d5cc623b165f``. The previous release maps a tenant that
+    literally sends that key onto the same pool, so it must never open the v3
+    store: v3 writes to the version-suffixed sibling and the unversioned path,
+    which the old release reads, stays at the pre-upgrade layout.
+    """
+    base = tmp_path / "toin.json"
+    derived_tenant = _sanitize_tenant_key("acme.corp")
+    assert derived_tenant == "tnt-acmecorp-80a1d5cc623b165f"
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(base), auto_save_interval=0))
+    toin.record_compression(
+        tool_signature=_signature(0),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+        tenant_key=derived_tenant,
+    )
+    toin.save()
+
+    v3 = json.loads(_current_store_path(base).read_text(encoding="utf-8"))
+    [stored_key] = v3["patterns"]
+    assert stored_key.split("|")[0] == derived_tenant
+
+    # What the previous release opens: the configured path, its own resolver.
+    previous_release_store = FileSystemTOINBackend(str(base)).load()
+    assert previous_release_store == {}
 
 
 def test_a_foreign_v3_store_keeps_its_digested_pools(caplog) -> None:
@@ -427,6 +472,29 @@ def test_a_foreign_v3_store_keeps_its_digested_pools(caplog) -> None:
     assert [
         r for r in caplog.records if getattr(r, "event", None) == "toin_tenant_key_upgrade_purge"
     ] == []
+
+
+def test_versioned_store_writes_a_sibling_over_the_pre_upgrade_file(tmp_path) -> None:
+    """v3 lives in its own file so a rolled-back reader cannot open it."""
+    base = tmp_path / "toin.json"
+    pre_upgrade = {"version": "2.0", "patterns": {"a": {"value": 1}}}
+    base.write_text(json.dumps(pre_upgrade), encoding="utf-8")
+
+    backend = FileSystemTOINBackend(str(base), store_version="3.0")
+    assert backend.load() == pre_upgrade
+    assert backend.loaded_pre_upgrade is True
+
+    backend.save({"version": "3.0", "patterns": {}})
+
+    current = _current_store_path(base)
+    assert json.loads(current.read_text(encoding="utf-8"))["version"] == "3.0"
+    assert json.loads(base.read_text(encoding="utf-8")) == pre_upgrade
+
+    # Once this layout's file exists it wins: the pre-upgrade file is only
+    # the one-time upgrade source and the rollback view.
+    reloaded = FileSystemTOINBackend(str(base), store_version="3.0")
+    assert reloaded.load()["version"] == "3.0"
+    assert reloaded.loaded_pre_upgrade is False
 
 
 def test_filesystem_backend_writes_compact_json(tmp_path) -> None:
@@ -538,12 +606,13 @@ def test_filesystem_backend_without_byte_limit_allows_growth(tmp_path) -> None:
 def test_toin_size_rejection_preserves_store_and_dirty_state(
     tmp_path, caplog, oversized_on_load
 ) -> None:
-    path = tmp_path / "toin.json"
+    base = tmp_path / "toin.json"
+    path = _current_store_path(base)
     _saved_store(path, 3 if oversized_on_load else 1)
     original = path.read_bytes()
     limit = len(original) - 1 if oversized_on_load else len(original) + 128
     toin = ToolIntelligenceNetwork(
-        TOINConfig(storage_path=str(path), max_storage_bytes=limit, auto_save_interval=0)
+        TOINConfig(storage_path=str(base), max_storage_bytes=limit, auto_save_interval=0)
     )
     assert len(toin._patterns) == (0 if oversized_on_load else 1)
     _record(toin, 99)

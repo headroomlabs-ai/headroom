@@ -210,9 +210,12 @@ class TestTOINPersistenceAcrossInstances:
             toin1.save()
             print(f"\nSaved to: {storage_path}")
 
-            # Verify file exists and show content
-            assert Path(storage_path).exists(), "TOIN file should exist after save"
-            with open(storage_path) as f:
+            # Verify this layout's file exists and show content
+            written_path = Path(storage_path).with_name(
+                f"{Path(storage_path).stem}.v3{Path(storage_path).suffix}"
+            )
+            assert written_path.exists(), "TOIN file should exist after save"
+            with open(written_path) as f:
                 saved_data = json.load(f)
             print(f"Saved patterns count: {len(saved_data.get('patterns', {}))}")
 
