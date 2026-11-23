@@ -688,6 +688,25 @@ def _long_context_suffix(info: dict[str, Any], billed_tokens: int) -> str:
     return ""
 
 
+def _slice_rate(info: dict[str, Any], field: str, tier_suffix: str, default: float) -> float:
+    """One cache slice's rate at ``tier_suffix``, tolerating unpublished prices.
+
+    A catalog row can carry a field with an explicit ``None`` (litellm does this
+    for rates it does not know), and ``dict.get(key, fallback)`` returns that
+    ``None`` rather than the fallback. Multiplying it raised, and the caller's
+    ``except`` then priced the WHOLE request at the blended fallback rate — far
+    worse than the base rate this falls back to. Falls through tier → base →
+    ``default`` (a cache read/write billed like a plain input token).
+    """
+    for key in (f"{field}{tier_suffix}" if tier_suffix else None, field):
+        if key is None:
+            continue
+        value = info.get(key)
+        if value is not None:
+            return float(value)
+    return float(default)
+
+
 def _estimate_input_cost_usd(
     model: str,
     input_tokens: int,
@@ -744,13 +763,11 @@ def _estimate_input_cost_usd(
                 input_cost_per_token = tiered_input
 
         if use_breakdown:
-            cache_read_cost = info.get(
-                f"cache_read_input_token_cost{tier_suffix}",
-                info.get("cache_read_input_token_cost", input_cost_per_token),
+            cache_read_cost = _slice_rate(
+                info, "cache_read_input_token_cost", tier_suffix, input_cost_per_token
             )
-            cache_write_cost = info.get(
-                f"cache_creation_input_token_cost{tier_suffix}",
-                info.get("cache_creation_input_token_cost", input_cost_per_token),
+            cache_write_cost = _slice_rate(
+                info, "cache_creation_input_token_cost", tier_suffix, input_cost_per_token
             )
             return (
                 float(cache_read) * float(cache_read_cost)
@@ -2431,10 +2448,11 @@ class SavingsTracker:
             if model == MODEL_UNKNOWN:
                 return None
             if model not in read_cost_per_token:
-                read_cost_per_token[model] = (
-                    _estimate_input_cost_usd(model, 1_000_000, cache_read_tokens=1_000_000)
-                    / 1_000_000
-                )
+                # A ONE-token probe: `chargeable_tokens` is what picks the tier,
+                # so a 1M-token probe crossed every model's long-context
+                # threshold and reported the upper tier's read rate for buckets
+                # that never went near it.
+                read_cost_per_token[model] = _estimate_input_cost_usd(model, 1, cache_read_tokens=1)
             return reads * read_cost_per_token[model]
 
         def _add_cache(

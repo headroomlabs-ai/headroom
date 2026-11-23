@@ -157,3 +157,67 @@ def test_tier_lookup_failure_does_not_break_request_recording(
 
     # Base rate, because the tier could not be read — and no exception escapes.
     assert _estimate_input_cost_usd("long-model", 250_000) == pytest.approx(0.25)
+
+
+def test_rollup_read_cost_probe_stays_on_the_base_tier(tiered_pricing: dict, tmp_path) -> None:
+    """The rollup's per-token read rate must be the BASE tier's.
+
+    The rate is probed by pricing a cache read, and the token count IS the tier
+    selector, so a 1M-token probe priced the upper tier for every model with a
+    long-context row and reported it for buckets that never crossed the
+    threshold. A 1-token probe cannot cross any model's threshold.
+    """
+    tracker = SavingsTracker(path=tmp_path / "savings.json", save_flush_every=1)
+    history = [
+        {
+            "timestamp": "2026-03-27T09:00:00Z",
+            "provider": "anthropic",
+            "model": "long-model",
+            "total_tokens_saved": 0,
+            "cache_read_tokens": 0,
+        },
+        {
+            "timestamp": "2026-03-27T09:30:00Z",
+            "provider": "anthropic",
+            "model": "long-model",
+            "total_tokens_saved": 0,
+            "cache_read_tokens": 1_000,
+            "cache_savings_usd": 0.9,
+        },
+    ]
+
+    bucket = tracker._build_rollup(history, "hour")[0]
+
+    # long-model publishes no cache-read rate, so reads bill at the base input
+    # rate — $1/M — not the long-context $2/M the 1M probe used to return.
+    assert bucket["cache_read_cost_usd_delta"] == pytest.approx(0.001)
+
+
+def test_unpublished_cache_rates_fall_back_to_the_base_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `None` cache rate must not throw the request onto the blended fallback.
+
+    ``dict.get(key, fallback)`` returns a published ``None`` rather than the
+    fallback, so multiplying it raised inside the try block and the whole
+    request — input tokens included — was priced at $3/M.
+    """
+    from types import SimpleNamespace
+
+    catalog = {
+        "half-priced-model": {
+            "input_cost_per_token": 1e-5,
+            "cache_read_input_token_cost": None,
+            "cache_creation_input_token_cost": None,
+        }
+    }
+    fake = SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
+    monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
+    monkeypatch.setattr(st, "_resolve_litellm_model", lambda model: model)
+
+    assert _estimate_input_cost_usd("half-priced-model", 0, cache_read_tokens=1_000) == (
+        pytest.approx(0.01)
+    )
+    assert _estimate_input_cost_usd("half-priced-model", 0, cache_write_tokens=1_000) == (
+        pytest.approx(0.01)
+    )
