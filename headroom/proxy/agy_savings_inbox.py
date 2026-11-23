@@ -32,7 +32,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from headroom.paths import workspace_dir
+from headroom.paths import persistence_allowed, workspace_dir
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -126,6 +126,8 @@ def emit_event(**funnel_kwargs: Any) -> None:
     """
 
     try:
+        if not persistence_allowed("AGY savings inbox"):
+            return
         directory = inbox_dir()
         _enforce_cap()
 
@@ -139,7 +141,7 @@ def emit_event(**funnel_kwargs: Any) -> None:
 
         fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".tmp-evt-", suffix=".json")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump(envelope, fh)
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -175,7 +177,7 @@ def _write_processed(path: Path, ids: list[str]) -> None:
     pruned = ids[-MAX_PROCESSED_IDS:]
     try:
         fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".tmp-proc-")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(pruned))
             if pruned:
                 fh.write("\n")
@@ -191,17 +193,21 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
 
     Delivery is at-least-once with best-effort dedup: an event is only unlinked
     *after* it has been recorded (or found already-processed), so a crash
-    between record and unlink re-delivers it next drain — the ``.processed`` set
+    between record and unlink re-delivers it next drain - the ``.processed`` set
     then suppresses the duplicate. Returns the number of events recorded.
 
     Never raises: the whole body is defended so a drain error can never crash
     the proxy lifespan loop or the stats handler.
     """
+    if not persistence_allowed("AGY savings inbox"):
+        return 0
 
     recorded = 0
     async with _drain_lock:
         try:
-            directory = inbox_dir()
+            directory = workspace_dir() / _INBOX_SUBDIR
+            if not directory.is_dir():
+                return 0
             processed_path = directory / _PROCESSED_FILE
             processed_list = _load_processed(processed_path)
             processed_set = set(processed_list)

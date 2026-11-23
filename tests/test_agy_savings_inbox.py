@@ -165,6 +165,41 @@ async def test_empty_inbox_returns_zero(isolated_home):
     fake = FakeMetrics()
     assert await agy_savings_inbox.drain_inbox(fake) == 0
     assert fake.calls == []
+    # Non-AGY proxy must not create savings.d on disk when unused.
+    assert not (isolated_home / ".headroom" / "savings.d").exists()
+
+
+@pytest.mark.asyncio
+async def test_stateless_mode_skips_emit_and_drain(isolated_home, monkeypatch):
+    monkeypatch.setenv("HEADROOM_STATELESS", "1")
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+    inbox_path = isolated_home / ".headroom" / "savings.d"
+    assert not inbox_path.exists()
+
+    # Pre-existing event file must not be unlinked or written to .processed in stateless mode.
+    inbox_path.mkdir(parents=True)
+    evt_file = inbox_path / "evt-stateless-1.json"
+    evt_file.write_text(
+        json.dumps({"v": 1, "event_id": "stateless-1", "kwargs": _FUNNEL_KWARGS}),
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake = FakeMetrics()
+    assert await agy_savings_inbox.drain_inbox(fake) == 0
+    assert fake.calls == []
+    assert evt_file.exists()
+    assert not (inbox_path / ".processed").exists()
+
+
+@pytest.mark.windows_newline
+@pytest.mark.asyncio
+async def test_processed_file_uses_lf_newlines(isolated_home):
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+    fake = FakeMetrics()
+    assert await agy_savings_inbox.drain_inbox(fake) == 1
+    raw = (isolated_home / ".headroom" / "savings.d" / ".processed").read_bytes()
+    assert b"\n" in raw
+    assert b"\r\n" not in raw
 
 
 def test_agy_emit_enabled_reflects_env(monkeypatch):

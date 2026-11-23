@@ -1670,6 +1670,7 @@ def _prime_agy_retrieve_tool_cache(registrar: Any) -> None:
                 }
             ),
             encoding="utf-8",
+            newline="\n",
         )
     except OSError:
         # A cache-write failure must never abort setup; the exposure gate simply
@@ -1678,17 +1679,30 @@ def _prime_agy_retrieve_tool_cache(registrar: Any) -> None:
 
 
 def _ccr_backend_is_cross_process() -> bool:
-    """True unless the CCR store backend is process-local (``memory``).
+    """True iff the resolved CCR store backend is shared across processes.
 
     The agy-spawned ``headroom mcp serve`` child resolves markers against the
-    CCR store. With ``HEADROOM_CCR_BACKEND=memory`` that store is a per-process
-    dict (compression_store.py ``_create_default_ccr_backend``), so the child
-    sees an empty store and cannot resolve the proxy's hashes — markers would
-    ship unrecoverable. Every other backend (default sqlite, redis, custom
-    entry points) is shared across processes. This is a PRODUCT guard on
-    ``WIRED``, not a test-only check.
+    CCR store. If the backend resolves to process-local in-memory storage
+    (``HEADROOM_CCR_BACKEND=memory``, ``HEADROOM_STATELESS=1`` without a
+    non-file backend, or a backend initialization fallback), the child sees an
+    empty store and cannot resolve the proxy's hashes - markers would ship
+    unrecoverable. This is a product guard on ``WIRED``.
     """
-    return (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower() != "memory"
+    from headroom.cache.backends.memory import InMemoryBackend
+    from headroom.cache.compression_store import _create_default_ccr_backend
+
+    if (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower() == "memory":
+        return False
+    backend = _create_default_ccr_backend()
+    if backend is None or isinstance(backend, InMemoryBackend):
+        return False
+    close_fn = getattr(backend, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:  # noqa: BLE001
+            pass
+    return True
 
 
 def _agy_exposes_retrieve_tool(registrar: Any) -> bool:
@@ -4712,7 +4726,7 @@ def _remove_gemini_md_block(gemini_md: Path, verbose: bool = False) -> bool:
         new_text = after
     else:
         new_text = ""
-    gemini_md.write_text(new_text, encoding="utf-8")
+    gemini_md.write_text(new_text, encoding="utf-8", newline="\n")
     if verbose:
         click.echo(f"  headroom block removed from {gemini_md}")
     return True

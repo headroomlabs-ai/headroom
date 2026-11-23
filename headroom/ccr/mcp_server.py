@@ -812,22 +812,8 @@ class HeadroomMCPServer:
             ),
             Tool(
                 name=CCR_TOOL_NAME,
-                description=(
-                    "Retrieve original uncompressed content by hash. "
-                    "Use this when you need full details from previously compressed content. "
-                    "The hash comes from headroom_compress results or from compression "
-                    "markers like [N items compressed... hash=abc123]."
-                ),
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "hash": {
-                            "type": "string",
-                            "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
-                        },
-                    },
-                    "required": ["hash"],
-                },
+                description=CCR_RETRIEVE_TOOL_DESCRIPTION,
+                input_schema=CCR_RETRIEVE_TOOL_INPUT_SCHEMA,
             ),
             Tool(
                 name=STATS_TOOL_NAME,

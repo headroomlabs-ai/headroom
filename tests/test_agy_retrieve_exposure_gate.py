@@ -46,23 +46,91 @@ class TestBackendCrossProcess:
     @pytest.mark.parametrize(
         "value,expected",
         [
-            (None, True),  # unset → default sqlite → shared
+            (None, True),  # unset -> default sqlite -> shared
             ("", True),
             ("sqlite", True),
-            ("redis", True),  # external shared store
-            ("memory", False),  # per-process dict → child sees empty store
+            ("memory", False),  # per-process dict -> child sees empty store
             ("MEMORY", False),  # case-insensitive
             ("  memory  ", False),  # whitespace-insensitive
         ],
     )
     def test_only_memory_is_process_local(
-        self, monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
     ) -> None:
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+        monkeypatch.delenv("HEADROOM_STATELESS", raising=False)
         if value is None:
             monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
         else:
             monkeypatch.setenv("HEADROOM_CCR_BACKEND", value)
         assert _ccr_backend_is_cross_process() is expected
+
+    def test_stateless_mode_is_not_cross_process(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+        monkeypatch.setenv("HEADROOM_STATELESS", "1")
+        monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.delenv("HEADROOM_COMPRESS_SESSION_STORE", raising=False)
+        assert _ccr_backend_is_cross_process() is False
+
+    def test_sqlite_init_fallback_is_not_cross_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.setattr(
+            "headroom.cache.compression_store._create_default_ccr_backend", lambda: None
+        )
+        assert _ccr_backend_is_cross_process() is False
+
+    def test_redis_without_url_falls_back_to_local(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HEADROOM_CCR_BACKEND", "redis")
+        monkeypatch.delenv("HEADROOM_REDIS_URL", raising=False)
+        monkeypatch.delenv("HEADROOM_COMPRESS_SESSION_STORE", raising=False)
+        assert _ccr_backend_is_cross_process() is False
+
+    def test_primed_and_live_retrieve_tool_schema_match(self) -> None:
+        import asyncio
+
+        from headroom.ccr.mcp_server import (
+            CCR_RETRIEVE_TOOL_DESCRIPTION,
+            CCR_RETRIEVE_TOOL_INPUT_SCHEMA,
+            CCR_TOOL_NAME,
+            create_ccr_mcp_server,
+        )
+
+        server = create_ccr_mcp_server()
+        assert server is not None
+        result = asyncio.run(server._on_list_tools(None, None))
+        retrieve_tools = [t for t in result.tools if t.name == CCR_TOOL_NAME]
+        assert len(retrieve_tools) == 1
+        assert retrieve_tools[0].description == CCR_RETRIEVE_TOOL_DESCRIPTION
+        assert retrieve_tools[0].input_schema == CCR_RETRIEVE_TOOL_INPUT_SCHEMA
+
+    @pytest.mark.windows_newline
+    def test_prime_cache_and_gemini_md_cleanup_use_lf_newlines(self, tmp_path: Path) -> None:
+        from headroom.cli.wrap import (
+            _AGY_GEMINI_BLOCK_END,
+            _AGY_GEMINI_BLOCK_START,
+            _prime_agy_retrieve_tool_cache,
+            _remove_gemini_md_block,
+        )
+
+        reg = _registrar(tmp_path)
+        _prime_agy_retrieve_tool_cache(reg)
+        cache_path = reg.cache_dir / "headroom" / f"{CCR_TOOL_NAME}.json"
+        assert b"\r\n" not in cache_path.read_bytes()
+
+        gemini_md = tmp_path / "GEMINI.md"
+        gemini_md.write_text(
+            f"before\n{_AGY_GEMINI_BLOCK_START}\nmanaged\n{_AGY_GEMINI_BLOCK_END}\nafter\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        assert _remove_gemini_md_block(gemini_md) is True
+        raw = gemini_md.read_bytes()
+        assert b"\n" in raw
+        assert b"\r\n" not in raw
 
 
 class TestExposureSignal:
