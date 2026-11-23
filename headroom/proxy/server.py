@@ -512,6 +512,17 @@ logger = logging.getLogger("headroom.proxy")
 
 # Liveness/readiness probe routes: auth-exempt, and logged at DEBUG.
 _HEALTH_PROBE_PATHS = frozenset({"/health", "/livez", "/readyz"})
+_in_readiness_probe: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "headroom_readiness_probe", default=False
+)
+
+
+def _filter_httpx_probe_log(record: logging.LogRecord) -> bool:
+    # Use the probe's sanitized diagnostics in place of HTTPX request logs.
+    return record.levelno != logging.INFO or not _in_readiness_probe.get()
+
+
+logging.getLogger("httpx").addFilter(_filter_httpx_probe_log)
 
 
 def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
@@ -4362,6 +4373,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _upstream_check_cache["error"] = "proxy client not initialised"
                 _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
                 return
+            probe_token = _in_readiness_probe.set(True)
             try:
                 resp = await client.head(url, timeout=5.0)
                 # Any HTTP response (even 4xx/5xx) means TLS+TCP worked.
@@ -4371,6 +4383,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             except Exception as exc:  # noqa: BLE001
                 _upstream_check_cache["ok"] = False
                 _upstream_check_cache["error"] = type(exc).__name__
+            finally:
+                _in_readiness_probe.reset(probe_token)
             _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
 
     # CORS: scoped to localhost by default. The old wildcard origin combined

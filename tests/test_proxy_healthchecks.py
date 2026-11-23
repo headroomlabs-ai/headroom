@@ -1,3 +1,4 @@
+import logging
 import os
 from types import SimpleNamespace
 
@@ -345,6 +346,38 @@ def test_readyz_probes_the_configured_primary_upstream(
     assert response.status_code == 200
     assert response.json()["checks"]["upstream"]["url"] == expected_probe
     probe.assert_awaited_once_with(expected_probe, timeout=5.0)
+
+
+def test_readiness_probe_uses_its_own_diagnostics(monkeypatch, caplog):
+    import httpx
+
+    monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
+    config = ProxyConfig(openai_api_url="https://llm.example", optimize=False)
+    requests = []
+
+    def upstream(request):
+        requests.append(request.method)
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(upstream)
+
+    async def head(url, **kwargs):
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await client.head(url, **kwargs)
+
+    with TestClient(create_app(config)) as client:
+        with caplog.at_level(logging.INFO, logger="httpx"):
+            monkeypatch.setattr(client.app.state.proxy.http_client, "head", head)
+            response = client.get("/readyz")
+            with httpx.Client(transport=transport) as other_client:
+                other_client.get("https://llm.example")
+
+    assert response.status_code == 200
+    assert response.json()["checks"]["upstream"]["ready"] is True
+    assert requests == ["HEAD", "GET"]
+    httpx_logs = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    assert any("HTTP Request: GET https://llm.example" in message for message in httpx_logs)
+    assert all("HTTP Request: HEAD" not in message for message in httpx_logs)
 
 
 def test_readyz_does_not_expose_upstream_url_details(monkeypatch):
