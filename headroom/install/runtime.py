@@ -651,9 +651,15 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         # After SIGTERM the exiting process briefly stops matching its own
         # argv while the kernel tears it down (#4891); like the absent-task
         # tolerance in stop_supervisor (#4468), that counts as stopping, not
-        # as a different process. A live process that is not exiting and does
-        # not match still means the PID was reused.
-        if _process_identity(pid, manifest) is False and not _process_is_exiting(pid):
+        # as a different process. The identity and exiting probes can also
+        # straddle the reap itself: if the PID is already gone by the time
+        # they run, that is stopped too. A live process that is not exiting
+        # and does not match still means the PID was reused.
+        if (
+            _process_identity(pid, manifest) is False
+            and not _process_is_exiting(pid)
+            and pid_alive(pid)
+        ):
             raise RuntimeError(
                 f"Cannot stop deployment '{manifest.profile}': runtime identity changed"
             )
