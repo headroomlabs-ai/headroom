@@ -171,6 +171,13 @@ def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
     monkeypatch.setenv("HEADROOM_BEACON", "off")
 
 
+# Same reason: every test that enters the proxy lifespan would otherwise
+# download LiteLLM's price table from GitHub on a background thread.
+@pytest.fixture(autouse=True)
+def _disable_price_refresh(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_PRICE_REFRESH", "off")
+
+
 # `wrap`/`init`/`doctor` probe loopback ports (and read deployment manifests)
 # to find a live Headroom proxy when --port is left at its default. A
 # developer's running proxy would make CLI tests non-deterministic, so

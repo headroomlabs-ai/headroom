@@ -439,16 +439,20 @@ def _inject_deepseek_pricing() -> None:
     """
     if not LITELLM_AVAILABLE:
         return
+    litellm.model_cost.update(deepseek_rows(litellm.model_cost))
+
+
+def deepseek_rows(model_cost: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Headroom's DeepSeek rows, each merged over what ``model_cost`` holds for it.
+
+    Also used by :mod:`headroom.pricing.live_prices`, so a refreshed upstream
+    table cannot put the peak rate back.
+    """
+    rows: dict[str, dict[str, Any]] = {}
     for model_name, pricing in _DEEPSEEK_V4_PRICING.items():
-        litellm.model_cost[model_name] = {
-            **litellm.model_cost.get(model_name, {}),
-            **pricing,
-        }
-        prefixed = f"deepseek/{model_name}"
-        litellm.model_cost[prefixed] = {
-            **litellm.model_cost.get(prefixed, {}),
-            **pricing,
-        }
+        for key in (model_name, f"deepseek/{model_name}"):
+            rows[key] = {**model_cost.get(key, {}), **pricing}
+    return rows
 
 
 _inject_deepseek_pricing()
