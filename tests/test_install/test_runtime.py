@@ -916,6 +916,52 @@ def test_stop_still_raises_when_pid_is_reused_by_a_live_process(
         stop_runtime(manifest)
 
 
+def test_stop_tolerates_identity_loss_when_pid_already_reaped(monkeypatch, tmp_path: Path) -> None:
+    # Second race from the reporter's real-macOS run of #4892: the identity
+    # probe reads the exit placeholder (argv gone, so False), and by the
+    # time the exiting probe spawns its own ps a few ms later the PID has
+    # already been reaped, so it also returns False. A vanished PID counts
+    # as stopped, the same as the not-alive check at the top of the loop.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 123)
+    # Alive for the pre-SIGTERM check and the first poll, then gone: the
+    # raise-time liveness check and the next poll both see a dead PID.
+    alive_states = iter([True, True, False])
+    identity_states = iter([True, False])
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(alive_states, False))
+    monkeypatch.setattr(
+        "headroom.install.runtime._process_identity",
+        lambda pid, current: next(identity_states, False),
+    )
+    monkeypatch.setattr("headroom.install.runtime._process_is_exiting", lambda pid: False)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda *args: None)
+
+    stop_runtime(manifest)
+
+    assert _read_pid("default") is None
+
+
+def test_stop_raises_when_identity_lost_but_pid_still_alive(monkeypatch, tmp_path: Path) -> None:
+    # The reaped-PID tolerance must not swallow PID reuse: identity lost,
+    # not exiting, and the PID still alive at the raise check means a
+    # genuinely different live process, so the stop still raises.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 123)
+    identity_states = iter([True, False])
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "headroom.install.runtime._process_identity",
+        lambda pid, current: next(identity_states, False),
+    )
+    monkeypatch.setattr("headroom.install.runtime._process_is_exiting", lambda pid: False)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda *args: None)
+
+    with pytest.raises(RuntimeError, match="runtime identity changed"):
+        stop_runtime(manifest)
+
+
 def test_process_is_exiting_detects_psutil_zombie(monkeypatch) -> None:
     class ZombieProcess:
         def __init__(self, pid: int) -> None:
