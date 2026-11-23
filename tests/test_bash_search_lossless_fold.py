@@ -88,8 +88,8 @@ def test_bash_program_peels_wrappers():
 # --- end-to-end through the router (both wire formats) ---
 
 
-def _openai(command: str, content: str, tokenizer):
-    router = ContentRouter(ContentRouterConfig())
+def _openai(command: str, content: str, tokenizer, config=None):
+    router = ContentRouter(config or ContentRouterConfig())
     messages = [
         {
             "role": "assistant",
@@ -106,8 +106,8 @@ def _openai(command: str, content: str, tokenizer):
     return result.messages[1]["content"], result.transforms_applied
 
 
-def _anthropic(command: str, content: str, tokenizer):
-    router = ContentRouter(ContentRouterConfig())
+def _anthropic(command: str, content: str, tokenizer, config=None):
+    router = ContentRouter(config or ContentRouterConfig())
     messages = [
         {
             "role": "assistant",
@@ -167,6 +167,33 @@ def test_go_log_keeps_its_timestamps(command, tokenizer):
     assert "router:bash:lossless_search" not in transforms
     assert "router:tool_result:lossless_search" not in transforms
     assert "2026/09/02 14" not in out.split("\n")
+
+
+TOMCAT_LOG = "\n".join(
+    f"02-Sep-2026 14:{i // 60:02d}:{i % 60:02d}.123 INFO [main] "
+    f"org.apache.catalina.core.ContainerBase response resource_{i:04d} handled successfully"
+    for i in range(240)
+)
+
+
+@pytest.mark.parametrize("send", [_openai, _anthropic])
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(lambda: ContentRouterConfig(ccr_inject_marker=False), id="no-ccr"),
+        pytest.param(
+            lambda: ContentRouterConfig(ccr_enabled=False, ccr_inject_marker=False),
+            id="ccr-disabled",
+        ),
+    ],
+)
+def test_timestamped_search_stays_whole_without_ccr(send, config, tokenizer):
+    # Timestamp rows are not path:line:content, so the search fold leaves them
+    # to the log compressor. Without a retrieval marker the dropped rows could
+    # not be fetched back, so the matches must reach the model as they are.
+    out, transforms = send("grep INFO logs/catalina.out", TOMCAT_LOG, tokenizer, config())
+    assert "router:bash:search_verbatim" in transforms
+    assert out == TOMCAT_LOG
 
 
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----

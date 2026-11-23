@@ -7029,6 +7029,15 @@ class ContentRouter(Transform):
                     if collect_diagnostics:
                         _diag[i] = "compressed:bash_lossless_search"
                     continue
+                if self._bash_search_keep_verbatim(tool_name, tool_call_id, content):
+                    result_slots[i] = message
+                    transforms_applied.append("router:bash:search_verbatim")
+                    route_counts["bash_search_verbatim"] = (
+                        route_counts.get("bash_search_verbatim", 0) + 1
+                    )
+                    if collect_diagnostics:
+                        _diag[i] = "protected:bash_search_verbatim"
+                    continue
 
                 # Small shell results stay verbatim (#3590). A short `ls`,
                 # `git status`, or JSON dump is cheap to keep; lossy
@@ -7797,6 +7806,28 @@ class ContentRouter(Transform):
             return None
         return folded if len(folded) < len(content) else None
 
+    def _bash_search_keep_verbatim(self, tool_name: str, tool_id: str, content: Any) -> bool:
+        """True for raw timestamped search output that only lossy paths could shrink.
+
+        ``grep INFO logs/catalina.out`` prints bare log rows. The search fold
+        skips timestamp rows, so the payload falls through to the log
+        compressor, which drops rows. Without a retrieval marker (``--no-ccr``)
+        there is no way to get them back, so keep the matches verbatim instead.
+        """
+        if self.config.ccr_enabled and self.config.ccr_inject_marker:
+            return False
+        if not isinstance(content, str) or len(content) < 200:
+            return False
+        if tool_name.lower() not in self.config.bash_tool_names:
+            return False
+        command = self._tool_call_commands.get(tool_id, "")
+        if not command or not _bash_command_is_search(command, self.config.bash_search_commands):
+            return False
+        from .lossless_compaction import _TIMESTAMP_ROW_RE
+
+        rows = [line for line in content.split("\n")[:100] if line.strip()]
+        return len(rows) >= 2 and all(_TIMESTAMP_ROW_RE.match(line) for line in rows)
+
     def _content_cache_key(
         self, content: str, *, gated: bool = False, bias: float = 1.0, context: str = ""
     ) -> str:
@@ -8342,6 +8373,14 @@ class ContentRouter(Transform):
                             route_counts.get("bash_lossless_search", 0) + 1
                         )
                     any_compressed = True
+                    continue
+                if self._bash_search_keep_verbatim(tool_name, tool_use_id, tool_text):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:bash:search_verbatim")
+                    if route_counts is not None:
+                        route_counts["bash_search_verbatim"] = (
+                            route_counts.get("bash_search_verbatim", 0) + 1
+                        )
                     continue
 
                 # Small shell results stay verbatim (#3590), same contract as
