@@ -309,7 +309,7 @@ def test_readyz_upstream_check_failure_returns_503(monkeypatch):
     data = response.json()
     assert data["ready"] is False
     assert data["checks"]["upstream"]["ready"] is False
-    assert "connection refused" in data["checks"]["upstream"]["error"]
+    assert data["checks"]["upstream"]["error"] == "ConnectError"
 
 
 @pytest.mark.parametrize(
@@ -345,6 +345,26 @@ def test_readyz_probes_the_configured_primary_upstream(
     assert response.status_code == 200
     assert response.json()["checks"]["upstream"]["url"] == expected_probe
     probe.assert_awaited_once_with(expected_probe, timeout=5.0)
+
+
+def test_readyz_does_not_expose_upstream_url_details(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    url = "https://test-user:test-password@llm.example/test-route?token=test-query"
+    config = ProxyConfig(openai_api_url=url, optimize=False)
+    with TestClient(create_app(config)) as client:
+        probe = AsyncMock(side_effect=httpx.ConnectError("Could not reach " + url))
+        monkeypatch.setattr(client.app.state.proxy.http_client, "head", probe)
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["upstream"]["url"] == "https://llm.example/<path>?<redacted>"
+    assert response.json()["checks"]["upstream"]["error"] == "ConnectError"
+    probe.assert_awaited_once_with(url, timeout=5.0)
 
 
 def test_health_includes_upstream_check_result(monkeypatch):

@@ -197,7 +197,7 @@ def _stem(path: str) -> str:
     return os.path.splitext(path.replace("\\", "/").rsplit("/", 1)[-1])[0]
 
 
-def redact_url(url: str) -> str:
+def redact_url(url: str, *, allow_content: bool = True) -> str:
     """Return ``url`` as scheme, host and port only, safe for any log line.
 
     Userinfo, query and fragment are always dropped, and so is the path, since
@@ -225,7 +225,7 @@ def redact_url(url: str) -> str:
     if ":" in host and host != "<host>":
         host = f"[{host}]"
     netloc = f"{host}:{port}" if port is not None else host
-    if content_logging_enabled():
+    if allow_content and content_logging_enabled():
         path = parts.path
     else:
         path = "/<path>" if parts.path not in ("", "/") else parts.path

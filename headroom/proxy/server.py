@@ -91,7 +91,7 @@ from headroom.config import (
 )
 from headroom.dashboard import get_dashboard_html
 from headroom.exceptions import ConfigurationError
-from headroom.log_safety import describe_exception, safe_id
+from headroom.log_safety import describe_exception, redact_url, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
     OTelMetricsConfig,
@@ -4355,7 +4355,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             if time.monotonic() < _upstream_check_cache["expires_at"]:
                 return
             url = _upstream_target_url()
-            _upstream_check_cache["url"] = url
+            _upstream_check_cache["url"] = redact_url(url, allow_content=False)
             client = proxy.http_client
             if client is None:
                 _upstream_check_cache["ok"] = False
@@ -4370,7 +4370,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _upstream_check_cache["error"] = None
             except Exception as exc:  # noqa: BLE001
                 _upstream_check_cache["ok"] = False
-                _upstream_check_cache["error"] = str(exc)
+                _upstream_check_cache["error"] = type(exc).__name__
             _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
 
     # CORS: scoped to localhost by default. The old wildcard origin combined
