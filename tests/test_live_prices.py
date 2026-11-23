@@ -148,6 +148,7 @@ def test_a_deepseek_alias_takes_headroom_off_peak_rate(monkeypatch, isolated_cat
 
 def test_cancelling_the_refresh_does_not_wait_for_a_stuck_download(monkeypatch):
     monkeypatch.setenv("HEADROOM_PRICE_REFRESH", "on")
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
     started, release = threading.Event(), threading.Event()
 
     def stuck_refresh():
