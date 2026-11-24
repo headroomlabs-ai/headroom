@@ -137,14 +137,21 @@ class AgyRegistrar(MCPRegistrar):
             raise _MalformedConfigError(f"{self._config_file} has invalid mcpServers")
         return bool(servers)
 
-    def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
+    def register_server(
+        self,
+        spec: ServerSpec,
+        *,
+        force: bool = False,
+        force_if: Callable[[ServerSpec], bool] | None = None,
+    ) -> RegisterResult:
         """Idempotently register an MCP server.
 
         Semantics mirror claude.py's file-path path:
 
         * Already present and matches → ALREADY.
         * Already present, different, no ``force`` → MISMATCH (no clobber).
-        * Already present, different, ``force=True`` → overwrite → REGISTERED.
+        * Already present, different, ``force=True`` (or ``force_if(owned)`` is
+          True under the config lock) → overwrite → REGISTERED.
         * Absent → write → REGISTERED.
 
         In all cases, only ``spec.name`` is touched; all other ``mcpServers``
@@ -176,21 +183,25 @@ class AgyRegistrar(MCPRegistrar):
                         if isinstance(raw_existing, dict)
                         else None
                     )
-                    if existing is None:
-                        if not force:
+                    if existing is not None and _specs_equivalent(existing, spec):
+                        return RegisterResult(
+                            RegisterStatus.ALREADY, "matches current configuration"
+                        )
+                    allow_overwrite = force
+                    if not allow_overwrite and force_if is not None:
+                        owned_existing = (
+                            _try_entry_to_spec(spec.name, raw_existing, allow_extra_keys=False)
+                            if isinstance(raw_existing, dict)
+                            else None
+                        )
+                        allow_overwrite = owned_existing is not None and force_if(owned_existing)
+                    if not allow_overwrite:
+                        if existing is None:
                             return RegisterResult(
                                 RegisterStatus.MISMATCH,
                                 "existing entry has non-string or malformed fields",
                             )
-                    else:
-                        if _specs_equivalent(existing, spec):
-                            return RegisterResult(
-                                RegisterStatus.ALREADY, "matches current configuration"
-                            )
-                        if not force:
-                            return RegisterResult(
-                                RegisterStatus.MISMATCH, _diff_specs(existing, spec)
-                            )
+                        return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
 
                 servers[spec.name] = _spec_to_entry(spec)
                 config["mcpServers"] = servers

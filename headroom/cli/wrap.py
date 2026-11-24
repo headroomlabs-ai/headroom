@@ -1597,16 +1597,31 @@ def _setup_headroom_retrieve_mcp_agy(registrar: Any, *, verbose: bool = False) -
         clear_install,
         headroom_installed_matching,
         record_install,
+        spec_fingerprint,
     )
 
     spec = build_headroom_spec()
-    owned_lookup = (
-        registrar.get_owned_server(spec.name)
-        if callable(getattr(type(registrar), "get_owned_server", None))
-        else registrar.get_server(spec.name)
-    )
-    owned = headroom_installed_matching(registrar.name, owned_lookup)
-    result = registrar.register_server(spec, force=owned)
+    supports_locked_ownership = callable(getattr(type(registrar), "get_owned_server", None))
+    clearable_fingerprints = {spec_fingerprint(spec)}
+    if supports_locked_ownership:
+
+        def _force_if_owned(current: Any) -> bool:
+            if headroom_installed_matching(registrar.name, current):
+                clearable_fingerprints.add(spec_fingerprint(current))
+                return True
+            return False
+
+        result = registrar.register_server(
+            spec,
+            force=False,
+            force_if=_force_if_owned,
+        )
+        owned = result.status == RegisterStatus.REGISTERED or headroom_installed_matching(
+            registrar.name, registrar.get_owned_server(spec.name)
+        )
+    else:
+        owned = headroom_installed_matching(registrar.name, registrar.get_server(spec.name))
+        result = registrar.register_server(spec, force=owned)
     if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
         click.echo(
             f"  MCP retrieve tool: could not register headroom MCP — skipping ({result.detail})."
@@ -1616,7 +1631,13 @@ def _setup_headroom_retrieve_mcp_agy(registrar: Any, *, verbose: bool = False) -
     if _smoke_verify_mcp_handshake(spec.command, list(spec.args), dict(spec.env)):
         # An identical user-installed spec can be used without claiming ownership.
         if result.status == RegisterStatus.REGISTERED or owned:
-            record_install(registrar.name, spec)
+            # Avoid overwriting a replacement entry's ledger record if another
+            # registrar replaced the config entry while the handshake ran.
+            still_ours = (
+                registrar.get_owned_server(spec.name) == spec if supports_locked_ownership else True
+            )
+            if still_ours:
+                record_install(registrar.name, spec)
         _prime_agy_retrieve_tool_cache(registrar)
         if verbose:
             click.echo(
@@ -1627,14 +1648,34 @@ def _setup_headroom_retrieve_mcp_agy(registrar: Any, *, verbose: bool = False) -
             click.echo("  MCP retrieve tool: headroom MCP wired (persistent, handshake verified).")
         return True
 
-    # A failed handshake never grants permission to remove user configuration.
+    # A failed handshake never grants permission to remove user configuration
+    # or a replacement installed while the handshake was running.
     removable = result.status == RegisterStatus.REGISTERED or owned
+    removed = False
     if removable:
-        registrar.unregister_server("headroom")
-        clear_install(registrar.name, "headroom")
+        if callable(getattr(type(registrar), "unregister_server_if", None)):
+
+            def _clear_owned_fingerprints(_removed_spec: Any) -> None:
+                for fp in clearable_fingerprints:
+                    clear_install(registrar.name, spec.name, expected_fingerprint=fp)
+
+            outcome = registrar.unregister_server_if(
+                spec.name,
+                lambda current: current == spec,
+                on_removed=_clear_owned_fingerprints,
+            )
+            removed = outcome == "removed"
+        else:
+            if registrar.unregister_server(spec.name):
+                clear_install(
+                    registrar.name,
+                    spec.name,
+                    expected_fingerprint=spec_fingerprint(spec),
+                )
+                removed = True
     click.echo(
         "  MCP retrieve tool: headroom MCP failed handshake — "
-        + ("entry removed" if removable else "user entry preserved")
+        + ("entry removed" if removed else "user entry preserved")
         + " (agy left transport-only)."
     )
     return False
@@ -3332,19 +3373,24 @@ def _setup_serena_mcp(
     _ensure_serena_dashboard_disabled(verbose=verbose)
 
     spec = build_serena_spec(context)
-    result = registrar.register_server(spec, force=force)
-    serena_owned_lookup = (
-        registrar.get_owned_server("serena")
-        if callable(getattr(type(registrar), "get_owned_server", None))
-        else registrar.get_server("serena")
-    )
-    owned_drift = (
-        result.status == RegisterStatus.MISMATCH
-        and not force
-        and headroom_installed_matching(
-            registrar.name, serena_owned_lookup, ownership_key=ownership_key
+    if not force and callable(getattr(type(registrar), "get_owned_server", None)):
+        result = registrar.register_server(
+            spec,
+            force=False,
+            force_if=lambda current: headroom_installed_matching(
+                registrar.name, current, ownership_key=ownership_key
+            ),
         )
-    )
+        owned_drift = False
+    else:
+        result = registrar.register_server(spec, force=force)
+        owned_drift = (
+            result.status == RegisterStatus.MISMATCH
+            and not force
+            and headroom_installed_matching(
+                registrar.name, registrar.get_server("serena"), ownership_key=ownership_key
+            )
+        )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
     # a differing spec without force, so an older Headroom Serena entry would

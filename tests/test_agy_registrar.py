@@ -926,3 +926,77 @@ class TestRegistrarSafety:
         after = _read_config(tmp_path)
         assert "headroom" in after["mcpServers"]
         assert after["mcpServers"]["headroom"]["cwd"] == "/tmp/my-project"
+
+    def test_retrieve_setup_rechecks_ownership_under_lock_before_overwriting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Edits made after initial ownership read must not be overwritten by retrieve setup."""
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.agy as agy_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg = _make_reg(tmp_path)
+        old_spec = ServerSpec(name="headroom", command="/old/headroom", args=("mcp", "serve"))
+        new_spec = ServerSpec(name="headroom", command="/new/headroom", args=("mcp", "serve"))
+        assert reg.register_server(old_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", old_spec)
+
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: new_spec)
+        monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **k: True)
+
+        orig_register = agy_mod.AgyRegistrar.register_server
+
+        def _edit_before_register(self, spec, **kwargs):
+            # Simulate a concurrent user edit (changed command + added cwd)
+            # landing right before register_server acquires the config lock.
+            data = _read_config(tmp_path)
+            data["mcpServers"]["headroom"]["command"] = "/custom/headroom"
+            data["mcpServers"]["headroom"]["cwd"] = "/tmp/user-proj"
+            _write_config(tmp_path, data)
+            return orig_register(self, spec, **kwargs)
+
+        monkeypatch.setattr(agy_mod.AgyRegistrar, "register_server", _edit_before_register)
+
+        assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg) is False
+        after = _read_config(tmp_path)["mcpServers"]["headroom"]
+        assert after["command"] == "/custom/headroom"
+        assert after["cwd"] == "/tmp/user-proj"
+
+    def test_retrieve_setup_failed_handshake_rollback_preserves_replacement_and_ledger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failed handshake rollback must not delete a replacement or clear its ledger record."""
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        setup_spec = ServerSpec(name="headroom", command="/setup/headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/replacement/headroom",
+            args=("mcp", "serve", "--custom"),
+        )
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: setup_spec)
+
+        def _replace_during_failed_handshake(*_args, **_kwargs) -> bool:
+            assert (
+                reg2.register_server(replacement_spec, force=True).status
+                == RegisterStatus.REGISTERED
+            )
+            ledger_mod.record_install("agy", replacement_spec)
+            return False
+
+        monkeypatch.setattr(
+            wrap_mod, "_smoke_verify_mcp_handshake", _replace_during_failed_handshake
+        )
+
+        assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg1) is False
+        assert reg1.get_server("headroom") == replacement_spec
+        assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True
