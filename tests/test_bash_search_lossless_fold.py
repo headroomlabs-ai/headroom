@@ -244,10 +244,17 @@ def test_timestamped_search_stays_whole_without_ccr(send, command, output, confi
 
 
 @pytest.mark.parametrize("ccr_enabled", [True, False], ids=["no-ccr", "ccr-disabled"])
-def test_text_blocks_with_stack_frame_stay_whole_without_ccr(ccr_enabled, tokenizer):
+@pytest.mark.parametrize(
+    "tail",
+    # An unindented throwable header fails the whole-result check, so the
+    # second block must still qualify on its own.
+    [JAVA_FRAME, "java.lang.IllegalStateException: unexpected state"],
+    ids=["stack-frame", "throwable-header"],
+)
+def test_text_blocks_with_stack_frame_stay_whole_without_ccr(tail, ccr_enabled, tokenizer):
     # First block: one log row and its stack frame. Second block: the other
     # 240 matches. Neither block may be shrunk on its own.
-    first = TOMCAT_LOG.split("\n")[0] + "\n" + JAVA_FRAME + "\n"
+    first = TOMCAT_LOG.split("\n")[0] + "\n" + tail + "\n"
     blocks = [{"type": "text", "text": first}, {"type": "text", "text": TOMCAT_LOG}]
     config = ContentRouterConfig(ccr_enabled=ccr_enabled, ccr_inject_marker=False)
     out, transforms = _openai("grep INFO logs/catalina.out", blocks, tokenizer, config)

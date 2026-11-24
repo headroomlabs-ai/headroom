@@ -7819,14 +7819,23 @@ class ContentRouter(Transform):
         Lossless mode never reaches lossy compression, so its own reversible
         folds still run.
         """
+        return self._bash_search_guard_applies(
+            tool_name, tool_id
+        ) and self._bash_search_rows_verbatim(content)
+
+    def _bash_search_guard_applies(self, tool_name: str, tool_id: str) -> bool:
+        """True when a marker-free Bash search result needs the verbatim check."""
         if self.config.lossless or (self.config.ccr_enabled and self.config.ccr_inject_marker):
-            return False
-        if not isinstance(content, str) or len(content) < 200:
             return False
         if tool_name.lower() not in self.config.bash_tool_names:
             return False
         command = self._tool_call_commands.get(tool_id, "")
-        if not command or not _bash_command_is_search(command, self.config.bash_search_commands):
+        return bool(command) and _bash_command_is_search(command, self.config.bash_search_commands)
+
+    @staticmethod
+    def _bash_search_rows_verbatim(content: Any) -> bool:
+        """True when ``content`` is timestamped log rows, see ``_bash_search_keep_verbatim``."""
+        if not isinstance(content, str) or len(content) < 200:
             return False
         from .lossless_compaction import _TIMESTAMP_ROW_RE
 
@@ -8179,7 +8188,8 @@ class ContentRouter(Transform):
         any_compressed = False
         role = message.get("role", "")
         # Set on the first tool text block from the whole result.
-        search_verbatim: bool | None = None
+        search_guard: bool | None = None
+        search_verbatim = False
 
         # Top-level text blocks are fragments of one tool result. Measure the
         # whole result so splitting a large log cannot activate the small-result
@@ -8537,20 +8547,23 @@ class ContentRouter(Transform):
                                 route_counts.get("shell_small_result", 0) + 1
                             )
                         continue
-                    if search_verbatim is None:
-                        # Judge the whole result: a fragment may start mid-row.
-                        search_verbatim = self._bash_search_keep_verbatim(
-                            _shell_name,
-                            _msg_tool_id,
+                    if search_guard is None:
+                        search_guard = self._bash_search_guard_applies(_shell_name, _msg_tool_id)
+                        # Judge the whole result first: a fragment may start mid-row.
+                        search_verbatim = search_guard and self._bash_search_rows_verbatim(
                             "".join(
                                 b["text"]
                                 for b in content_blocks
                                 if isinstance(b, dict)
                                 and b.get("type") == "text"
                                 and isinstance(b.get("text"), str)
-                            ),
+                            )
                         )
-                    if search_verbatim:
+                    # Other blocks may break the whole-result check, so a block
+                    # of timestamped rows still qualifies on its own.
+                    if search_verbatim or (
+                        search_guard and self._bash_search_rows_verbatim(block.get("text"))
+                    ):
                         new_blocks.append(block)
                         transforms_applied.append("router:bash:search_verbatim")
                         if route_counts is not None:
