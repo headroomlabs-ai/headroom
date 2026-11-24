@@ -115,23 +115,24 @@ def _tiktoken_cache_dir() -> str:
     return os.path.join(tempfile.gettempdir(), "data-gym-cache")
 
 
-def _encoding_cached_locally(encoding_name: str) -> bool:
+def _encoding_cached_locally(encoding_name: str) -> tuple[bool, bool]:
     """Check if a tiktoken encoding is available in local cache (memory or disk).
 
-    Returns True if the encoding can be loaded without network access.
+    Returns (is_cached, has_invalid_cache_entry).
+    - is_cached: True if the encoding can be loaded without network access.
+    - has_invalid_cache_entry: True if a cache file exists but is invalid (hash mismatch).
     """
     # Check in-memory cache first
     try:
         import tiktoken
         if encoding_name in tiktoken.registry.ENCODINGS:
-            return True
+            return True, False
     except Exception:
         pass
 
-    # Check on-disk cache by actually trying to load it
+    # Check on-disk cache
     # The encoding constructors use specific URLs; we need to check if the
     # cached file exists for the expected URL and is valid.
-    # For o200k_base, cl100k_base, p50k_base, r50k_base, gpt2, o200k_harmony
     url_map = {
         "o200k_base": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
         "o200k_harmony": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
@@ -151,19 +152,19 @@ def _encoding_cached_locally(encoding_name: str) -> bool:
     }
     url = url_map.get(encoding_name)
     if not url:
-        return False
+        return False, False
 
     cache_dir = _tiktoken_cache_dir()
     if cache_dir == "":
-        return False
+        return False, False
 
     cache_key = hashlib.sha1(url.encode()).hexdigest()
     cache_path = os.path.join(cache_dir, cache_key)
-    
+
     # File must exist AND be valid (not a hash mismatch)
     if not os.path.exists(cache_path):
-        return False
-    
+        return False, False
+
     # Validate the cache file hash without triggering a download
     # read_file_cached triggers a download on hash mismatch, so we check manually
     expected_hash = hash_map.get(encoding_name)
@@ -173,11 +174,11 @@ def _encoding_cached_locally(encoding_name: str) -> bool:
                 data = f.read()
             actual_hash = hashlib.sha256(data).hexdigest()
             if actual_hash != expected_hash:
-                return False
+                return False, True  # Cache exists but invalid
         except Exception:
-            return False
-    
-    return True
+            return False, True  # Cache exists but invalid (corrupted)
+
+    return True, False
 
 
 @lru_cache(maxsize=8)
@@ -191,9 +192,10 @@ def _get_encoding(encoding_name: str):
     first timed-out encoding is remembered so later calls fail fast instead of
     re-blocking on every request.
 
-    If the encoding is already cached locally (in memory or on disk), it is loaded
-    without calling ``guard_egress``, allowing offline operation with pre-populated
-    vocabularies.
+    If the encoding is already cached in memory, it is loaded
+    without calling ``guard_egress``, allowing fast offline operation with pre-populated
+    vocabularies. If only a disk cache entry exists, the load is still bounded by the
+    configured timeout to prevent a stalled constructor from blocking indefinitely.
     """
     import tiktoken
     from headroom.offline import is_offline
@@ -201,14 +203,49 @@ def _get_encoding(encoding_name: str):
     if encoding_name in _load_failed:
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
 
-    # If the encoding is already cached locally (in memory or on disk),
-    # load it without network access.
-    if _encoding_cached_locally(encoding_name):
-        try:
+    # Fast path: encoding already in memory cache
+    try:
+        if encoding_name in tiktoken.registry.ENCODINGS:
             return tiktoken.get_encoding(encoding_name)
-        except BaseException as exc:  # noqa: BLE001
+    except Exception:
+        pass
+
+    # Check disk cache (may be slow if constructor stalls) - use bounded load
+    is_cached, has_invalid_cache = _encoding_cached_locally(encoding_name)
+    if is_cached:
+        # Load from disk cache with timeout to prevent stall
+        box: dict[str, Any] = {}
+
+        def _load_from_disk() -> None:
+            try:
+                box["enc"] = tiktoken.get_encoding(encoding_name)
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
+                box["err"] = exc
+
+        worker = threading.Thread(target=_load_from_disk, name=f"tiktoken-disk-load-{encoding_name}", daemon=True)
+        worker.start()
+        worker.join(_load_timeout_seconds())
+
+        if worker.is_alive():
             _load_failed.add(encoding_name)
-            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to load from local cache") from exc
+            logger.warning(
+                "tiktoken encoding %r did not load from disk cache within %.1fs (stalled constructor); "
+                "falling back to token estimation. Pre-populate TIKTOKEN_CACHE_DIR "
+                "or tune HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS.",
+                encoding_name,
+                _load_timeout_seconds(),
+            )
+            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load timed out")
+        if "err" in box:
+            _load_failed.add(encoding_name)
+            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to load from local cache") from box["err"]
+        return box["enc"]
+
+    # If there's an invalid cache entry on disk, fail fast without attempting
+    # a network request. This keeps disk loading cache-only and bounded.
+    if has_invalid_cache:
+        _load_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} has invalid cache entry; not attempting download")
 
     # If offline mode is enabled and the encoding is not cached locally,
     # fail fast without attempting a network request.
