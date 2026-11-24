@@ -101,7 +101,10 @@ class AgyRegistrar(MCPRegistrar):
 
     def get_server(self, server_name: str) -> ServerSpec | None:
         """Return the registered ServerSpec for ``server_name``, or ``None``."""
-        entry = _read_json(self._config_file).get("mcpServers", {}).get(server_name)
+        servers = _read_json(self._config_file).get("mcpServers")
+        if not isinstance(servers, dict):
+            return None
+        entry = servers.get(server_name)
         if not isinstance(entry, dict):
             return None
         return _entry_to_spec(server_name, entry)
@@ -303,11 +306,15 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
 
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
+    raw_args = entry.get("args", ())
+    args = tuple(str(x) for x in raw_args) if isinstance(raw_args, (list, tuple)) else ()
+    raw_env = entry.get("env", {})
+    env = {str(k): str(v) for k, v in raw_env.items()} if isinstance(raw_env, dict) else {}
     return ServerSpec(
         name=name,
         command=str(entry.get("command", "")),
-        args=tuple(entry.get("args", ())),
-        env=dict(entry.get("env", {})),
+        args=args,
+        env=env,
     )
 
 

@@ -678,3 +678,26 @@ class TestRegistrarSafety:
         assert config_link.resolve() == target.resolve()
         target_data = json.loads(target.read_text(encoding="utf-8"))
         assert set(target_data["mcpServers"].keys()) == {"existing"}
+
+    def test_mcp_status_with_null_mcp_servers_reports_unconfigured_and_preserves_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """{"mcpServers": null} must report AGY unconfigured without raising or editing the file."""
+        from click.testing import CliRunner
+
+        from headroom.cli.mcp import mcp_status
+
+        cfg = _config_path(tmp_path)
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        original_content = '{"mcpServers": null}\n'
+        cfg.write_text(original_content, encoding="utf-8", newline="\n")
+
+        reg = _make_reg(tmp_path)
+        assert reg.get_server("headroom") is None
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        result = CliRunner().invoke(mcp_status, [])
+        assert result.exit_code == 0, result.output
+        assert "AttributeError" not in result.output
+        assert cfg.read_text(encoding="utf-8") == original_content
