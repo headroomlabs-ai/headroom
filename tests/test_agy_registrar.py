@@ -372,3 +372,113 @@ class TestRegistrarSafety:
         raw = (tmp_path / ".gemini" / "config" / "mcp_config.json").read_bytes()
         assert b"\n" in raw
         assert b"\r\n" not in raw
+
+    def test_concurrent_registrations_preserve_both_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two concurrent registrations for different servers must both survive."""
+        import threading
+
+        import headroom.mcp_registry.agy as agy_mod
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"existing": {"command": "/bin/existing"}}},
+        )
+        reg = _make_reg(tmp_path)
+        spec_a = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        spec_b = ServerSpec(name="serena", command="uvx", args=("serena", "start-mcp-server"))
+
+        entered = threading.Event()
+        release = threading.Event()
+        orig_write_json = agy_mod._write_json
+        call_count = 0
+        count_lock = threading.Lock()
+
+        def _coordinated_write(path: Path, data: dict) -> None:
+            nonlocal call_count
+            with count_lock:
+                call_count += 1
+                is_first = call_count == 1
+            if is_first:
+                entered.set()
+                # Hold the first writer briefly so an unlocked second caller
+                # would read the stale pre-write config and clobber this write.
+                release.wait(timeout=0.3)
+            orig_write_json(path, data)
+
+        monkeypatch.setattr(agy_mod, "_write_json", _coordinated_write)
+
+        results: dict[str, object] = {}
+
+        def _worker(label: str, spec: ServerSpec) -> None:
+            results[label] = reg.register_server(spec)
+
+        t1 = threading.Thread(target=_worker, args=("a", spec_a))
+        t2 = threading.Thread(target=_worker, args=("b", spec_b))
+        t1.start()
+        assert entered.wait(timeout=5.0)
+        t2.start()
+        # Give t2 a moment to contend on the lock (or race past read if unlocked).
+        t2.join(timeout=0.1)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert results["a"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        assert results["b"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        config = _read_config(tmp_path)
+        assert set(config["mcpServers"].keys()) == {"existing", "headroom", "serena"}
+
+    def test_cross_process_concurrent_registrations_preserve_both_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """Two separate Headroom processes registering different servers must both survive."""
+        import subprocess
+        import sys
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"existing": {"command": "/bin/existing"}}},
+        )
+        worker_script = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "import headroom.mcp_registry.agy as agy_mod\n"
+            "from headroom.mcp_registry.base import ServerSpec\n"
+            "home = Path(sys.argv[1])\n"
+            "name = sys.argv[2]\n"
+            "delay = float(sys.argv[3])\n"
+            "orig_write = agy_mod._write_json\n"
+            "def slow_write(path, data):\n"
+            "    if delay:\n"
+            "        time.sleep(delay)\n"
+            "    orig_write(path, data)\n"
+            "agy_mod._write_json = slow_write\n"
+            "reg = agy_mod.AgyRegistrar(home_dir=home)\n"
+            "res = reg.register_server(ServerSpec(name=name, command='cmd-' + name, args=()))\n"
+            "print(res.status.value)\n"
+        )
+
+        p1 = subprocess.Popen(
+            [sys.executable, "-c", worker_script, str(tmp_path), "headroom", "0.25"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        p2 = subprocess.Popen(
+            [sys.executable, "-c", worker_script, str(tmp_path), "serena", "0.0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out1, err1 = p1.communicate(timeout=15)
+        out2, err2 = p2.communicate(timeout=15)
+        assert p1.returncode == 0, err1
+        assert p2.returncode == 0, err2
+        assert out1.strip() == RegisterStatus.REGISTERED.value
+        assert out2.strip() == RegisterStatus.REGISTERED.value
+
+        config = _read_config(tmp_path)
+        assert set(config["mcpServers"].keys()) == {"existing", "headroom", "serena"}

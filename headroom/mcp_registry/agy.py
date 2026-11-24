@@ -22,7 +22,12 @@ import json
 import logging
 import os
 import stat
+import sys
 import tempfile
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -121,18 +126,50 @@ class AgyRegistrar(MCPRegistrar):
         * Absent → write → REGISTERED.
 
         In all cases, only ``spec.name`` is touched; all other ``mcpServers``
-        entries are preserved (merge-not-clobber).
+        entries are preserved (merge-not-clobber). The read-modify-replace
+        transaction is serialized across threads and Headroom processes.
         """
-        existing = self.get_server(spec.name)
+        try:
+            with _config_file_lock(self._config_file):
+                try:
+                    config = _read_json_for_write(self._config_file)
+                except (_MalformedConfigError, OSError) as exc:
+                    return RegisterResult(
+                        RegisterStatus.FAILED,
+                        f"refusing to overwrite {self._config_file}: {exc}",
+                    )
+                servers = config.get("mcpServers")
+                if servers is None:
+                    servers = {}
+                elif not isinstance(servers, dict):
+                    return RegisterResult(
+                        RegisterStatus.FAILED,
+                        f"refusing to overwrite {self._config_file}: mcpServers must be an object",
+                    )
 
-        if existing is not None:
-            if _specs_equivalent(existing, spec):
-                return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
-            if not force:
-                return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
-            # force=True: fall through and overwrite below.
+                raw_existing = servers.get(spec.name)
+                if isinstance(raw_existing, dict):
+                    existing = _entry_to_spec(spec.name, raw_existing)
+                    if _specs_equivalent(existing, spec):
+                        return RegisterResult(
+                            RegisterStatus.ALREADY, "matches current configuration"
+                        )
+                    if not force:
+                        return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
 
-        return self._write_entry(spec)
+                servers[spec.name] = _spec_to_entry(spec)
+                config["mcpServers"] = servers
+                try:
+                    _write_json(self._config_file, config)
+                except OSError as exc:
+                    return RegisterResult(
+                        RegisterStatus.FAILED, f"could not write {self._config_file}: {exc}"
+                    )
+                return RegisterResult(RegisterStatus.REGISTERED, f"wrote {self._config_file}")
+        except OSError as exc:
+            return RegisterResult(
+                RegisterStatus.FAILED, f"could not lock {self._config_file}: {exc}"
+            )
 
     def unregister_server(self, server_name: str) -> bool:
         """Remove ``server_name`` from the config; preserves all other entries.
@@ -143,43 +180,83 @@ class AgyRegistrar(MCPRegistrar):
         if not self._config_file.exists():
             return False
         try:
-            config = _read_json_for_write(self._config_file)
-        except (_MalformedConfigError, OSError) as exc:
-            logger.debug("agy: refusing to rewrite %s: %s", self._config_file, exc)
-            return False
-        servers: dict[str, Any] = config.get("mcpServers", {})
-        if server_name not in servers:
-            return False
-        del servers[server_name]
-        config["mcpServers"] = servers
-        try:
-            _write_json(self._config_file, config)
+            with _config_file_lock(self._config_file):
+                if not self._config_file.exists():
+                    return False
+                try:
+                    config = _read_json_for_write(self._config_file)
+                except (_MalformedConfigError, OSError) as exc:
+                    logger.debug("agy: refusing to rewrite %s: %s", self._config_file, exc)
+                    return False
+                servers = config.get("mcpServers", {})
+                if not isinstance(servers, dict) or server_name not in servers:
+                    return False
+                del servers[server_name]
+                config["mcpServers"] = servers
+                try:
+                    _write_json(self._config_file, config)
+                except OSError as exc:
+                    logger.debug("agy: could not write %s: %s", self._config_file, exc)
+                    return False
+                return True
         except OSError as exc:
-            logger.debug("agy: could not write %s: %s", self._config_file, exc)
+            logger.debug("agy: could not lock %s: %s", self._config_file, exc)
             return False
-        return True
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
 
-    def _write_entry(self, spec: ServerSpec) -> RegisterResult:
+_THREAD_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[Path, threading.Lock] = {}
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    key = path.resolve()
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _THREAD_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _config_file_lock(path: Path) -> Iterator[None]:
+    """Serialize read-modify-replace transactions across threads and Headroom processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _thread_lock_for(lock_path):
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            config = _read_json_for_write(self._config_file)
-        except (_MalformedConfigError, OSError) as exc:
-            return RegisterResult(
-                RegisterStatus.FAILED,
-                f"refusing to overwrite {self._config_file}: {exc}",
-            )
-        servers: dict[str, Any] = config.setdefault("mcpServers", {})
-        servers[spec.name] = _spec_to_entry(spec)
-        try:
-            _write_json(self._config_file, config)
-        except OSError as exc:
-            return RegisterResult(
-                RegisterStatus.FAILED, f"could not write {self._config_file}: {exc}"
-            )
-        return RegisterResult(RegisterStatus.REGISTERED, f"wrote {self._config_file}")
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            if sys.platform == "win32":
+                import msvcrt
+
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                while True:
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                try:
+                    yield
+                finally:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 # ----------------------------------------------------------------------
