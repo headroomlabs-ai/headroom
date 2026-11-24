@@ -176,8 +176,8 @@ def test_auto_dispatch_spends_one_budget_not_two(monkeypatch, caplog):
     """
     monkeypatch.setenv(ENV, "0.25")
     monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
-    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
-    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda deadline=None: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda deadline=None: True)
     # The import is not what this test is about, and no backend may do real work.
     monkeypatch.setattr(kc, "_import_auto_tokenizer", lambda model_id, deadline: object())
     monkeypatch.setattr(kc, "_import_ml_stack", lambda model_id, deadline: (object(), object()))
@@ -270,8 +270,8 @@ def test_zero_budget_caller_does_not_wait_for_a_cold_transformers_import(monkeyp
     """A busy caller must reach its timeout *before* the import, not after it."""
     monkeypatch.setenv(ENV, "0")
     monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
-    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
-    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda deadline=None: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda deadline=None: True)
     monkeypatch.setattr(
         kc, "_load_kompress_pytorch", lambda *a, **k: pytest.fail("reached a second backend")
     )
@@ -326,8 +326,8 @@ def test_paused_import_restores_a_primed_sys_modules_entry(monkeypatch):
     original.AutoTokenizer = object  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "transformers", original)
     monkeypatch.setattr(kc, "_selected_backend", lambda: "onnx")
-    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
-    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda deadline=None: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda deadline=None: True)
     monkeypatch.setenv(ENV, "0")
     thread = _hold_lock_for(3.0)
 
@@ -361,3 +361,26 @@ def caplog_v2():
     finally:
         logger.setLevel(old_level)
         logger.removeHandler(handler)
+
+
+def test_auto_loader_deadline_covers_unmocked_availability_probes(monkeypatch):
+    """The probes sit inside the same budget as everything else.
+
+    ``_is_onnx_available``/``_is_pytorch_available`` are cached and do a plain
+    inline ``import transformers``; on a cold process with the module paused in
+    ``exec_module`` that inline import waits out the pause before the loader
+    ever sees the budget. The dispatcher bounds the probes first, so a 20 ms
+    budget returns busy while initialisation is still paused.
+    """
+    monkeypatch.setenv(ENV, "0.02")
+    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
+    # Deliberately NOT mocking the availability probes: they are the finding.
+    monkeypatch.delenv("HEADROOM_KOMPRESS_BACKEND", raising=False)
+
+    with _PausedTransformersImport():
+        started = time.monotonic()
+        with pytest.raises(kc.KompressModelBusy):
+            kc._load_kompress("kompress-probe-budget")
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.15, f"waited {elapsed:.3f}s past a 0.02s budget"

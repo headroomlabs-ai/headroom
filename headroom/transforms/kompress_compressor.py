@@ -465,6 +465,22 @@ def _import_bounded(model_id: str, deadline: float, key: str, loader: Callable[[
     return box["value"]
 
 
+def wait_for_inflight_imports(timeout: float | None = None) -> bool:
+    """Block until background import workers finish; ``True`` when none remain.
+
+    For callers that must not give up when the budget expires -- the startup
+    warm-up, which otherwise records ``not_cached`` and leaves the model
+    unloaded until a request pays for the load.
+    """
+    with _inflight_imports_guard:
+        workers = [entry[0] for entry in _inflight_imports.values() if entry[0].is_alive()]
+    for worker in workers:
+        worker.join(timeout)
+        if worker.is_alive():
+            return False
+    return True
+
+
 def _load_ml_stack() -> tuple[Any, Any]:
     """``(torch, transformers.AutoTokenizer)`` for a first-touch load."""
     import torch
@@ -841,6 +857,32 @@ def _is_pytorch_available() -> bool:
         # bool, and callers guard the call with `except ImportError` too, so it
         # propagated into the request path instead of degrading to "no
         # kompress".
+        return False
+
+
+def _load_probe_transformers() -> Any:
+    import transformers  # noqa: F401
+
+    return transformers
+
+
+def _transformers_importable_within(deadline: float) -> bool:
+    """Bounded first import for the availability probes.
+
+    ``_is_onnx_available``/``_is_pytorch_available`` are ``lru_cache``d and do a
+    plain inline ``import transformers`` -- correct once warm, but on a cold
+    process the probe itself waits out the module import (importlib serialises a
+    first import behind a per-module lock), so an unmocked probe can block past
+    the caller's whole budget before the loader even runs. Bounding it here keeps
+    the cached probes untouched: a budget-starved probe reports "not loadable
+    within budget" without poisoning the process-wide availability answer.
+    """
+    try:
+        _import_bounded(
+            "probe-transformers", deadline, "probe-transformers", _load_probe_transformers
+        )
+        return True
+    except KompressModelBusy:
         return False
 
 
@@ -1490,7 +1532,8 @@ def _load_kompress(
     # compression quality/perf characteristics for existing installs while
     # allowing opt-in MPS/CoreML experiments via HEADROOM_KOMPRESS_BACKEND.
     onnx_error: Exception | None = None
-    if _is_onnx_available():
+    probes_starved = not _transformers_importable_within(deadline)
+    if not probes_starved and _is_onnx_available():
         try:
             return _load_kompress_onnx(
                 model_id, use_coreml=False, allow_download=allow_download, deadline=deadline
@@ -1509,10 +1552,16 @@ def _load_kompress(
             onnx_error = e
             logger.warning("ONNX load failed for %s, trying PyTorch: %s", model_id, e)
 
-    if _is_pytorch_available():
+    if not probes_starved and _is_pytorch_available():
         return _load_kompress_pytorch(
             model_id, device, allow_download=allow_download, deadline=deadline
         )
+
+    if probes_starved:
+        # Both probes answer "is the ML stack even importable here"; the budget
+        # ran out before either could tell. That is contention, not absence --
+        # report busy rather than "requires onnxruntime or torch".
+        raise KompressModelBusy(model_id)
 
     if onnx_error is not None:
         # onnxruntime IS installed and was tried, but loading failed. The

@@ -516,6 +516,10 @@ logger = logging.getLogger("headroom.proxy")
 # Liveness/readiness probe routes: auth-exempt, and logged at DEBUG.
 _HEALTH_PROBE_PATHS = frozenset({"/health", "/livez", "/readyz"})
 
+# How long the background warm-up waits out an in-flight first-touch import
+# before giving up on its one retry (see _warm).
+_WARM_BUSY_WAIT_SECONDS = 300.0
+
 
 def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
     """/stats payload for the output-shaping layer.
@@ -2238,27 +2242,40 @@ class HeadroomProxy(
             time.sleep(max(0.0, delay))
             started = time.monotonic()
             try:
-                from headroom.transforms.kompress_compressor import KompressModelNotCached
+                from headroom.transforms.kompress_compressor import (
+                    KompressModelBusy,
+                    KompressModelNotCached,
+                    wait_for_inflight_imports,
+                )
 
                 not_cached: tuple[type[BaseException], ...] = (KompressModelNotCached,)
             except Exception:  # ML extras absent; every failure is just "failed"
                 not_cached = ()
-            try:
-                backend = compressor.preload(allow_download=True)
-            except not_cached:
-                # The local loader only raises this when downloads are off, so
-                # with allow_download=True a cold cache downloads instead. This
-                # covers compressors that report a cache miss on their own.
-                slot.info["detail"] = KOMPRESS_DETAIL_NOT_CACHED
-                logger.debug("Kompress background warm-up: model not cached")
-                return
-            except Exception:
-                # The detail lands on the auth-exempt /health payload, so it
-                # stays a bounded token; loader failures embed paths, model
-                # ids and URLs. The real cause goes to the log only.
-                slot.info["detail"] = KOMPRESS_DETAIL_WARM_FAILED
-                logger.warning("Kompress background warm-up failed", exc_info=True)
-                return
+            backend: str | None = None
+            for attempt in range(2):
+                try:
+                    backend = compressor.preload(allow_download=True)
+                    break
+                except not_cached as exc:
+                    # KompressModelBusy subclasses NotCached, but for the warm-up
+                    # it means "someone is mid-load" -- usually the first-touch
+                    # transformers import, which the loader's budget cut short.
+                    # Giving up here would leave the model unloaded until a
+                    # request pays for the load; wait the import out and retry
+                    # once, so an idle proxy still ends up ready.
+                    if attempt == 0 and not_cached and isinstance(exc, KompressModelBusy):
+                        wait_for_inflight_imports(timeout=_WARM_BUSY_WAIT_SECONDS)
+                        continue
+                    slot.info["detail"] = KOMPRESS_DETAIL_NOT_CACHED
+                    logger.debug("Kompress background warm-up: model not cached")
+                    return
+                except Exception:
+                    # The detail lands on the auth-exempt /health payload, so it
+                    # stays a bounded token; loader failures embed paths, model
+                    # ids and URLs. The real cause goes to the log only.
+                    slot.info["detail"] = KOMPRESS_DETAIL_WARM_FAILED
+                    logger.warning("Kompress background warm-up failed", exc_info=True)
+                    return
             if not backend:
                 return
             slot.info.pop("detail", None)
