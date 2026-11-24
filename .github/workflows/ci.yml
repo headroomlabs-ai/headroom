@@ -781,6 +781,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ". -> target"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Run agy suite on Windows
         shell: bash
@@ -791,15 +794,17 @@ jobs:
         # `huggingface_hub/file_download.py ... xet_get(` attributed to
         # test_dispatch_server_tls_and_route, whose 10s guard then tripped
         # while the same test passed on Linux. None of the agy tests need the
-        # model — verified with a cold HF_HOME plus these flags, 38 passed.
+        # model - verified with a cold HF_HOME plus these flags, 38 passed.
         env:
+          HEADROOM_OFFLINE: "1"
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
         run: |
-          uv run --extra proxy --with pytest --with pytest-asyncio python -m pytest \
+          uv run --locked --extra proxy --extra dev python -m pytest \
             tests/test_agy_ca.py tests/test_agy_ca_concurrency.py \
             tests/test_agy_dispatch.py tests/test_agy_terminator.py tests/test_agy_routing_boundary.py \
             tests/test_agy_retrieve.py tests/test_agy_stats.py tests/test_agy_registrar.py \
+            tests/test_mcp_registry/test_antigravity_registrar.py \
             tests/test_proxy_google_cloudcode_route_aliases.py tests/test_wrap_agy.py -q
 
   # Runtime coverage for pure-Python proxy logic on Windows, kept separate
