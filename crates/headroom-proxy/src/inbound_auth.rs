@@ -194,8 +194,10 @@ pub(crate) fn upstream_takes_relay_proof(upstream: &url::Url) -> bool {
     }
 }
 
-/// For a [`NonLocalCaller`]: [`NON_LOCAL_HOST`] when the `Host` that would
-/// be sent may name loopback, else `None` (keep it). That `Host` is the
+/// For a [`NonLocalCaller`]: [`NON_LOCAL_HOST`] when the upstream is the
+/// Python proxy (`--python-upstream`), which tells relayed callers apart by
+/// that name, or when the `Host` that would be sent may name loopback; else
+/// `None` (keep it, so a generic backend can route on the caller's `Host`). That `Host` is the
 /// explicit outgoing one (`--no-rewrite-host`), else the upstream URL's
 /// authority. Judged on the value, not on the upstream address, so an
 /// upstream name that resolves to loopback cannot be paired with a
@@ -203,11 +205,9 @@ pub(crate) fn upstream_takes_relay_proof(upstream: &url::Url) -> bool {
 pub(crate) fn host_override_for_non_local(
     outgoing: Option<&HeaderValue>,
     upstream: &url::Url,
+    python_upstream: bool,
 ) -> Option<HeaderValue> {
-    // The Python proxy on this machine tells relayed callers apart by this
-    // name alone (and the proof), so it is always sent there, even when a
-    // preserved caller Host (`--no-rewrite-host`) names something else.
-    if upstream_takes_relay_proof(upstream) {
+    if python_upstream {
         return Some(HeaderValue::from_static(NON_LOCAL_HOST));
     }
     let effective = match outgoing {
@@ -459,21 +459,25 @@ mod tests {
             "::1%lo",
         ] {
             assert_eq!(
-                host_override_for_non_local(Some(&hv(host)), &alias).unwrap(),
+                host_override_for_non_local(Some(&hv(host)), &alias, false).unwrap(),
                 NON_LOCAL_HOST,
                 "{host}"
             );
         }
         // Rewritten Host on a loopback upstream: the reserved name.
         assert_eq!(
-            host_override_for_non_local(None, &loopback).unwrap(),
+            host_override_for_non_local(None, &loopback, false).unwrap(),
             NON_LOCAL_HOST
         );
         // Not loopback: left alone.
-        assert!(host_override_for_non_local(None, &alias).is_none());
-        // A loopback upstream (the Python proxy) always gets the reserved name.
+        assert!(host_override_for_non_local(None, &alias, false).is_none());
+        // A generic loopback backend keeps a public Host it may route on.
+        assert!(
+            host_override_for_non_local(Some(&hv("proxy.example")), &loopback, false).is_none()
+        );
+        // The Python proxy (--python-upstream) always gets the reserved name.
         assert_eq!(
-            host_override_for_non_local(Some(&hv("proxy.example")), &loopback).unwrap(),
+            host_override_for_non_local(Some(&hv("proxy.example")), &loopback, true).unwrap(),
             NON_LOCAL_HOST
         );
     }

@@ -41,8 +41,22 @@ async fn send(
     path: &str,
     headers: &[(&str, &str)],
 ) -> StatusCode {
+    send_to(upstream, false, token, peer, method, path, headers).await
+}
+
+/// [`send`], with `python` choosing `--python-upstream`.
+async fn send_to(
+    upstream: &MockServer,
+    python: bool,
+    token: Option<&str>,
+    peer: Option<&str>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> StatusCode {
     let mut config = Config::for_test(upstream.uri().parse().unwrap());
     config.proxy_token = token.and_then(ProxyToken::new);
+    config.python_upstream = python;
     let app = build_app(AppState::new(config).unwrap());
     let mut builder = Request::builder().method(method).uri(path);
     // What a client on this machine sends; a test that names its own Host
@@ -311,14 +325,14 @@ async fn loopback_peer_with_a_foreign_host_needs_the_token() {
     assert_eq!(host, "headroom-remote.invalid");
 }
 
-/// The relay-proof header the upstream received for one request.
+/// The relay-proof header a `--python-upstream` upstream received for one request.
 async fn upstream_proof(
     token: Option<&str>,
     peer: &str,
     headers: &[(&str, &str)],
 ) -> Option<String> {
     let up = upstream().await;
-    let status = send(&up, token, Some(peer), "GET", "/v1/models", headers).await;
+    let status = send_to(&up, true, token, Some(peer), "GET", "/v1/models", headers).await;
     assert_eq!(status, StatusCode::OK);
     let seen = up.received_requests().await.unwrap();
     seen[0]
@@ -395,7 +409,7 @@ async fn remote_token_holder_is_not_relayed_as_local() {
     }
 }
 
-/// Headers the upstream received for one POST with a JSON body.
+/// Headers a `--python-upstream` upstream received for one POST with a JSON body.
 async fn upstream_post_headers(
     path: &str,
     body: &str,
@@ -404,6 +418,7 @@ async fn upstream_post_headers(
     let up = upstream().await;
     let mut config = Config::for_test(up.uri().parse().unwrap());
     config.proxy_token = ProxyToken::new(TOKEN);
+    config.python_upstream = true;
     let app = build_app(AppState::new(config).unwrap());
     let mut builder = Request::builder()
         .method("POST")
@@ -472,26 +487,59 @@ async fn front_health_probe_answers_a_loopback_peer_under_a_public_host() {
     assert_eq!(status, StatusCode::OK);
 }
 
-#[tokio::test]
-async fn preserved_host_is_replaced_for_a_loopback_upstream() {
-    // Token-less front with --no-rewrite-host: a remote caller's public
-    // Host would reach the Python proxy behind it as an unknown name.
+/// What a loopback upstream saw for a remote `GET /v1/models` under
+/// `--no-rewrite-host` and `Host: proxy.example:8787`: (Host, proof?).
+async fn no_rewrite_remote_request(python: bool, token: Option<&str>) -> (String, bool) {
     let up = upstream().await;
     let mut config = Config::for_test(up.uri().parse().unwrap());
     config.rewrite_host = false;
+    config.python_upstream = python;
+    config.proxy_token = token.and_then(ProxyToken::new);
     let app = build_app(AppState::new(config).unwrap());
-    let mut req = Request::builder()
+    let mut builder = Request::builder()
         .method("GET")
         .uri("/v1/models")
-        .header("host", "proxy.example:8787")
-        .body(Body::empty())
-        .unwrap();
+        .header("host", "proxy.example:8787");
+    if let Some(token) = token {
+        builder = builder.header("x-headroom-proxy-token", token);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
     let peer: SocketAddr = REMOTE.parse().unwrap();
     req.extensions_mut().insert(ConnectInfo(peer));
     assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     let seen = up.received_requests().await.unwrap();
+    let host = seen[0]
+        .headers
+        .get("host")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    (host, seen[0].headers.get(RELAY_PROOF_HEADER).is_some())
+}
+
+#[tokio::test]
+async fn generic_loopback_upstream_keeps_the_callers_public_host() {
+    // A same-host gateway that routes by Host: it must see the caller's
+    // Host, and never the relay proof meant for the Python proxy.
+    for token in [None, Some(TOKEN)] {
+        assert_eq!(
+            no_rewrite_remote_request(false, token).await,
+            ("proxy.example:8787".to_owned(), false),
+            "{token:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn python_upstream_gets_the_relay_host_under_no_rewrite_host() {
+    // The Python proxy tells relayed callers apart by the reserved name.
     assert_eq!(
-        seen[0].headers.get("host").unwrap(),
-        "headroom-remote.invalid"
+        no_rewrite_remote_request(true, None).await,
+        ("headroom-remote.invalid".to_owned(), false)
+    );
+    assert_eq!(
+        no_rewrite_remote_request(true, Some(TOKEN)).await,
+        ("headroom-remote.invalid".to_owned(), true)
     );
 }
