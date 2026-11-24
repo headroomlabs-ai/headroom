@@ -220,15 +220,30 @@ pub(crate) fn host_override_for_non_local(
     may_name_loopback(effective.as_deref()).then(|| HeaderValue::from_static(NON_LOCAL_HOST))
 }
 
-/// Conservative superset of what the Python proxy treats as a loopback
+/// Conservative superset of what the Python proxy treats as a local
 /// `Host`: anything [`is_loopback_host_header`] accepts, an unreadable
-/// value, and any value with an IPv6 zone (`%`), since Python's
-/// `ipaddress` accepts scoped literals such as `[::1%lo]`.
+/// value, any value with an IPv6 zone (`%`), since Python's `ipaddress`
+/// accepts scoped literals such as `[::1%lo]`, and the container host
+/// aliases, which Python trusts from a loopback peer (Docker Desktop
+/// delivers container callers to the host from 127.0.0.1).
 fn may_name_loopback(value: Option<&str>) -> bool {
     match value {
         None => true,
-        Some(v) => v.contains('%') || is_loopback_host_header(Some(v)),
+        Some(v) => {
+            v.contains('%') || is_loopback_host_header(Some(v)) || names_container_host_alias(v)
+        }
     }
+}
+
+/// Python's `_CONTAINER_HOST_ALIASES`, on any port; case and a trailing
+/// dot ignored.
+fn names_container_host_alias(value: &str) -> bool {
+    let host = value.trim();
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    ["host.docker.internal", "host.containers.internal"]
+        .iter()
+        .any(|alias| host.eq_ignore_ascii_case(alias))
 }
 
 /// Same rules as Python's `loopback_guard.is_loopback_host_header`:
@@ -471,6 +486,18 @@ mod tests {
         );
         // Not loopback: left alone.
         assert!(host_override_for_non_local(None, &alias, false).is_none());
+        // The container host aliases the Python proxy trusts from loopback.
+        for host in [
+            "host.docker.internal",
+            "HOST.DOCKER.INTERNAL.:8787",
+            "host.containers.internal:443",
+        ] {
+            assert_eq!(
+                host_override_for_non_local(Some(&hv(host)), &loopback, false).unwrap(),
+                NON_LOCAL_HOST,
+                "{host}"
+            );
+        }
         // A generic loopback backend keeps a public Host it may route on.
         assert!(
             host_override_for_non_local(Some(&hv("proxy.example")), &loopback, false).is_none()

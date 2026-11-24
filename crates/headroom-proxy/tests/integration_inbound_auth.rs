@@ -532,6 +532,34 @@ async fn generic_loopback_upstream_keeps_the_callers_public_host() {
 }
 
 #[tokio::test]
+async fn container_alias_host_is_never_relayed_for_a_remote_caller() {
+    // The Python proxy trusts these names from a loopback peer (Docker
+    // Desktop delivers container callers from 127.0.0.1), so a tokenless,
+    // Host-preserving front must not relay a remote caller under them.
+    for host in ["host.docker.internal:8787", "host.containers.internal"] {
+        let up = upstream().await;
+        let mut config = Config::for_test(up.uri().parse().unwrap());
+        config.rewrite_host = false;
+        let app = build_app(AppState::new(config).unwrap());
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap();
+        let peer: SocketAddr = REMOTE.parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let seen = up.received_requests().await.unwrap();
+        assert_eq!(
+            seen[0].headers.get("host").unwrap(),
+            "headroom-remote.invalid",
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn python_upstream_gets_the_relay_host_under_no_rewrite_host() {
     // The Python proxy tells relayed callers apart by the reserved name.
     assert_eq!(
