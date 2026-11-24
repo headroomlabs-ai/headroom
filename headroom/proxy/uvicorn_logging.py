@@ -36,7 +36,8 @@ _FORMATTERS = {
 
 def uvicorn_log_config() -> dict[str, Any]:
     """uvicorn's default ``log_config`` with the single-line formatters swapped in."""
-    config = copy.deepcopy(LOGGING_CONFIG)
+    # Annotated: where uvicorn is not installed (the lint job), mypy sees it as Any.
+    config: dict[str, Any] = copy.deepcopy(LOGGING_CONFIG)
     for formatter in config["formatters"].values():
         factory = formatter.get("()")
         if factory not in _FORMATTERS:
