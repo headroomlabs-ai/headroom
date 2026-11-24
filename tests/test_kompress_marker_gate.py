@@ -15,6 +15,7 @@ space-prefixed form in the source.
 from __future__ import annotations
 
 import hashlib
+import time
 
 import pytest
 
@@ -190,3 +191,37 @@ def test_a_vocab_arriving_mid_gate_does_not_mix_units(monkeypatch, batched):
     after = run()
     assert after.compressed == SINGLE_TOKEN_SOURCE
     assert after.compression_ratio == 1.0
+
+
+def test_a_fast_vocab_failure_does_not_disable_bpe_for_the_process(monkeypatch):
+    # A download that failed fast escaped as a raw ConnectionError, which the
+    # payload counter's broad handler turned into "no encoder, ever".
+    import tiktoken
+
+    from headroom.tokenizers import tiktoken_counter
+
+    real = tiktoken.get_encoding("cl100k_base")
+    calls = []
+
+    def _fails_once(name):
+        calls.append(name)
+        if len(calls) == 1:
+            raise ConnectionError("Name or service not known")
+        return real
+
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.setattr(kc, "_payload_encoder", None)
+    monkeypatch.setattr(tiktoken, "get_encoding", _fails_once)
+    monkeypatch.setattr(tiktoken_counter, "_slots", {})
+    monkeypatch.setattr(tiktoken_counter, "_RETRY_COOLDOWN_SECONDS", 0.0)
+    tiktoken_counter._get_encoding.cache_clear()
+    try:
+        assert payload_tokens(SINGLE_TOKEN_SOURCE) == len(SINGLE_TOKEN_SOURCE)
+        assert kc._payload_encoder is None
+        # The retry runs in the background; the counter adopts it once it lands.
+        deadline = time.monotonic() + 5.0
+        while payload_tokens(SINGLE_TOKEN_SOURCE) != _tok(SINGLE_TOKEN_SOURCE):
+            assert time.monotonic() < deadline, "BPE never came back"
+            time.sleep(0.02)
+    finally:
+        tiktoken_counter._get_encoding.cache_clear()

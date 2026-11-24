@@ -911,7 +911,7 @@ def tiktoken_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setitem(
         tiktoken.registry.ENCODING_CONSTRUCTORS, _FAKE_ENCODING, _fake_encoding_constructor
     )
-    monkeypatch.setattr(tiktoken_counter, "_pending_loads", {})
+    monkeypatch.setattr(tiktoken_counter, "_slots", {})
     tiktoken_counter._get_encoding.cache_clear()
     yield cache
     tiktoken_counter._get_encoding.cache_clear()
@@ -961,16 +961,40 @@ class TestTiktokenVocabOffline:
         assert vocab_downloads == []
 
     def test_a_refusal_is_not_remembered(
-        self, offline: None, no_sockets: None, tiktoken_cache: Path, vocab_downloads: list[str]
+        self,
+        offline: None,
+        no_sockets: None,
+        tiktoken_cache: Path,
+        vocab_downloads: list[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Pre-seeding the cache after a refusal works without a restart."""
-        from headroom.tokenizers.tiktoken_counter import TiktokenVocabNotCached, load_encoding
+        """Pre-seeding the cache after a refusal works without a restart: the
+        retry after the short offline cooldown runs in the background and the
+        loader adopts it once it lands."""
+        import time
 
+        from headroom.tokenizers import tiktoken_counter
+        from headroom.tokenizers.tiktoken_counter import (
+            TiktokenLoadError,
+            TiktokenVocabNotCached,
+            load_encoding,
+        )
+
+        monkeypatch.setattr(tiktoken_counter, "_OFFLINE_RETRY_SECONDS", 0.0)
         with pytest.raises(TiktokenVocabNotCached):
             load_encoding(_FAKE_ENCODING)
         assert vocab_downloads == []
         _seed(tiktoken_cache, _FAKE_VOCAB_URL, _FAKE_VOCAB)
-        assert load_encoding(_FAKE_ENCODING).encode("a") == [0]
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                enc = load_encoding(_FAKE_ENCODING)
+                break
+            except TiktokenLoadError:
+                assert time.monotonic() < deadline, "the seeded vocab was never picked up"
+                time.sleep(0.02)
+        assert enc.encode("a") == [0]
+        assert vocab_downloads == []
 
     def test_online_a_cold_cache_still_downloads(
         self, monkeypatch: pytest.MonkeyPatch, tiktoken_cache: Path, vocab_downloads: list[str]
@@ -1009,10 +1033,8 @@ class TestTiktokenVocabOffline:
         longer be told apart from a cache hit, so offline refuses the load."""
         import tiktoken.load
 
-        from headroom.tokenizers import tiktoken_counter
         from headroom.tokenizers.tiktoken_counter import TiktokenVocabNotCached, load_encoding
 
-        monkeypatch.setattr(tiktoken_counter, "_read_file_guard_installed", False)
         monkeypatch.delattr(tiktoken.load, "read_file")
         _seed(tiktoken_cache, _FAKE_VOCAB_URL, _FAKE_VOCAB)
         with pytest.raises(TiktokenVocabNotCached) as excinfo:
@@ -1028,14 +1050,36 @@ class TestTiktokenVocabOffline:
     ) -> None:
         import tiktoken.load
 
-        from headroom.tokenizers import tiktoken_counter
         from headroom.tokenizers.tiktoken_counter import load_encoding
 
         monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
-        monkeypatch.setattr(tiktoken_counter, "_read_file_guard_installed", False)
         monkeypatch.delattr(tiktoken.load, "read_file")
         _seed(tiktoken_cache, _FAKE_VOCAB_URL, _FAKE_VOCAB)
         assert load_encoding(_FAKE_ENCODING).encode("a") == [0]
+
+    def test_a_replaced_read_file_is_guarded_again(
+        self,
+        offline: None,
+        no_sockets: None,
+        tiktoken_cache: Path,
+        vocab_downloads: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A tiktoken.load.read_file replaced after the guard was installed (a
+        module reload, a host's own patch) must not let a download through."""
+        import requests
+        import tiktoken.load
+
+        from headroom.tokenizers.tiktoken_counter import TiktokenVocabNotCached, load_encoding
+
+        with pytest.raises(TiktokenVocabNotCached):
+            load_encoding(_FAKE_ENCODING)
+        monkeypatch.setattr(
+            tiktoken.load, "read_file", lambda blobpath, *a, **k: requests.get(blobpath).content
+        )
+        with pytest.raises(TiktokenVocabNotCached):
+            load_encoding(_FAKE_ENCODING)
+        assert vocab_downloads == []
 
     def test_the_claude_token_counter_falls_back_to_estimation(
         self, offline: None, no_sockets: None, tiktoken_cache: Path, vocab_downloads: list[str]

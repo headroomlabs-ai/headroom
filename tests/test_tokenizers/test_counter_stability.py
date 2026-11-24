@@ -43,6 +43,7 @@ def vocab(monkeypatch: pytest.MonkeyPatch) -> _Vocab:
     fake = _Vocab()
     monkeypatch.setenv("HEADROOM_OFFLINE", "1")
     monkeypatch.setattr(tiktoken, "get_encoding", fake.get_encoding)
+    monkeypatch.setattr(tc, "_slots", {})
     tc._get_encoding.cache_clear()
     openai_provider._get_encoding.cache_clear()
     TokenizerRegistry.clear_cache()
