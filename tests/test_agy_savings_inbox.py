@@ -391,3 +391,77 @@ def test_conftest_preserves_runner_headroom_offline_opt_in():
         timeout=30,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.asyncio
+async def test_abrupt_exit_mid_batch_does_not_replay_completed_event(isolated_home, tmp_path):
+    """If a worker dies entering the 2nd event, restart must not replay the 1st event."""
+    import os
+    import subprocess
+    import sys
+
+    inbox = agy_savings_inbox.inbox_dir()
+    first_kwargs = {**_FUNNEL_KWARGS, "project": "first"}
+    second_kwargs = {**_FUNNEL_KWARGS, "project": "second"}
+    (inbox / "evt-001-first.json").write_text(
+        json.dumps({"v": 1, "event_id": "evt-first", "kwargs": first_kwargs}),
+        encoding="utf-8",
+        newline="\n",
+    )
+    (inbox / "evt-002-second.json").write_text(
+        json.dumps({"v": 1, "event_id": "evt-second", "kwargs": second_kwargs}),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    sink_path = tmp_path / "durable_sink.log"
+
+    crash_worker = """
+import asyncio
+import os
+import sys
+from pathlib import Path
+from headroom.proxy import agy_savings_inbox
+
+sink = Path(sys.argv[1])
+
+class CrashingDurableMetrics:
+    def __init__(self) -> None:
+        self._seen = 0
+
+    async def record_request(self, **kwargs) -> None:
+        self._seen += 1
+        if self._seen == 2:
+            os._exit(99)
+        with sink.open("a", encoding="utf-8", newline="\\n") as fh:
+            fh.write(f"{kwargs['project']}\\n")
+            fh.flush()
+
+asyncio.run(agy_savings_inbox.drain_inbox(CrashingDurableMetrics()))
+"""
+    env = {
+        **os.environ,
+        "HOME": str(isolated_home),
+        "HEADROOM_WORKSPACE_DIR": str(isolated_home / ".headroom"),
+        "HEADROOM_OFFLINE": "1",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", crash_worker, str(sink_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 99, proc.stdout + proc.stderr
+    assert sink_path.read_text(encoding="utf-8").splitlines() == ["first"]
+
+    class DurableMetrics:
+        async def record_request(self, **kwargs) -> None:
+            with sink_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(f"{kwargs['project']}\n")
+                fh.flush()
+
+    recorded = await agy_savings_inbox.drain_inbox(DurableMetrics())
+    assert recorded == 1
+    assert sink_path.read_text(encoding="utf-8").splitlines() == ["first", "second"]
+    assert _evt_files() == []

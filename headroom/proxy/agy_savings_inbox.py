@@ -255,6 +255,29 @@ def _load_processed(path: Path) -> list[str]:
     return ids
 
 
+def _append_processed(path: Path, event_id: str) -> None:
+    """Append one completed event id (LF-terminated) and fsync in O(1) time.
+
+    Appending per completed event before starting the next replay prevents an
+    abrupt worker exit mid-batch from replaying already-committed events,
+    without rewriting up to ``MAX_PROCESSED_IDS`` entries on every event.
+    """
+    try:
+        with path.open("a+b") as fh:
+            fh.seek(0, os.SEEK_END)
+            needs_leading_lf = False
+            if fh.tell() > 0:
+                fh.seek(-1, os.SEEK_END)
+                needs_leading_lf = fh.read(1) != b"\n"
+                fh.seek(0, os.SEEK_END)
+            payload = f"\n{event_id}\n" if needs_leading_lf else f"{event_id}\n"
+            fh.write(payload.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        logger.debug("agy savings processed-file append failed: %s", exc)
+
+
 def _write_processed(path: Path, ids: list[str]) -> None:
     """Atomically persist the processed-id list, pruned to the newest N."""
 
@@ -308,7 +331,6 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
                 except OSError:
                     return 0
 
-                replayed_files: list[Path] = []
                 try:
                     for event_file in files[:max_events]:
                         try:
@@ -341,17 +363,16 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
 
                             processed_set.add(event_id)
                             processed_list.append(event_id)
-                            replayed_files.append(event_file)
+                            _append_processed(processed_path, event_id)
+                            _safe_unlink(event_file)
                         except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
                             logger.debug(
                                 "agy savings: error replaying %s: %s", event_file.name, exc
                             )
                             continue
                 finally:
-                    if replayed_files:
+                    if len(processed_list) > MAX_PROCESSED_IDS:
                         _write_processed(processed_path, processed_list)
-                        for event_file in replayed_files:
-                            _safe_unlink(event_file)
         except Exception as exc:  # noqa: BLE001 - drain never raises out
             logger.debug("agy savings drain failed: %s", exc)
 
