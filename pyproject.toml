@@ -378,6 +378,7 @@ dev = [
     # transitive dep, not a guarantee it is installed -- CI had neither.
     "cryptography>=50.0.0",
     "hypercorn>=0.16",  # agy in-process HTTPS dispatch server
+    "maturin>=1.5,<2.0",  # Rust extension build backend locked in uv.lock for --no-build-isolation CI
     "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests
 ]
 # All optional dependencies for the default CLI/proxy feature set.
