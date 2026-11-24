@@ -287,8 +287,10 @@ def destination_listed(
 # so it stays rejected as non-global. Teredo and IPv4-mapped forms are caught
 # by the `is_global` test below.
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
-# 6to4 (RFC 3056) embeds an IPv4 address in bits 16-47 and a relay delivers to
-# it, so `2002:a9fe:a9fe::` reaches 169.254.169.254. Only Python releases that
+# 6to4 (RFC 3056) embeds an IPv4 address in bits 16-47: the tunnel endpoint the
+# IPv6 traffic is encapsulated to. A 6to4 destination embedding 169.254.169.254
+# or an RFC 1918 address therefore sends the proxy's traffic into internal IPv4
+# space, where any 6to4 router at that address delivers it. Only Python releases that
 # carry the 2024 `ipaddress` table fix call 2002::/16 non-global; older 3.11
 # patch releases call it global, so the guard cannot lean on `is_global` here.
 # The mechanism is deprecated (RFC 7526) and no API upstream is reached through
