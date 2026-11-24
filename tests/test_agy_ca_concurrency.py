@@ -152,3 +152,67 @@ print(json.dumps({'fingerprint': cert.fingerprint(hashes.SHA256()).hex(),
             if child.poll() is None:
                 child.terminate()
             child.wait(timeout=5)
+
+
+def test_windows_root_ca_file_lock_raises_permanent_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permanent msvcrt.locking errors in _root_ca_file_lock must raise immediately."""
+    import errno
+    import types
+
+    calls = 0
+
+    def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 3:
+            raise AssertionError("_root_ca_file_lock retried indefinitely on permanent EBADF")
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    fake_msvcrt = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=_fake_locking)
+    monkeypatch.setattr(ca.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(ca.time, "sleep", lambda _secs: None)
+
+    lock_path = tmp_path / "ca.lock"
+    with pytest.raises(OSError) as exc_info:
+        with ca._root_ca_file_lock(lock_path):
+            pass
+    assert exc_info.value.errno == errno.EBADF
+    assert calls == 1
+
+
+def test_windows_root_ca_file_lock_retries_contention_without_writing_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contended _root_ca_file_lock retries until granted and locks byte 0 past EOF."""
+    import errno
+    import os
+    import types
+
+    events: list[int] = []
+    sleeps: list[float] = []
+    seen_sizes: list[int] = []
+
+    def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+        events.append(mode)
+        if mode == 2:
+            seen_sizes.append(os.fstat(fd).st_size)
+            if len(events) <= 2:
+                raise PermissionError(errno.EACCES, "Permission denied")
+
+    fake_msvcrt = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=_fake_locking)
+    monkeypatch.setattr(ca.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(ca.time, "sleep", lambda secs: sleeps.append(secs))
+
+    lock_path = tmp_path / "ca.lock"
+    entered = False
+    with ca._root_ca_file_lock(lock_path):
+        entered = True
+
+    assert entered is True
+    assert events == [2, 2, 2, 0]
+    assert len(sleeps) == 2
+    assert seen_sizes == [0, 0, 0]

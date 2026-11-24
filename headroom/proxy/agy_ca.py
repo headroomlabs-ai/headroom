@@ -18,6 +18,7 @@ Security invariants (enforced by assertion):
 from __future__ import annotations
 
 import datetime
+import errno
 import logging
 import os
 import ssl
@@ -360,6 +361,22 @@ def _collect_corporate_ca_pems(env_vars: Sequence[str] = _CORP_CA_ENV_VARS) -> l
 # ---------------------------------------------------------------------------
 
 
+_WIN_LOCK_RETRY_ERRNOS = frozenset(
+    code
+    for name in ("EACCES", "EAGAIN", "EDEADLK", "EDEADLOCK")
+    if (code := getattr(errno, name, None)) is not None
+)
+_WIN_LOCK_RETRY_WINERRORS = frozenset({32, 33})  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+
+
+def _is_windows_lock_contention(exc: OSError) -> bool:
+    """True when msvcrt.locking failed because another handle holds the lock."""
+    return (
+        exc.errno in _WIN_LOCK_RETRY_ERRNOS
+        or getattr(exc, "winerror", None) in _WIN_LOCK_RETRY_WINERRORS
+    )
+
+
 @contextmanager
 def _root_ca_file_lock(path: Path) -> Iterator[None]:
     """Serialize complete key/cert transactions across wrap processes."""
@@ -369,14 +386,16 @@ def _root_ca_file_lock(path: Path) -> Iterator[None]:
         if sys.platform == "win32":
             import msvcrt
 
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"0")
+            # Windows byte-range locks can extend beyond EOF; do not write a
+            # sentinel byte before acquiring the lock or two starters race.
             os.lseek(fd, 0, os.SEEK_SET)
             while True:
                 try:
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                     break
-                except OSError:
+                except OSError as exc:
+                    if not _is_windows_lock_contention(exc):
+                        raise
                     time.sleep(0.05)
             try:
                 yield
