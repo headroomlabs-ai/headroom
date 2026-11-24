@@ -272,7 +272,6 @@ async def _run_ws_session(
     import asyncio
     import copy
     import sys
-    from unittest.mock import patch
 
     from tests.test_openai_codex_ws_lifecycle import (
         _DummyOpenAIHandler,
@@ -331,7 +330,10 @@ async def _run_ws_session(
     handler.config.optimize = True
     handler._compress_openai_responses_payload = compress
     upstream = _Upstream([e for g in groups for e in g])
-    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+    # Swap only the websockets entry: restoring the whole of sys.modules undoes
+    # lazy imports made meanwhile and breaks later tests in the same process.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(sys.modules, "websockets", _make_fake_websockets_module(upstream))
         await asyncio.wait_for(
             handler.handle_openai_responses_ws(_Client(frames=frames)), timeout=10.0
         )
