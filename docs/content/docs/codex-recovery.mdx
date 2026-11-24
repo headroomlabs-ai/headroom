@@ -15,7 +15,12 @@ The target defaults to `$CODEX_HOME` when it is set, otherwise `~/.codex`. Check
 
 ## Automatic recovery
 
-The first interactive `headroom wrap codex` with the fixed version searches Python's temporary directory, `$TMPDIR`, `/tmp`, `/private/tmp`, and the macOS `/private/var/folders/*/*/T` roots for non-empty `headroom-codex-home-*` directories. If it finds any, it lists them and offers to back up and recover them before Codex starts.
+The first interactive `headroom wrap codex` with the fixed version searches for non-empty `headroom-codex-home-*` directories and, if it finds any, lists them and offers to back up and recover them before Codex starts. `headroom recover codex` without `--source` uses the same search.
+
+- On macOS and Linux it searches Python's temporary directory, `$TMPDIR`, `/tmp`, `/private/tmp`, and the macOS `/private/var/folders/*/*/T` roots. A directory is offered only if you own it and it is not writable by group or others, because another local account can create directories in shared temp roots.
+- On Windows it searches only Python's temporary directory, and only when that directory is inside your user profile (normally `%LOCALAPPDATA%\Temp`). Windows ownership is not checked here, so shared locations such as `C:\tmp` or `C:\Windows\Temp` are not searched.
+
+A home that is not offered automatically can still be recovered with `--source` (see below).
 
 Declining the prompt changes nothing. You can run the manual command later.
 
@@ -39,7 +44,7 @@ headroom recover codex \
   --target "${CODEX_HOME:-$HOME/.codex}"
 ```
 
-Repeat `--source` to merge multiple homes. Headroom shows the target and every source before asking for confirmation. Use `--yes` only in automation where those paths have already been reviewed.
+On macOS and Linux every source must be owned by you; recovery refuses one owned by another account, and aborts if the source directory is replaced while it is being copied. Repeat `--source` to merge multiple homes. Headroom shows the target and every source before asking for confirmation. Use `--yes` only in automation where those paths have already been reviewed.
 
 ## What gets migrated
 

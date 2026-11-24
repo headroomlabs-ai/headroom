@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import stat
@@ -142,15 +143,42 @@ def test_discover_dangling_homes_skips_group_or_world_writable_homes(tmp_path: P
     assert discover_dangling_homes(tmp_path) == [candidate]
 
 
-def test_discover_dangling_homes_on_windows_only_searches_the_user_temp_dir(
+@pytest.mark.parametrize(
+    ("temp_under", "expected"), [("home", ["Temp"]), ("shared", [])], ids=["profile", "shared"]
+)
+def test_windows_discovery_only_searches_a_temp_dir_inside_the_user_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, temp_under: str, expected: list[str]
+) -> None:
+    """Windows has no owner check here: /tmp (C:\\tmp), TMPDIR and a shared TEMP are skipped."""
+    home = tmp_path / "home"
+    temp = (home / "AppData" / "Local" if temp_under == "home" else tmp_path / "Windows") / "Temp"
+    # Only the module's platform check is switched; os.name stays put so
+    # pathlib keeps building native paths.
+    monkeypatch.setattr(codex_recovery.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "env-tmp"))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
+
+    assert [root.name for root in codex_recovery._temp_roots()] == expected
+
+
+def test_discover_dangling_homes_skips_a_home_that_vanishes_before_ranking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Windows has no owner check here, so shared roots such as C:\\tmp are not searched."""
-    monkeypatch.setattr(codex_recovery.os, "name", "nt")
-    monkeypatch.setenv("TMPDIR", str(tmp_path / "env-tmp"))
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "user-tmp"))
+    kept = tmp_path / "headroom-codex-home-kept"
+    gone = tmp_path / "headroom-codex-home-gone"
+    for home in (kept, gone):
+        home.mkdir(mode=0o700)
+        (home / "history.jsonl").write_text("{}\n", encoding="utf-8")
+    latest = codex_recovery._latest_state_mtime_ns
 
-    assert [root.name for root in codex_recovery._temp_roots()] == ["user-tmp"]
+    def latest_or_gone(home: Path) -> int:
+        if home == gone:
+            raise FileNotFoundError(home)
+        return latest(home)
+
+    monkeypatch.setattr(codex_recovery, "_latest_state_mtime_ns", latest_or_gone)
+    assert discover_dangling_homes(tmp_path) == [kept]
 
 
 def test_recovery_refuses_a_source_owned_by_another_user(
@@ -166,6 +194,31 @@ def test_recovery_refuses_a_source_owned_by_another_user(
     monkeypatch.setattr(codex_recovery.os, "getuid", lambda: own_uid + 1, raising=False)
 
     with pytest.raises(ValueError, match="not owned by the current user"):
+        recover_codex_home(source=source, target=target)
+    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+
+
+def test_recovery_refuses_a_source_swapped_after_the_owner_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory pinned must be the one whose owner was checked."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-swapped"
+    target.mkdir()
+    source.mkdir()
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    (source / "config.toml").write_text('model = "planted"\n', encoding="utf-8")
+    copy_home = codex_recovery._copy_home
+
+    def copy_then_swap(src: Path, dest: Path, skipped: list[str]) -> None:
+        copy_home(src, dest, skipped)
+        if src == source.resolve():
+            # Same content, different directory: only the inode tells them apart.
+            src.rename(tmp_path / "original")
+            shutil.copytree(tmp_path / "original", src)
+
+    monkeypatch.setattr(codex_recovery, "_copy_home", copy_then_swap)
+    with pytest.raises(RuntimeError, match="replaced while it was being pinned"):
         recover_codex_home(source=source, target=target)
     assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
 
@@ -208,7 +261,12 @@ def test_discover_dangling_homes_searches_tmpdir_and_python_temp_root(
     monkeypatch.setenv("TMPDIR", str(env_root))
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(python_root))
 
-    assert discover_dangling_homes() == [python_candidate, env_candidate]
+    if sys.platform == "win32":
+        # TMPDIR is not a Windows temp root; tmp_path sits in the profile's Temp.
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        assert discover_dangling_homes() == [python_candidate]
+    else:
+        assert discover_dangling_homes() == [python_candidate, env_candidate]
 
 
 def test_recovery_merges_files_config_and_sqlite_with_backups(tmp_path: Path) -> None:

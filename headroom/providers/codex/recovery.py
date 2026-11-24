@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -65,23 +66,38 @@ def _is_trusted_owner(path: Path) -> bool:
     """
     if not _owned_by_current_user(path):
         return False
-    return os.name == "nt" or not path.lstat().st_mode & 0o022
+    return sys.platform == "win32" or not path.lstat().st_mode & 0o022
 
 
 def _temp_roots() -> list[Path]:
     """Temp directories an older Headroom may have left a Codex home in.
 
-    On Windows only the per-user temp dir: ``Path("/tmp")`` there is
-    ``C:\\tmp``, which any user can create, and ownership is not checked.
+    Windows has no owner check here, so only a temp dir inside the user's
+    profile (private to that user by default) is searched; ``Path("/tmp")``
+    there is ``C:\\tmp``, which any user can create. A shared ``TEMP`` (for
+    example ``C:\\Windows\\Temp``) is not searched; recover from it with
+    ``headroom recover codex --source``.
     """
-    roots = [Path(tempfile.gettempdir())]
-    if os.name == "nt":
-        return roots
+    temp = Path(tempfile.gettempdir())
+    if sys.platform == "win32":
+        return [temp] if temp.resolve().is_relative_to(Path.home().resolve()) else []
+    roots = [temp]
     if env_tmpdir := os.environ.get("TMPDIR"):
         roots.append(Path(env_tmpdir))
     roots.extend((Path("/tmp"), Path("/private/tmp")))
     roots.extend(Path("/private/var/folders").glob("*/*/T"))
     return roots
+
+
+def _newest_first(homes: list[Path]) -> list[Path]:
+    """``homes`` newest state first; a home that vanished meanwhile is dropped."""
+    ranked: list[tuple[int, Path]] = []
+    for home in homes:
+        try:
+            ranked.append((_latest_state_mtime_ns(home), home))
+        except OSError:
+            continue
+    return [home for _, home in sorted(ranked, key=lambda item: item[0], reverse=True)]
 
 
 def discover_dangling_homes(temp_root: Path | None = None) -> list[Path]:
@@ -108,7 +124,7 @@ def discover_dangling_homes(temp_root: Path | None = None) -> list[Path]:
                     candidates.append(path)
             except OSError:  # removed or unreadable since the listing
                 continue
-    return sorted(candidates, key=_latest_state_mtime_ns, reverse=True)
+    return _newest_first(candidates)
 
 
 def discover_referenced_temp_homes(target: Path) -> list[Path]:
@@ -772,6 +788,7 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
         # Checked again here, on the resolved path: the directory chosen at a
         # prompt could have been replaced by then.
         raise ValueError(f"source Codex home {source} is not owned by the current user")
+    checked = source.lstat()
     if source in target.parents or target in source.parents or target == Path(target.anchor):
         raise ValueError("source and target Codex homes must not overlap")
     _reject_target_symlink_traversal(source, target)
@@ -783,6 +800,10 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     _copy_home(source, pinned, report.skipped_runtime)
     if home_fingerprint(source) != before:
         raise RuntimeError("source Codex home changed while it was being pinned")
+    pinned_from = source.lstat()
+    if (pinned_from.st_dev, pinned_from.st_ino) != (checked.st_dev, checked.st_ino):
+        # The directory copied is not the one whose owner was checked.
+        raise RuntimeError("source Codex home was replaced while it was being pinned")
     target_existed = target.exists()
     target_modes: dict[str, int] = {}
     if target_existed:
