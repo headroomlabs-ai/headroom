@@ -4576,6 +4576,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.bind_policy import enforce_bind_policy
 
     _bind_decision = enforce_bind_policy(getattr(config, "host", None), _proxy_token)
+    # Whether a caller from the container bridge gateway may be taken for the
+    # host on the loopback-or-gateway routes (/debug/memory, /v1/compress,
+    # /v1/usage). The gateway address alone cannot tell the host from a peer
+    # container (#4794): trust it only when the gate makes every non-loopback
+    # caller present the token, or the operator acknowledged the open bind,
+    # which is documented to mean a publication on host loopback only.
+    app.state.container_gateway_vouched = bool(_proxy_token) or _bind_decision.acknowledged
 
     def _apply_security_headers(response) -> None:
         # setdefault: never clobber a header an upstream/handler already set.
