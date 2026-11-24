@@ -321,6 +321,41 @@ def test_openai_responses_payload_that_counts_nothing_does_no_lookup(
     assert handler.openai_provider.lookups == 0
 
 
+# ---------------------------------------------------------------------------
+# Gemini generateContent / countTokens: the replay recount and the guard use
+# the handler's counter, so the pipeline must count with it too.
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_pipeline_gets_the_handlers_counter() -> None:
+    gemini = "gemini-2.5-pro"
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"content-type": "application/json"}
+    payload = {
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 2},
+    }
+    resp.content = json.dumps(payload).encode()
+    resp.json.return_value = payload
+
+    app = create_app(_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        spy = MagicMock(side_effect=proxy.openai_pipeline.apply)
+        proxy.openai_pipeline.apply = spy
+        proxy._retry_request = AsyncMock(return_value=resp)
+        r = client.post(
+            f"/v1beta/models/{gemini}:generateContent?key=test-key",
+            json={"contents": [{"parts": [{"text": BODY}]}]},
+        )
+
+    assert r.status_code == 200, r.text
+    assert spy.call_count >= 1
+    for call in spy.call_args_list:
+        assert call.kwargs.get("token_counter") is get_tokenizer(gemini)
+
+
 def test_openai_responses_payload_uses_the_callers_counter(_isolated_turn_hooks: Any) -> None:
     """The HTTP handler subtracts tokens_saved from its own original_tokens."""
 
