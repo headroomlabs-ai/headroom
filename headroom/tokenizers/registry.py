@@ -369,10 +369,11 @@ class TokenizerRegistry:
                 get_encoding_for_model,
                 load_encoding,
             )
+            from headroom.offline import OfflineEgressBlocked
 
             try:
                 load_encoding(get_encoding_for_model(model))
-            except TiktokenLoadError as exc:
+            except (TiktokenLoadError, OfflineEgressBlocked) as exc:
                 logger.warning("tiktoken unavailable (%s); using estimation.", exc)
                 return EstimatingTokenCounter()
             return TiktokenCounter(model)

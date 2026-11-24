@@ -10,8 +10,10 @@ It supports multiple encodings:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import tempfile
 import threading
 from functools import lru_cache
 from typing import Any
@@ -104,6 +106,53 @@ MODEL_TO_ENCODING = {
 DEFAULT_ENCODING = "cl100k_base"
 
 
+def _tiktoken_cache_dir() -> str:
+    """Get the tiktoken cache directory, matching tiktoken's logic."""
+    if "TIKTOKEN_CACHE_DIR" in os.environ:
+        return os.environ["TIKTOKEN_CACHE_DIR"]
+    if "DATA_GYM_CACHE_DIR" in os.environ:
+        return os.environ["DATA_GYM_CACHE_DIR"]
+    return os.path.join(tempfile.gettempdir(), "data-gym-cache")
+
+
+def _encoding_cached_locally(encoding_name: str) -> bool:
+    """Check if a tiktoken encoding is available in local cache (memory or disk).
+
+    Returns True if the encoding can be loaded without network access.
+    """
+    # Check in-memory cache first
+    try:
+        import tiktoken
+        if encoding_name in tiktoken.registry.ENCODINGS:
+            return True
+    except Exception:
+        pass
+
+    # Check on-disk cache
+    # The encoding constructors use specific URLs; we need to check if the
+    # cached file exists for the expected URL.
+    # For o200k_base, cl100k_base, p50k_base, r50k_base, gpt2, o200k_harmony
+    url_map = {
+        "o200k_base": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+        "o200k_harmony": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+        "cl100k_base": "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",
+        "p50k_base": "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",
+        "r50k_base": "https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken",
+        "gpt2": "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/vocab.bpe",
+    }
+    url = url_map.get(encoding_name)
+    if not url:
+        return False
+
+    cache_dir = _tiktoken_cache_dir()
+    if cache_dir == "":
+        return False
+
+    cache_key = hashlib.sha1(url.encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, cache_key)
+    return os.path.exists(cache_path)
+
+
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str):
     """Get a tiktoken encoding, cached for performance.
@@ -114,11 +163,24 @@ def _get_encoding(encoding_name: str):
     callers fall back to estimation rather than hang the request (GH #956). The
     first timed-out encoding is remembered so later calls fail fast instead of
     re-blocking on every request.
+
+    If the encoding is already cached locally (in memory or on disk), it is loaded
+    without calling ``guard_egress``, allowing offline operation with pre-populated
+    vocabularies.
     """
     import tiktoken
 
     if encoding_name in _load_failed:
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
+
+    # If the encoding is already cached locally (in memory or on disk),
+    # load it without network access.
+    if _encoding_cached_locally(encoding_name):
+        try:
+            return tiktoken.get_encoding(encoding_name)
+        except BaseException as exc:  # noqa: BLE001
+            _load_failed.add(encoding_name)
+            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to load from local cache") from exc
 
     box: dict[str, Any] = {}
 
