@@ -2989,7 +2989,8 @@ class _UpstreamAfterSends(_FakeUpstream):
 async def test_ws_pending_savings_beyond_32_rows_are_all_booked(
     sources_per_frame, frames_n, expected_rows, overflowed
 ):
-    """Pending frames hand every token and every event to the billed turn.
+    """Frames whose responses fail hand every token and every event to the
+    next completion with usage, the billed turn.
 
     Rows coalesce to one per (source, realized, estimated) key; distinct
     sources past ``MAX_NAMED_ROWS`` fold into ``other`` rather than growing
@@ -3025,14 +3026,20 @@ async def test_ws_pending_savings_beyond_32_rows_are_all_booked(
             }
         )
 
+    failed = [
+        json.dumps({"type": kind, "response": {"id": f"r_{i}"}})
+        for i in range(frames_n - 1)
+        for kind in ("response.created", "response.failed")
+    ]
     upstream = _UpstreamAfterSends(
         [
-            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            *failed,
+            json.dumps({"type": "response.created", "response": {"id": "r_last"}}),
             json.dumps(
                 {
                     "type": "response.completed",
                     "response": {
-                        "id": "r_1",
+                        "id": "r_last",
                         "usage": {"input_tokens": 10, "output_tokens": 1},
                     },
                 }

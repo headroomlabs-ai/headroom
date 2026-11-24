@@ -200,6 +200,45 @@ def _bucket_by_cache_mix(
     return split.read, split.write_5m, split.write_1h, split.uncached
 
 
+def _split_compression_by_region(
+    tokens_saved: int,
+    prefix_tokens_saved: int,
+    *,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    uncached_tokens: int,
+    cache_write_5m_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
+) -> tuple[float, float, float, float]:
+    """Compression's (read, write_5m, write_1h, list) shares.
+
+    The live zone was never a cache read, so its share sees no reads. The
+    ``prefix_tokens_saved`` share sat in a re-sent prefix and fills the reads
+    first, like deferred tool schemas.
+    """
+    prefix = min(max(0, prefix_tokens_saved), tokens_saved)
+    mix = {
+        "cache_write_tokens": cache_write_tokens,
+        "cache_write_5m_tokens": cache_write_5m_tokens,
+        "cache_write_1h_tokens": cache_write_1h_tokens,
+        "uncached_tokens": uncached_tokens,
+    }
+    live = _bucket_by_cache_mix(
+        tokens_saved - prefix, cache_read_tokens=0, region="live_zone", **mix
+    )
+    if prefix <= 0:
+        return live
+    replayed = _bucket_by_cache_mix(
+        prefix, cache_read_tokens=cache_read_tokens, region="prefix", **mix
+    )
+    return (
+        live[0] + replayed[0],
+        live[1] + replayed[1],
+        live[2] + replayed[2],
+        live[3] + replayed[3],
+    )
+
+
 def _summarize_transforms(transforms: list[str]) -> str:
     """Collapse repeated transforms into counted summary.
 
@@ -954,6 +993,10 @@ class CostTracker:
         self._saved_write_5m_by_tier: dict[tuple[str, bool], float] = {}
         self._saved_write_1h_by_tier: dict[tuple[str, bool], float] = {}
         self._saved_list_by_tier: dict[tuple[str, bool], float] = {}
+        # Cache reads of the removed tokens that sat in a re-sent prefix
+        # (``prefix_tokens_saved`` in ``record_tokens``); live-zone removals
+        # never have one.
+        self._saved_read_by_tier: dict[tuple[str, bool], float] = {}
         # Forwarded tokens of requests that compression kept under the model's
         # long-context threshold (their uncompressed prompt would have crossed
         # it), as [read, write 5m, write 1h, uncached, output]. The provider
@@ -1019,6 +1062,7 @@ class CostTracker:
         self._saved_write_5m_by_tier.clear()
         self._saved_write_1h_by_tier.clear()
         self._saved_list_by_tier.clear()
+        self._saved_read_by_tier.clear()
         self._tier_crossing_by_model.clear()
         self._tool_saved_by_model.clear()
         self._tool_saved_read_by_model.clear()
@@ -1126,6 +1170,7 @@ class CostTracker:
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
         provider_reported: bool = False,
+        prefix_tokens_saved: int = 0,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -1153,6 +1198,10 @@ class CostTracker:
                 counted both.
             provider_reported: True when ``tokens_sent`` is the provider's own
                 billed input (uncached + cache read + cache write).
+            prefix_tokens_saved: The share of ``tokens_saved`` removed from
+                items the conversation's previous request already carried (a
+                re-sent transcript). Counted in ``tokens_saved`` as usual; only
+                its cache-aware price differs: prefix region, not live zone.
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1215,16 +1264,20 @@ class CostTracker:
             # live-zone mix (write + uncached) instead; tool-schema deferral
             # below keeps the full-request mix, because deferred schemas do sit
             # in the cached prefix.
-            _read, c_w5m, c_w1h, c_list = _bucket_by_cache_mix(
+            # Except a re-sent transcript's removals (``prefix_tokens_saved``):
+            # those items sat in the prefix the previous request cached, so they
+            # price like it, reads first.
+            c_read, c_w5m, c_w1h, c_list = _split_compression_by_region(
                 tokens_saved,
-                cache_read_tokens=0,
+                prefix_tokens_saved,
+                cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=write_eff,
                 cache_write_5m_tokens=write_5m_eff,
                 cache_write_1h_tokens=write_1h_eff,
                 uncached_tokens=uncached_tokens,
-                region="live_zone",
             )
             wkey = (key, long_context or crossed)
+            self._saved_read_by_tier[wkey] = self._saved_read_by_tier.get(wkey, 0.0) + c_read
             self._saved_write_5m_by_tier[wkey] = self._saved_write_5m_by_tier.get(wkey, 0.0) + c_w5m
             self._saved_write_1h_by_tier[wkey] = self._saved_write_1h_by_tier.get(wkey, 0.0) + c_w1h
             self._saved_list_by_tier[wkey] = self._saved_list_by_tier.get(wkey, 0.0) + c_list
@@ -1290,6 +1343,7 @@ class CostTracker:
                 uncached=uncached_tokens,
                 output=output_tokens,
                 tool_schema_saved=tool_schema_saved,
+                prefix_tokens_saved=prefix_tokens_saved,
             )
 
         # Populate _costs so check_budget() has real data to enforce against.
@@ -1549,6 +1603,7 @@ class CostTracker:
         uncached: int,
         output: int,
         tool_schema_saved: int,
+        prefix_tokens_saved: int = 0,
     ) -> None:
         """Price one request whose label was folded, with the read-time formulas."""
         prices = self._get_cache_prices(model)
@@ -1571,18 +1626,20 @@ class CostTracker:
         # Cache-aware compression and tool-schema savings: same buckets and
         # same price lookups as the record-time maps and stats() use.
         if tokens_saved > 0:
-            _r, c5, c1, cl = _bucket_by_cache_mix(
+            cr, c5, c1, cl = _split_compression_by_region(
                 tokens_saved,
-                cache_read_tokens=0,
+                prefix_tokens_saved,
+                cache_read_tokens=cache_read,
                 cache_write_tokens=write,
                 cache_write_5m_tokens=write_5m,
                 cache_write_1h_tokens=write_1h,
                 uncached_tokens=uncached,
-                region="live_zone",
             )
             ca = self._get_cache_prices(model, long_context=long_context, for_billing=False)
             if ca:
-                self._folded_cache_aware_savings_usd += c5 * ca[1] + c1 * ca[2] + cl * ca[3]
+                self._folded_cache_aware_savings_usd += (
+                    cr * ca[0] + c5 * ca[1] + c1 * ca[2] + cl * ca[3]
+                )
         if tool_schema_saved > 0:
             rd, t5, t1, tl = _bucket_by_cache_mix(
                 tool_schema_saved,
@@ -1787,14 +1844,16 @@ class CostTracker:
             set(self._saved_write_5m_by_tier)
             | set(self._saved_write_1h_by_tier)
             | set(self._saved_list_by_tier)
+            | set(self._saved_read_by_tier)
         ):
             model, long_context = key
             prices = self._get_cache_prices(model, long_context=long_context, for_billing=False)
             if not prices:
                 continue
-            _cr_price, cw5_price, cw1h_price, uncached_price = prices
+            cr_price, cw5_price, cw1h_price, uncached_price = prices
             cache_aware_savings_usd += (
-                self._saved_write_5m_by_tier.get(key, 0.0) * cw5_price
+                self._saved_read_by_tier.get(key, 0.0) * cr_price
+                + self._saved_write_5m_by_tier.get(key, 0.0) * cw5_price
                 + self._saved_write_1h_by_tier.get(key, 0.0) * cw1h_price
                 + self._saved_list_by_tier.get(key, 0.0) * uncached_price
             )

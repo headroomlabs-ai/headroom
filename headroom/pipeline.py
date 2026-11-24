@@ -110,11 +110,9 @@ class OutcomeSnapshot:
     #: Input tokens Headroom removed from THIS request's payload (the wire
     #: figure PERF logs as ``tok_saved``), message compression only.
     tokens_saved: int = 0
-    #: The share of ``tokens_saved`` new to this conversation, which is what
-    #: running totals book (PERF ``tok_novel``). The proxy funnel always sets
-    #: both; they differ only on ``/v1/responses``, where the whole transcript
-    #: is re-sent and recompressed every turn, and ``tokens_saved -
-    #: novel_tokens_saved`` is the re-sent history removed again.
+    #: What the running totals book for this request. Every path books the
+    #: per-request figure, so the proxy funnel sets this equal to
+    #: ``tokens_saved``; it stays for extensions that read it.
     novel_tokens_saved: int = 0
     #: Whose request this was: ``{dimension: label}``, for now ``project`` and
     #: ``client`` when known. Self-reported labels, not authenticated

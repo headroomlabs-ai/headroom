@@ -541,6 +541,7 @@ def estimate_request_savings_usd(
     model: str,
     *,
     compression_tokens_saved: int = 0,
+    compression_prefix_tokens_saved: int = 0,
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
     output_tokens: int = 0,
@@ -563,7 +564,10 @@ def estimate_request_savings_usd(
     the request it actually came out of (see
     :mod:`headroom.pricing.counterfactual`):
 
-    * ``compression`` — live-zone content, which was never a cache read.
+    * ``compression`` — live-zone content, which was never a cache read,
+      except ``compression_prefix_tokens_saved``: the share removed from items
+      the conversation's previous request already carried (a re-sent
+      transcript), priced against the prefix like ``tool_schema``.
     * ``tool_schema`` — prefix content, which on a warm turn was *entirely* a
       cache read.
 
@@ -626,11 +630,14 @@ def estimate_request_savings_usd(
             fallback_rate_per_token=DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
         )
 
+    compression_tokens = max(_coerce_int(compression_tokens_saved), 0)
+    prefix_tokens = min(max(_coerce_int(compression_prefix_tokens_saved), 0), compression_tokens)
     compression = _price(
-        compression_tokens_saved, Region.LIVE_ZONE, long_tier=long_context or crossed
+        compression_tokens - prefix_tokens, Region.LIVE_ZONE, long_tier=long_context or crossed
     )
+    compression_prefix = _price(prefix_tokens, Region.PREFIX, long_tier=long_context or crossed)
     tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX, long_tier=long_context)
-    compression_usd = compression.usd
+    compression_usd = compression.usd + compression_prefix.usd
     if crossed:
         compression_usd += long_context_premium_avoided_usd(
             model,
@@ -642,7 +649,7 @@ def estimate_request_savings_usd(
 
     return {
         "compression": compression_usd,
-        "compression_list": compression.usd_list,
+        "compression_list": compression.usd_list + compression_prefix.usd_list,
         "tool_schema": tool_schema.usd,
         "tool_schema_list": tool_schema.usd_list,
         "output_shaping": _estimate_output_savings_usd(
@@ -656,6 +663,7 @@ def estimate_request_savings_usd(
         # had no mix to work with reports the weaker of the two.
         "basis": weakest_basis(
             compression.basis if compression.tokens else None,
+            compression_prefix.basis if compression_prefix.tokens else None,
             tool_schema.basis if tool_schema.tokens else None,
         ),
     }
@@ -1503,6 +1511,10 @@ class SavingsTracker:
         # provider never billed), not a metric that aggregate stores, so it
         # must not survive into that call.
         cache_inferred = bool(metrics.pop("cache_inferred", False))
+        # Popped for the same reason: a pricing input, not a stored metric.
+        compression_prefix_tokens_saved = _coerce_int(
+            metrics.pop("compression_prefix_tokens_saved", 0)
+        )
         metrics.setdefault(
             "input_usd",
             _estimate_input_cost_usd(
@@ -1523,6 +1535,7 @@ class SavingsTracker:
             priced = estimate_request_savings_usd(
                 model,
                 compression_tokens_saved=_coerce_int(metrics.get("tokens_saved")),
+                compression_prefix_tokens_saved=compression_prefix_tokens_saved,
                 output_tokens=_coerce_int(metrics.get("output_tokens")),
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,

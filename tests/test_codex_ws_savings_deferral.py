@@ -33,57 +33,44 @@ def test_deferrable_savings_delta_gates_on_input() -> None:
 
 
 def test_deferred_savings_land_with_next_usage_turn() -> None:
-    """Walk the recorded-total bookkeeping the handler performs per turn.
+    """A frame whose response ends without usage hands its savings to the
+    next completion with usage on the connection; its measure is released."""
+    from headroom.proxy.handlers.openai import _WsFrame, _WsTurnMeasures
 
-    The handler computes ``saved_delta = _deferrable_savings_delta(input_delta,
-    tokens_saved - recorded)`` and then advances ``recorded += saved_delta``.
-    A deferred turn must leave the savings pending so they ride along with the
-    next usage-carrying turn instead of being dropped.
-    """
+    released: list[object] = []
+    turns = _WsTurnMeasures(release=released.append)
+    # Frame 1: compressed (100 saved) but its response fails before any usage.
+    turns.sent(_WsFrame("m1", saved=100))  # type: ignore[arg-type]
+    turns.created("r1")
+    turns.ended("r1", completed=False)
+    assert turns.take_completed() is None  # nothing booked...
+    assert released == ["m1"]  # ...and frame 1 never becomes a baseline.
 
-    recorded = 0
-
-    # Turn 1: compressed (100 saved) but cancelled before any usage frame.
-    tokens_saved = 100
-    delta = _deferrable_savings_delta(0, tokens_saved - recorded)
-    assert delta == 0  # nothing recorded...
-    recorded += delta
-    assert recorded == 0  # ...and the 100 stays pending.
-
-    # Turn 2: compressed (50 more saved) and completed with usage.
-    tokens_saved = 150
-    delta = _deferrable_savings_delta(4_000, tokens_saved - recorded)
-    assert delta == 150  # turn 2's 50 plus the deferred 100.
-    recorded += delta
-    assert recorded == tokens_saved
+    # Frame 2: compressed (50 saved) and completed with usage.
+    turns.sent(_WsFrame(None, saved=50))
+    turns.created("r2")
+    turns.ended("r2", completed=True)
+    booking = turns.take_completed()
+    assert booking is not None and booking.saved == 150  # its 50 plus the deferred 100.
 
 
 def test_per_turn_and_residual_sites_use_the_gate() -> None:
-    """Source-level guard for the closure-internal wiring.
-
-    The per-turn metrics closure and the session-end residual flush both live
-    inside ``handle_openai_responses_ws`` and cannot be reached by unit tests
-    (see the pending-harness note in test_codex_ws_compression_scheduler.py),
-    so guard the wiring in source: both sites must gate their savings delta
-    through ``_deferrable_savings_delta``, and the recorded-savings total must
-    advance by the recorded delta (``+= saved_delta``) — a naked
-    ``= tokens_saved`` assignment would silently drop deferred savings.
-    """
+    """Source-level guard for the closure-internal wiring: the per-turn record
+    books only the frame its response completed with usage (plus deferred
+    savings), and the session-end residual gates its savings on input through
+    ``_deferrable_savings_delta``. Booking a savings delta without input
+    accounting writes a savings-with-zero-spend checkpoint."""
 
     source = OPENAI_HANDLER.read_text()
-    assert source.count("_deferrable_savings_delta(") >= 3, (
-        "Expected the per-turn WS metrics closure and the session-end "
-        "residual flush to both gate savings through "
-        "_deferrable_savings_delta (plus its def). A savings delta recorded "
-        "without input accounting writes a savings-with-zero-spend "
-        "checkpoint into the savings tracker."
+    assert source.count("_deferrable_savings_delta(") >= 2, (
+        "Expected the session-end residual flush to gate savings through "
+        "_deferrable_savings_delta (plus its def)."
     )
-    assert re.search(r"ws_recorded_tokens_saved_total\s*\+=\s*saved_delta", source), (
-        "The recorded-savings total must advance by the recorded delta so "
-        "savings deferred from usage-less turns stay pending for the next "
-        "usage-carrying turn."
+    assert "booking = ws_measures.take_completed()" in source, (
+        "The per-turn WS record must book the frame whose response completed "
+        "with usage, not a connection-wide savings delta."
     )
-    assert not re.search(r"ws_recorded_tokens_saved_total\s*=\s*tokens_saved\b", source), (
-        "Naked `ws_recorded_tokens_saved_total = tokens_saved` reintroduced: "
-        "this silently drops savings deferred from usage-less turns."
+    assert not re.search(r"tokens_saved\s*-\s*ws_recorded_tokens_saved_total", source), (
+        "A connection-wide savings delta in the per-turn record books the "
+        "savings of frames still awaiting their response."
     )

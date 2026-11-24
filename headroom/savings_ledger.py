@@ -21,6 +21,9 @@ produced:
   apart. They sit in different regions of the prompt and price at different
   rates (see :mod:`headroom.pricing.counterfactual`), so an event storing only
   their sum cannot be priced correctly at all.
+* ``saved_prefix`` — the share of compression removed from items the
+  conversation's previous request already carried (a re-sent transcript),
+  priced against the prefix rather than the live zone. Absent means none.
 * ``cache`` — the request's observed read/write/uncached mix.
 * ``cost_effective_usd`` — the cache-aware figure, alongside the unchanged
   list-priced ``cost_usd``.
@@ -243,6 +246,7 @@ def _price_event(
     # present so an externally-written or older v2 line round-trips.
     tool_schema = min(_nonneg_int(event.get("saved_tool_schema", 0)), saved)
     compression = _nonneg_int(event.get("saved_compression", saved - tool_schema))
+    prefix = min(_nonneg_int(event.get("saved_prefix", 0)), compression)
     model = str(event.get("model") or UNKNOWN)
     provider = event.get("provider")
 
@@ -251,7 +255,8 @@ def _price_event(
         total_list = 0.0
         bases: list[str] = []
         for tokens, region in (
-            (compression, Region.LIVE_ZONE),
+            (compression - prefix, Region.LIVE_ZONE),
+            (prefix, Region.PREFIX),
             (tool_schema, Region.PREFIX),
         ):
             if tokens <= 0:
@@ -297,6 +302,7 @@ def record_savings_event(
     # All optional. The MCP tool path supplies none of them and keeps writing
     # exactly the events it always did, priced at list and labelled as such.
     saved_compression: Any = None,
+    saved_compression_prefix: Any = 0,
     saved_tool_schema: Any = None,
     cache_read_tokens: Any = 0,
     cache_write_tokens: Any = 0,
@@ -388,6 +394,9 @@ def record_savings_event(
     split = _coerce_split(saved, saved_compression, saved_tool_schema)
     if split is not None:
         event["saved_tool_schema"] = split[1]
+        prefix = min(_nonneg_int(saved_compression_prefix), split[0])
+        if prefix:
+            event["saved_prefix"] = prefix
 
     # Short keys, and zero-valued ones omitted entirely. This file gets one line
     # per request and is capped at 1 MB before compaction, so field names and
@@ -695,6 +704,15 @@ def aggregate_savings(
                 deferred = max(int(event.get("deferred", 0) or 0), 0)
             except (TypeError, ValueError):
                 new_input = None
+            # Replayed-prefix removals a warm turn would have read from cache
+            # never entered new input either: leave them out of the numerator
+            # like deferral, capped at the event's reads as /stats caps them.
+            # An event without ``saved_prefix`` keeps the full figure.
+            cache = event.get("cache")
+            deferred += min(
+                _nonneg_int(event.get("saved_prefix", 0)),
+                _nonneg_int(cache.get("cr", 0) if isinstance(cache, dict) else 0),
+            )
 
         targets = [windowed]
         if ts >= today_cutoff:
