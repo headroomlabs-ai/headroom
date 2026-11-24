@@ -12,6 +12,8 @@ import stat
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,25 +74,42 @@ def _is_trusted_owner(path: Path) -> bool:
 def _temp_roots() -> list[Path]:
     """Temp directories an older Headroom may have left a Codex home in.
 
-    Windows has no owner check here, so only a temp dir inside the user's
-    profile (private to that user by default) is searched; ``Path("/tmp")``
-    there is ``C:\\tmp``, which any user can create. A shared ``TEMP`` (for
-    example ``C:\\Windows\\Temp``) is not searched; recover from it with
-    ``headroom recover codex --source``.
+    None on Windows: discovery cannot verify there that a temp directory is
+    private to the user (no POSIX owner or mode bits, and a directory under
+    the profile can still carry a permissive ACL), and ``Path("/tmp")`` is
+    ``C:\\tmp``, which any user can create. Recover a known home on Windows
+    with ``headroom recover codex --source``.
     """
-    temp = Path(tempfile.gettempdir())
     if sys.platform == "win32":
-        try:
-            profile = Path.home().resolve()
-        except (RuntimeError, OSError):  # no locatable profile: nothing is private
-            return []
-        return [temp] if temp.resolve().is_relative_to(profile) else []
-    roots = [temp]
+        return []
+    roots = [Path(tempfile.gettempdir())]
     if env_tmpdir := os.environ.get("TMPDIR"):
         roots.append(Path(env_tmpdir))
     roots.extend((Path("/tmp"), Path("/private/tmp")))
     roots.extend(Path("/private/var/folders").glob("*/*/T"))
     return roots
+
+
+@contextmanager
+def _held_source(source: Path) -> Iterator[os.stat_result]:
+    """Hold ``source`` open while it is pinned; yield its metadata.
+
+    On POSIX the directory is opened once (no symlink followed) and the owner
+    and the identity used later both come from that one ``fstat``; holding the
+    descriptor keeps the inode from being reused meanwhile. Windows has no
+    POSIX owner, so only the identity is taken.
+    """
+    if sys.platform == "win32":
+        yield source.lstat()
+        return
+    fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        held = os.fstat(fd)
+        if held.st_uid != os.getuid():
+            raise ValueError(f"source Codex home {source} is not owned by the current user")
+        yield held
+    finally:
+        os.close(fd)
 
 
 def _newest_first(homes: list[Path]) -> list[Path]:
@@ -788,32 +807,33 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     target = target.expanduser().resolve()
     if not source.is_dir() or source == target:
         raise ValueError("source must be an existing Codex home different from target")
-    if not _owned_by_current_user(source):
-        # Checked again here, on the resolved path: the directory chosen at a
-        # prompt could have been replaced by then.
-        raise ValueError(f"source Codex home {source} is not owned by the current user")
-    checked = source.lstat()
     if source in target.parents or target in source.parents or target == Path(target.anchor):
         raise ValueError("source and target Codex homes must not overlap")
     _reject_target_symlink_traversal(source, target)
-    before = home_fingerprint(source)
-    backup_dir = _new_backup_dir(target)
-    report = RecoveryReport(source=source, target=target, backup_dir=backup_dir)
-    pinned = backup_dir / "source-pinned"
+    with _held_source(source) as held:
+        before = home_fingerprint(source)
+        backup_dir = _new_backup_dir(target)
+        report = RecoveryReport(source=source, target=target, backup_dir=backup_dir)
+        pinned = backup_dir / "source-pinned"
+        # Copied under a staging name and published only once complete and
+        # verified: discover_retained_sources offers any `source-pinned`, so a
+        # partial or unverified copy must never carry that name.
+        staging = backup_dir / "source-pinned.partial"
+        try:
+            _copy_home(source, staging, report.skipped_runtime)
+            copied_from = source.lstat()
+            if home_fingerprint(source) != before:
+                raise RuntimeError("source Codex home changed while it was being pinned")
+            if (copied_from.st_dev, copied_from.st_ino) != (held.st_dev, held.st_ino):
+                # The directory copied is not the one whose owner was checked.
+                raise RuntimeError("source Codex home was replaced while it was being pinned")
+        except BaseException:
+            # Best effort: a leftover staging dir is never offered for recovery,
+            # and the original error is the one to report.
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        staging.rename(pinned)
     target_backup = backup_dir / "target-before"
-    _copy_home(source, pinned, report.skipped_runtime)
-    pinned_from = source.lstat()
-    rejected = None
-    if home_fingerprint(source) != before:
-        rejected = "source Codex home changed while it was being pinned"
-    elif (pinned_from.st_dev, pinned_from.st_ino) != (checked.st_dev, checked.st_ino):
-        # The directory copied is not the one whose owner was checked.
-        rejected = "source Codex home was replaced while it was being pinned"
-    if rejected is not None:
-        # An unverified copy must not stay where discover_retained_sources
-        # would offer it for a later automatic merge.
-        shutil.rmtree(pinned)
-        raise RuntimeError(rejected)
     target_existed = target.exists()
     target_modes: dict[str, int] = {}
     if target_existed:

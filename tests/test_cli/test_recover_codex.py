@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -143,23 +144,20 @@ def test_discover_dangling_homes_skips_group_or_world_writable_homes(tmp_path: P
     assert discover_dangling_homes(tmp_path) == [candidate]
 
 
-@pytest.mark.parametrize(
-    ("temp_under", "expected"), [("home", ["Temp"]), ("shared", [])], ids=["profile", "shared"]
-)
-def test_windows_discovery_only_searches_a_temp_dir_inside_the_user_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, temp_under: str, expected: list[str]
+def test_windows_has_no_automatic_temp_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Windows has no owner check here: /tmp (C:\\tmp), TMPDIR and a shared TEMP are skipped."""
+    """Privacy of a Windows temp dir cannot be verified here (ACLs), so none is searched,
+    not even one under the user profile; --source still works."""
     home = tmp_path / "home"
-    temp = (home / "AppData" / "Local" if temp_under == "home" else tmp_path / "Windows") / "Temp"
     # Only the module's platform check is switched; os.name stays put so
     # pathlib keeps building native paths.
     monkeypatch.setattr(codex_recovery.sys, "platform", "win32")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setenv("TMPDIR", str(tmp_path / "env-tmp"))
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(home / "AppData" / "Local" / "Temp"))
 
-    assert [root.name for root in codex_recovery._temp_roots()] == expected
+    assert codex_recovery._temp_roots() == []
 
 
 def test_discover_dangling_homes_skips_a_home_that_vanishes_before_ranking(
@@ -181,6 +179,7 @@ def test_discover_dangling_homes_skips_a_home_that_vanishes_before_ranking(
     assert discover_dangling_homes(tmp_path) == [kept]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX owner check")
 def test_recovery_refuses_a_source_owned_by_another_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -241,7 +240,7 @@ def test_recovery_never_retains_a_replacement_the_copy_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Swapped after the owner check but before the copy: the copy reads the
-    replacement. Recovery must refuse it and keep no trace of it."""
+    replacement. Recovery must refuse it and keep no copy of it."""
     target = tmp_path / "codex"
     source = tmp_path / "headroom-codex-home-swapped"
     target.mkdir()
@@ -249,6 +248,7 @@ def test_recovery_never_retains_a_replacement_the_copy_read(
     (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
     (source / "config.toml").write_text('model = "mine-too"\n', encoding="utf-8")
     copy_home = codex_recovery._copy_home
+    copied_to: list[Path] = []
 
     def swap_then_copy(src: Path, dest: Path, skipped: list[str]) -> None:
         if src == source.resolve():
@@ -257,28 +257,49 @@ def test_recovery_never_retains_a_replacement_the_copy_read(
             (src / "config.toml").write_text(
                 '[mcp_servers.x]\ncommand = "true"\n', encoding="utf-8"
             )
+            copied_to.append(dest)
         copy_home(src, dest, skipped)
 
     monkeypatch.setattr(codex_recovery, "_copy_home", swap_then_copy)
     with pytest.raises(RuntimeError, match="while it was being pinned"):
         recover_codex_home(source=source, target=target)
     assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+    assert len(copied_to) == 1
+    assert not copied_to[0].exists()
+    assert not (copied_to[0].parent / "source-pinned").exists()
     assert codex_recovery.discover_retained_sources(target) == []
-    recovery_files = [p for p in tmp_path.rglob("*") if "mcp_servers" in _text_or_empty(p)]
-    assert recovery_files == [source / "config.toml"]
 
 
-def _text_or_empty(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8") if path.is_file() else ""
-    except (OSError, UnicodeDecodeError):
-        return ""
+def test_recovery_offers_no_snapshot_when_the_pinning_copy_fails_midway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy that fails part way (disk full on the second file) leaves nothing to merge later."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-partial"
+    target.mkdir()
+    source.mkdir()
+    (source / "a.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "b.jsonl").write_text("{}\n", encoding="utf-8")
+    copy2 = shutil.copy2
+    copies: list[str] = []
+
+    def copy_until_disk_full(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+        copies.append(str(src))
+        if len(copies) == 2:
+            raise OSError(errno.ENOSPC, "No space left on device", str(dst))
+        return copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", copy_until_disk_full)
+    with pytest.raises(OSError, match="No space left"):
+        recover_codex_home(source=source, target=target)
+
+    assert codex_recovery.discover_retained_sources(target) == []
 
 
 def test_windows_discovery_without_a_locatable_profile_finds_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No profile means no private root; recovery with --target still runs."""
+    """Windows discovery never needs the profile; recovery with --target still runs."""
 
     def no_profile(cls: type[Path]) -> Path:
         raise RuntimeError("Could not determine home directory.")
@@ -332,9 +353,7 @@ def test_discover_dangling_homes_searches_tmpdir_and_python_temp_root(
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(python_root))
 
     if sys.platform == "win32":
-        # TMPDIR is not a Windows temp root; tmp_path sits in the profile's Temp.
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-        assert discover_dangling_homes() == [python_candidate]
+        assert discover_dangling_homes() == []  # no automatic roots on Windows
     else:
         assert discover_dangling_homes() == [python_candidate, env_candidate]
 
