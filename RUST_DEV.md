@@ -166,12 +166,39 @@ Python proxy trusts loopback callers (no token needed, and access to
   with an empty `200`. No other route is exempt.
 - A loopback peer under a loopback `Host` is indistinguishable from a
   client on this machine. A same-host TLS terminator or reverse proxy
-  (nginx, Caddy, ...) in front of the Rust proxy must therefore keep the
-  client's original `Host` (nginx: `proxy_set_header Host $host;`), so its
-  callers need the token; if it rewrites `Host` to `127.0.0.1` or
-  `localhost`, every caller it relays counts as local, skips the token and
-  reaches the Python proxy's local-only routes. Alternatively, have it
-  forward to the front on a non-loopback address. The front logs
+  (nginx, Caddy, ...) in front of the Rust proxy must therefore relay only
+  requests for its public name, with that name as `Host`: if it relays a
+  request whose `Host` is `127.0.0.1`, `localhost` or a container alias
+  (`host.docker.internal`), whether it rewrote it or the client sent it,
+  that caller counts as local, skips the token and reaches the Python
+  proxy's local-only routes. Validate the authority explicitly; `$host`
+  alone passes through whatever the client sent. For nginx:
+
+  ```nginx
+  # Any authority other than the public name never reaches the front.
+  server {
+      listen 443 ssl default_server;
+      ssl_reject_handshake on;   # unknown SNI (IP literals, localhost, ...)
+      return 444;                # known SNI, other Host: close, no response
+  }
+  server {
+      listen 443 ssl;
+      server_name proxy.example.com;     # your public name, nothing else
+      ssl_certificate     /etc/ssl/headroom/fullchain.pem;
+      ssl_certificate_key /etc/ssl/headroom/privkey.pem;
+      location / {
+          proxy_pass http://127.0.0.1:8787;
+          proxy_set_header Host $host;   # the validated public name
+          proxy_http_version 1.1;
+          proxy_buffering off;           # streaming responses
+      }
+  }
+  ```
+
+  Callers of the public name then need the token; `Host: 127.0.0.1:8787`,
+  `localhost` or `host.docker.internal` are closed by nginx and never
+  reach the front. Alternatively, have the terminator forward to the
+  front on a non-loopback address. The front logs
   `event=proxy_loopback_listen_with_token` at startup as a reminder when
   it listens on loopback with a token configured.
 - A non-loopback `--listen` with no token refuses to start. Set

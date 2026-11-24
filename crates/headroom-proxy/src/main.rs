@@ -49,9 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             event = "proxy_loopback_listen_with_token",
             listen = %config.listen,
             "a same-host TLS terminator or reverse proxy in front of this \
-             listener must keep the client's original Host (not 127.0.0.1 or \
-             localhost); a caller relayed under a loopback Host is treated as \
-             local and skips HEADROOM_PROXY_TOKEN"
+             listener must relay only its public name as Host (never \
+             127.0.0.1, localhost or a container alias); a caller relayed \
+             under such a Host is treated as local and skips \
+             HEADROOM_PROXY_TOKEN. See RUST_DEV.md, Inbound authentication"
         );
     }
 
