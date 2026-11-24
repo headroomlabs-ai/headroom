@@ -31,6 +31,7 @@ from urllib.parse import urlsplit, urlunsplit
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 from headroom.cache.compression_cache import _is_tool_result_message
+from headroom.log_safety import LOG_FORMAT, SingleLineFormatter
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -2084,9 +2085,7 @@ def _setup_file_logging(
         )
         handler.set_name(_PROXY_LOG_HANDLER_NAME)
         handler.setLevel(level)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
+        handler.setFormatter(SingleLineFormatter(LOG_FORMAT))
         for stale in existing:
             headroom_logger.removeHandler(stale)
             stale.close()

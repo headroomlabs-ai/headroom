@@ -5562,7 +5562,7 @@ class OpenAIHandlerMixin:
 
                     if tokens_saved > 0:
                         logger.info(
-                            f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                            f"[{request_id}] {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                             f"(saved {tokens_saved:,} tokens) via {request_backend.name}"
                         )
 
@@ -6195,7 +6195,7 @@ class OpenAIHandlerMixin:
 
                 if tokens_saved > 0:
                     logger.info(
-                        f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                        f"[{request_id}] {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                         f"(saved {tokens_saved:,} tokens)"
                     )
 
@@ -7744,7 +7744,7 @@ class OpenAIHandlerMixin:
                     )
 
                     logger.info(
-                        f"[{request_id}] /v1/responses {model}: {total_input_tokens:,} tokens"
+                        f"[{request_id}] /v1/responses {safe_id(model)}: {total_input_tokens:,} tokens"
                     )
 
                     # Capture Codex rate-limit window data from response headers
