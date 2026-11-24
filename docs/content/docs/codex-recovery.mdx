@@ -18,7 +18,7 @@ The target defaults to `$CODEX_HOME` when it is set, otherwise `~/.codex`. Check
 The first interactive `headroom wrap codex` with the fixed version searches for non-empty `headroom-codex-home-*` directories and, if it finds any, lists them and offers to back up and recover them before Codex starts. `headroom recover codex` without `--source` uses the same search.
 
 - On macOS and Linux it searches Python's temporary directory, `$TMPDIR`, `/tmp`, `/private/tmp`, and the macOS `/private/var/folders/*/*/T` roots. A directory is offered only if you own it and it is not writable by group or others, because another local account can create directories in shared temp roots.
-- On Windows it does not search temporary directories. Headroom cannot verify that a temporary directory is private to you there (ACLs can grant other accounts access), so recover a known home with `--source`.
+- On Windows it does not search any temporary directory, including ones inside your user profile. Headroom cannot verify that a temporary directory is private to you there (ACLs can grant other accounts access). Recover a known home with `--source`; retained `source-pinned/` copies from interrupted recoveries are still found.
 
 A home that is not offered automatically can still be recovered with `--source` (see below).
 
