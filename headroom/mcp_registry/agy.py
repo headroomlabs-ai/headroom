@@ -23,6 +23,7 @@ import logging
 import os
 import stat
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -221,6 +222,49 @@ class AgyRegistrar(MCPRegistrar):
         except OSError as exc:
             logger.debug("agy: could not lock %s: %s", self._config_file, exc)
             return False
+
+    def unregister_server_if(
+        self,
+        server_name: str,
+        predicate: Callable[[ServerSpec], bool],
+    ) -> str:
+        """Atomically verify ownership and remove ``server_name`` under one config lock.
+
+        Returns ``"removed"`` when ``predicate(current)`` matched and the entry
+        was deleted, ``"not_matched"`` when absent/unreadable/non-matching, or
+        ``"failed"`` if locking or writing failed.
+        """
+        if not self._config_file.exists():
+            return "not_matched"
+        try:
+            with _config_file_lock(self._config_file):
+                if not self._config_file.exists():
+                    return "not_matched"
+                try:
+                    config = _read_json_for_write(self._config_file)
+                except (_MalformedConfigError, OSError) as exc:
+                    logger.debug("agy: refusing to rewrite %s: %s", self._config_file, exc)
+                    return "not_matched"
+                servers = config.get("mcpServers")
+                if not isinstance(servers, dict):
+                    return "not_matched"
+                raw_entry = servers.get(server_name)
+                if not isinstance(raw_entry, dict):
+                    return "not_matched"
+                current = _try_entry_to_spec(server_name, raw_entry)
+                if current is None or not predicate(current):
+                    return "not_matched"
+                del servers[server_name]
+                config["mcpServers"] = servers
+                try:
+                    _write_json(self._config_file, config)
+                except OSError as exc:
+                    logger.debug("agy: could not write %s: %s", self._config_file, exc)
+                    return "failed"
+                return "removed"
+        except OSError as exc:
+            logger.debug("agy: could not lock %s: %s", self._config_file, exc)
+            return "failed"
 
 
 # ----------------------------------------------------------------------

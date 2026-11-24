@@ -730,3 +730,59 @@ class TestRegistrarSafety:
         assert result.status == RegisterStatus.MISMATCH
         # File still preserves the user's edited JSON boolean.
         assert _read_config(tmp_path)["mcpServers"]["serena"]["args"][-1] is False
+
+    def test_unwrap_checks_ownership_and_removes_in_one_locked_transaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Concurrent replacement during unwrap must survive instead of being deleted."""
+        import threading
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        installed_spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/usr/local/bin/custom-headroom",
+            args=("--user-managed",),
+        )
+        assert reg1.register_server(installed_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", installed_spec)
+
+        entered = threading.Event()
+        release = threading.Event()
+        orig_matching = ledger_mod.headroom_installed_matching
+
+        def _paused_matching(*args, **kwargs) -> bool:
+            entered.set()
+            release.wait(timeout=0.3)
+            return orig_matching(*args, **kwargs)
+
+        monkeypatch.setattr(ledger_mod, "headroom_installed_matching", _paused_matching)
+
+        results: dict[str, object] = {}
+
+        def _run_unwrap() -> None:
+            results["unwrap"] = wrap_mod._remove_headroom_installed_retrieve_mcp(reg1)
+
+        def _run_replace() -> None:
+            results["replace"] = reg2.register_server(replacement_spec, force=True)
+
+        t1 = threading.Thread(target=_run_unwrap)
+        t2 = threading.Thread(target=_run_replace)
+        t1.start()
+        assert entered.wait(timeout=5.0)
+        t2.start()
+        t2.join(timeout=0.1)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert results["replace"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        final = reg1.get_server("headroom")
+        assert final == replacement_spec
