@@ -429,3 +429,67 @@ def test_windows_search_output_takes_the_lossless_dir_fold(name, tool_input, lab
     out = result.messages[1]["content"][0]["content"]
     assert label in result.transforms_applied
     assert search_dir_unheading(out, backslash=True) == windows
+
+
+# --- Windows separators in path listings: rg --files, rg -l, PowerShell ---
+_DEEP_FILES = "".join(
+    f"crates/headroom-core/src/{folder}/{name}.rs\n"
+    for folder, names in (
+        ("transforms", ("anchor", "content", "diff", "log", "search", "smart")),
+        ("ccr", ("store", "marker", "resolve", "batch")),
+        ("signals", ("keyword", "tokens", "budget", "error")),
+    )
+    for name in names
+)
+
+
+@pytest.mark.parametrize("root", ["", "./"])  # rg --files / PowerShell Resolve-Path -Relative
+def test_path_fold_handles_windows_backslash_paths(root) -> None:
+    posix = "".join(root + row for row in _DEEP_FILES.splitlines(keepends=True))
+    windows = posix.replace("/", chr(92))
+    folded = compact_lossless(windows, "paths")
+    assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
+    first_header = f"{root}crates/headroom-core/src/transforms/".replace("/", chr(92))
+    assert folded.split("\n")[0] == first_header
+    assert _puh(folded, backslash=True) == windows
+
+
+def test_mixed_separator_listing_takes_the_smaller_fold() -> None:
+    # `rg --files headroom/cli headroom/proxy` on Windows prints headroom/cli\x.py.
+    grouped = "".join(
+        f"headroom/{folder}{chr(92)}mod_{i}.py\n" for folder in ("cli", "proxy") for i in range(12)
+    )
+    assert compact_lossless(grouped, "paths") == _ph(grouped, backslash=True)
+    # Interleaved folders: factoring headroom/ beats a header per row, so the
+    # "/" fold has to stay a candidate, and its bases may hold a "\".
+    interleaved = "".join(
+        f"headroom/{folder}{chr(92)}mod_{i}.py\n" for i in range(12) for folder in ("cli", "proxy")
+    )
+    assert compact_lossless(interleaved, "paths") == _ph(interleaved)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A lone leading "\" is not a path root: a list of regexes is not a listing.
+        "".join(f"{chr(92)}{c}+{chr(92)}s{chr(92)}{c}+\n" for c in "wdS"),
+        # The "/" fold's markup rule holds with "\" as a separator too.
+        "{{/if}}\n{{/each}}\n",
+    ],
+    ids=["regexes", "template-closers"],
+)
+def test_backslash_path_fold_skips_non_listings(text) -> None:
+    assert _ph(text, backslash=True) == text
+
+
+def test_windows_listing_takes_the_lossless_paths_fold(tokenizer) -> None:
+    # Over the 2000-char floor below which a shell result stays verbatim (#3590).
+    posix = "".join(
+        f"crates/headroom-core/src/{folder}/module_{i:02}.rs\n"
+        for folder in ("transforms", "ccr", "signals")
+        for i in range(20)
+    )
+    windows = posix.replace("/", chr(92))
+    out, transforms = _anthropic("rg --files crates", windows, tokenizer)
+    assert "router:tool_result:lossless_paths" in transforms
+    assert _puh(out, backslash=True) == windows

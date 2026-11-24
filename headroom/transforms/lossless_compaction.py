@@ -460,9 +460,16 @@ def diff_strip_index(text: str) -> str:
 _PATH_ROW_RE = re.compile(
     r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
 )
+# The same with ``\`` also a separator, for the paths Windows tools print
+# (ripgrep, PowerShell). The root may be ``.\`` or ``..\`` but not a lone
+# ``\``, so a list of regexes such as ``\w+\s\w+`` is not a listing.
+_PATH_ROW_BACKSLASH_RE = re.compile(
+    r"^(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?(?:(?=[^/\\]*\w)[^/\\\s:<>;]+[/\\])+)"
+    r"(?P<base>[^/\\\s:<>;]+)$"
+)
 
 
-def path_heading(text: str) -> str:
+def path_heading(text: str, *, backslash: bool = False) -> str:
     """Fold a *pure* file-path listing (``find`` / ``ls -1`` / ``rg -l`` output)
     into ripgrep-heading form: each parent directory printed once on its own
     line (ending in ``/``), then the bare basenames beneath it.
@@ -475,11 +482,15 @@ def path_heading(text: str) -> str:
     round-trip via :func:`path_unheading` and discards the fold on any mismatch.
     Complements ``search_heading``, which only handles the ``path:line:content``
     grep shape, not plain path lists.
+
+    With ``backslash=True`` a ``\\`` also ends a directory, as in the paths that
+    Windows tools print. Pass the same flag to :func:`path_unheading`.
     """
+    row_re = _PATH_ROW_BACKSLASH_RE if backslash else _PATH_ROW_RE
     lines, had_trailing = _split_keep_trailing(text)
     matches = []
     for ln in lines:
-        m = _PATH_ROW_RE.match(ln)
+        m = row_re.match(ln)
         if ln and not m:  # not a pure listing; stop at the first such line
             return text
         matches.append(m)
@@ -500,28 +511,30 @@ def path_heading(text: str) -> str:
     return _join(out, had_trailing)
 
 
-def path_unheading(text: str) -> str:
+def path_unheading(text: str, *, backslash: bool = False) -> str:
     """Exact inverse of :func:`path_heading`.
 
     A *header* is a line ending in ``/`` immediately followed by a basename row
     (a non-empty line with no ``/``); it is consumed and re-prefixed onto each
-    following basename row until a blank line or another header.
+    following basename row until a blank line or another header. ``backslash``
+    must match the flag the fold was made with (``\\`` then counts as ``/``).
     """
+    seps = ("/", "\\") if backslash else ("/",)
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
+    is_base = [ln != "" and "/" not in ln and not (backslash and "\\" in ln) for ln in lines]
     out: list[str] = []
     current: str | None = None
     n = len(lines)
     i = 0
     while i < n:
         line = lines[i]
-        is_base = line != "" and "/" not in line
-        if current is not None and is_base:
+        if current is not None and is_base[i]:
             out.append(current + line)
             i += 1
             continue
-        if line.endswith("/") and i + 1 < n and lines[i + 1] != "" and "/" not in lines[i + 1]:
+        if line.endswith(seps) and i + 1 < n and is_base[i + 1]:
             current = line
             i += 1
             continue
@@ -603,10 +616,16 @@ def compact_lossless(content: str, kind: str) -> str:
 
         if kind == "paths":
             # Pure path listings (find/ls -1/rg -l): fold repeated parent dirs.
-            candidate = path_heading(content)
-            if path_unheading(candidate) != content:
-                return content
-            return candidate if _smaller(candidate, content) else content
+            # As in "search", the "\" fold for Windows paths is an extra
+            # candidate and the smallest exact round-trip wins.
+            best = content
+            for backslash in (False, True) if "\\" in content else (False,):
+                candidate = path_heading(content, backslash=backslash)
+                if path_unheading(candidate, backslash=backslash) == content and _smaller(
+                    candidate, best
+                ):
+                    best = candidate
+            return best
 
         if kind == "diff":
             # Purely subtractive of non-semantic bookkeeping lines; the
