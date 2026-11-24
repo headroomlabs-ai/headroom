@@ -98,7 +98,10 @@ def test_a_refresh_does_not_break_a_lookup_already_reading_the_table(isolated_ca
     litellm resolves a mixed-case name by rebuilding a lowercase index, which
     iterates ``litellm.model_cost``. Growing that dict in place, even in one
     ``dict.update``, made the running iteration fail and the model read as
-    unmapped. A key whose ``lower()`` blocks pauses the rebuild mid-iteration.
+    unmapped. The index that rebuild then stored was of the replaced table, and
+    litellm never rebuilt it for a missing name, so a refreshed model could not
+    be found by a mixed-case name. A key whose ``lower()`` blocks pauses the
+    rebuild mid-iteration.
     """
     started, resume = threading.Event(), threading.Event()
 
@@ -109,6 +112,7 @@ def test_a_refresh_does_not_break_a_lookup_already_reading_the_table(isolated_ca
             return str(self).lower()
 
     litellm.model_cost[PausingKey("headroom-test-pause")] = {"input_cost_per_token": 0.0}
+    live_prices.merge_litellm_prices({})  # the proxy's earlier refreshes
     litellm.utils._invalidate_model_cost_lowercase_map()
     found: list[object] = []
 
@@ -127,7 +131,8 @@ def test_a_refresh_does_not_break_a_lookup_already_reading_the_table(isolated_ca
     reader.join(5)
 
     assert found == [pytest.approx(2.5e-06)]
-    assert litellm.model_cost[NEW_MODEL]["input_cost_per_token"] == NEW_ROW["input_cost_per_token"]
+    refreshed = litellm.get_model_info(NEW_MODEL.upper(), custom_llm_provider="anthropic")
+    assert refreshed["input_cost_per_token"] == NEW_ROW["input_cost_per_token"]
 
 
 def test_refresh_keeps_headroom_deepseek_off_peak_rates(monkeypatch, isolated_catalog):

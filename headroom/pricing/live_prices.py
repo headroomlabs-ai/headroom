@@ -121,6 +121,39 @@ def _resolve_aliases(models: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return resolved
 
 
+def _rebuild_lowercase_index() -> dict[str, str]:
+    """litellm's lowercase-index rebuild, storing an index of the current table only.
+
+    litellm builds the index by iterating ``litellm.model_cost`` and then
+    storing it. A rebuild that began on a table a refresh has since replaced
+    stores an index without the refreshed rows, after the refresh invalidated
+    it, and litellm rebuilds only when an indexed name disappears, so a
+    refreshed model would never be found by a mixed-case name. This stores the
+    index, then rebuilds if the table it read is no longer the current one.
+    """
+    from headroom.pricing.litellm_pricing import litellm
+
+    while True:
+        table = litellm.model_cost
+        index = {key.lower(): key for key in table}
+        litellm.utils._model_cost_lowercase_map = index
+        if litellm.model_cost is table:
+            return index
+
+
+def _guard_lowercase_index() -> None:
+    """Route litellm's lowercase-index rebuilds through :func:`_rebuild_lowercase_index`."""
+    from headroom.pricing.litellm_pricing import litellm
+
+    utils = getattr(litellm, "utils", None)
+    if (
+        utils is not None
+        and hasattr(utils, "_rebuild_model_cost_lowercase_map")
+        and hasattr(utils, "_model_cost_lowercase_map")
+    ):
+        utils._rebuild_model_cost_lowercase_map = _rebuild_lowercase_index
+
+
 def merge_litellm_prices(models: dict[str, Any]) -> int:
     """Merge ``models`` into LiteLLM's table and drop stale caches.
 
@@ -141,6 +174,7 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
 
     if litellm is None:
         return 0
+    _guard_lowercase_index()
     current = litellm.model_cost
     # Headroom's rows go on before aliases resolve, so an alias such as
     # deepseek/deepseek-flash-latest takes the off-peak rate of its target,
@@ -224,6 +258,9 @@ async def refresh_periodically(interval: float = REFRESH_INTERVAL_SECONDS) -> No
     """Refresh now and then every interval seconds until cancelled."""
     if not is_price_refresh_enabled():
         return
+    # Before the first download, so no index rebuild can still be running on
+    # the old table, unguarded, when the first refresh replaces it.
+    _guard_lowercase_index()
     while True:
         await _refresh_in_daemon_thread()
         await asyncio.sleep(interval)
