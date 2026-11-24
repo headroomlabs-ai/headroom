@@ -13,6 +13,7 @@ registrars to install headroom across every detected agent.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import threading
@@ -175,6 +176,21 @@ def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
 _CONFIG_THREAD_LOCKS_GUARD = threading.Lock()
 _CONFIG_THREAD_LOCKS: dict[Path, threading.Lock] = {}
 
+_WIN_LOCK_RETRY_ERRNOS = frozenset(
+    code
+    for name in ("EACCES", "EAGAIN", "EDEADLK", "EDEADLOCK")
+    if (code := getattr(errno, name, None)) is not None
+)
+_WIN_LOCK_RETRY_WINERRORS = frozenset({32, 33})  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+
+
+def _is_windows_lock_contention(exc: OSError) -> bool:
+    """True when msvcrt.locking failed because another handle holds the lock."""
+    return (
+        exc.errno in _WIN_LOCK_RETRY_ERRNOS
+        or getattr(exc, "winerror", None) in _WIN_LOCK_RETRY_WINERRORS
+    )
+
 
 def _config_thread_lock_for(path: Path) -> threading.Lock:
     key = path.resolve()
@@ -208,7 +224,9 @@ def config_file_lock(path: Path) -> Iterator[None]:
                     try:
                         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                         break
-                    except OSError:
+                    except OSError as exc:
+                        if not _is_windows_lock_contention(exc):
+                            raise
                         time.sleep(0.05)
                 try:
                     yield

@@ -535,3 +535,83 @@ class TestRegistrarSafety:
         assert results["ide"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
         config = _read_config(tmp_path)
         assert set(config["mcpServers"].keys()) == {"existing", "headroom-cli", "headroom-ide"}
+
+    def test_windows_config_file_lock_raises_permanent_oserror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Permanent msvcrt.locking errors must fail immediately and propagate to the registrar."""
+        import errno
+        import sys
+        import types
+
+        import headroom.mcp_registry.base as base_mod
+
+        calls = 0
+
+        def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 3:
+                raise AssertionError("config_file_lock retried indefinitely on permanent EBADF")
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=2,
+            LK_UNLCK=0,
+            locking=_fake_locking,
+        )
+        monkeypatch.setattr(base_mod.sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+        monkeypatch.setattr(base_mod.time, "sleep", lambda _secs: None)
+
+        config_path = tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
+        with pytest.raises(OSError) as exc_info:
+            with base_mod.config_file_lock(config_path):
+                pass
+        assert exc_info.value.errno == errno.EBADF
+        assert calls == 1
+
+        # Registrar should receive the error cleanly and report FAILED (thread lock released).
+        reg = _make_reg(tmp_path)
+        calls = 0
+        result = reg.register_server(
+            ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        )
+        assert result.status == RegisterStatus.FAILED
+        assert calls == 1
+
+    def test_windows_config_file_lock_retries_contended_lock_until_available(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Contended msvcrt.locking calls retry until the lock is granted, then unlock on exit."""
+        import errno
+        import sys
+        import types
+
+        import headroom.mcp_registry.base as base_mod
+
+        events: list[int] = []
+        sleeps: list[float] = []
+
+        def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+            events.append(mode)
+            if mode == 2 and len(events) <= 2:
+                raise PermissionError(errno.EACCES, "Permission denied")
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=2,
+            LK_UNLCK=0,
+            locking=_fake_locking,
+        )
+        monkeypatch.setattr(base_mod.sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+        monkeypatch.setattr(base_mod.time, "sleep", lambda secs: sleeps.append(secs))
+
+        config_path = tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
+        entered = False
+        with base_mod.config_file_lock(config_path):
+            entered = True
+
+        assert entered is True
+        assert events == [2, 2, 2, 0]
+        assert len(sleeps) == 2
