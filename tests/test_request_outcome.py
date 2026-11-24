@@ -302,6 +302,7 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # as uncached_tokens, so counting it in the billed prompt total would
         # double it. Defaults False for providers with disjoint buckets.
         "cache_inferred": False,
+        "pricing_surface": None,
         # Tool-schema deferral, disjoint from the positional ``tokens_saved``.
         # The funnel already computed it for metrics.record_request; forwarding
         # it here is what lets the dashboard's per-model table count the layer

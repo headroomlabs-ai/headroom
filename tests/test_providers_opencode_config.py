@@ -14,13 +14,17 @@ from headroom.providers.opencode.config import (
     HEADROOM_OPENCODE_PLUGIN,
     _inject_key_into_json,
     _parse_json_loose,
+    _resolve_plugin_spec,
+    append_headroom_plugin,
     extra_models_from_env,
     headroom_provider_entry,
     inject_opencode_provider_config,
     opencode_config_paths,
     parse_extra_model_spec,
+    remove_headroom_plugin,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
+    strip_opencode_runtime_plugin_config,
 )
 
 
@@ -1252,3 +1256,90 @@ def test_inject_provider_config_reparses_config_with_legacy_marker_block(
     headroom = config["provider"]["headroom"]
     assert "8787" in json.dumps(headroom)
     assert headroom.get("options", {}).get("baseURL") != "http://127.0.0.1:1"
+
+
+def _expected_plugin_entry(port: int) -> list[object]:
+    return [
+        [_resolve_plugin_spec(), {"proxyUrl": f"http://127.0.0.1:{port}", "mode": "native-fetch"}]
+    ]
+
+
+def test_append_headroom_plugin_adds_plugin_once() -> None:
+    config: dict[str, object] = {"plugin": ["some-plugin"]}
+
+    assert append_headroom_plugin(config) is True
+    assert append_headroom_plugin(config) is False
+
+    assert config["plugin"] == ["some-plugin", _resolve_plugin_spec()]
+
+
+def test_append_headroom_plugin_preserves_configured_tuple_entry() -> None:
+    config: dict[str, object] = {
+        "plugin": [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
+    }
+
+    assert append_headroom_plugin(config) is False
+    assert config["plugin"] == [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
+
+
+def test_remove_headroom_plugin_removes_all_matching_entries() -> None:
+    config: dict[str, object] = {
+        "plugin": [
+            "some-plugin",
+            HEADROOM_OPENCODE_PLUGIN,
+            [_resolve_plugin_spec(), {"proxyUrl": "http://127.0.0.1:8787"}],
+        ]
+    }
+
+    assert remove_headroom_plugin(config) is True
+    assert config["plugin"] == ["some-plugin"]
+
+
+def test_remove_headroom_plugin_preserves_unrelated_opencode_suffix_plugins() -> None:
+    config: dict[str, object] = {
+        "plugin": [
+            "file:///tmp/plugins/opencode",
+            "some-plugin",
+            [_resolve_plugin_spec(), {"proxyUrl": "http://127.0.0.1:8787"}],
+        ]
+    }
+
+    assert remove_headroom_plugin(config) is True
+    assert config["plugin"] == ["file:///tmp/plugins/opencode", "some-plugin"]
+
+
+def test_strip_runtime_plugin_config_preserves_other_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "model": "openai/gpt-4o",
+                "plugin": _expected_plugin_entry(8787),
+                "mcp": {"existing": {"type": "remote", "url": "https://example.com"}},
+            }
+        )
+    )
+
+    assert strip_opencode_runtime_plugin_config(config_file) is True
+
+    config = json.loads(config_file.read_text())
+    assert config == {
+        "model": "openai/gpt-4o",
+        "mcp": {"existing": {"type": "remote", "url": "https://example.com"}},
+    }
+
+
+def test_strip_runtime_plugin_config_deletes_plugin_only_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(json.dumps({"plugin": _expected_plugin_entry(8787)}))
+
+    assert strip_opencode_runtime_plugin_config(config_file) is True
+    assert not config_file.exists()

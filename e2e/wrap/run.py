@@ -274,6 +274,7 @@ def create_shims(shim_dir: Path) -> None:
                     "OPENAI_API_BASE",
                     "ANTHROPIC_BASE_URL",
                     "CODEX_HOME",
+                    "HEADROOM_PROXY_URL",
                     "OPENCODE_CONFIG_CONTENT",
                 )
                 if os.environ.get(key) is not None
@@ -1152,13 +1153,23 @@ def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: P
     assert_true(len(entries) > 0, "Opencode shim should have been invoked")
     env_vars = entries[-1]["env"]
     assert_true(
-        env_vars.get("OPENCODE_CONFIG_CONTENT") is not None,
-        "Opencode wrap should set OPENCODE_CONFIG_CONTENT",
+        env_vars.get("HEADROOM_PROXY_URL") == f"http://127.0.0.1:{port}",
+        "Opencode wrap should set HEADROOM_PROXY_URL",
     )
-    config = json.loads(env_vars["OPENCODE_CONFIG_CONTENT"])
     assert_true(
-        config["provider"]["headroom"]["options"]["baseURL"] == f"http://127.0.0.1:{port}/v1",
-        "Opencode wrap should inject headroom provider baseURL",
+        "OPENCODE_CONFIG_CONTENT" not in env_vars,
+        "Opencode wrap should preserve native config instead of injecting a provider",
+    )
+
+    plugin_dir = Path(base_env["HOME"]) / ".config" / "opencode" / "plugins"
+    manifest_path = plugin_dir / ".headroom-plugin-manifest.json"
+    assert_true(manifest_path.exists(), "Opencode wrap should install the local plugin manifest")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    plugin_files = manifest.get("files", [])
+    assert_true("index.js" in plugin_files, "Opencode plugin manifest should include index.js")
+    assert_true(
+        all((plugin_dir / name).is_file() for name in plugin_files),
+        "Opencode wrap should install every plugin bundle file",
     )
 
     run(
@@ -1166,6 +1177,14 @@ def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: P
         env=base_env,
         cwd=project_dir,
         timeout=120,
+    )
+    assert_true(
+        not manifest_path.exists(),
+        "Opencode unwrap should remove the local plugin manifest",
+    )
+    assert_true(
+        all(not (plugin_dir / name).exists() for name in plugin_files),
+        "Opencode unwrap should remove every installed plugin bundle file",
     )
     config_path = Path(base_env["HOME"]) / ".config" / "opencode" / "opencode.json"
     if config_path.exists():

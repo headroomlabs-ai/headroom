@@ -18,6 +18,7 @@ from headroom.proxy.handlers.openai import (
     _is_allowed_websocket_origin,
     _openai_responses_unit_cache_key,
     _resolve_codex_routing_headers,
+    _resolve_openai_upstream_base_url,
     _responses_stateless_output_items,
 )
 
@@ -106,6 +107,22 @@ def test_resolve_codex_routing_ignores_invalid_jwt_payloads():
 
     assert is_chatgpt is False
     assert headers["authorization"] == f"Bearer {token}"
+
+
+def test_resolve_openai_upstream_base_url_prefers_headroom_override() -> None:
+    assert (
+        _resolve_openai_upstream_base_url(
+            {"x-headroom-base-url": "https://zenmux.ai/api/v1/"},
+            "https://api.openai.com",
+        )
+        == "https://zenmux.ai/api"
+    )
+
+
+def test_resolve_openai_upstream_base_url_falls_back_to_default() -> None:
+    assert (
+        _resolve_openai_upstream_base_url({}, "https://api.openai.com/") == "https://api.openai.com"
+    )
 
 
 def test_openai_responses_unit_cache_key_includes_target_ratio() -> None:
@@ -731,6 +748,34 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     method, url, headers, body = handler.captured_request
     assert method == "POST"
     assert url == "https://api.openai.com/v1/responses"
+    assert headers.get("ChatGPT-Account-ID") is None
+    assert body["input"] == "hello"
+    assert response.status_code == 200
+
+
+def test_handle_openai_responses_prefers_custom_upstream_base_url(monkeypatch):
+    # Keep the SSRF guard out of the way: zenmux.ai is a public host, but a DNS
+    # miss in a sandboxed run would make the handler ignore the override.
+    async def _always_safe(url: str) -> bool:
+        return True
+
+    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url_async", _always_safe)
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello"},
+        {
+            "Authorization": "Bearer sk-test",
+            "x-headroom-base-url": "https://zenmux.ai/api",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert handler.captured_request is not None
+    _, url, headers, body = handler.captured_request
+    assert url == "https://zenmux.ai/api/v1/responses"
     assert headers.get("ChatGPT-Account-ID") is None
     assert body["input"] == "hello"
     assert response.status_code == 200

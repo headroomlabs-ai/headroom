@@ -2153,6 +2153,54 @@ def prefers_http1_passthrough(base_url: str) -> bool:
     return host == "chatgpt.com" or host.endswith(".chatgpt.com")
 
 
+def _resolve_openai_upstream_base_url(headers: dict[str, str], default_base_url: str) -> str:
+    """Resolve an OpenAI-compatible upstream base URL for this request.
+
+    Native OpenAI routes historically pinned to ``OPENAI_API_URL`` and ignored
+    ``x-headroom-base-url``. OpenCode provider-preserving routing for
+    OpenAI-compatible providers needs that override to survive on the native
+    path too, not only the generic passthrough catch-all.
+    """
+    base_url = headers.get("x-headroom-base-url", "").strip() or default_base_url.strip()
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        return normalized[:-3]
+    return normalized
+
+
+def _resolve_openai_upstream_url(
+    headers: dict[str, str],
+    default_base_url: str,
+    fallback_path: str,
+    query: str = "",
+) -> str:
+    """Resolve an OpenAI-compatible upstream URL from Headroom routing hints.
+
+    OpenCode's transport shim normalizes provider requests to Headroom's native
+    ``/v1`` routes, then sends the provider's original path in
+    ``x-headroom-original-path``. Preserve that original path when the custom
+    base URL is valid; otherwise fall back to the canonical OpenAI path.
+    """
+    base_url = _resolve_openai_upstream_base_url(headers, default_base_url)
+    parsed_base = urlparse(base_url)
+    original_path = headers.get("x-headroom-original-path", "").strip()
+
+    if parsed_base.scheme in {"http", "https"} and parsed_base.netloc and original_path:
+        parsed_path = urlparse(original_path)
+        if (
+            original_path.startswith("/")
+            and not parsed_path.scheme
+            and not parsed_path.netloc
+            and not parsed_path.query
+            and not parsed_path.fragment
+        ):
+            url = build_copilot_upstream_url(base_url, original_path)
+            return f"{url}?{query}" if query else url
+
+    url = build_copilot_upstream_url(base_url, fallback_path)
+    return f"{url}?{query}" if query else url
+
+
 _prefers_http1_passthrough = prefers_http1_passthrough
 
 
@@ -7991,6 +8039,17 @@ class OpenAIHandlerMixin:
             headers=ws_headers,
             metadata={"path": _ws_path},
         )
+        # Same upstream-guard contract as the HTTP path: an
+        # ``x-headroom-base-url`` override must pass the safety check before
+        # we open an upstream connection to it.
+        _custom_ws_base = (
+            ws_headers.get("x-headroom-base-url") or ws_headers.get("X-Headroom-Base-Url") or ""
+        ).strip()
+        if _custom_ws_base and not await is_safe_upstream_url_async(_custom_ws_base):
+            logger.warning("[ws:%s] rejecting x-headroom-base-url that fails the guard", session_id)
+            await websocket.close(code=4400)
+            return
+        upstream_base_url = _resolve_openai_upstream_base_url(ws_headers, self.OPENAI_API_URL)
         # Extract per-request tags from headers up front so the
         # session-end RequestLog can attach them. `_extract_tags` is
         # the same helper the HTTP handlers use; on a WebSocket the
@@ -8069,7 +8128,7 @@ class OpenAIHandlerMixin:
             )
         else:
             # API key auth → route to configured OpenAI API URL
-            base = self.OPENAI_API_URL
+            base = upstream_base_url
             ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
             upstream_url = build_copilot_upstream_url(ws_base, "/v1/responses")
 
@@ -10620,7 +10679,12 @@ class OpenAIHandlerMixin:
                     fb_uncached_tokens,
                     ws_cache_inferred,
                 ) = await self._ws_http_fallback(
-                    websocket, body, first_msg_raw, upstream_headers, request_id
+                    websocket,
+                    body,
+                    first_msg_raw,
+                    upstream_headers,
+                    request_id,
+                    upstream_base_url,
                 )
                 # Fold the fallback's provider usage into the session totals so
                 # the WS session-end outcome records the authoritative wire-token
@@ -10901,6 +10965,7 @@ class OpenAIHandlerMixin:
         first_msg_raw: str,
         upstream_headers: dict[str, str],
         request_id: str,
+        upstream_base_url: str | None = None,
     ) -> tuple[int, int, int, int, int, bool]:
         """Fall back to HTTP POST streaming when upstream WS fails.
 
@@ -10935,7 +11000,10 @@ class OpenAIHandlerMixin:
         if is_chatgpt_fallback:
             http_url = codex_responses_http_url()
         else:
-            http_url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            base_url = _resolve_openai_upstream_base_url(
+                {"x-headroom-base-url": upstream_base_url or ""}, self.OPENAI_API_URL
+            )
+            http_url = build_copilot_upstream_url(base_url, "/v1/responses")
 
         # Build HTTP body from the WS response.create payload.
         # WS messages use {"type": "response.create", "response": {...}} wrapper.

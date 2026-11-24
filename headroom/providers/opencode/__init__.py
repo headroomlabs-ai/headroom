@@ -7,6 +7,7 @@ from .config import (
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
     opencode_config_paths,
+    remove_headroom_opencode_plugin_files,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "inject_opencode_provider_config",
     "opencode_config_paths",
     "proxy_base_url",
+    "remove_headroom_opencode_plugin_files",
     "revert_provider_scope",
     "snapshot_opencode_config_if_unwrapped",
     "strip_opencode_headroom_blocks",

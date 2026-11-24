@@ -617,6 +617,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # Project attribution: explicit outcome field wins, else the value the
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
+    # Import only when OpenCode routing markers are present: pulling
+    # ``headroom.pricing`` runs its package __init__, which imports litellm —
+    # a multi-second cold import that would stall the WS event loop on the
+    # first outcome of a process for traffic that can never match.
+    pricing_surface = None
+    if outcome.tags and ("original-path" in outcome.tags or "base-url" in outcome.tags):
+        from headroom.pricing.opencode_prices import pricing_surface_from_tags
+
+        pricing_surface = pricing_surface_from_tags(outcome.tags)
 
     # Savings that are new to this conversation. Per-request descriptions
     # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
@@ -737,6 +746,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         output_tokens_saved_high=output_tokens_saved_high_est,
         project=project,
         client=outcome.client,
+        pricing_surface=pricing_surface,
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
         savings_attribution=savings_breakdown,
@@ -763,6 +773,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             uncached_tokens=outcome.uncached_input_tokens,
             cache_inferred=outcome.cache_inferred,
             output_tokens=outcome.output_tokens,
+            pricing_surface=pricing_surface,
             # Same figure already handed to metrics.record_request above. The
             # cost tracker feeds the dashboard's per-model table, which read
             # compression only while its own headline counted both layers.
