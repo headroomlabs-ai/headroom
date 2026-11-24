@@ -269,7 +269,7 @@ def test_update_upgrade_failure_surfaces_command(monkeypatch):
 
 class _UpgradeThenProbe:
     """Fake ``subprocess.run``: the upgrade succeeds, then the post-upgrade
-    version probe (a fresh ``sys.executable -c`` process) reports
+    version probe (a fresh ``sys.executable -P -c`` process) reports
     ``installed`` -- or fails when ``installed`` is None."""
 
     def __init__(self, installed: str | None) -> None:
@@ -278,7 +278,7 @@ class _UpgradeThenProbe:
 
     def __call__(self, argv, *a, **k):
         self.argvs.append(list(argv))
-        is_probe = argv[:2] == [sys.executable, "-c"]
+        is_probe = argv[:3] == [sys.executable, "-P", "-c"]
         if is_probe and self.installed is None:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
         stdout = f"{self.installed}\n" if is_probe else ""
@@ -327,6 +327,24 @@ def test_update_does_not_claim_a_version_it_could_not_confirm(monkeypatch):
     assert res.exit_code == 0
     assert "upgraded to" not in res.output
     assert "headroom --version" in res.output
+
+
+def test_version_probe_ignores_metadata_in_the_working_directory(monkeypatch, tmp_path):
+    """Unpacked metadata in the cwd must not pass for the installed release."""
+    from importlib.metadata import version
+
+    installed = version(up.PACKAGE_NAME)
+    decoy = "999.0.0"
+    dist_info = tmp_path / f"{up.PACKAGE_NAME.replace('-', '_')}-{decoy}.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {up.PACKAGE_NAME}\nVersion: {decoy}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    # Real subprocess: the probe runs a fresh interpreter in this directory.
+    assert up._installed_version_after_upgrade() == installed
 
 
 # --------------------------------------------------------------------------- #

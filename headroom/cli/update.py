@@ -232,14 +232,16 @@ def _installed_version_after_upgrade() -> str | None:
     A package manager can exit 0 without upgrading (a pip pin or constraint
     keeps the old release), so the exit code alone does not prove the upgrade
     landed (#4253). A new process sees the distribution metadata as it is on
-    disk now, not as this process cached it at import.
+    disk now, not as this process cached it at import. ``-P`` keeps the
+    working directory off ``sys.path``, so distribution metadata lying in it
+    cannot stand in for the installed one.
 
     Returns None when the version cannot be read.
     """
     probe = f"from importlib.metadata import version; print(version({PACKAGE_NAME!r}))"
     try:
         result = _subprocess_run(
-            [sys.executable, "-c", probe],
+            [sys.executable, "-P", "-c", probe],
             capture_output=True,
             text=True,
             timeout=30,
