@@ -295,6 +295,17 @@ def test_alpha_search_forwards_to_the_checked_override_through_the_real_handler(
     monkeypatch: pytest.MonkeyPatch, bundled_pricing: None, auth: dict[str, str]
 ) -> None:
     """The real passthrough handler delivers the request, and its credential, there."""
+    # The gateway is on loopback and must be dialled directly; an outbound
+    # proxy from the developer's environment would otherwise take the request.
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "127.0.0.1")
     unreachable_provider = f"http://127.0.0.1:{_free_port()}"
     with (
