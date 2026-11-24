@@ -31,9 +31,10 @@ and upstream CA-trust discovery in `ssl_context.py`).
 ### Two distinct hosts (do not conflate)
 - **Allowlist host** = the host `agy` opens `CONNECT` to (capture-verified:
   `daily-cloudcode-pa.googleapis.com`). The terminator matches on this.
-- **Upstream host** = where the existing handler re-originates the request. Today that is
-  the (wrong) constant `ANTIGRAVITY_DAILY_API_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com"`
-  (`gemini.py:28`), corrected under `headroom-30y.4`. These are separate values.
+- **Upstream host** = where the existing handler re-originates the request.
+  For ordinary shared-proxy clients without verified AGY dispatch scope, `ANTIGRAVITY_DAILY_API_URL` remains `https://daily-cloudcode-pa.sandbox.googleapis.com` (`gemini.py`) unless overridden via `HEADROOM_ANTIGRAVITY_API_URL`.
+  For verified AGY MITM requests, the handler preserves the allowlisted `CONNECT` host (`daily-cloudcode-pa.googleapis.com` or `cloudcode-pa.googleapis.com`).
+  These are separate values.
 
 ## Decision
 

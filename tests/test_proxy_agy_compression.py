@@ -122,7 +122,7 @@ def test_compression_delta_on_antigravity_path(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_antigravity_routes_to_daily_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    """antigravity UA → https://daily-cloudcode-pa.googleapis.com target URL."""
+    """Unwrapped antigravity UA -> https://daily-cloudcode-pa.sandbox.googleapis.com target URL."""
     captured: list[str] = []
 
     async def _fake_stream(proxy_self: Any, url: str, *args: Any, **kwargs: Any) -> JSONResponse:
@@ -143,9 +143,10 @@ def test_antigravity_routes_to_daily_endpoint(monkeypatch: pytest.MonkeyPatch) -
     assert len(captured) == 1
     # Parse and compare scheme+host exactly (not a URL-prefix substring check).
     parsed = urlparse(captured[0])
-    assert (parsed.scheme, parsed.netloc) == ("https", "daily-cloudcode-pa.googleapis.com"), (
-        f"Expected daily endpoint, got: {captured[0]}"
-    )
+    assert (parsed.scheme, parsed.netloc) == (
+        "https",
+        "daily-cloudcode-pa.sandbox.googleapis.com",
+    ), f"Expected daily sandbox endpoint, got: {captured[0]}"
 
 
 # ---------------------------------------------------------------------------

@@ -65,7 +65,7 @@ def test_antigravity_cloudcode_route_uses_daily_endpoint(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {
-        "url": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
         "provider": "gemini",
         "model": "claude-sonnet-4-6",
     }
@@ -136,7 +136,7 @@ def test_antigravity_header_detection_is_case_insensitive(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {
-        "url": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
         "provider": "gemini",
         "model": "claude-opus-4-6-thinking",
     }
@@ -159,7 +159,7 @@ def test_antigravity_route_does_not_cross_route_to_cloudcode_override(monkeypatc
 
     assert response.status_code == 200
     assert response.json() == {
-        "url": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
         "provider": "gemini",
         "model": "claude-sonnet-4-6",
     }
@@ -218,7 +218,7 @@ AGY_AGENT_BODY = {
 
 
 def test_agy_agent_model_body_routes_to_daily_endpoint(monkeypatch):
-    """agy traffic with agent-model name + project + request.contents hits non-sandbox daily host."""
+    """Unwrapped agy agent-model body routes to the default Antigravity daily endpoint."""
 
     async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
         return JSONResponse({"url": url, "provider": provider, "model": model})
@@ -237,7 +237,7 @@ def test_agy_agent_model_body_routes_to_daily_endpoint(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {
-        "url": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
         "provider": "gemini",
         "model": "gemini-3-flash-agent",
     }
@@ -309,7 +309,7 @@ def test_unguarded_streaming_request_ignores_untrusted_host(monkeypatch, forged_
     assert response.status_code == 200
     assert (
         response.json()["url"]
-        == "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        == "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     )
 
 
@@ -362,7 +362,7 @@ def test_pi_openclaw_requesttype_agent_still_detected(monkeypatch):
     assert response.status_code == 200
     assert (
         response.json()["url"]
-        == "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        == "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     )
 
 

@@ -49,7 +49,7 @@ from headroom.transforms.agy_fr_compressor import (  # noqa: F401  (re-exported 
 logger = logging.getLogger("headroom.proxy")
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
-ANTIGRAVITY_DAILY_API_URL = "https://daily-cloudcode-pa.googleapis.com"
+ANTIGRAVITY_DAILY_API_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 
 
 def _resolve_agy_fr_mode() -> str:

@@ -91,7 +91,7 @@ def test_shared_proxy_streaming_ignores_untrusted_cloudcode_host(monkeypatch):
     )
     assert response.status_code == 200
     assert response.json() == {
-        "url": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
         "auth": "Bearer local-caller",
     }
 
@@ -122,4 +122,29 @@ def test_verified_dispatch_streaming_preserves_cloudcode_host(monkeypatch, conne
     assert response.json() == {
         "url": f"https://{connect_host}/v1internal:streamGenerateContent?alt=sse",
         "auth": "Bearer cloudcode-caller",
+    }
+
+
+def test_shared_proxy_antigravity_stream_preserves_sandbox_default(monkeypatch):
+    """Unwrapped shared-proxy Antigravity streams keep the sandbox default URL."""
+
+    async def fake_stream(self, url, headers, _body, provider, model, *_args, **_kwargs):
+        return JSONResponse({"url": url, "provider": provider, "model": model})
+
+    monkeypatch.delenv("HEADROOM_ANTIGRAVITY_API_URL", raising=False)
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+    app = create_app(ProxyConfig(optimize=False))
+    response = TestClient(app).post(
+        "/v1internal:streamGenerateContent",
+        params={"alt": "sse"},
+        json=_STREAM_ANTIGRAVITY_BODY,
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "url": (
+            "https://daily-cloudcode-pa.sandbox.googleapis.com"
+            "/v1internal:streamGenerateContent?alt=sse"
+        ),
+        "provider": "gemini",
+        "model": "gemini-3-flash",
     }
