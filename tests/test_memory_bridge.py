@@ -420,6 +420,37 @@ class TestMarkdownSectionMerge:
                 id="html-closing-tag-block",
             ),
             pytest.param(
+                "## Facts\n- a\n\nBackground\n==========\n<span>\nExample text\n"
+                "## Example\n</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\nBackground\n==========\n<span>\nExample text\n"
+                "## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-setext-heading",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n-\n<span>\n## Example\n</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n-\n<span>\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-empty-list-item",
+            ),
+            pytest.param(
+                "## Facts\nSome fact.\n\n    code\n<span>\n## Example\n</span>\n\nNotes resume here.\n",
+                "## Facts\nSome fact.\n\n    code\n<span>\n## Example\n</span>\n\n"
+                "Notes resume here.\n- new\n",
+                id="html-span-after-indented-code",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]: /url\n<span>\n## Example\n</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[ref]: /url\n<span>\n## Example\n</span>\n\n"
+                "Notes resume here.\n- new\n",
+                id="html-span-after-link-reference",
+            ),
+            pytest.param(
+                '## Facts\nSome fact.\n\n[foo\\]]: </my url> "a \\" b"\n<span>\n'
+                "## Example\n</span>\n\nNotes resume here.\n",
+                '## Facts\nSome fact.\n\n[foo\\]]: </my url> "a \\" b"\n<span>\n'
+                "## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-escaped-link-reference",
+            ),
+            pytest.param(
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n## Real Updates\n- real\n",
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n- new\n"
                 "## Real Updates\n- real\n",

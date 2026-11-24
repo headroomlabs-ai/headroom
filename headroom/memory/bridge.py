@@ -85,6 +85,19 @@ _HTML_TYPE_7_RE = re.compile(
     rf" {{0,3}}(?:<(?:{_HTML_TAG_NAME})(?:{_HTML_ATTRIBUTE})*[ \t]*/?>"
     rf"|</(?:{_HTML_TAG_NAME})[ \t]*>)[ \t]*$"
 )
+# Lines after which no paragraph is open, so a standalone tag line can start a block.
+_SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+_NO_PARAGRAPH_RE = re.compile(
+    r"^(?: {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]*"  # empty list item
+    r"|(?: {4}| {0,3}\t).*"  # indented code
+    r"| {0,3}\[(?:\\.|[^\]\\])+\]:[ \t]*"  # link reference label
+    r"(?:<(?:\\.|[^>\\\n])*>|\S+)"  # destination
+    r"(?:[ \t]+(?:"  # optional title
+    r'"(?:\\.|[^"\\])*"'
+    r"|'(?:\\.|[^'\\])*'"
+    r"|\((?:\\.|[^)\\])*\)))?"
+    r"[ \t]*)$"
+)
 
 
 def _markdown_structure(
@@ -135,10 +148,10 @@ def _markdown_structure(
             elif not line.strip():
                 in_paragraph = False
             else:
-                # Other paragraph-ending constructs (setext underlines, indented code,
-                # containers, and link references) are deliberately not modelled. A tag
-                # after one retains PR head non-type-7 behavior.
-                in_paragraph = True
+                if in_paragraph:
+                    in_paragraph = not _SETEXT_UNDERLINE_RE.match(line)
+                else:
+                    in_paragraph = not _NO_PARAGRAPH_RE.match(line)
 
     if block is not None and block[2]:
         blank_line_block_ends.add(len(lines))
