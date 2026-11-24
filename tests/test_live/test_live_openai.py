@@ -15,10 +15,13 @@ import os
 import httpx
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY not set",
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not os.environ.get("OPENAI_API_KEY"),
+        reason="OPENAI_API_KEY not set",
+    ),
+]
 
 MODEL = "gpt-4o-mini"
 API_URL = "https://api.openai.com/v1/chat/completions"
