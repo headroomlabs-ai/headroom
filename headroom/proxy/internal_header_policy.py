@@ -35,6 +35,7 @@ CREDENTIAL_NAME_COMPONENTS: frozenset[str] = frozenset(
         "bearer",
         "cookie",
         "signature",
+        "proof",  # x-headroom-front-proof (the Rust front's relay proof)
     }
 )
 

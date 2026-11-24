@@ -204,6 +204,12 @@ pub(crate) fn host_override_for_non_local(
     outgoing: Option<&HeaderValue>,
     upstream: &url::Url,
 ) -> Option<HeaderValue> {
+    // The Python proxy on this machine tells relayed callers apart by this
+    // name alone (and the proof), so it is always sent there, even when a
+    // preserved caller Host (`--no-rewrite-host`) names something else.
+    if upstream_takes_relay_proof(upstream) {
+        return Some(HeaderValue::from_static(NON_LOCAL_HOST));
+    }
     let effective = match outgoing {
         Some(h) => h.to_str().ok().map(str::to_owned),
         None => upstream.host_str().map(|h| match upstream.port() {
@@ -308,7 +314,7 @@ pub async fn inbound_gate(
         if bearer(headers).is_some_and(|b| token.matches(b)) {
             headers.remove(header::AUTHORIZATION);
         }
-    } else if loopback_peer && !local {
+    } else if loopback_peer && !local && !is_health_probe(req.method(), req.uri().path()) {
         tracing::warn!(
             event = "proxy_loopback_host_rejected",
             method = %req.method(),
@@ -465,7 +471,11 @@ mod tests {
         );
         // Not loopback: left alone.
         assert!(host_override_for_non_local(None, &alias).is_none());
-        assert!(host_override_for_non_local(Some(&hv("proxy.example")), &loopback).is_none());
+        // A loopback upstream (the Python proxy) always gets the reserved name.
+        assert_eq!(
+            host_override_for_non_local(Some(&hv("proxy.example")), &loopback).unwrap(),
+            NON_LOCAL_HOST
+        );
     }
 
     #[test]

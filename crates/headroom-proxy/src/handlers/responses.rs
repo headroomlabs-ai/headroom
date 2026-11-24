@@ -60,7 +60,7 @@
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, Method, Request, Uri};
+use axum::http::{Extensions, HeaderMap, Method, Request, Uri};
 use axum::response::Response;
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -78,6 +78,7 @@ pub async fn handle_responses(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    extensions: Extensions,
     body: Bytes,
 ) -> Response {
     // PR-C4: streaming pipeline confirmation. When the client asks
@@ -145,6 +146,11 @@ pub async fn handle_responses(
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(hs) = builder.headers_mut() {
         *hs = headers;
+    }
+    // Keep what the inbound gate recorded about the caller (non-local,
+    // relay proof); forward_http reads it from the request extensions.
+    if let Some(ext) = builder.extensions_mut() {
+        *ext = extensions;
     }
     let req = match builder.body(Body::from(body)) {
         Ok(r) => r,

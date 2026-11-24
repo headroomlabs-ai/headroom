@@ -66,18 +66,23 @@ curl -s http://127.0.0.1:8787/healthz/upstream   # => 200 if upstream reachable
 ### Operator runbook (Phase 1 cutover)
 
 ```bash
+# 0. One token for both processes, exported before either starts: the Rust
+#    proxy checks it from remote callers, and the Python proxy checks the
+#    relay proof the Rust proxy derives from it (see below).
+export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
+
 # 1. Move the Python proxy to a private port (e.g. 8788)
 HEADROOM_HOST=127.0.0.1 HEADROOM_PORT=8788 python -m headroom.proxy &  # or your existing launcher
 
 # 2. Run the Rust proxy on the previously-public port (8787) pointing at it.
 #    The Python proxy sees every relayed request as coming from 127.0.0.1,
 #    so the Rust proxy enforces HEADROOM_PROXY_TOKEN itself (see below).
-export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
 ./target/release/headroom-proxy --listen 0.0.0.0:8787 --upstream http://127.0.0.1:8788 &
 
-# 3. End users keep hitting :8787 unchanged.
-# 4. Confirm passthrough:
+# 3. End users keep hitting :8787 unchanged, now sending the token.
+# 4. Confirm passthrough, locally and as a remote caller would:
 curl -si http://127.0.0.1:8787/v1/models
+curl -si -H "X-Headroom-Proxy-Token: $HEADROOM_PROXY_TOKEN" http://<this-host>:8787/v1/models
 # 5. Rollback = stop the Rust proxy and rebind Python back to 8787.
 ```
 

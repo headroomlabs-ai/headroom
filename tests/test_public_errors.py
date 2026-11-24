@@ -286,6 +286,8 @@ def test_extract_tags_never_carries_credentials() -> None:
             "x-headroom-license-token": "lic",
             "x-headroom-api-key": "k",
             "X-Headroom-Key": "hr_cloud_key",
+            # The Rust front's relay proof stands in for the proxy token.
+            "X-Headroom-Front-Proof": "0" * 64,
             "authorization": "Bearer sk-live",
         }
     )

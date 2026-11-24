@@ -394,3 +394,104 @@ async fn remote_token_holder_is_not_relayed_as_local() {
         assert_eq!(host, "headroom-remote.invalid", "{client_host}");
     }
 }
+
+/// Headers the upstream received for one POST with a JSON body.
+async fn upstream_post_headers(
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> wiremock::http::HeaderMap {
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.proxy_token = ProxyToken::new(TOKEN);
+    let app = build_app(AppState::new(config).unwrap());
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let mut req = builder.body(Body::from(body.to_owned())).unwrap();
+    let peer: SocketAddr = REMOTE.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    assert_eq!(seen.len(), 1, "{path}");
+    seen[0].headers.clone()
+}
+
+#[tokio::test]
+async fn buffered_openai_routes_keep_the_callers_relay_identity() {
+    // These two routes buffer the body and rebuild the request; the
+    // rebuilt request must still carry what the inbound gate recorded.
+    let expected = ProxyToken::new(TOKEN).unwrap().relay_proof();
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/v1/responses", r#"{"model":"gpt-4o","input":"hi"}"#),
+    ] {
+        let seen = upstream_post_headers(
+            path,
+            body,
+            &[
+                ("x-headroom-proxy-token", TOKEN),
+                ("host", "proxy.example:8787"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen.get(RELAY_PROOF_HEADER).map(|v| v.to_str().unwrap()),
+            Some(expected.as_str()),
+            "{path}"
+        );
+        assert_eq!(
+            seen.get("host").unwrap().to_str().unwrap(),
+            "headroom-remote.invalid",
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn front_health_probe_answers_a_loopback_peer_under_a_public_host() {
+    // A monitor behind a same-host reverse proxy that keeps the public
+    // Host, with no token configured.
+    let up = upstream().await;
+    let status = send(
+        &up,
+        None,
+        Some(LOCAL),
+        "GET",
+        "/healthz",
+        &[("host", "proxy.example")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn preserved_host_is_replaced_for_a_loopback_upstream() {
+    // Token-less front with --no-rewrite-host: a remote caller's public
+    // Host would reach the Python proxy behind it as an unknown name.
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.rewrite_host = false;
+    let app = build_app(AppState::new(config).unwrap());
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("host", "proxy.example:8787")
+        .body(Body::empty())
+        .unwrap();
+    let peer: SocketAddr = REMOTE.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    assert_eq!(
+        seen[0].headers.get("host").unwrap(),
+        "headroom-remote.invalid"
+    );
+}
