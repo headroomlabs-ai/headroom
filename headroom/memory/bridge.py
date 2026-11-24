@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 # Same heading rule as the bridge parsers, so exported bullets re-import under their topic.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_THEMATIC_BREAK_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
 _HTML_BLOCK_TAGS = (
     "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
     "dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|"
@@ -75,24 +76,36 @@ _HTML_BLOCKS = (
         re.compile(r"^[ \t]*$"),
     ),
 )
+_HTML_TAG_NAME = r"[A-Za-z][A-Za-z0-9-]*"
+_HTML_ATTRIBUTE = (
+    r"[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t]*=[ \t]*(?:[^ \t\n\"'=<>`]+|'[^']*'|\"[^\"]*\"))?"
+)
+_HTML_TYPE_7_RE = re.compile(
+    rf"(?:<(?P<open>{_HTML_TAG_NAME})(?:{_HTML_ATTRIBUTE})*[ \t]*/?>"
+    rf"|</(?P<close>{_HTML_TAG_NAME})[ \t]*>)[ \t]*$"
+)
+_HTML_TYPE_7_EXCLUDED_TAGS = {"pre", "script", "style", "textarea"}
 
 
 def _markdown_structure(
     lines: list[str],
 ) -> tuple[list[tuple[int, str]], int | None, set[int]]:
-    """Return real headings, an unterminated opener, and type-6 block ends."""
+    """Return real headings, an unterminated opener, and blank-line HTML block ends."""
     headings: list[tuple[int, str]] = []
     block: tuple[re.Pattern[str], int, bool] | None = None
-    type_6_ends: set[int] = set()
+    blank_line_block_ends: set[int] = set()
+    in_paragraph = False
 
     for index, original_line in enumerate(lines):
         line = original_line.removesuffix("\r")
         if block is not None:
-            end_pattern, _, is_type_6 = block
+            end_pattern, _, ends_at_blank_line = block
             if end_pattern.search(line):
-                if is_type_6:
-                    type_6_ends.add(index)
+                if ends_at_blank_line:
+                    blank_line_block_ends.add(index)
                 block = None
+                in_paragraph = False
             continue
 
         fence_match = _FENCE_RE.match(line)
@@ -102,20 +115,45 @@ def _markdown_structure(
             marker = fence_match.group(1)
             end_pattern = re.compile(rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$")
             block = (end_pattern, index, False)
+            in_paragraph = False
             continue
 
         for html_type, (start_pattern, end_pattern) in enumerate(_HTML_BLOCKS):
             if start_pattern.match(line):
                 if not end_pattern.search(line):
                     block = (end_pattern, index, html_type == len(_HTML_BLOCKS) - 1)
+                in_paragraph = False
                 break
         else:
-            if heading_match := _HEADING_RE.match(line):
+            type_7_match = _HTML_TYPE_7_RE.match(line) if not in_paragraph else None
+            type_7_tag = (
+                (type_7_match.group("open") or type_7_match.group("close")).lower()
+                if type_7_match
+                else None
+            )
+            if type_7_tag is not None and type_7_tag not in _HTML_TYPE_7_EXCLUDED_TAGS:
+                block = (_HTML_BLOCKS[-1][1], index, True)
+                in_paragraph = False
+            elif heading_match := _HEADING_RE.match(line):
                 headings.append((index, heading_match.group(2).strip()))
+                in_paragraph = False
+            elif _THEMATIC_BREAK_RE.match(line):
+                in_paragraph = False
+            elif not line.strip():
+                in_paragraph = False
+            else:
+                # Other paragraph-ending constructs (setext underlines, indented code,
+                # containers, and link references) are deliberately not modelled. A tag
+                # after one, or an indented tag, retains PR head non-type-7 behavior.
+                in_paragraph = True
 
     if block is not None and block[2]:
-        type_6_ends.add(len(lines))
-    return headings, block[1] if block is not None and not block[2] else None, type_6_ends
+        blank_line_block_ends.add(len(lines))
+    return (
+        headings,
+        block[1] if block is not None and not block[2] else None,
+        blank_line_block_ends,
+    )
 
 
 def _merge_bullets_into_markdown(
@@ -128,7 +166,7 @@ def _merge_bullets_into_markdown(
     land under a later section or a sub-heading.
     """
     lines = existing_content.split("\n")
-    headings, unterminated_block, type_6_ends = _markdown_structure(lines)
+    headings, unterminated_block, blank_line_block_ends = _markdown_structure(lines)
     inserts: dict[int, list[str]] = defaultdict(list)
     appended: list[str] = []
 
@@ -148,7 +186,7 @@ def _merge_bullets_into_markdown(
         while end > start and not lines[end - 1].strip():
             end -= 1
         line_suffix = "\r" if lines[end - 1].endswith("\r") else ""
-        if end in type_6_ends:
+        if end in blank_line_block_ends:
             if end < len(lines):
                 end += 1
             else:

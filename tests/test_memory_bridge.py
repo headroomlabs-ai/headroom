@@ -401,6 +401,13 @@ class TestMarkdownSectionMerge:
                 id="html-div-block-at-eof",
             ),
             pytest.param(
+                "## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\n"
+                "Notes resume here.\n",
+                "## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\n"
+                "Notes resume here.\n- new\n",
+                id="html-span-block",
+            ),
+            pytest.param(
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n## Real Updates\n- real\n",
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n- new\n"
                 "## Real Updates\n- real\n",
