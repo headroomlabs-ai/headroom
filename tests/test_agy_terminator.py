@@ -1906,3 +1906,87 @@ def test_upstream_proxy_auth_rejects_socks5_scheme() -> None:
     parsed = urllib.parse.urlparse("socks5://user:secret@proxy.corp.example:1080")
     assert _upstream_proxy_auth(parsed, None) is None
     assert _upstream_proxy_auth(parsed, "Basic aW5ib3VuZDpzZWNyZXQ=") is None
+
+
+@pytest.mark.asyncio
+async def test_direct_connect_bracketed_ipv6_loopback_echo(
+    tmp_ca: tuple, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct CONNECT [::1]:<port> must resolve ::1, return 200, and relay bytes."""
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+
+    async def _echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            data = await asyncio.wait_for(reader.read(64), timeout=5.0)
+            if data:
+                writer.write(data)
+                await writer.drain()
+        finally:
+            writer.close()
+
+    try:
+        echo_server = await asyncio.start_server(_echo, "::1", 0)
+    except OSError as exc:
+        pytest.skip(f"IPv6 loopback ::1 unavailable on this host: {exc}")
+
+    echo_port = echo_server.sockets[0].getsockname()[1]
+    key, cert, _ = tmp_ca
+    try:
+        async with AgyCONNECTTerminator(ca_key=key, ca_cert=cert, dispatch_port=1) as term:
+            reader, writer = await asyncio.open_connection(*term.address)
+            try:
+                writer.write(f"CONNECT [::1]:{echo_port} HTTP/1.1\r\n\r\n".encode())
+                await writer.drain()
+                status = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                assert b"200" in status, f"expected 200 Connection Established, got {status!r}"
+                # Drain blank line ending CONNECT response headers.
+                blank = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                assert blank == b"\r\n"
+
+                writer.write(b"ping-ipv6")
+                await writer.drain()
+                echoed = await asyncio.wait_for(reader.readexactly(9), timeout=5.0)
+                assert echoed == b"ping-ipv6"
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        echo_server.close()
+        await echo_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_upstream_proxy_connect_preserves_ipv6_brackets() -> None:
+    """Upstream proxy CONNECT must bracket IPv6 literals and _parse_connect rejects bad brackets."""
+    from headroom.proxy.agy_terminator import _connect_via_upstream_proxy, _parse_connect
+
+    assert _parse_connect("CONNECT [::1]:8443 HTTP/1.1") == ("::1", 8443)
+    with pytest.raises(ValueError):
+        _parse_connect("CONNECT [not-an-ipv6]:443 HTTP/1.1")
+    with pytest.raises(ValueError):
+        _parse_connect("CONNECT [::1] HTTP/1.1")
+
+    seen_request: list[bytes] = []
+
+    async def _fake_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5.0)
+            seen_request.append(data)
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+        finally:
+            writer.close()
+
+    proxy_server = await asyncio.start_server(_fake_proxy, "127.0.0.1", 0)
+    proxy_port = proxy_server.sockets[0].getsockname()[1]
+    try:
+        r, w = await _connect_via_upstream_proxy("127.0.0.1", proxy_port, "::1", 8443, None)
+        w.close()
+        await w.wait_closed()
+    finally:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+
+    assert len(seen_request) == 1
+    assert seen_request[0].startswith(b"CONNECT [::1]:8443 HTTP/1.1\r\nHost: [::1]:8443\r\n")

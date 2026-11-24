@@ -301,16 +301,42 @@ def normalize_host(value: str) -> str:
     return host.rstrip(".").lower()
 
 
+def _format_authority(host: str, port: int) -> str:
+    """Format host:port for HTTP CONNECT/Host headers, bracketing IPv6 literals."""
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
 def _parse_connect(line: str) -> tuple[str, int]:
-    """Parse 'CONNECT host:port HTTP/1.x' → (host, port). Raises ValueError."""
+    """Parse 'CONNECT host:port HTTP/1.x' (including '[ipv6]:port') -> (host, port)."""
     parts = line.strip().split()
     if len(parts) < 2 or parts[0].upper() != "CONNECT":
         raise ValueError(f"Not a CONNECT request: {line!r}")
     hostport = parts[1]
+    if hostport.startswith("["):
+        close_idx = hostport.find("]")
+        if close_idx == -1 or close_idx + 1 >= len(hostport) or hostport[close_idx + 1] != ":":
+            raise ValueError(f"Malformed bracketed CONNECT target: {hostport!r}")
+        raw_host = hostport[1:close_idx]
+        port_str = hostport[close_idx + 2 :]
+        if not raw_host or not port_str.isdigit():
+            raise ValueError(f"Malformed bracketed CONNECT target: {hostport!r}")
+        # Validate IPv6 literal (Python 3.9+ validates optional %zone_id natively).
+        ipaddress.IPv6Address(raw_host)
+        port = int(port_str)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Invalid port in CONNECT target: {hostport!r}")
+        return raw_host.lower(), port
     if ":" not in hostport:
         raise ValueError(f"Missing port in CONNECT target: {hostport!r}")
     host, port_str = hostport.rsplit(":", 1)
-    return normalize_host(host), int(port_str)
+    if not host or not port_str.isdigit():
+        raise ValueError(f"Malformed CONNECT target: {hostport!r}")
+    port = int(port_str)
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Invalid port in CONNECT target: {hostport!r}")
+    return normalize_host(host), port
 
 
 # ---------------------------------------------------------------------------
@@ -342,9 +368,8 @@ async def _connect_via_upstream_proxy(
         ),
         timeout=_CONNECT_TIMEOUT,
     )
-    connect_line = (
-        f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
-    )
+    authority = _format_authority(target_host, target_port)
+    connect_line = f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n"
     if proxy_auth:
         connect_line += f"Proxy-Authorization: {proxy_auth}\r\n"
     connect_line += "\r\n"
