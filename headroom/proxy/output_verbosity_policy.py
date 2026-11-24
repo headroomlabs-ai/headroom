@@ -89,6 +89,36 @@ VERBOSITY_LEVELS = {
 }
 
 
+def register_verbosity_text(level: int, text: str) -> None:
+    """Replace the steering text for one existing level.
+
+    Extension seam, the text-side twin of
+    :func:`headroom.proxy.output_savings.register_modelled_factors`: an
+    extension that has benchmarked its own wording installs it at startup,
+    together with the factors measured for that wording. Call it before the
+    proxy serves traffic. Changing a level's text mid-conversation rewrites the
+    system-prompt tail and so busts the provider prefix cache once. The text is
+    process-wide: every app in the process steers with it.
+
+    Only levels core already defines can be replaced, so the 0-4 range every
+    caller clamps to stays true. The text must be non-empty and must not
+    contain the sentinel or suffix, which would break the idempotent
+    replace-in-place in :func:`replace_or_append_steering_block`.
+    """
+    if level not in VERBOSITY_LEVELS:
+        raise ValueError(
+            f"no verbosity level {level} to replace; levels are {sorted(VERBOSITY_LEVELS)}"
+        )
+    if not text.strip():
+        raise ValueError(f"steering text for level {level} must not be empty")
+    if STEERING_SENTINEL in text or STEERING_SUFFIX in text:
+        raise ValueError(
+            f"steering text for level {level} must not contain "
+            f"{STEERING_SENTINEL} or {STEERING_SUFFIX}; steering_text() adds them"
+        )
+    VERBOSITY_LEVELS[level] = text
+
+
 def steering_text(level: int) -> str | None:
     """The full steering block for a verbosity level, or ``None`` for level 0."""
     text = VERBOSITY_LEVELS.get(level)

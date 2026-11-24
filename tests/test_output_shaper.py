@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
+
 from headroom.proxy.output_shaper import (
     DEFAULT_VERBOSITY_LEVEL,
     OutputShaperSettings,
@@ -421,7 +423,7 @@ class TestCacheModeSuppressesSteeringOnly:
         settings = OutputShaperSettings(enabled=True, verbosity_level=4, steering_enabled=False)
         assert resolve_verbosity_level(settings) == (4, "env_pinned")
 
-    def test_shaper_alone_steers_at_l2_in_cache_mode(self, monkeypatch):
+    def test_shaper_alone_steers_at_l3_in_cache_mode(self, monkeypatch):
         """``HEADROOM_OUTPUT_SHAPER=1`` must be sufficient on its own.
 
         The shaper is opt-in, so an enabled shaper is already an explicit
@@ -439,7 +441,7 @@ class TestCacheModeSuppressesSteeringOnly:
         settings = OutputShaperSettings.from_env(enabled=True, steering_enabled=False)
         assert settings.enabled is True
         assert resolve_verbosity_level(settings) == (DEFAULT_VERBOSITY_LEVEL, "cache_mode_default")
-        assert DEFAULT_VERBOSITY_LEVEL == 2
+        assert DEFAULT_VERBOSITY_LEVEL == 3
 
     def test_cache_mode_ignores_a_learned_level(self, tmp_path, monkeypatch):
         """``verbosity.json`` appears the moment someone runs ``learn``, so it
@@ -552,3 +554,39 @@ class TestCacheModeSuppressesSteeringOnly:
         result = shape_request(body, settings, level_override=0)
         assert "system" not in body, "cache mode must not create a system block"
         assert result is not None
+
+
+def test_registered_default_level_applies_only_when_no_level_is_pinned(monkeypatch) -> None:
+    from headroom.proxy import output_shaper
+
+    monkeypatch.setattr(
+        output_shaper, "DEFAULT_VERBOSITY_LEVEL", output_shaper.DEFAULT_VERBOSITY_LEVEL
+    )
+    monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+    output_shaper.register_default_verbosity_level(4)
+    assert output_shaper.OutputShaperSettings.from_env(enabled=True).verbosity_level == 4
+
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    assert output_shaper.OutputShaperSettings.from_env(enabled=True).verbosity_level == 2
+
+
+def test_direct_settings_use_the_registered_default_level(monkeypatch) -> None:
+    from headroom.proxy import output_shaper
+
+    monkeypatch.setattr(
+        output_shaper, "DEFAULT_VERBOSITY_LEVEL", output_shaper.DEFAULT_VERBOSITY_LEVEL
+    )
+    output_shaper.register_default_verbosity_level(4)
+    assert output_shaper.OutputShaperSettings(enabled=True).verbosity_level == 4
+
+
+@pytest.mark.parametrize("bad", [5, -1, True, "4"])
+def test_register_default_level_rejects_out_of_range(monkeypatch, bad) -> None:
+    from headroom.proxy import output_shaper
+
+    monkeypatch.setattr(
+        output_shaper, "DEFAULT_VERBOSITY_LEVEL", output_shaper.DEFAULT_VERBOSITY_LEVEL
+    )
+    with pytest.raises(ValueError):
+        output_shaper.register_default_verbosity_level(bad)
+    assert output_shaper.DEFAULT_VERBOSITY_LEVEL == 3
