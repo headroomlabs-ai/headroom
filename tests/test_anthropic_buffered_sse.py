@@ -25,6 +25,7 @@ message.
 
 from __future__ import annotations
 
+import codecs
 import json
 
 import pytest
@@ -351,6 +352,23 @@ def test_bom_prefixed_event_stream_under_a_vague_content_type_is_still_adapted()
         upstream=httpx.Response(
             200,
             content=_bom_data_only(COMPLETE_SSE),
+            headers={"content-type": "application/octet-stream"},
+        )
+    )
+
+    assert resp.status_code == 200
+    assert "application/json" in resp.headers["content-type"]
+    assert resp.json()["id"] == "msg_1"
+
+
+@pytest.mark.parametrize("bom", [b"", codecs.BOM_UTF8], ids=["no-bom", "bom"])
+def test_bom_does_not_shrink_the_sniff_window(bom: bytes) -> None:
+    """Padding that fits the 64-byte window must still fit after a BOM (#4255)."""
+    payload = _bom_data_only(COMPLETE_SSE).removeprefix(codecs.BOM_UTF8)
+    resp, _ = _drive(
+        upstream=httpx.Response(
+            200,
+            content=bom + b"\n" * 57 + payload,
             headers={"content-type": "application/octet-stream"},
         )
     )

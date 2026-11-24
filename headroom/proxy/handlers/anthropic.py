@@ -441,7 +441,8 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
     if "text/event-stream" in content_type:
         return True
     # A stream may open with one UTF-8 BOM ahead of its first field (#4255).
-    head = response.content[:64].removeprefix(codecs.BOM_UTF8).lstrip()
+    # Skip it before taking the 64-byte window, so the BOM does not shrink it.
+    head = response.content.removeprefix(codecs.BOM_UTF8)[:64].lstrip()
     return head.startswith(b"event:") or head.startswith(b"data:")
 
 
