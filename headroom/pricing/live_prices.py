@@ -33,6 +33,9 @@ LITELLM_PRICES_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 )
 REFRESH_INTERVAL_SECONDS = 24 * 3600
+#: Seconds after a refresh before litellm's lowercase index is invalidated
+#: again; far longer than a rebuild of the index takes.
+INDEX_SETTLE_SECONDS = 5.0
 _FETCH_TIMEOUT_SECONDS = 15.0
 #: A real table lists thousands of models. Anything far smaller is an error
 #: page or a truncated download, and must not be merged.
@@ -121,37 +124,15 @@ def _resolve_aliases(models: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return resolved
 
 
-def _rebuild_lowercase_index() -> dict[str, str]:
-    """litellm's lowercase-index rebuild, storing an index of the current table only.
-
-    litellm builds the index by iterating ``litellm.model_cost`` and then
-    storing it. A rebuild that began on a table a refresh has since replaced
-    stores an index without the refreshed rows, after the refresh invalidated
-    it, and litellm rebuilds only when an indexed name disappears, so a
-    refreshed model would never be found by a mixed-case name. This stores the
-    index, then rebuilds if the table it read is no longer the current one.
-    """
+def _invalidate_lowercase_index() -> None:
+    """Drop litellm's lowercase model-name index, so its next lookup rebuilds it."""
     from headroom.pricing.litellm_pricing import litellm
 
-    while True:
-        table = litellm.model_cost
-        index = {key.lower(): key for key in table}
-        litellm.utils._model_cost_lowercase_map = index
-        if litellm.model_cost is table:
-            return index
-
-
-def _guard_lowercase_index() -> None:
-    """Route litellm's lowercase-index rebuilds through :func:`_rebuild_lowercase_index`."""
-    from headroom.pricing.litellm_pricing import litellm
-
-    utils = getattr(litellm, "utils", None)
-    if (
-        utils is not None
-        and hasattr(utils, "_rebuild_model_cost_lowercase_map")
-        and hasattr(utils, "_model_cost_lowercase_map")
-    ):
-        utils._rebuild_model_cost_lowercase_map = _rebuild_lowercase_index
+    invalidate = getattr(
+        getattr(litellm, "utils", None), "_invalidate_model_cost_lowercase_map", None
+    )
+    if invalidate is not None:
+        invalidate()
 
 
 def merge_litellm_prices(models: dict[str, Any]) -> int:
@@ -174,7 +155,6 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
 
     if litellm is None:
         return 0
-    _guard_lowercase_index()
     current = litellm.model_cost
     # Headroom's rows go on before aliases resolve, so an alias such as
     # deepseek/deepseek-flash-latest takes the off-peak rate of its target,
@@ -194,9 +174,7 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
         # built at import, and caches a lowercase index of the keys; new models
         # need both, or `cost_per_token` cannot place them.
         litellm.add_known_models(changed)
-        invalidate = getattr(litellm.utils, "_invalidate_model_cost_lowercase_map", None)
-        if invalidate is not None:
-            invalidate()
+        _invalidate_lowercase_index()
     finally:
         _clear_price_caches()
     return len(changed)
@@ -258,11 +236,16 @@ async def refresh_periodically(interval: float = REFRESH_INTERVAL_SECONDS) -> No
     """Refresh now and then every interval seconds until cancelled."""
     if not is_price_refresh_enabled():
         return
-    # Before the first download, so no index rebuild can still be running on
-    # the old table, unguarded, when the first refresh replaces it.
-    _guard_lowercase_index()
     while True:
         await _refresh_in_daemon_thread()
+        # A lookup that was rebuilding litellm's lowercase index when the
+        # refresh swapped the table can store an index of the old table after
+        # the refresh invalidated it, and litellm rebuilds only when an indexed
+        # name disappears. Invalidating once more shortly after discards that
+        # index: until then a refreshed model may miss by a mixed-case name,
+        # never by its exact name.
+        await asyncio.sleep(INDEX_SETTLE_SECONDS)
+        _invalidate_lowercase_index()
         await asyncio.sleep(interval)
 
 

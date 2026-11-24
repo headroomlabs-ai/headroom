@@ -92,17 +92,30 @@ def test_refresh_prices_a_model_the_bundled_table_lacks(monkeypatch, isolated_ca
     assert live_prices.refresh_litellm_prices() == 0
 
 
-def test_a_refresh_does_not_break_a_lookup_already_reading_the_table(isolated_catalog):
-    """A lookup that is iterating the table when a refresh lands still prices its model.
+def _input_rate(model: str, provider: str) -> object:
+    """``model``'s input price from ``litellm.get_model_info``, or the error it raised."""
+    try:
+        return litellm.get_model_info(model, custom_llm_provider=provider)["input_cost_per_token"]
+    except Exception as exc:  # noqa: BLE001 - litellm raises a bare Exception when unmapped
+        return exc
+
+
+def test_a_refresh_overlapping_a_lookup_keeps_it_priced_and_settles_the_index(
+    monkeypatch, isolated_catalog
+):
+    """A lookup reading the table when a refresh lands still prices its model.
 
     litellm resolves a mixed-case name by rebuilding a lowercase index, which
     iterates ``litellm.model_cost``. Growing that dict in place, even in one
     ``dict.update``, made the running iteration fail and the model read as
-    unmapped. The index that rebuild then stored was of the replaced table, and
-    litellm never rebuilt it for a missing name, so a refreshed model could not
-    be found by a mixed-case name. A key whose ``lower()`` blocks pauses the
-    rebuild mid-iteration.
+    unmapped. The rebuild still stores an index of the replaced table after the
+    refresh invalidated it, so a refreshed model can miss by a mixed-case name
+    until the periodic refresh invalidates the index again. A key whose
+    ``lower()`` blocks pauses the rebuild mid-iteration.
     """
+    monkeypatch.setenv("HEADROOM_PRICE_REFRESH", "on")
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.setattr(live_prices, "INDEX_SETTLE_SECONDS", 0)
     started, resume = threading.Event(), threading.Event()
 
     class PausingKey(str):
@@ -112,27 +125,35 @@ def test_a_refresh_does_not_break_a_lookup_already_reading_the_table(isolated_ca
             return str(self).lower()
 
     litellm.model_cost[PausingKey("headroom-test-pause")] = {"input_cost_per_token": 0.0}
-    live_prices.merge_litellm_prices({})  # the proxy's earlier refreshes
     litellm.utils._invalidate_model_cost_lowercase_map()
-    found: list[object] = []
+    during: list[object] = []
+    after_overlap: list[object] = []
 
-    def lookup() -> None:
-        try:
-            info = litellm.get_model_info("GPT-4O", custom_llm_provider="openai")
-            found.append(info["input_cost_per_token"])
-        except Exception as exc:  # noqa: BLE001 - the failure is what is asserted
-            found.append(exc)
+    def overlapped_refresh() -> None:
+        reader = threading.Thread(target=lambda: during.append(_input_rate("GPT-4O", "openai")))
+        reader.start()
+        assert started.wait(5)
+        live_prices.merge_litellm_prices({NEW_MODEL: NEW_ROW})
+        resume.set()
+        reader.join(5)
+        after_overlap.append(_input_rate(NEW_MODEL.upper(), "anthropic"))
 
-    reader = threading.Thread(target=lookup)
-    reader.start()
-    assert started.wait(5)
-    live_prices.merge_litellm_prices({NEW_MODEL: NEW_ROW})
-    resume.set()
-    reader.join(5)
+    monkeypatch.setattr(live_prices, "refresh_litellm_prices", overlapped_refresh)
 
-    assert found == [pytest.approx(2.5e-06)]
-    refreshed = litellm.get_model_info(NEW_MODEL.upper(), custom_llm_provider="anthropic")
-    assert refreshed["input_cost_per_token"] == NEW_ROW["input_cost_per_token"]
+    async def run_one_tick() -> None:
+        task = asyncio.create_task(live_prices.refresh_periodically(interval=3600))
+        while not after_overlap:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # past INDEX_SETTLE_SECONDS into the long sleep
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run_one_tick())
+
+    assert during == [pytest.approx(2.5e-06)]
+    assert isinstance(after_overlap[0], Exception)  # the stale index, bounded:
+    assert _input_rate(NEW_MODEL.upper(), "anthropic") == NEW_ROW["input_cost_per_token"]
+    assert _input_rate(NEW_MODEL, "anthropic") == NEW_ROW["input_cost_per_token"]
 
 
 def test_refresh_keeps_headroom_deepseek_off_peak_rates(monkeypatch, isolated_catalog):
