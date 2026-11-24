@@ -8,7 +8,8 @@ deployment exists to carry.
 Refused (this is not a sample — it is the rule, and the meta-test enforces it):
 the telemetry beacon, the update check, the license/usage reporter, OTLP and
 Langfuse export, HuggingFace/Kompress/fastembed model downloads, tiktoken
-vocabulary downloads (a pre-seeded ``TIKTOKEN_CACHE_DIR`` still loads), release-binary
+vocabulary downloads (a cached vocabulary still loads; litellm repoints
+``TIKTOKEN_CACHE_DIR`` on import, see docs/content/docs/security-model.mdx), release-binary
 downloads (codebase-memory-mcp among them), litellm's import-time pricing-table
 refresh, CrewAI's import-time install tracking, eval dataset downloads and the
 provider SDK clients the eval harness drives, GitHub Copilot device-flow auth and token
