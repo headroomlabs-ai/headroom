@@ -391,7 +391,17 @@ def test_native_responses_route_carries_the_client_decision(
         assert transport.call_count == 1, response.text
         assert response.status_code == 200, response.text
         assert seen, "the Responses compressor was never reached"
-        assert {k: v for k, v in seen[0].items() if k not in {"timing", "savings_tags"}} == expected
+        excluded = {"timing", "savings_tags", "token_counter"}
+        assert {k: v for k, v in seen[0].items() if k not in excluded} == expected
+        # The compressor counts with the handler's counter (#5037): the same
+        # ruler the handler uses for this model, not a second lookup.
+        from headroom.tokenizers import get_tokenizer
+
+        counter = seen[0]["token_counter"]
+        assert counter is not None
+        sample = [{"role": "user", "content": "hello world " * 20}]
+        handler_counter = get_tokenizer(TOOL_SEARCH_MODEL)
+        assert counter.count_messages(sample) == handler_counter.count_messages(sample)
 
 
 # --- production route: the Codex WebSocket handler ---------------------------
