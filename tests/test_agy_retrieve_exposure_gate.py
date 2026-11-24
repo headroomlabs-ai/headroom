@@ -336,3 +336,108 @@ def test_exposure_gate_rejects_replacement_command_even_with_existing_cache(
     reg2.register_server(replacement, force=True)
 
     assert _agy_exposes_retrieve_tool(reg1) is False
+
+
+def test_smoke_verify_mcp_handshake_rejects_jsonrpc_error_and_accepts_result() -> None:
+    """Smoke probe must return False for JSON-RPC error responses and True for result objects."""
+    import sys
+
+    from headroom.cli import wrap as wrap_mod
+
+    error_child = (
+        "import json, sys; "
+        "sys.stdin.readline(); "
+        'print(json.dumps({"jsonrpc": "2.0", "id": 1, '
+        '"error": {"code": -32603, "message": "init failed"}}), flush=True)'
+    )
+    ok_child = (
+        "import json, sys; "
+        "sys.stdin.readline(); "
+        'print(json.dumps({"jsonrpc": "2.0", "id": 1, '
+        '"result": {"protocolVersion": "2024-11-05", "capabilities": {}}}), flush=True)'
+    )
+
+    assert wrap_mod._smoke_verify_mcp_handshake(sys.executable, ["-c", error_child], {}) is False
+    assert wrap_mod._smoke_verify_mcp_handshake(sys.executable, ["-c", ok_child], {}) is True
+
+
+def test_exposure_gate_rechecks_verified_entry_after_backend_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacing the headroom command during _ccr_backend_is_cross_process must fail exposure."""
+    from headroom.cli import wrap as wrap_mod
+    from headroom.mcp_registry.base import ServerSpec
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+    monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+    monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **k: True)
+
+    reg1 = _registrar(tmp_path)
+    reg2 = _registrar(tmp_path)
+    assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg1) is True
+
+    replacement = ServerSpec(
+        name="headroom",
+        command="/other/unverified-during-probe",
+        args=("mcp", "serve"),
+    )
+
+    def _replace_during_backend_probe() -> bool:
+        reg2.register_server(replacement, force=True)
+        return True
+
+    monkeypatch.setattr(wrap_mod, "_ccr_backend_is_cross_process", _replace_during_backend_probe)
+    assert _agy_exposes_retrieve_tool(reg1) is False
+
+
+def test_cache_priming_runs_under_config_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tool cache priming runs inside confirm_server_if's config lock."""
+    import threading
+
+    from headroom.cli import wrap as wrap_mod
+    from headroom.mcp_registry.base import RegisterStatus, ServerSpec
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+    monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **k: True)
+
+    reg1 = _registrar(tmp_path)
+    reg2 = _registrar(tmp_path)
+    replacement = ServerSpec(
+        name="headroom",
+        command="/other/replacement",
+        args=("mcp", "serve"),
+    )
+
+    entered_prime = threading.Event()
+    release_prime = threading.Event()
+    orig_prime = wrap_mod._prime_agy_retrieve_tool_cache
+
+    def _paused_prime(registrar: Any) -> None:
+        entered_prime.set()
+        release_prime.wait(timeout=5.0)
+        orig_prime(registrar)
+
+    monkeypatch.setattr(wrap_mod, "_prime_agy_retrieve_tool_cache", _paused_prime)
+
+    setup_results: list[bool] = []
+    replace_results: list[Any] = []
+
+    t1 = threading.Thread(
+        target=lambda: setup_results.append(wrap_mod._setup_headroom_retrieve_mcp_agy(reg1))
+    )
+    t2 = threading.Thread(
+        target=lambda: replace_results.append(reg2.register_server(replacement, force=True))
+    )
+    t1.start()
+    assert entered_prime.wait(timeout=5.0)
+    t2.start()
+    t2.join(timeout=0.1)
+    assert t2.is_alive(), "replacement did not block on config lock during cache priming"
+    release_prime.set()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+
+    assert setup_results == [True]
+    assert replace_results[0].status == RegisterStatus.REGISTERED

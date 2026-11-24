@@ -213,6 +213,10 @@ class AgyRegistrar(MCPRegistrar):
                     )
                 return RegisterResult(RegisterStatus.REGISTERED, f"wrote {self._config_file}")
         except OSError as exc:
+            if not force:
+                existing = self.get_server(spec.name)
+                if existing is not None and _specs_equivalent(existing, spec):
+                    return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
             return RegisterResult(
                 RegisterStatus.FAILED, f"could not lock {self._config_file}: {exc}"
             )

@@ -1560,7 +1560,7 @@ def _smoke_verify_mcp_handshake(
                 and payload.get("jsonrpc") == "2.0"
                 and payload.get("id") == 1
             ):
-                return True
+                return "error" not in payload and isinstance(payload.get("result"), dict)
         return False
     except (OSError, ValueError):
         return False
@@ -1795,6 +1795,10 @@ def _agy_exposes_retrieve_tool(registrar: Any, expected_spec: Any = None) -> boo
     from headroom.ccr.mcp_server import CCR_TOOL_NAME
     from headroom.mcp_registry import build_headroom_spec
 
+    if not _ccr_backend_is_cross_process():
+        return False
+    # Revalidate the live config entry and tool cache AFTER the backend probe
+    # so a replacement installed while probing cannot pass the exposure gate.
     current = registrar.get_server("headroom")
     target_spec = expected_spec if expected_spec is not None else build_headroom_spec()
     if current is None or current != target_spec:
@@ -1803,9 +1807,7 @@ def _agy_exposes_retrieve_tool(registrar: Any, expected_spec: Any = None) -> boo
     # dir — agy writes <appdata>/mcp/<server>/<tool>.json regardless of which
     # config file declared the server.
     tool_cache = registrar.cache_dir / "headroom" / f"{CCR_TOOL_NAME}.json"
-    if not tool_cache.is_file():
-        return False
-    return _ccr_backend_is_cross_process()
+    return tool_cache.is_file()
 
 
 def _maybe_warn_agy_ccr_downgrade(retrieve_wired: bool) -> None:
