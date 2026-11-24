@@ -3322,13 +3322,25 @@ _CODEX_EMBEDDED_MODE_NOTE = (
 )
 
 
+def _is_codex_proxy_url(url: str, port: int) -> bool:
+    """Whether ``url`` points at this wrap's own Headroom proxy on loopback."""
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        return parsed.hostname in _LOCAL_HOSTNAMES and parsed.port == port
+    except ValueError:
+        return False
+
+
 def _codex_session_launch_settings(
     *, port: int, codex_args: tuple[str, ...], environ: dict[str, str]
 ) -> tuple[tuple[str, ...], dict[str, str], list[str]]:
     """Build process-local routing while preserving the selected provider id."""
     config_file, _ = _codex_config_paths()
+    config_text = ""
     try:
-        config = loads_codex_config(_read_text(config_file)) if config_file.exists() else {}
+        if config_file.exists():
+            config_text = _read_text(config_file)
+        config = loads_codex_config(config_text) if config_text else {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise click.ClickException(
             f"could not read Codex config for session routing: {exc}"
@@ -3372,12 +3384,23 @@ def _codex_session_launch_settings(
                 f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
             )
         )
-        env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
-        display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
-        overrides.append(
-            f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
-            f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
-        )
+        # Never hand the proxy its own address as the upstream: it rejects
+        # that header, so every HTTP request fails with 400 (#5025). The
+        # ``headroom`` table is Headroom's own route (left by `headroom init
+        # codex` or a persistent install), so forward the provider it
+        # replaced instead, if any, by the same rule the persistent path uses.
+        preserved_upstream: str | None = upstream
+        if provider == "headroom":
+            preserved_upstream = _detect_custom_codex_upstream_base_url(config_text)
+        elif _is_codex_proxy_url(upstream, port):
+            preserved_upstream = None
+        if preserved_upstream:
+            env[_UPSTREAM_BASE_URL_ENV_VAR] = preserved_upstream.rstrip("/")
+            display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={preserved_upstream.rstrip('/')}")
+            overrides.append(
+                f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
+                f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
+            )
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project

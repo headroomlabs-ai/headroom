@@ -1660,6 +1660,100 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
+def _session_settings_for_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: str, *, port: int = 8787
+) -> tuple[tuple[str, ...], dict[str, str], list[str]]:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    (codex_home / "config.toml").write_text(config, encoding="utf-8")
+    return wrap_mod._codex_session_launch_settings(
+        port=port,
+        codex_args=("resume", "session-id"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+
+_UPSTREAM_HEADER_OVERRIDE = (
+    "model_providers.headroom.env_http_headers.X-Headroom-Base-Url"
+    '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+)
+
+
+def test_codex_session_launch_settings_headroom_provider_sends_no_self_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #5025: the config `headroom init codex` / a persistent install leaves
+    # behind. Forwarding the proxy's own address as X-Headroom-Base-Url made
+    # the proxy reject every HTTP request (400), so HTTP fallback and
+    # `wrap codex resume` failed.
+    args, env, display = _session_settings_for_config(
+        monkeypatch,
+        tmp_path,
+        'model_provider = "headroom"\n'
+        'openai_base_url = "http://127.0.0.1:8787/v1"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "http://127.0.0.1:8787/v1"\n'
+        "requires_openai_auth = true\n"
+        "supports_websockets = true\n",
+    )
+
+    assert 'model_providers.headroom.base_url="http://127.0.0.1:8787/v1"' in args
+    assert "model_providers.headroom.supports_websockets=true" in args
+    assert _UPSTREAM_HEADER_OVERRIDE not in args
+    assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+    assert not any(line.startswith(wrap_mod._UPSTREAM_BASE_URL_ENV_VAR) for line in display)
+    assert args[-2:] == ("resume", "session-id")
+
+
+def test_codex_session_launch_settings_headroom_provider_keeps_replaced_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `init` rewrote `model_provider = "company"` in place; the `# was:`
+    # comment names the gateway the session must still reach.
+    args, env, _ = _session_settings_for_config(
+        monkeypatch,
+        tmp_path,
+        'model_provider = "headroom"  # was: company\n\n'
+        "[model_providers.company]\n"
+        'base_url = "https://api.example.test/v1/"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "http://127.0.0.1:8787/v1"\n',
+    )
+
+    assert _UPSTREAM_HEADER_OVERRIDE in args
+    assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
+
+
+def test_codex_session_launch_settings_skip_upstream_that_is_this_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args, env, _ = _session_settings_for_config(
+        monkeypatch,
+        tmp_path,
+        'model_provider = "company"\n\n'
+        "[model_providers.company]\n"
+        'base_url = "http://localhost:9898/v1"\n',
+        port=9898,
+    )
+
+    assert 'model_providers.company.base_url="http://127.0.0.1:9898/v1"' in args
+    assert not any("env_http_headers" in item for item in args)
+    assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+
+
+def test_is_codex_proxy_url_matches_only_this_loopback_port() -> None:
+    assert wrap_mod._is_codex_proxy_url("http://127.0.0.1:8787/v1", 8787)
+    assert wrap_mod._is_codex_proxy_url("http://[::1]:8787/v1", 8787)
+    # A local gateway on another port (e.g. LiteLLM allowed through
+    # HEADROOM_ALLOWED_BASE_URLS) is still a real upstream.
+    assert not wrap_mod._is_codex_proxy_url("http://localhost:4000/v1", 8787)
+    assert not wrap_mod._is_codex_proxy_url("https://api.example.test:8787/v1", 8787)
+    assert not wrap_mod._is_codex_proxy_url("http://127.0.0.1:99999/v1", 8787)
+
+
 def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
     """#2358: quoted segments are silently ignored by Codex's --config parser."""
     assert (
