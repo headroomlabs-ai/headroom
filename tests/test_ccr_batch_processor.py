@@ -619,6 +619,62 @@ class TestContinuationCalls:
         assert call_args.kwargs["headers"]["x-api-key"] == "gateway-credential"
 
     @pytest.mark.asyncio
+    async def test_anthropic_continuation_replays_captured_system_prompt(self):
+        """A captured top-level system prompt must survive a CCR continuation verbatim."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"content": [{"type": "text", "text": "Final answer"}]}
+        mock_response.raise_for_status = MagicMock()
+
+        http_client = AsyncMock(spec=httpx.AsyncClient)
+        http_client.post.return_value = mock_response
+        processor = BatchResultProcessor(http_client)
+
+        system = [
+            {"type": "text", "text": "You add 20% VAT on the subtotal."},
+            {"type": "text", "text": "Reply with the final total only."},
+        ]
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Subtotal is 100"}],
+            model="claude-3-opus-20240229",
+            extras={"max_tokens": 1000, "system": system},
+        )
+        batch_context = BatchContext(batch_id="batch_123", provider="anthropic", api_key="k")
+
+        await processor._anthropic_continuation(
+            [{"role": "user", "content": "Subtotal is 100"}], None, request_context, batch_context
+        )
+
+        payload = http_client.post.call_args.kwargs["json"]
+        assert payload["system"] == system
+
+    @pytest.mark.asyncio
+    async def test_anthropic_continuation_omits_absent_system_prompt(self):
+        """A batch request without a system prompt must not gain an explicit null."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"content": [{"type": "text", "text": "Final answer"}]}
+        mock_response.raise_for_status = MagicMock()
+
+        http_client = AsyncMock(spec=httpx.AsyncClient)
+        http_client.post.return_value = mock_response
+        processor = BatchResultProcessor(http_client)
+
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Hello"}],
+            model="claude-3-opus-20240229",
+            extras={"max_tokens": 1000, "system": None},
+        )
+        batch_context = BatchContext(batch_id="batch_123", provider="anthropic", api_key="k")
+
+        await processor._anthropic_continuation(
+            [{"role": "user", "content": "Hello"}], None, request_context, batch_context
+        )
+
+        payload = http_client.post.call_args.kwargs["json"]
+        assert "system" not in payload
+
+    @pytest.mark.asyncio
     async def test_openai_continuation_uses_configured_api_base_url(self):
         """A trailing slash on the recorded target does not double the separator."""
         mock_response = MagicMock()
