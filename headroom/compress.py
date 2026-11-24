@@ -316,9 +316,17 @@ def compress(
         # round-trip (mode='agent' / verify_lossless).
         original_messages = messages
 
+        # Agent / verify_lossless mode recounts tokens_after below and
+        # subtracts it from the pipeline's tokens_before, so both must come
+        # from one counter; two lookups can resolve two (#5037). Without the
+        # recount both numbers come from the pipeline run alone.
+        recounts = agent_mode or cfg.verify_lossless
+        tokenizer = pipeline._get_tokenizer(model) if recounts else None
+
         result = pipeline.apply(
             messages=messages,
             model=model,
+            token_counter=tokenizer,
             model_limit=model_limit,
             context=context,
             biases=biases,
@@ -407,8 +415,8 @@ def compress(
 
         # Factoring and reverts change the messages after the pipeline counted
         # them; recount with the pipeline's own message-counting contract.
-        if agent_mode or cfg.verify_lossless:
-            tokens_after = pipeline._get_tokenizer(model).count_messages(compressed_messages)
+        if tokenizer is not None:
+            tokens_after = tokenizer.count_messages(compressed_messages)
 
         tokens_saved = tokens_before - tokens_after
         ratio = tokens_saved / tokens_before if tokens_before > 0 else 0.0

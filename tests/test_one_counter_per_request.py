@@ -17,8 +17,13 @@ caching.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
+import pytest
+
+from headroom.client import HeadroomClient
 from headroom.providers.openai import OpenAIProvider
 from headroom.tokenizer import Tokenizer
 from headroom.tokenizers import EstimatingTokenCounter
@@ -115,3 +120,98 @@ def test_token_counter_is_not_forwarded_to_transforms() -> None:
 
     assert "token_counter" not in seen
     assert seen["tokenizer"].count_messages(MESSAGES) == mine.count_messages(MESSAGES)
+
+
+# ---------------------------------------------------------------------------
+# HeadroomClient: tokens_before is the client's count, tokens_after the
+# pipeline's. They must be one ruler.
+# ---------------------------------------------------------------------------
+
+
+def _client(tmp_path: Path) -> HeadroomClient:
+    original = MagicMock()
+    original.chat.completions.create.return_value = MagicMock()
+    return HeadroomClient(
+        original_client=original,
+        provider=_FlippingProvider(),
+        store_url=f"sqlite:///{tmp_path / 'metrics.db'}",
+        default_mode="optimize",
+        enable_cache_optimizer=False,
+    )
+
+
+def test_sdk_simulate_reports_zero_savings_for_an_untouched_request(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    _open_breaker(client._pipeline)
+
+    sim = client.chat.completions.simulate(model=MODEL, messages=MESSAGES)
+
+    assert sim.tokens_before == sim.tokens_after
+    assert sim.tokens_saved == 0
+
+
+def test_sdk_create_records_equal_totals_for_an_untouched_request(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    _open_breaker(client._pipeline)
+    saved: list[Any] = []
+    client._storage.save = saved.append  # type: ignore[method-assign]
+
+    client.chat.completions.create(model=MODEL, messages=MESSAGES)
+
+    (metrics,) = saved
+    assert metrics.tokens_input_before == metrics.tokens_input_after
+
+
+def test_sdk_input_compressed_event_sees_one_ruler(tmp_path: Path) -> None:
+    """Extensions get ``tokens_before``/``tokens_after`` before any recount."""
+    from headroom.pipeline import PipelineStage
+
+    client = _client(tmp_path)
+    _open_breaker(client._pipeline)
+    client._storage.save = lambda _m: None  # type: ignore[method-assign]
+    seen: list[dict[str, Any]] = []
+
+    class _Spy:
+        def on_pipeline_event(self, event: Any) -> None:
+            if event.stage == PipelineStage.INPUT_COMPRESSED:
+                seen.append(dict(event.metadata))
+
+    client._pipeline_extensions.add(_Spy())
+
+    client.chat.completions.create(model=MODEL, messages=MESSAGES)
+
+    (metadata,) = seen
+    assert metadata["tokens_before"] == metadata["tokens_after"]
+
+
+# ---------------------------------------------------------------------------
+# compress(): agent / verify_lossless mode recounts after the pipeline.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode_kwargs", [{"mode": "agent"}, {"verify_lossless": True}])
+def test_compress_recount_uses_the_pipelines_counter(
+    monkeypatch: pytest.MonkeyPatch, mode_kwargs: dict[str, Any]
+) -> None:
+    import importlib
+
+    compress_mod = importlib.import_module("headroom.compress")
+    from headroom.compress import CompressConfig, compress
+
+    lookups = {"n": 0}
+
+    def _flipping_get_tokenizer(self: TransformPipeline, model: str) -> Tokenizer:
+        lookups["n"] += 1
+        cpt = 4.0 if lookups["n"] % 2 else 2.0
+        return Tokenizer(EstimatingTokenCounter(chars_per_token=cpt), model)
+
+    monkeypatch.setattr(TransformPipeline, "_get_tokenizer", _flipping_get_tokenizer)
+    pipeline = TransformPipeline(transforms=[])
+    monkeypatch.setattr(compress_mod, "_get_pipeline", lambda: pipeline)
+    monkeypatch.setattr(compress_mod, "_get_agent_pipeline", lambda: pipeline)
+
+    result = compress(MESSAGES, model=MODEL, config=CompressConfig(**mode_kwargs))
+
+    # Nothing was compressed (no transforms), so one ruler reports no change.
+    assert result.tokens_before == result.tokens_after
+    assert result.tokens_saved == 0

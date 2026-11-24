@@ -526,6 +526,9 @@ class HeadroomClient:
             result = self._pipeline.apply(
                 messages,
                 model,
+                # tokens_before above and tokens_after below must come from
+                # one ruler, or tokens_saved is a difference of two (#5037).
+                token_counter=tokenizer,
                 model_limit=model_limit,
                 output_buffer=output_buffer,
                 tool_profiles=headroom_tool_profiles or {},
@@ -809,6 +812,7 @@ class HeadroomClient:
         result = self._pipeline.simulate(
             messages,
             model,
+            token_counter=tokenizer,
             model_limit=model_limit,
             output_buffer=output_buffer,
             tool_profiles=headroom_tool_profiles or {},
