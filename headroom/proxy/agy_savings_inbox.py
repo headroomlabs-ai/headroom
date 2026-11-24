@@ -23,12 +23,16 @@ path, and drain never raises out into the proxy's lifespan / stats handler.
 from __future__ import annotations
 
 import asyncio
+import errno
 import itertools
 import json
 import logging
 import os
 import random
+import sys
 import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -50,12 +54,80 @@ MAX_PROCESSED_IDS = 20000
 
 _INBOX_SUBDIR = "savings.d"
 _PROCESSED_FILE = ".processed"
+_DRAIN_LOCK_FILE = ".drain.lock"
 
 # Monotonic per-process sequence so two events from the same pid never collide.
 _seq = itertools.count()
 
-# Serialize drains so the periodic task and /stats-triggered drain never race.
+# Serialize drains within this process so periodic replay and /stats never race.
 _drain_lock = asyncio.Lock()
+
+_WIN_LOCK_RETRY_ERRNOS = frozenset(
+    code
+    for name in ("EACCES", "EAGAIN", "EDEADLK", "EDEADLOCK")
+    if (code := getattr(errno, name, None)) is not None
+)
+_WIN_LOCK_RETRY_WINERRORS = frozenset({32, 33})  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+
+
+def _is_windows_lock_contention(exc: OSError) -> bool:
+    """True when a Windows msvcrt.locking error indicates temporary lock contention."""
+    return (
+        exc.errno in _WIN_LOCK_RETRY_ERRNOS
+        or getattr(exc, "winerror", None) in _WIN_LOCK_RETRY_WINERRORS
+    )
+
+
+@asynccontextmanager
+async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[None]:
+    """Serialize inbox claim and replay across worker processes.
+
+    Acquiring the OS file lock guarantees that two workers (e.g. uvicorn
+    ``--workers 2``) never read and replay the same event file concurrently,
+    while OS-level lock release on process exit preserves crash recovery.
+    """
+    lock_path = directory / _DRAIN_LOCK_FILE
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        if sys.platform == "win32":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if not _is_windows_lock_contention(exc):
+                        raise
+                    await asyncio.sleep(0.05)
+            try:
+                yield
+            finally:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+        else:
+            import fcntl
+
+            await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    finally:
+        os.close(fd)
 
 
 def inbox_dir() -> Path:
@@ -208,55 +280,58 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
             directory = workspace_dir() / _INBOX_SUBDIR
             if not directory.is_dir():
                 return 0
-            processed_path = directory / _PROCESSED_FILE
-            processed_list = _load_processed(processed_path)
-            processed_set = set(processed_list)
-
             try:
-                files = sorted(directory.glob("evt-*.json"))
+                if not any(directory.glob("evt-*.json")):
+                    return 0
             except OSError:
                 return 0
 
-            dirty = False
-            for event_file in files[:max_events]:
+            async with _cross_process_drain_lock(directory):
+                processed_path = directory / _PROCESSED_FILE
+                processed_list = _load_processed(processed_path)
+                processed_set = set(processed_list)
+
                 try:
+                    files = sorted(directory.glob("evt-*.json"))
+                except OSError:
+                    return 0
+
+                for event_file in files[:max_events]:
                     try:
-                        raw = event_file.read_text(encoding="utf-8")
-                        envelope = json.loads(raw)
-                    except (OSError, ValueError):
-                        # Malformed / unreadable: skip and remove, never fatal.
-                        logger.debug("agy savings: dropping malformed %s", event_file.name)
+                        try:
+                            raw = event_file.read_text(encoding="utf-8")
+                            envelope = json.loads(raw)
+                        except (OSError, ValueError):
+                            # Malformed / unreadable: skip and remove, never fatal.
+                            logger.debug("agy savings: dropping malformed %s", event_file.name)
+                            _safe_unlink(event_file)
+                            continue
+
+                        event_id = envelope.get("event_id")
+                        if not isinstance(event_id, str) or not event_id:
+                            _safe_unlink(event_file)
+                            continue
+
+                        if event_id in processed_set:
+                            # Crash-window duplicate: already recorded, just remove.
+                            _safe_unlink(event_file)
+                            continue
+
+                        kwargs = envelope.get("kwargs")
+                        if not isinstance(kwargs, dict):
+                            _safe_unlink(event_file)
+                            continue
+
+                        await metrics.record_request(**kwargs)
+                        recorded += 1
+
+                        processed_set.add(event_id)
+                        processed_list.append(event_id)
+                        _write_processed(processed_path, processed_list)
                         _safe_unlink(event_file)
+                    except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
+                        logger.debug("agy savings: error replaying %s: %s", event_file.name, exc)
                         continue
-
-                    event_id = envelope.get("event_id")
-                    if not isinstance(event_id, str) or not event_id:
-                        _safe_unlink(event_file)
-                        continue
-
-                    if event_id in processed_set:
-                        # Crash-window duplicate: already recorded, just remove.
-                        _safe_unlink(event_file)
-                        continue
-
-                    kwargs = envelope.get("kwargs")
-                    if not isinstance(kwargs, dict):
-                        _safe_unlink(event_file)
-                        continue
-
-                    await metrics.record_request(**kwargs)
-                    recorded += 1
-
-                    processed_set.add(event_id)
-                    processed_list.append(event_id)
-                    dirty = True
-                    _safe_unlink(event_file)
-                except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
-                    logger.debug("agy savings: error replaying %s: %s", event_file.name, exc)
-                    continue
-
-            if dirty:
-                _write_processed(processed_path, processed_list)
         except Exception as exc:  # noqa: BLE001 - drain never raises out
             logger.debug("agy savings drain failed: %s", exc)
 

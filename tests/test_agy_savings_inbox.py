@@ -211,3 +211,70 @@ def test_agy_emit_enabled_reflects_env(monkeypatch):
 
     monkeypatch.setenv(agy_savings_inbox.AGY_INBOX_EMIT_ENV, "0")
     assert agy_savings_inbox.agy_emit_enabled() is False
+
+
+def test_two_processes_draining_same_inbox_record_event_once(isolated_home, tmp_path):
+    """Two worker processes draining the same inbox must replay one event only once."""
+    import os
+    import subprocess
+    import sys
+
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+    assert len(_evt_files()) == 1
+
+    sync_dir = tmp_path / "sync"
+    sync_dir.mkdir()
+
+    worker_script = """
+import asyncio
+import sys
+import time
+from pathlib import Path
+from headroom.proxy import agy_savings_inbox
+
+worker_id = sys.argv[1]
+other_id = sys.argv[2]
+sync_dir = Path(sys.argv[3])
+
+class SyncMetrics:
+    async def record_request(self, **kwargs):
+        (sync_dir / f"{worker_id}.entered").write_text("1", encoding="utf-8")
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            if (sync_dir / f"{other_id}.entered").exists():
+                break
+            await asyncio.sleep(0.01)
+
+count = asyncio.run(agy_savings_inbox.drain_inbox(SyncMetrics()))
+print(count)
+"""
+    env = {
+        **os.environ,
+        "HOME": str(isolated_home),
+        "HEADROOM_WORKSPACE_DIR": str(isolated_home / ".headroom"),
+        "HEADROOM_OFFLINE": "1",
+    }
+
+    p1 = subprocess.Popen(
+        [sys.executable, "-c", worker_script, "w1", "w2", str(sync_dir)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    p2 = subprocess.Popen(
+        [sys.executable, "-c", worker_script, "w2", "w1", str(sync_dir)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    out1, err1 = p1.communicate(timeout=15)
+    out2, err2 = p2.communicate(timeout=15)
+
+    assert p1.returncode == 0, err1
+    assert p2.returncode == 0, err2
+    c1 = int(out1.strip())
+    c2 = int(out2.strip())
+    assert c1 + c2 == 1, f"expected 1 combined record across two workers, got {c1} + {c2}"
+    assert _evt_files() == []
