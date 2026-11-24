@@ -165,7 +165,7 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_pytorch",
-            lambda model_id, device, *, allow_download=True: (
+            lambda model_id, device, *, allow_download=True, deadline=None: (
                 calls.append((model_id, device)) or ("model", "tokenizer", "pytorch")
             ),
         )
@@ -182,7 +182,7 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False, allow_download=True: (
+            lambda model_id, *, use_coreml=False, allow_download=True, deadline=None: (
                 calls.append((model_id, use_coreml)) or ("model", "tokenizer", "onnx_coreml")
             ),
         )
@@ -201,14 +201,14 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False, allow_download=True: (
+            lambda model_id, *, use_coreml=False, allow_download=True, deadline=None: (
                 calls.append("onnx") or ("model", "tokenizer", "onnx")
             ),
         )
         monkeypatch.setattr(
             kmod,
             "_load_kompress_pytorch",
-            lambda model_id, device, *, allow_download=True: (
+            lambda model_id, device, *, allow_download=True, deadline=None: (
                 calls.append("pytorch") or ("model", "tokenizer", "pytorch")
             ),
         )

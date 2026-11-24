@@ -17,6 +17,7 @@ every existing passthrough/fallback handler already covers it -- and a wait that
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 
@@ -135,3 +136,120 @@ def test_load_returns_cached_model_without_waiting(monkeypatch):
         assert kc._load_kompress(model_id) is sentinel
     finally:
         kc._kompress_cache.pop(model_id, None)
+
+
+def _hold_lock_for(seconds: float) -> threading.Thread:
+    holder = threading.Event()
+
+    def hold() -> None:
+        kc._kompress_lock.acquire()
+        holder.set()
+        time.sleep(seconds)
+        kc._kompress_lock.release()
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    assert holder.wait(5.0)
+    return thread
+
+
+def test_auto_dispatch_spends_one_budget_not_two(monkeypatch, caplog):
+    """``auto`` must not retry the second backend on a busy lock.
+
+    With ONNX and PyTorch both available the dispatcher tries ONNX, and a
+    ``KompressModelBusy`` from it used to be caught by the ``NotCached`` handler
+    and fall through to PyTorch -- which queues on the *same* lock for a second
+    full budget. The caller then reported busy twice as late as it was told.
+    """
+    monkeypatch.setenv(ENV, "0.25")
+    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
+    # The import is not what this test is about, and no backend may do real work.
+    monkeypatch.setattr(kc, "_import_auto_tokenizer", lambda model_id, deadline: object())
+    attempts: list[object] = []
+
+    def pytorch_attempt(*args: object, **kwargs: object) -> None:
+        attempts.append(kwargs.get("deadline"))
+        raise kc.KompressModelBusy("kompress-auto-one-budget")
+
+    monkeypatch.setattr(kc, "_load_kompress_pytorch", pytorch_attempt)
+    thread = _hold_lock_for(1.5)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger=kc.__name__):
+        with pytest.raises(kc.KompressModelBusy):
+            kc._load_kompress("kompress-auto-one-budget")
+    elapsed = time.monotonic() - started
+    thread.join(5.0)
+
+    assert attempts == [], "the dispatcher retried the second backend after a busy lock"
+    waits = [r for r in caplog.records if "event=kompress_load_lock_timeout" in r.getMessage()]
+    assert len(waits) == 1, f"waited on the lock {len(waits)} times"
+    assert elapsed < 0.4, f"waited {elapsed:.2f}s for a 0.25s budget"
+
+
+class _BlockingTransformersImport:
+    """Hold ``import transformers`` open, the way a cold page-in does."""
+
+    def __init__(self, stall_seconds: float = 3.0) -> None:
+        self.stall_seconds = stall_seconds
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def find_spec(self, fullname, path=None, target=None):  # noqa: D102 - meta_path hook
+        if fullname != "transformers":
+            return None
+        self.entered.set()
+        self.release.wait(self.stall_seconds)
+        return None
+
+    def __enter__(self) -> _BlockingTransformersImport:
+        sys.modules.pop("transformers", None)
+        sys.meta_path.insert(0, self)
+        self.thread = threading.Thread(target=self._import, daemon=True)
+        self.thread.start()
+        assert self.entered.wait(5.0), "the blocking finder never ran"
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release.set()
+        self.thread.join(5.0)
+        if self in sys.meta_path:
+            sys.meta_path.remove(self)
+        sys.modules.pop("transformers", None)
+
+    def _import(self) -> None:
+        try:
+            import transformers  # noqa: F401 - deliberately blocked
+        except Exception:  # noqa: BLE001 - the finder refuses the import
+            pass
+
+
+def test_zero_budget_caller_does_not_wait_for_a_cold_transformers_import(monkeypatch, caplog):
+    """A busy caller must reach its timeout *before* the import, not after it.
+
+    importlib serialises a module's first import behind its own per-module lock,
+    so a caller that starts by importing ``transformers`` inherits whoever is
+    mid-import -- the 156.9 s/2.8 s stall from #4967 -- and only then reaches the
+    lock it can time out on. With no budget that wait must collapse to nothing.
+    """
+    monkeypatch.setenv(ENV, "0")
+    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
+    monkeypatch.setattr(
+        kc, "_load_kompress_pytorch", lambda *a, **k: pytest.fail("reached a second backend")
+    )
+    thread = _hold_lock_for(2.0)
+
+    with caplog.at_level(logging.WARNING, logger=kc.__name__):
+        with _BlockingTransformersImport():
+            started = time.monotonic()
+            with pytest.raises(kc.KompressModelBusy):
+                kc._load_kompress("kompress-cold-import")
+            elapsed = time.monotonic() - started
+    thread.join(5.0)
+
+    assert elapsed < 1.0, f"waited {elapsed:.2f}s inside a concurrent import"
+    assert any("stage=import" in r.getMessage() for r in caplog.records), caplog.text

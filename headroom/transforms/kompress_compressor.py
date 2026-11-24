@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -367,34 +368,100 @@ def _load_lock_budget_seconds() -> float:
 
 
 @contextlib.contextmanager
-def _kompress_load_lock(model_id: str) -> Iterator[None]:
+def _kompress_load_lock(model_id: str, deadline: float | None = None) -> Iterator[None]:
     """``_kompress_lock`` with a bounded wait; cached result wins after it.
 
     On timeout the caller gets :class:`KompressModelBusy` instead of blocking for
     as long as the loader takes. If the wait *succeeds*, the loader is done and
     the body's cache check picks up its entry -- so a bounded wait still returns
     a usable model rather than a needless passthrough.
+
+    ``deadline`` (a ``time.monotonic()`` value) carries the budget already spent
+    elsewhere -- the first-time import, or an earlier backend the dispatcher
+    tried. Otherwise each contention point would get its own full budget and a
+    caller could wait twice over.
     """
     budget = _load_lock_budget_seconds()
+    if deadline is not None:
+        budget = max(deadline - time.monotonic(), 0.0)
     acquired = (
         _kompress_lock.acquire(timeout=budget)
         if budget > 0
         else _kompress_lock.acquire(blocking=False)
     )
     if not acquired:
-        logger.warning(
-            "event=kompress_load_lock_timeout model=%s budget_seconds=%.1f detail=another "
-            "thread is loading the model; compression falls back to the non-ML path "
-            "(%s to tune)",
-            safe_id(model_id),
-            budget,
-            KOMPRESS_LOAD_LOCK_TIMEOUT_ENV,
-        )
+        _report_load_busy(model_id, budget, stage="lock")
         raise KompressModelBusy(model_id)
     try:
         yield
     finally:
         _kompress_lock.release()
+
+
+def _report_load_busy(model_id: str, budget: float, *, stage: str) -> None:
+    logger.warning(
+        "event=kompress_load_lock_timeout model=%s stage=%s budget_seconds=%.1f detail=another "
+        "thread is loading the model; compression falls back to the non-ML path "
+        "(%s to tune)",
+        safe_id(model_id),
+        stage,
+        budget,
+        KOMPRESS_LOAD_LOCK_TIMEOUT_ENV,
+    )
+
+
+def _import_bounded(model_id: str, deadline: float, loader: Callable[[], Any]) -> Any:
+    """Run a first-time import, but not for longer than the remaining budget.
+
+    ``import transformers`` pulls torch in through ``dlopen``; importlib
+    serialises a module's first import behind a per-module lock, so a caller that
+    merely *imports* can wait just as long as one waiting on our model lock.
+    Running it here means a busy-import caller reaches its timeout instead of
+    inheriting someone else's minute-scale page-in.
+    """
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["value"] = loader()
+        except BaseException as exc:  # re-raised in the caller's thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=_run, name="kompress-import", daemon=True)
+    worker.start()
+    worker.join(max(deadline - time.monotonic(), 0.0))
+    if worker.is_alive():
+        # The import keeps running on its own; the next caller finds it in
+        # sys.modules instead of paying for it again.
+        _report_load_busy(model_id, 0.0, stage="import")
+        raise KompressModelBusy(model_id)
+    error = box.get("error")
+    if error is not None:
+        raise error
+    return box["value"]
+
+
+def _import_ml_stack() -> tuple[Any, Any]:
+    """``(torch, transformers.AutoTokenizer)`` for a first-touch load."""
+    import torch
+    from transformers import AutoTokenizer
+
+    return torch, AutoTokenizer
+
+
+def _import_auto_tokenizer(model_id: str, deadline: float) -> Any:
+    """``transformers.AutoTokenizer``, bounded when this is a first import."""
+    if "transformers" in sys.modules:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer
+
+    def _load() -> Any:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer
+
+    return _import_bounded(model_id, deadline, _load)
 
 
 _execution_semaphores: dict[str, threading.BoundedSemaphore] = {}
@@ -1021,6 +1088,7 @@ def _load_kompress_onnx(
     *,
     use_coreml: bool = False,
     allow_download: bool = True,
+    deadline: float | None = None,
 ) -> tuple[Any, Any, str]:
     """Download ONNX INT8 model from HuggingFace and load with onnxruntime.
 
@@ -1029,20 +1097,22 @@ def _load_kompress_onnx(
     instead of hitting the network.
     """
     stage_ms: StageTimings = {}
+    if deadline is None:
+        deadline = time.monotonic() + _load_lock_budget_seconds()
     # Imported BEFORE the lock on purpose. This import pulls torch in through
     # dlopen and has been measured at 156.9s wall for 2.8s CPU on a degraded
     # filesystem; holding the load lock across it means every other kompress
-    # caller waits minutes (#4967). Outside the lock only the importer does.
+    # caller waits minutes (#4967). Outside the lock only the importer does --
+    # and it is bounded by the same deadline, because importlib serialises a
+    # first import behind its own lock, so "just importing" waits too.
     auto_tokenizer: Any = None
     with _timed_stage(stage_ms, "transformers_import"):
         try:
-            from transformers import AutoTokenizer as _AutoTokenizer
+            auto_tokenizer = _import_auto_tokenizer(model_id, deadline)
         except ImportError:
             pass
-        else:
-            auto_tokenizer = _AutoTokenizer
 
-    with _kompress_load_lock(model_id):
+    with _kompress_load_lock(model_id, deadline):
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
@@ -1086,9 +1156,7 @@ def _load_kompress_onnx(
 
         with _timed_stage(stage_ms, "tokenizer_load"):
             if auto_tokenizer is None:
-                from transformers import AutoTokenizer as _AutoTokenizer
-
-                auto_tokenizer = _AutoTokenizer
+                auto_tokenizer = _import_auto_tokenizer(model_id, deadline)
             tokenizer = _load_modernbert_tokenizer(auto_tokenizer, allow_download=allow_download)
 
         _kompress_cache[model_id] = (model, tokenizer, backend)
@@ -1236,17 +1304,31 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
 
 
 def _load_kompress_pytorch(
-    model_id: str, device: str = "auto", *, allow_download: bool = True
+    model_id: str,
+    device: str = "auto",
+    *,
+    allow_download: bool = True,
+    deadline: float | None = None,
 ) -> tuple[Any, Any, str]:
     """Download PyTorch model from HuggingFace and load with torch.
 
     When ``allow_download`` is ``False`` weights and tokenizer are loaded from
     the local cache only; a cache miss raises :class:`KompressModelNotCached`.
     """
-    import torch
-    from transformers import AutoTokenizer
+    if deadline is None:
+        deadline = time.monotonic() + _load_lock_budget_seconds()
 
-    with _kompress_load_lock(model_id):
+    if "torch" in sys.modules and "transformers" in sys.modules:
+        import torch
+        from transformers import AutoTokenizer
+    else:
+        # First touch of the ML stack: minutes of dlopen on a degraded
+        # filesystem, so it spends the same contention budget as the lock.
+        torch, AutoTokenizer = _import_bounded(  # type: ignore[misc]
+            model_id, deadline, _import_ml_stack
+        )
+
+    with _kompress_load_lock(model_id, deadline):
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
@@ -1327,22 +1409,34 @@ def _load_kompress(
     than fetching from the network.
 
     Models are cached by model_id — multiple models can coexist.
+
+    One contention budget covers the whole call: the first-time import, the lock
+    wait, and -- in ``auto`` mode -- every backend the dispatcher tries. A busy
+    result is final rather than a fallback trigger, so a second backend cannot
+    spend the same budget again.
     """
     if model_id in _kompress_cache:
         return _kompress_cache[model_id]
 
+    deadline = time.monotonic() + _load_lock_budget_seconds()
     backend = _selected_backend()
     if backend in ("onnx", "onnx_cpu"):
-        return _load_kompress_onnx(model_id, use_coreml=False, allow_download=allow_download)
+        return _load_kompress_onnx(
+            model_id, use_coreml=False, allow_download=allow_download, deadline=deadline
+        )
 
     if backend == "onnx_coreml":
-        return _load_kompress_onnx(model_id, use_coreml=True, allow_download=allow_download)
+        return _load_kompress_onnx(
+            model_id, use_coreml=True, allow_download=allow_download, deadline=deadline
+        )
 
     if backend in ("pytorch", "pytorch_mps"):
         forced_device = "mps" if backend == "pytorch_mps" else device
         try:
-            return _load_kompress_pytorch(model_id, forced_device, allow_download=allow_download)
-        except KompressModelNotCached:
+            return _load_kompress_pytorch(
+                model_id, forced_device, allow_download=allow_download, deadline=deadline
+            )
+        except (KompressModelNotCached, KompressModelBusy):
             raise
         except Exception as exc:
             if backend != "pytorch_mps":
@@ -1354,9 +1448,14 @@ def _load_kompress(
             )
             if _is_onnx_available():
                 return _load_kompress_onnx(
-                    model_id, use_coreml=False, allow_download=allow_download
+                    model_id,
+                    use_coreml=False,
+                    allow_download=allow_download,
+                    deadline=deadline,
                 )
-            return _load_kompress_pytorch(model_id, "cpu", allow_download=allow_download)
+            return _load_kompress_pytorch(
+                model_id, "cpu", allow_download=allow_download, deadline=deadline
+            )
 
     # Auto mode: preserve stable default behavior. This avoids changing
     # compression quality/perf characteristics for existing installs while
@@ -1364,7 +1463,14 @@ def _load_kompress(
     onnx_error: Exception | None = None
     if _is_onnx_available():
         try:
-            return _load_kompress_onnx(model_id, use_coreml=False, allow_download=allow_download)
+            return _load_kompress_onnx(
+                model_id, use_coreml=False, allow_download=allow_download, deadline=deadline
+            )
+        except KompressModelBusy:
+            # Another thread is mid-load and this caller's budget is spent.
+            # Falling through to PyTorch would queue on the very same lock for a
+            # second full budget and report busy twice as late.
+            raise
         except KompressModelNotCached:
             # Cache-only miss: don't trigger a PyTorch network download as a
             # fallback — propagate so the caller can defer.
@@ -1375,7 +1481,9 @@ def _load_kompress(
             logger.warning("ONNX load failed for %s, trying PyTorch: %s", model_id, e)
 
     if _is_pytorch_available():
-        return _load_kompress_pytorch(model_id, device, allow_download=allow_download)
+        return _load_kompress_pytorch(
+            model_id, device, allow_download=allow_download, deadline=deadline
+        )
 
     if onnx_error is not None:
         # onnxruntime IS installed and was tried, but loading failed. The
