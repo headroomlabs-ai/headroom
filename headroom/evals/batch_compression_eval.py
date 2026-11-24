@@ -1298,17 +1298,35 @@ class BatchCompressionEvaluator:
 
 @dataclass
 class TokenCountAccuracyResult:
-    """Result of token counting accuracy evaluation."""
+    """Result of token counting accuracy evaluation.
+
+    When the reference tokenizer cannot load (``reference_error`` is set), no
+    accuracy was measured: the scores are ``None`` and each result carries only
+    Headroom's own estimate.
+    """
 
     model: str
     test_cases: int
-    exact_matches: int
-    avg_error_percent: float
-    max_error_percent: float
+    exact_matches: int | None
+    avg_error_percent: float | None
+    max_error_percent: float | None
     results: list[dict[str, Any]] = field(default_factory=list)
+    reference_error: str | None = None
+
+    @property
+    def reference_available(self) -> bool:
+        return self.reference_error is None
 
     def summary(self) -> str:
         """Generate summary."""
+        if (
+            self.exact_matches is None
+            or self.avg_error_percent is None
+            or self.max_error_percent is None
+        ):
+            return f"""=== Token Counting Accuracy ({self.model}) ===
+Test cases: {self.test_cases}
+Accuracy not measured: reference tokenizer unavailable ({self.reference_error})"""
         return f"""=== Token Counting Accuracy ({self.model}) ===
 Test cases: {self.test_cases}
 Exact matches: {self.exact_matches} ({self.exact_matches / self.test_cases:.1%})
@@ -1347,19 +1365,30 @@ def evaluate_token_counting_accuracy(
     results = []
     errors = []
 
+    # Note: In a real implementation, we would call the API and check the
+    # actual token count from the response. For now, we compare against a
+    # reference tokenizer, resolved once up front: without it there is nothing
+    # to measure against, and another estimate must not stand in for it.
+    try:
+        # Bounded and offline-aware, unlike a bare tiktoken.get_encoding.
+        enc = load_encoding("cl100k_base")
+    except (ImportError, TiktokenLoadError) as exc:
+        return TokenCountAccuracyResult(
+            model=model,
+            test_cases=len(test_texts),
+            exact_matches=None,
+            avg_error_percent=None,
+            max_error_percent=None,
+            results=[
+                {"text_length": len(text), "estimated_tokens": token_counter.count_text(text)}
+                for text in test_texts
+            ],
+            reference_error=str(exc),
+        )
+
     for text in test_texts:
         estimated = token_counter.count_text(text)
-
-        # Note: In a real implementation, we would call the API and check
-        # the actual token count from the response. For now, we compare
-        # against a reference tokenizer.
-        try:
-            # Bounded and offline-aware, unlike a bare tiktoken.get_encoding.
-            enc = load_encoding("cl100k_base")
-            actual = len(enc.encode(text))
-        except (ImportError, TiktokenLoadError):
-            # Fallback: assume estimate is close
-            actual = len(text) // 4
+        actual = len(enc.encode(text))
 
         error_percent = abs(estimated - actual) / max(actual, 1) * 100
         errors.append(error_percent)
@@ -1513,6 +1542,8 @@ def main() -> None:
                 json.dump(
                     {
                         "model": token_results.model,
+                        "reference_available": token_results.reference_available,
+                        "reference_error": token_results.reference_error,
                         "test_cases": token_results.test_cases,
                         "exact_matches": token_results.exact_matches,
                         "avg_error_percent": token_results.avg_error_percent,
