@@ -348,18 +348,32 @@ def test_rust_front_relay_without_a_token_anywhere_is_a_remote_caller() -> None:
     assert admin.status_code == 404
 
 
-@pytest.mark.parametrize("path", ["/health", "/livez", "/readyz"])
+@pytest.mark.parametrize(
+    ("path", "statuses", "payload_key"),
+    [
+        ("/health", {200}, "checks"),
+        ("/livez", {200}, "alive"),
+        # Not ready until startup has run, which this client skips.
+        ("/readyz", {200, 503}, "ready"),
+    ],
+)
 def test_health_probe_relayed_without_a_proof_still_answers(
-    monkeypatch: pytest.MonkeyPatch, path: str
+    monkeypatch: pytest.MonkeyPatch, path: str, statuses: set[int], payload_key: str
 ) -> None:
     # The Rust front relays a remote monitor's probe without the token, so
-    # without a proof; health probes answer every caller.
+    # without a proof; it gets the probe's own answer, minus local-only detail.
     monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "proxy-token")
     client, _ = _client()
+    local = client.get(path)
 
     resp = client.get(path, headers={"Host": RELAY_HOST})
 
-    assert resp.status_code != 403, resp.text
+    assert resp.status_code in statuses, resp.text
+    assert resp.status_code == local.status_code
+    body = resp.json()
+    assert body["service"] == local.json()["service"]
+    assert payload_key in body
+    assert "config" not in body  # operator config is for local callers only
 
 
 def test_rust_front_relay_with_its_proof_forwards_without_the_proof(
