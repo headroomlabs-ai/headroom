@@ -379,6 +379,7 @@ def _store():
 
 def _config() -> ProxyConfig:
     return ProxyConfig(
+        ccr_event_streaming=False,  # Keep this suite scoped to the buffered fallback.
         optimize=False,
         cache_enabled=False,
         rate_limit_enabled=False,

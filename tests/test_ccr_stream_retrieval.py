@@ -219,6 +219,7 @@ def _two_turn_session(
         )
 
     config = ProxyConfig(
+        ccr_event_streaming=False,  # Exercise buffered introduction + later-turn serving.
         optimize=False,
         cache_enabled=False,
         rate_limit_enabled=False,
