@@ -42,17 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     // A token on a loopback listener means remote callers arrive through
     // something on this machine (a TLS terminator, a reverse proxy). If that
-    // rewrites Host to a loopback name, they look local here: no token check,
-    // and the Python proxy's local-only routes. Nothing here can tell.
+    // relays them under a loopback Host, they look local here: no token
+    // check, and the Python proxy's local-only routes. Nothing here can tell.
     if config.listen.ip().is_loopback() && config.proxy_token.is_some() {
         tracing::warn!(
             event = "proxy_loopback_listen_with_token",
             listen = %config.listen,
             "a same-host TLS terminator or reverse proxy in front of this \
-             listener must relay only its public name as Host (never \
-             127.0.0.1, localhost or a container alias); a caller relayed \
-             under such a Host is treated as local and skips \
-             HEADROOM_PROXY_TOKEN. See RUST_DEV.md, Inbound authentication"
+             listener must relay only its public name as Host: a caller it \
+             relays under a loopback Host (127.0.0.1, localhost) is treated \
+             as local here and skips HEADROOM_PROXY_TOKEN. See RUST_DEV.md, \
+             Inbound authentication"
         );
     }
 

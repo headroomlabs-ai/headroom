@@ -168,13 +168,23 @@ Python proxy trusts loopback callers (no token needed, and access to
   client on this machine. A same-host TLS terminator or reverse proxy
   (nginx, Caddy, ...) in front of the Rust proxy must therefore relay only
   requests for its public name, with that name as `Host`: if it relays a
-  request whose `Host` is `127.0.0.1`, `localhost` or a container alias
-  (`host.docker.internal`), whether it rewrote it or the client sent it,
-  that caller counts as local, skips the token and reaches the Python
-  proxy's local-only routes. Validate the authority explicitly; `$host`
-  alone passes through whatever the client sent. For nginx:
+  request whose `Host` is `127.0.0.1` or `localhost`, whether it rewrote
+  it or the client sent it, that caller counts as local here, skips the
+  token and reaches the Python proxy's local-only routes. (A container
+  alias such as `host.docker.internal` is not local to the front, which
+  requires the token for it; only the Python proxy trusts those names
+  from a loopback peer. The front never forwards a caller-chosen alias
+  under `--no-rewrite-host`; a front that reaches the Python proxy as
+  `http://host.docker.internal:<port>` must run with `--python-upstream
+  true`, so its relayed callers carry `headroom-remote.invalid` instead.) Validate the authority explicitly; `$host` alone passes
+  through whatever the client sent. For nginx:
 
   ```nginx
+  # WebSocket routes (/v1/responses, /v1/live) need the upgrade forwarded.
+  map $http_upgrade $connection_upgrade {
+      default upgrade;
+      ''      close;
+  }
   # Any authority other than the public name never reaches the front.
   server {
       listen 443 ssl default_server;
@@ -190,14 +200,16 @@ Python proxy trusts loopback callers (no token needed, and access to
           proxy_pass http://127.0.0.1:8787;
           proxy_set_header Host $host;   # the validated public name
           proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
           proxy_buffering off;           # streaming responses
       }
   }
   ```
 
-  Callers of the public name then need the token; `Host: 127.0.0.1:8787`,
-  `localhost` or `host.docker.internal` are closed by nginx and never
-  reach the front. Alternatively, have the terminator forward to the
+  Callers of the public name then need the token; any other authority
+  (`Host: 127.0.0.1:8787`, `localhost`, `host.docker.internal`, an IP) is
+  closed by nginx and never reaches the front. Alternatively, have the terminator forward to the
   front on a non-loopback address. The front logs
   `event=proxy_loopback_listen_with_token` at startup as a reminder when
   it listens on loopback with a token configured.
