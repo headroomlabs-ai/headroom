@@ -2361,6 +2361,34 @@ def test_pids_from_proc_reads_probed_listeners_from_kernel_tables(tmp_path: Path
     assert wrap_mod._pids_from_proc(8787, tmp_path) == {4242}
 
 
+def test_pids_from_proc_skips_a_descriptor_that_closes_during_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vanished fd must not hide the proxy's listening socket on a later fd."""
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        "   0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501 0 1111\n",
+        encoding="ascii",
+    )
+    fds = tmp_path / "4242" / "fd"
+    fds.mkdir(parents=True)
+    os.symlink("pipe:[9]", fds / "3")
+    os.symlink("socket:[1111]", fds / "4")
+    real_iterdir, real_readlink = Path.iterdir, os.readlink
+
+    def readlink(path: Any) -> str:
+        if Path(path) == fds / "3":
+            raise FileNotFoundError(path)  # closed between listing and readlink
+        return real_readlink(path)
+
+    # List fd 3 before fd 4, whatever order the filesystem returns.
+    monkeypatch.setattr(Path, "iterdir", lambda self: iter(sorted(real_iterdir(self))))
+    monkeypatch.setattr(wrap_mod.os, "readlink", readlink)
+
+    assert wrap_mod._pids_from_proc(8787, tmp_path) == {4242}
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

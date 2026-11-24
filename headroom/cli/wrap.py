@@ -4672,10 +4672,17 @@ def _pids_from_proc(port: int, proc: Path = Path("/proc")) -> set[int] | None:
         if pid is None:
             continue
         try:
-            if any(os.readlink(fd) in sockets for fd in (entry / "fd").iterdir()):
-                pids.add(pid)
+            descriptors = list((entry / "fd").iterdir())
         except OSError:  # another user's process, or it exited meanwhile
             continue
+        for fd in descriptors:
+            try:
+                target = os.readlink(fd)
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue  # this descriptor closed meanwhile; the others still count
+            if target in sockets:
+                pids.add(pid)
+                break
     return pids
 
 
