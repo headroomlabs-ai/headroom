@@ -895,6 +895,9 @@ def _is_read_command(command: str) -> bool:
 # `grep -n x a.py | head -40` is derived search output (compressible), while
 # `cat a.py | head -40` is a file read (caught via the first stage).
 _CMD_SEPARATOR_RE = re.compile(r"\|\||&&|;")
+# Rows that continue the log record above them: indented stack frames,
+# `Caused by:` and `... N more`.
+_LOG_CONTINUATION_RE = re.compile(r"^(?:\s+\S|Caused by: |\.\.\. \d+ more)")
 
 
 def _command_segments(command: str) -> list[str]:
@@ -7828,8 +7831,18 @@ class ContentRouter(Transform):
         from .lossless_compaction import _TIMESTAMP_ROW_RE
 
         # `--` is the group separator grep prints with -A/-B/-C.
-        rows = [line for line in content.split("\n")[:100] if line.strip() and line != "--"]
-        return len(rows) >= 2 and all(_TIMESTAMP_ROW_RE.match(line) for line in rows)
+        rows = [
+            line
+            for line in (raw.rstrip("\r") for raw in content.split("\n")[:100])
+            if line.strip() and line != "--"
+        ]
+        stamped = [bool(_TIMESTAMP_ROW_RE.match(line)) for line in rows]
+        # A log record may carry continuation rows, such as a Java stack frame.
+        return (
+            sum(stamped) >= 2
+            and stamped[0]
+            and all(s or _LOG_CONTINUATION_RE.match(line) for s, line in zip(stamped, rows))
+        )
 
     def _content_cache_key(
         self, content: str, *, gated: bool = False, bias: float = 1.0, context: str = ""

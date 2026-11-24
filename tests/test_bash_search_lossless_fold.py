@@ -182,6 +182,15 @@ TOMCAT_CONTEXT = "\n--\n".join(
     "\n".join(TOMCAT_LOG.split("\n")[g * 20 : g * 20 + 20]) for g in range(12)
 )
 
+JAVA_FRAME = (
+    "\tat org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:199)"
+)
+
+# Same `grep -A1` output, but one context row is a stack frame, not a log row.
+_context_rows = TOMCAT_CONTEXT.split("\n")
+_context_rows[19] = JAVA_FRAME
+TOMCAT_FRAME_CONTEXT = "\n".join(_context_rows)
+
 
 def _openai_text_blocks(command: str, content: str, tokenizer, config=None):
     # Some OpenAI-compatible clients send tool output as a list of text blocks.
@@ -205,6 +214,14 @@ def _openai_split_text_blocks(command: str, content: str, tokenizer, config=None
     [
         pytest.param("grep INFO logs/catalina.out", TOMCAT_LOG, id="matches"),
         pytest.param("grep -A1 matched logs/catalina.out", TOMCAT_CONTEXT, id="context"),
+        pytest.param(
+            "grep -A1 matched logs/catalina.out", TOMCAT_FRAME_CONTEXT, id="context-stack-frame"
+        ),
+        pytest.param(
+            "grep -A1 matched logs/catalina.out",
+            TOMCAT_CONTEXT.replace("\n", "\r\n"),
+            id="context-crlf",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -224,6 +241,18 @@ def test_timestamped_search_stays_whole_without_ccr(send, command, output, confi
     out, transforms = send(command, output, tokenizer, config())
     assert "router:bash:search_verbatim" in transforms
     assert out == output
+
+
+@pytest.mark.parametrize("ccr_enabled", [True, False], ids=["no-ccr", "ccr-disabled"])
+def test_text_blocks_with_stack_frame_stay_whole_without_ccr(ccr_enabled, tokenizer):
+    # First block: one log row and its stack frame. Second block: the other
+    # 240 matches. Neither block may be shrunk on its own.
+    first = TOMCAT_LOG.split("\n")[0] + "\n" + JAVA_FRAME + "\n"
+    blocks = [{"type": "text", "text": first}, {"type": "text", "text": TOMCAT_LOG}]
+    config = ContentRouterConfig(ccr_enabled=ccr_enabled, ccr_inject_marker=False)
+    out, transforms = _openai("grep INFO logs/catalina.out", blocks, tokenizer, config)
+    assert "router:bash:search_verbatim" in transforms
+    assert [block["text"] for block in out] == [first, TOMCAT_LOG]
 
 
 def test_lossless_mode_still_folds_repeated_timestamped_matches(tokenizer):
