@@ -401,7 +401,9 @@ def _parse_destinations(
 ) -> tuple[frozenset[str], frozenset[tuple[str, str, int]]]:
     hosts: set[str] = set()
     origins: set[tuple[str, str, int]] = set()
-    for item in raw.split(","):
+    # Entries can carry credentials (``https://user:pass@host``), so a rejected
+    # one is reported by its position, never by its text.
+    for position, item in enumerate(raw.split(","), start=1):
         item = item.strip()
         if not item:
             continue
@@ -412,14 +414,14 @@ def _parse_destinations(
             parsed = None
         host = _connect_name(parsed.hostname or "") if parsed is not None else None
         if parsed is None or not host:
-            logger.warning("ignoring malformed %s entry: %r", env, item)
+            logger.warning("ignoring %s entry %d: not a valid host, port or URL", env, position)
             continue
         if "://" not in item:
             hosts.add(host)
             continue
         scheme = parsed.scheme.lower()
         if scheme not in _SAFE_SCHEMES:
-            logger.warning("ignoring %s entry with an unsupported scheme: %r", env, item)
+            logger.warning("ignoring %s entry %d: unsupported scheme", env, position)
             continue
         if port is None:
             port = 443 if scheme in {"https", "wss"} else 80

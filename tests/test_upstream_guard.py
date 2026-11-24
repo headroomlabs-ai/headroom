@@ -6,6 +6,7 @@ All cases use IP literals or ``localhost`` so no external network is required.
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 import socket
 import ssl
@@ -1780,3 +1781,60 @@ def test_a_malformed_destination_entry_is_skipped_not_fatal(
     assert allow is not None and destination_listed(allow, "https", "gw.example", None)
     if env == "HEADROOM_PROXIED_BASE_URLS":
         assert is_safe_upstream_url("https://public.example/v1") is True
+
+
+class _Records(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@pytest.mark.parametrize("env", ["HEADROOM_ALLOWED_BASE_URLS", "HEADROOM_PROXIED_BASE_URLS"])
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        ("https://demo:dummy-password@gateway.example:bad", "not a valid host, port or URL"),
+        ("ftp://demo:dummy-password@gateway.example", "unsupported scheme"),
+    ],
+)
+def test_a_rejected_destination_entry_is_logged_without_its_text(
+    monkeypatch: pytest.MonkeyPatch, env: str, entry: str, reason: str
+) -> None:
+    """Entries can carry credentials; the warning names the setting and position only."""
+    from headroom.proxy import upstream_guard
+
+    # Attached to the module's own logger: caplog misses `headroom.*` records
+    # once the proxy's logging setup has run elsewhere in the session.
+    records = _Records()
+    upstream_guard.logger.addHandler(records)
+    previous_level = upstream_guard.logger.level
+    upstream_guard.logger.setLevel(logging.WARNING)
+    try:
+        monkeypatch.setenv(env, f"{entry}, backup.example")
+        upstream_guard._parse_destinations.cache_clear()  # parse, and log, now
+        allow = upstream_guard.allowlisted_destinations(env)
+    finally:
+        upstream_guard.logger.removeHandler(records)
+        upstream_guard.logger.setLevel(previous_level)
+
+    assert allow is not None
+    assert upstream_guard.destination_listed(allow, "https", "backup.example", None)
+    assert any(f"{env} entry 1: {reason}" in message for message in records.messages)
+    assert not any("dummy-password" in m or "demo:" in m for m in records.messages)
+
+
+@pytest.mark.parametrize("listed", _IDN_SPELLINGS)
+@pytest.mark.parametrize("requested", _IDN_SPELLINGS)
+def test_the_allowlist_matches_every_spelling_of_an_idn(
+    monkeypatch: pytest.MonkeyPatch, listed: str, requested: str
+) -> None:
+    def no_lookup(*args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("allowlist mode must not resolve")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_lookup)
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", listed)
+
+    assert is_safe_upstream_url(f"https://{requested}/v1") is True
