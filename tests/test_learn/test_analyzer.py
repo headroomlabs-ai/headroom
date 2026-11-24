@@ -997,6 +997,28 @@ class TestCallCliLlm:
         assert "--strict-mcp-config" not in argvs[1]
         assert argvs[1][argvs[1].index("--disallowedTools") + 1] == "mcp__*"
 
+    def test_claude_cli_success_without_reading_the_whole_digest_is_rejected(
+        self, monkeypatch, tmp_path
+    ):
+        # A real process that closes stdin unread, prints a valid result and exits 0:
+        # that result was not produced from the digest, so it must not count.
+        stub = tmp_path / "claude_stub.py"
+        stub.write_text(
+            "import json, os\n"
+            "os.close(0)\n"
+            "rules = json.dumps({'context_file_rules': [], 'memory_file_rules': []})\n"
+            "print(json.dumps({'type': 'result', 'result': rules}))\n"
+        )
+        monkeypatch.delenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", raising=False)
+        real_popen = subprocess.Popen
+        popen = MagicMock(
+            side_effect=lambda cmd, **kw: real_popen([sys.executable, str(stub), *cmd[1:]], **kw)
+        )
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            with pytest.raises(RuntimeError, match="closed its input before reading the whole"):
+                _call_cli_llm(self._LARGE_DIGEST, "claude-cli")
+        assert popen.call_count == 1
+
     def test_claude_cli_progress_callback_is_throttled(self):
         stdout = [
             _stream_event("system", subtype="init"),

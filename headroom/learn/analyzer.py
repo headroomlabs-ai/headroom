@@ -964,18 +964,22 @@ def _call_claude_cli_streaming(
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
     # A CLI can exit before reading its input (the enterprise MCP refusal does),
     # so the pipe may close mid-write. Like subprocess.communicate(), ignore that
-    # (EPIPE, or EINVAL on Windows): its stderr and exit status below decide.
+    # (EPIPE, or EINVAL on Windows): its stderr and exit status below decide,
+    # and a zero exit without the whole prompt is still a failure.
+    input_incomplete = False
     try:
         proc.stdin.write(prompt)
     except OSError as exc:
         if not _pipe_closed(exc):
             raise
+        input_incomplete = True
     finally:
         try:
             proc.stdin.close()
         except OSError as exc:
             if not _pipe_closed(exc):
                 raise
+            input_incomplete = True
 
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
 
@@ -1075,6 +1079,13 @@ def _call_claude_cli_streaming(
         # stderr only: stdout and the result text can echo session text.
         error = _EnterpriseMcpRefusal if _ENTERPRISE_MCP_REFUSAL in stderr_blob else RuntimeError
         raise error(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{detail}")
+
+    if input_incomplete:
+        # Any result it printed was not produced from the digest.
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` exited 0 but closed its input before reading the whole "
+            "analysis prompt, so its output is not an analysis of these sessions."
+        )
 
     if stderr_blob.strip():
         logger.debug("CLI stderr (exit 0): %s", stderr_blob[:_MAX_SNIPPET_LEN])
