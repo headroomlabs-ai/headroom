@@ -15,6 +15,14 @@ STRIP_INTERNAL_HEADERS_DEFAULT: StripInternalHeadersMode = "enabled"
 # labels or exports, which is what ``is_credential_header`` guards.
 PROXY_TOKEN_HEADER = "x-headroom-proxy-token"
 
+# Relay proof the Rust front (crates/headroom-proxy) sends this proxy for a
+# caller that presented the proxy token there; derived from that token.
+FRONT_RELAY_PROOF_HEADER = "x-headroom-front-proof"
+
+# Headers that authenticate a caller to Headroom and nothing else: never
+# forwarded upstream, whatever HEADROOM_STRIP_INTERNAL_HEADERS says.
+NEVER_FORWARDED_HEADERS: frozenset[str] = frozenset({PROXY_TOKEN_HEADER, FRONT_RELAY_PROOF_HEADER})
+
 # Name components that mark an ``x-headroom-*`` header (or the tag key derived
 # from it by stripping the prefix) as credential material rather than a label.
 # Names are lower-cased, ``_`` is folded to ``-`` and the name is split on
@@ -88,10 +96,18 @@ def strip_internal_headers(
     *,
     mode: StripInternalHeadersMode,
 ) -> dict[str, str]:
-    """Return a copy of headers with internal x-headroom-* request headers removed."""
+    """Return a copy of headers with internal x-headroom-* request headers removed.
+
+    ``disabled`` (diagnostic shadow tracing) keeps them, except
+    :data:`NEVER_FORWARDED_HEADERS`, which are Headroom credentials.
+    """
 
     if mode == "disabled":
-        return dict(headers)
+        return {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in NEVER_FORWARDED_HEADERS
+        }
     return {
         key: value
         for key, value in headers.items()

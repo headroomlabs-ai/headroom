@@ -155,6 +155,7 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+from headroom.proxy.internal_header_policy import FRONT_RELAY_PROOF_HEADER
 from headroom.proxy.kompress_health_detail_policy import (
     KOMPRESS_DETAIL_LOADED,
     KOMPRESS_DETAIL_NOT_CACHED,
@@ -3331,6 +3332,7 @@ def _auth_rejection_path(path: object) -> str:
 
 
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
+_FRONT_RELAY_PROOF_HEADER = FRONT_RELAY_PROOF_HEADER.encode("ascii")
 
 
 def _is_proxy_token_bearer(value: bytes, token_bytes: bytes) -> bool:
@@ -3360,8 +3362,8 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
     this once, on the scope, covers every handler and transport at once instead
     of relying on each upstream call site to remember.
 
-    ``x-headroom-proxy-token`` is dropped unconditionally, so it cannot reach an
-    upstream even with ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``. An
+    ``x-headroom-proxy-token`` and the Rust front's ``x-headroom-front-proof``
+    are dropped unconditionally, so neither can reach an upstream even with ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``. An
     ``Authorization`` header is dropped only when it carries the configured
     token; any other value is a provider credential and is left alone.
     """
@@ -3372,7 +3374,7 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
         (name, value)
         for name, value in headers
         if not (
-            name.lower() == _PROXY_TOKEN_HEADER
+            name.lower() in (_PROXY_TOKEN_HEADER, _FRONT_RELAY_PROOF_HEADER)
             or (
                 token_bytes
                 and name.lower() == b"authorization"
