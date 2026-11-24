@@ -371,6 +371,38 @@ class _Capture(logging.Handler):
         self.records.append(record)
 
 
+def test_session_summary_prices_tool_savings_for_a_model_missing_from_the_price_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session summary values deferred tool tokens as telemetry and the ledger do.
+
+    A model newer than the price table used to get $0 tool savings here while
+    the savings tracker priced the same request at its family's cache ratios.
+    """
+    from headroom.pricing.counterfactual import BASIS_FALLBACK_PROVIDER_RATIO
+    from headroom.proxy.savings_tracker import estimate_request_savings_usd
+
+    _patch_litellm(monkeypatch, {})
+    model = "claude-not-yet-in-catalog-9"
+    usage = {"cache_read_tokens": 150_000, "uncached_tokens": 500}
+    tracker = CostTracker()
+    tracker.record_tokens(
+        model, tokens_saved=0, tokens_sent=150_500, tool_schema_saved=100_000, **usage
+    )
+    stats = tracker.stats()
+    telemetry = estimate_request_savings_usd(
+        model,
+        tool_schema_tokens_saved=100_000,
+        cache_read_tokens=usage["cache_read_tokens"],
+        uncached_input_tokens=usage["uncached_tokens"],
+    )
+
+    # 100K cached-prefix tokens at the $3/M fallback and Claude's 0.1x read ratio.
+    assert stats["tool_savings_usd"] == pytest.approx(0.03)
+    assert stats["tool_savings_usd"] == pytest.approx(telemetry["tool_schema"])
+    assert stats["tool_savings_basis"] == BASIS_FALLBACK_PROVIDER_RATIO
+
+
 def test_cache_rate_failure_warns_once_per_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """A raising rate resolver used to read as 'unpriced' ($0) with no trace."""
     from headroom.proxy import cost

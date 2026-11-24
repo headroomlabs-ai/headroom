@@ -856,6 +856,7 @@ def build_session_summary(
                 "compression_savings_usd": round(compression_savings, 2),
                 "compression_savings_list_usd": round(compression_savings_list, 2),
                 "tool_search_savings_usd": round(tool_savings, 2),
+                "tool_search_savings_basis": cost_stats.get("tool_savings_basis"),
                 "extension_realized_usd": round(ext_realized_usd, 2),
                 "extension_projected_usd": round(ext_projected_usd, 2),
             },
@@ -1006,6 +1007,7 @@ class CostTracker:
         self._folded_savings_usd = 0.0
         self._folded_cache_aware_savings_usd = 0.0
         self._folded_tool_savings_usd = 0.0
+        self._folded_tool_savings_basis: str | None = None
 
     def reset_runtime(self) -> None:
         """Reset in-memory cost/token counters for local test/debug use."""
@@ -1040,6 +1042,7 @@ class CostTracker:
         self._folded_savings_usd = 0.0
         self._folded_cache_aware_savings_usd = 0.0
         self._folded_tool_savings_usd = 0.0
+        self._folded_tool_savings_basis = None
 
     def estimate_cost(
         self,
@@ -1593,9 +1596,43 @@ class CostTracker:
                 uncached_tokens=uncached,
                 region="prefix",
             )
-            tp = self._get_cache_prices(model, for_billing=False)
-            if tp:
+            priced = self._tool_savings_prices(model)
+            if priced:
+                tp, basis = priced
                 self._folded_tool_savings_usd += rd * tp[0] + t5 * tp[1] + t1 * tp[2] + tl * tp[3]
+                from headroom.pricing.counterfactual import weakest_basis
+
+                self._folded_tool_savings_basis = weakest_basis(
+                    self._folded_tool_savings_basis, basis
+                )
+
+    def _tool_savings_prices(
+        self, model: str
+    ) -> tuple[tuple[float, float, float, float], str] | None:
+        """Prices (cache read, 5m write, 1h write, uncached) for deferred tool tokens, and their basis.
+
+        The rates :func:`headroom.pricing.counterfactual.price_savings` gives the
+        savings tracker and ledger: the catalog's when it prices ``model``, else
+        the blended fallback rate split by the model family's cache ratios, else
+        that rate flat. Without the fallback a model newer than the price table
+        showed tool savings in telemetry and the ledger but none here.
+        """
+        try:
+            from headroom.pricing.counterfactual import (
+                BASIS_LIST,
+                _fallback_cache_rates,
+                resolve_rates,
+            )
+            from headroom.proxy.savings_tracker import DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
+
+            fallback = float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+            rates = resolve_rates(model) or _fallback_cache_rates(model, None, fallback)
+        except (ImportError, TypeError, ValueError) as e:
+            _warn_pricing_once("tool_rates", "Failed to resolve tool-savings rates", model, e)
+            return None
+        if rates is None:
+            return (fallback, fallback, fallback, fallback), BASIS_LIST
+        return (rates.read, rates.write_5m, rates.write_1h, rates.uncached), rates.basis
 
     def _get_cache_prices(
         self, model: str, *, long_context: bool = False, for_billing: bool = True
@@ -1827,14 +1864,15 @@ class CostTracker:
         # them a write premium they never paid. Expiry cycles still come from
         # real traffic (an expired window is a write-heavy request) instead of
         # being modelled.
-        # Rates come from _get_cache_prices (LiteLLM per-model catalog, with
-        # writes split 5m/1h, and the list rate when a provider publishes no
-        # cache pricing) — the same
-        # provider-agnostic source the real cost math uses, never a hardcoded
-        # multiplier. Reported as its OWN key rather than widening
-        # ``savings_usd``: that figure feeds budget enforcement, and the
-        # session summary widens the cost card from this key instead.
+        # Rates come from _tool_savings_prices, the same rates the savings
+        # tracker and ledger use, never a hardcoded multiplier. Reported as its
+        # OWN key rather than widening ``savings_usd``: that figure feeds budget
+        # enforcement, and the session summary widens the cost card from this
+        # key instead.
+        from headroom.pricing.counterfactual import weakest_basis
+
         tool_savings_usd = self._folded_tool_savings_usd
+        tool_bases = [self._folded_tool_savings_basis]
         tool_models = (
             set(self._tool_saved_read_by_model)
             | set(self._tool_saved_write_5m_by_model)
@@ -1842,9 +1880,15 @@ class CostTracker:
             | set(self._tool_saved_list_by_model)
         )
         for model in tool_models:
-            prices = self._get_cache_prices(model, for_billing=False)
-            if not prices:
+            # ``other`` holds folded requests, already priced by their own
+            # names at record time; a passthrough request is not Headroom's.
+            if model == OTHER_MODEL or model.startswith("passthrough:"):
                 continue
+            priced = self._tool_savings_prices(model)
+            if not priced:
+                continue
+            prices, basis = priced
+            tool_bases.append(basis)
             cr_price, cw5_price, cw1h_price, uncached_price = prices
             tool_savings_usd += (
                 self._tool_saved_read_by_model.get(model, 0.0) * cr_price
@@ -1884,6 +1928,10 @@ class CostTracker:
             "savings_usd": round(savings_usd, 4),
             "cache_aware_savings_usd": round(cache_aware_savings_usd, 4),
             "tool_savings_usd": round(tool_savings_usd, 4),
+            # Weakest basis behind ``tool_savings_usd`` (see
+            # headroom.pricing.counterfactual), e.g. ``fallback+provider-ratio``
+            # for a model newer than the price table.
+            "tool_savings_basis": weakest_basis(*tool_bases),
             # Budget config passthrough — surfaces in /stats["cost"] so
             # `headroom doctor` can report whether a budget is set.
             "budget_limit_usd": self.budget_limit_usd,
