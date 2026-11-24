@@ -6,12 +6,15 @@ All cases use IP literals or ``localhost`` so no external network is required.
 from __future__ import annotations
 
 import contextlib
+import errno
+import ipaddress
 import re
 import socket
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import httpcore
 import httpx
@@ -19,7 +22,6 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import WebSocketRoute
-from starlette.websockets import WebSocketDisconnect
 
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.proxy.upstream_guard import is_safe_upstream_url
@@ -191,7 +193,7 @@ class _InternalService:
 
             # Every method a route might forward with, so a forwarded PUT or
             # DELETE is recorded rather than answered 501 and missed.
-            do_GET = do_PUT = do_PATCH = do_DELETE = do_POST  # noqa: N815
+            do_GET = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_POST  # noqa: N815
 
             def do_HEAD(self) -> None:  # noqa: N802
                 hits.append(self.path)
@@ -249,18 +251,41 @@ def test_alpha_search_rejects_a_caller_named_loopback_upstream() -> None:
 
 
 # A body most provider handlers accept, so a route that validates its body
-# before resolving the upstream is still driven past that check.
+# before resolving the upstream is still driven past that check. ``request``
+# is the Cloud Code Assist envelope (``/v1internal:streamGenerateContent``).
+_CONTENTS = [{"role": "user", "parts": [{"text": "x"}]}]
 _PROVIDER_SHAPED_BODY = {
     "model": "gpt-4o-mini",
     "max_tokens": 8,
     "messages": [{"role": "user", "content": "x"}],
     "input": "x",
-    "contents": [{"role": "user", "parts": [{"text": "x"}]}],
+    "contents": _CONTENTS,
     "query": "x",
+    "project": "probe",
+    "request": {"contents": _CONTENTS},
 }
 _PROBE_BODIES = ({"q": "x"}, _PROVIDER_SHAPED_BODY)
 _BODY_METHODS = {"POST", "PUT", "PATCH"}
 _UNLOCK_HEADERS = ({"api-key": "x"}, {"x-goog-api-key": "x"})
+
+# Path parameters that pick a handler: each Vertex publisher has its own
+# (Gemini for google, the Anthropic handler for anthropic, passthrough for the
+# rest), so every one is probed. Any other parameter is filled with "probe".
+_PATH_PARAM_VALUES: dict[str, tuple[str, ...]] = {
+    "api_version": ("v1",),
+    "location": ("us-central1",),
+    "publisher": ("google", "anthropic", "probe"),
+}
+
+
+def _expand_path(path: str) -> list[str]:
+    """Every concrete path for a route template, one per parameter combination."""
+    paths = [path]
+    for name in re.findall(r"\{([^}:]+)(?::[^}]*)?\}", path):
+        pattern = re.compile(r"\{" + re.escape(name) + r"(?::[^}]*)?\}")
+        values = _PATH_PARAM_VALUES.get(name, ("probe",))
+        paths = [pattern.sub(value, p, count=1) for p in paths for value in values]
+    return paths
 
 
 def _route_probes(app: FastAPI) -> tuple[set[tuple[str, str]], set[str]]:
@@ -268,34 +293,92 @@ def _route_probes(app: FastAPI) -> tuple[set[tuple[str, str]], set[str]]:
     http: set[tuple[str, str]] = set()
     websocket: set[str] = set()
     for route in app.routes:
-        path = getattr(route, "path", None)
-        if not path:
+        template = getattr(route, "path", None)
+        if not template:
             continue
-        path = re.sub(r"\{[^}]+\}", "probe", path)
-        if isinstance(route, WebSocketRoute):
-            websocket.add(path)
-            continue
-        for method in getattr(route, "methods", None) or ():
-            http.add((method, path))
+        for path in _expand_path(template):
+            if isinstance(route, WebSocketRoute):
+                websocket.add(path)
+                continue
+            for method in getattr(route, "methods", None) or ():
+                http.add((method, path))
     return http, websocket
 
 
-def test_no_route_forwards_to_a_loopback_upstream() -> None:
+def _ip(host: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    text = host.decode() if isinstance(host, bytes) else str(host)
+    try:
+        return ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return None
+
+
+def _is_loopback(host: object) -> bool:
+    if host in (None, "localhost", b"localhost"):
+        return True
+    ip = _ip(host)
+    return ip is not None and ip.is_loopback
+
+
+@pytest.fixture
+def no_outbound_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Refuse every non-loopback name lookup and connect, and record the attempts.
+
+    A probe that falls through to a provider's default upstream then fails at
+    once instead of waiting on a live host, and nothing leaves the machine.
+    """
+    refused: list[str] = []
+    real_getaddrinfo = socket.getaddrinfo
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        # An IP literal resolves locally; only a name lookup reaches DNS.
+        if _ip(host) is None and not _is_loopback(host):
+            refused.append(f"dns:{host}")
+            raise socket.gaierror(socket.EAI_NONAME, "outbound network blocked in test")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    def _check(address: object) -> None:
+        # Non-tuple addresses are AF_UNIX paths: local by definition.
+        host = address[0] if isinstance(address, tuple) else None
+        if isinstance(address, tuple) and not _is_loopback(host):
+            refused.append(f"connect:{host}")
+            raise OSError(errno.ENETUNREACH, "outbound network blocked in test")
+
+    def connect(self: socket.socket, address: Any) -> None:
+        _check(address)
+        return real_connect(self, address)
+
+    def connect_ex(self: socket.socket, address: Any) -> int:
+        _check(address)
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    # LiteLLM would otherwise fetch its price map at app startup.
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    return refused
+
+
+def test_no_route_forwards_to_a_loopback_upstream(no_outbound_network: list[str]) -> None:
     """Sweep the whole route table -- the guard must hold everywhere.
 
     This is the generalisation of the fix: a future route that resolves a
     caller-named upstream without validating it fails here rather than in a
     CVE. Every method a route accepts is tried, body-carrying methods with a
-    provider-shaped body as well as a minimal one, and WebSocket routes are
-    opened too.
+    provider-shaped body as well as a minimal one, every Vertex publisher, and
+    WebSocket routes are opened too. Outbound network is blocked, so a probe
+    that reaches a provider's default upstream fails fast and stays local.
     """
-    # A short connect timeout and no connect retries bound each probe that
-    # falls through to a real upstream, so a slow network cannot stall the sweep.
     app = _app(connect_timeout_seconds=1, retry_max_attempts=1)
     http_probes, ws_probes = _route_probes(app)
 
     assert len(http_probes) > 50, "route discovery found suspiciously few routes"
     assert {method for method, _ in http_probes} >= {"GET", "POST", "PUT", "DELETE"}
+    assert any("/publishers/google/" in path for _, path in http_probes)
+    assert any("/publishers/anthropic/" in path for _, path in http_probes)
     assert ws_probes, "route discovery found no WebSocket routes"
 
     # Route errors are not the subject: a 500 is a response like any other,
@@ -316,15 +399,18 @@ def test_no_route_forwards_to_a_loopback_upstream() -> None:
         for path in sorted(ws_probes):
             for unlock in _UNLOCK_HEADERS:
                 headers = {**unlock, "x-headroom-base-url": internal.url}
-                # A refused handshake closes the socket; that is not a forward.
+                # A refused handshake or a handler that fails on its (blocked)
+                # default upstream is not a forward; only a hit counts.
                 with (
-                    contextlib.suppress(WebSocketDisconnect),
+                    contextlib.suppress(Exception),
                     client.websocket_connect(path, headers=headers),
                 ):
                     pass
         reached = list(internal.hits)
 
     assert reached == [], f"routes forwarded to a loopback upstream: {reached}"
+    # The blocker was live: default upstreams were tried and refused locally.
+    assert no_outbound_network, "no outbound attempt was seen; is the blocker installed?"
 
 
 _GATEWAY = "my-resource.openai.azure.com"
