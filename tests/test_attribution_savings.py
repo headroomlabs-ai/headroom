@@ -554,26 +554,33 @@ def test_tenant_from_a_credential_header_never_reaches_the_ledger(
     assert json.loads(ledger.splitlines()[-1]).get("dims", {}).get("tenant") == expected
 
 
-def test_a_resolved_label_outranks_the_client_header_tag_in_the_request_log(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("dimension", "header"),
+    [("user", "X-Headroom-User"), ("user_id", "X-Headroom-User_Id")],
+)
+def test_a_resolved_label_outranks_the_client_header_tag_in_the_request_log(
+    tmp_path, monkeypatch, dimension, header
+):
     from headroom.proxy import attribution
     from headroom.proxy.helpers import extract_tags
 
-    attribution.register_dimension("user", lambda request: "alice")
+    attribution.register_dimension(dimension, lambda request: "resolved-user")
     try:
         with _proxy_client(tmp_path, monkeypatch) as client:
             proxy = client.app.state.proxy
             sink = _LogSink()
-            spoofed = extract_tags({"X-Headroom-User": "admin", "X-Headroom-Team": "infra"})
+            spoofed = extract_tags({header: "client-supplied", "X-Headroom-Team": "infra"})
+            assert spoofed[dimension] == "client-supplied"
             with monkeypatch.context() as patch:
                 patch.setattr(proxy, "logger", sink, raising=False)
                 # ``team`` is not listed: its label does not replace the tag.
-                set_current_attribution({"user": "alice", "team": "other"})
+                set_current_attribution({dimension: "resolved-user", "team": "other"})
                 _emit(proxy, tags=spoofed)
                 set_current_attribution(None)
             tags = sink.entries[-1].tags
-            assert (tags["user"], tags["team"]) == ("alice", "infra")
+            assert (tags[dimension], tags["team"]) == ("resolved-user", "infra")
     finally:
-        attribution.unregister_dimension("user")
+        attribution.unregister_dimension(dimension)
 
 
 @pytest.mark.parametrize("server_value", [70, None])

@@ -522,7 +522,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         enabled_dimensions,
         get_current_attribution,
         get_current_conversation,
-        header_name_for,
         merge_attribution,
         normalize_attribution,
     )
@@ -835,11 +834,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             if dimension in TOOL_SCHEMA_SAVINGS_TAGS:
                 continue
             # A listed dimension's label is its resolver's, which outranks the
-            # ``X-Headroom-<name>`` tag a client sent. ``extract_tags`` keys
-            # that tag by the header's own spelling, so a tag under any other
-            # key was set by the handler and is never replaced.
-            client_key = header_name_for(dimension)[len("x-headroom-") :]
-            if dimension in listed and (dimension not in log_tags or dimension == client_key):
+            # ``X-Headroom-<name>`` tag a client sent under the same key,
+            # whatever the dimension's spelling (``user_id`` included).
+            if dimension in listed:
                 log_tags[dimension] = label
             else:
                 log_tags.setdefault(dimension, label)
