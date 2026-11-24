@@ -1688,21 +1688,27 @@ def _ccr_backend_is_cross_process() -> bool:
     empty store and cannot resolve the proxy's hashes - markers would ship
     unrecoverable. This is a product guard on ``WIRED``.
     """
+    from headroom.cache import redis_client
     from headroom.cache.backends.memory import InMemoryBackend
     from headroom.cache.compression_store import _create_default_ccr_backend
 
     if (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower() == "memory":
         return False
-    backend = _create_default_ccr_backend()
-    if backend is None or isinstance(backend, InMemoryBackend):
-        return False
-    close_fn = getattr(backend, "close", None)
-    if callable(close_fn):
-        try:
-            close_fn()
-        except Exception:  # noqa: BLE001
-            pass
-    return True
+    prev_guard = redis_client._GUARDS.get("ccr")
+    try:
+        backend = _create_default_ccr_backend()
+        if backend is None or isinstance(backend, InMemoryBackend):
+            return False
+        close_fn = getattr(backend, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+    finally:
+        if prev_guard is not None:
+            redis_client._GUARDS["ccr"] = prev_guard
 
 
 def _agy_exposes_retrieve_tool(registrar: Any) -> bool:

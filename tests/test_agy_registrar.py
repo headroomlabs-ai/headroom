@@ -615,3 +615,66 @@ class TestRegistrarSafety:
         assert entered is True
         assert events == [2, 2, 2, 0]
         assert len(sleeps) == 2
+
+    def test_windows_config_file_lock_does_not_write_empty_lockfile_before_locking(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows locking must lock byte 0 past EOF without writing a sentinel byte first."""
+        import os
+        import sys
+        import types
+
+        import headroom.mcp_registry.base as base_mod
+
+        seen_sizes: list[int] = []
+
+        def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+            if mode == 2:
+                seen_sizes.append(os.fstat(fd).st_size)
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=2,
+            LK_UNLCK=0,
+            locking=_fake_locking,
+        )
+        monkeypatch.setattr(base_mod.sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+        config_path = _config_path(tmp_path)
+        with base_mod.config_file_lock(config_path):
+            pass
+
+        assert seen_sizes == [0]
+
+    def test_register_and_unregister_preserve_symlinked_mcp_config(self, tmp_path: Path) -> None:
+        """Atomic writes must update the symlink target and keep mcp_config.json a symlink."""
+        dotfiles = tmp_path / "dotfiles"
+        dotfiles.mkdir()
+        target = dotfiles / "agy-mcp.json"
+        target.write_text(
+            json.dumps({"mcpServers": {"existing": {"command": "/bin/existing"}}}, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        config_link = _config_path(tmp_path)
+        config_link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            config_link.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this platform/user: {exc}")
+
+        reg = _make_reg(tmp_path)
+        spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        result = reg.register_server(spec)
+        assert result.status == RegisterStatus.REGISTERED
+        assert config_link.is_symlink()
+        assert config_link.resolve() == target.resolve()
+        target_data = json.loads(target.read_text(encoding="utf-8"))
+        assert set(target_data["mcpServers"].keys()) == {"existing", "headroom"}
+
+        assert reg.unregister_server("headroom") is True
+        assert config_link.is_symlink()
+        assert config_link.resolve() == target.resolve()
+        target_data = json.loads(target.read_text(encoding="utf-8"))
+        assert set(target_data["mcpServers"].keys()) == {"existing"}

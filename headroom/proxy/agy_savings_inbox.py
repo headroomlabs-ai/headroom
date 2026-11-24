@@ -101,8 +101,8 @@ async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[None]:
         if sys.platform == "win32":
             import msvcrt
 
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"0")
+            # Windows byte-range locks can extend beyond EOF; do not write a
+            # sentinel byte before acquiring the lock or two workers race.
             os.lseek(fd, 0, os.SEEK_SET)
             while True:
                 try:
@@ -308,42 +308,50 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
                 except OSError:
                     return 0
 
-                for event_file in files[:max_events]:
-                    try:
+                replayed_files: list[Path] = []
+                try:
+                    for event_file in files[:max_events]:
                         try:
-                            raw = event_file.read_text(encoding="utf-8")
-                            envelope = json.loads(raw)
-                        except (OSError, ValueError):
-                            # Malformed / unreadable: skip and remove, never fatal.
-                            logger.debug("agy savings: dropping malformed %s", event_file.name)
-                            _safe_unlink(event_file)
+                            try:
+                                raw = event_file.read_text(encoding="utf-8")
+                                envelope = json.loads(raw)
+                            except (OSError, ValueError):
+                                # Malformed / unreadable: skip and remove, never fatal.
+                                logger.debug("agy savings: dropping malformed %s", event_file.name)
+                                _safe_unlink(event_file)
+                                continue
+
+                            event_id = envelope.get("event_id")
+                            if not isinstance(event_id, str) or not event_id:
+                                _safe_unlink(event_file)
+                                continue
+
+                            if event_id in processed_set:
+                                # Crash-window duplicate: already recorded, just remove.
+                                _safe_unlink(event_file)
+                                continue
+
+                            kwargs = envelope.get("kwargs")
+                            if not isinstance(kwargs, dict):
+                                _safe_unlink(event_file)
+                                continue
+
+                            await metrics.record_request(**kwargs)
+                            recorded += 1
+
+                            processed_set.add(event_id)
+                            processed_list.append(event_id)
+                            replayed_files.append(event_file)
+                        except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
+                            logger.debug(
+                                "agy savings: error replaying %s: %s", event_file.name, exc
+                            )
                             continue
-
-                        event_id = envelope.get("event_id")
-                        if not isinstance(event_id, str) or not event_id:
-                            _safe_unlink(event_file)
-                            continue
-
-                        if event_id in processed_set:
-                            # Crash-window duplicate: already recorded, just remove.
-                            _safe_unlink(event_file)
-                            continue
-
-                        kwargs = envelope.get("kwargs")
-                        if not isinstance(kwargs, dict):
-                            _safe_unlink(event_file)
-                            continue
-
-                        await metrics.record_request(**kwargs)
-                        recorded += 1
-
-                        processed_set.add(event_id)
-                        processed_list.append(event_id)
+                finally:
+                    if replayed_files:
                         _write_processed(processed_path, processed_list)
-                        _safe_unlink(event_file)
-                    except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
-                        logger.debug("agy savings: error replaying %s: %s", event_file.name, exc)
-                        continue
+                        for event_file in replayed_files:
+                            _safe_unlink(event_file)
         except Exception as exc:  # noqa: BLE001 - drain never raises out
             logger.debug("agy savings drain failed: %s", exc)
 

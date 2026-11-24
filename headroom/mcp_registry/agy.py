@@ -259,17 +259,18 @@ def _read_json_for_write(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    """Atomically write JSON with LF newlines, preserving existing file mode."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically write JSON with LF newlines, preserving symlinks and file mode."""
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
     existing_mode: int | None = None
     try:
-        existing_mode = stat.S_IMODE(path.stat().st_mode)
+        existing_mode = stat.S_IMODE(target.stat().st_mode)
     except OSError:
         existing_mode = None
 
     fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
+        dir=target.parent,
+        prefix=f".{target.name}.",
         suffix=".tmp",
     )
     try:
@@ -283,7 +284,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
                 os.chmod(tmp_name, existing_mode)
             except OSError:
                 pass
-        os.replace(tmp_name, path)
+        os.replace(tmp_name, target)
     except BaseException:
         try:
             os.unlink(tmp_name)

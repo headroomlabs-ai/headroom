@@ -205,8 +205,9 @@ def _config_thread_lock_for(path: Path) -> threading.Lock:
 @contextmanager
 def config_file_lock(path: Path) -> Iterator[None]:
     """Serialize read-modify-replace on a shared MCP config across threads and processes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f".{path.name}.lock")
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_name(f".{target.name}.lock")
     with _config_thread_lock_for(lock_path):
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -217,8 +218,8 @@ def config_file_lock(path: Path) -> Iterator[None]:
             if sys.platform == "win32":
                 import msvcrt
 
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"0")
+                # Windows byte-range locks can extend beyond EOF; do not write a
+                # sentinel byte before acquiring the lock or two starters race.
                 os.lseek(fd, 0, os.SEEK_SET)
                 while True:
                     try:

@@ -278,3 +278,33 @@ class TestWiredGate:
             assert os.environ.get("HEADROOM_AGY_RETRIEVE_WIRED") == "1"
         else:
             assert "HEADROOM_AGY_RETRIEVE_WIRED" not in os.environ
+
+
+def test_ccr_backend_probe_preserves_live_redis_health_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probing the CCR backend must not overwrite or unregister an active Redis guard."""
+    from headroom.cache import redis_client
+    from headroom.cli import wrap as wrap_mod
+
+    class _DummyGuard:
+        pass
+
+    live_guard = _DummyGuard()
+    monkeypatch.setitem(redis_client._GUARDS, "ccr", live_guard)
+
+    class _FakeRedisBackend:
+        def __init__(self) -> None:
+            self._guard = _DummyGuard()
+            redis_client._GUARDS["ccr"] = self._guard
+
+        def close(self) -> None:
+            redis_client._GUARDS.pop("ccr", None)
+
+    monkeypatch.setattr(
+        "headroom.cache.compression_store._create_default_ccr_backend",
+        _FakeRedisBackend,
+    )
+
+    assert wrap_mod._ccr_backend_is_cross_process() is True
+    assert redis_client._GUARDS.get("ccr") is live_guard
