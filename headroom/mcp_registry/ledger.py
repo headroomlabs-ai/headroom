@@ -16,7 +16,7 @@ from typing import Any
 
 from headroom import fsutil, paths
 
-from .base import ServerSpec
+from .base import ServerSpec, _config_thread_lock_for
 
 _LEDGER_FILE = "mcp_installs.json"
 
@@ -53,20 +53,21 @@ def record_install(
     ledger_file = path or ledger_path()
     # Automatic installs must recover from a stale or damaged ledger. The
     # explicit reconcile route performs strict validation before config writes.
-    data = _read_ledger(ledger_file)
-    agents = data.get("agents")
-    if not isinstance(agents, dict):
-        agents = {}
-        data["agents"] = agents
-    agent_entry = agents.get(agent)
-    if not isinstance(agent_entry, dict):
-        agent_entry = {}
-        agents[agent] = agent_entry
-    agent_entry[ownership_key or spec.name] = {
-        "fingerprint": spec_fingerprint(spec),
-        "installed_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _write_ledger(ledger_file, data)
+    with _config_thread_lock_for(ledger_file):
+        data = _read_ledger(ledger_file)
+        agents = data.get("agents")
+        if not isinstance(agents, dict):
+            agents = {}
+            data["agents"] = agents
+        agent_entry = agents.get(agent)
+        if not isinstance(agent_entry, dict):
+            agent_entry = {}
+            agents[agent] = agent_entry
+        agent_entry[ownership_key or spec.name] = {
+            "fingerprint": spec_fingerprint(spec),
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_ledger(ledger_file, data)
 
 
 def clear_install(
@@ -75,23 +76,34 @@ def clear_install(
     *,
     path: Path | None = None,
     ownership_key: str | None = None,
+    expected_fingerprint: str | None = None,
 ) -> None:
-    """Remove one ledger entry if present."""
+    """Remove one ledger entry if present (and matching ``expected_fingerprint`` if given)."""
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file)
-    agents = data.get("agents")
-    if not isinstance(agents, dict):
+    if not ledger_file.exists():
         return
-    agent_entry = agents.get(agent)
-    key = ownership_key or server_name
-    if not isinstance(agent_entry, dict) or key not in agent_entry:
-        return
-    del agent_entry[key]
-    if not agent_entry:
-        del agents[agent]
-    if not agents:
-        data.pop("agents", None)
-    _write_ledger(ledger_file, data)
+    with _config_thread_lock_for(ledger_file):
+        data = _read_ledger(ledger_file)
+        agents = data.get("agents")
+        if not isinstance(agents, dict):
+            return
+        agent_entry = agents.get(agent)
+        key = ownership_key or server_name
+        if not isinstance(agent_entry, dict) or key not in agent_entry:
+            return
+        if expected_fingerprint is not None:
+            current_entry = agent_entry.get(key)
+            if (
+                not isinstance(current_entry, dict)
+                or current_entry.get("fingerprint") != expected_fingerprint
+            ):
+                return
+        del agent_entry[key]
+        if not agent_entry:
+            del agents[agent]
+        if not agents:
+            data.pop("agents", None)
+        _write_ledger(ledger_file, data)
 
 
 def headroom_installed_matching(

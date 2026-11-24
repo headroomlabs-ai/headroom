@@ -817,3 +817,105 @@ class TestRegistrarSafety:
         reg = _make_reg(tmp_path)
         assert reg.unregister_server_if("headroom", lambda _spec: True) == "not_matched"
         assert reg.unregister_server_if("user-tool", lambda _spec: False) == "not_matched"
+
+    def test_unwrap_preserves_replacement_ledger_ownership_after_delete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Replacing an entry after unwrap deletes it must leave the replacement ledger-owned."""
+        import threading
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        installed_spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="headroom",
+            args=("mcp", "serve", "--workspace", "/tmp/new"),
+        )
+        assert reg1.register_server(installed_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", installed_spec)
+
+        entered_clear = threading.Event()
+        release_clear = threading.Event()
+        orig_clear = ledger_mod.clear_install
+
+        def _paused_clear(*args, **kwargs) -> None:
+            if not entered_clear.is_set():
+                entered_clear.set()
+                release_clear.wait(timeout=5.0)
+            orig_clear(*args, **kwargs)
+
+        monkeypatch.setattr(ledger_mod, "clear_install", _paused_clear)
+
+        unwrap_results: list[str] = []
+
+        def _run_unwrap() -> None:
+            unwrap_results.append(wrap_mod._remove_headroom_installed_retrieve_mcp(reg1))
+
+        def _run_replace() -> None:
+            assert reg2.register_server(replacement_spec).status == RegisterStatus.REGISTERED
+            ledger_mod.record_install("agy", replacement_spec)
+
+        t1 = threading.Thread(target=_run_unwrap)
+        t2 = threading.Thread(target=_run_replace)
+        t1.start()
+        assert entered_clear.wait(timeout=5.0)
+        t2.start()
+        # Because clear_install runs inside _config_file_lock, t2 must wait for
+        # t1 to finish clearing the old fingerprint before writing its replacement.
+        t2.join(timeout=0.1)
+        assert t2.is_alive()
+        release_clear.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert unwrap_results == ["removed"]
+        assert reg1.get_server("headroom") == replacement_spec
+
+        # Even an out-of-band clear with the old fingerprint must preserve replacement ownership.
+        ledger_mod.clear_install(
+            "agy",
+            "headroom",
+            expected_fingerprint=ledger_mod.spec_fingerprint(installed_spec),
+        )
+
+        # A second unwrap must still recognize the replacement as Headroom-owned.
+        assert wrap_mod._remove_headroom_installed_retrieve_mcp(reg1) == "removed"
+        assert reg1.get_server("headroom") is None
+
+    def test_unwrap_preserves_entry_with_added_cwd_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adding an extra field like 'cwd' to a ledger-owned entry must prevent unwrap deletion."""
+        from click.testing import CliRunner
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg = _make_reg(tmp_path)
+        installed_spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        assert reg.register_server(installed_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", installed_spec)
+
+        # User adds a custom 'cwd' field to the Headroom entry.
+        config = _read_config(tmp_path)
+        config["mcpServers"]["headroom"]["cwd"] = "/tmp/my-project"
+        _write_config(tmp_path, config)
+
+        result = CliRunner().invoke(wrap_mod.unwrap_agy, [])
+        assert result.exit_code == 0, result.output
+        assert "Removed Headroom MCP retrieve tool" not in result.output
+
+        after = _read_config(tmp_path)
+        assert "headroom" in after["mcpServers"]
+        assert after["mcpServers"]["headroom"]["cwd"] == "/tmp/my-project"

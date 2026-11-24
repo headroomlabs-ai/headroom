@@ -3488,12 +3488,18 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
         return "removed" if found_owned else "not_headroom_owned"
 
     if callable(getattr(type(registrar), "unregister_server_if", None)):
+        from headroom.mcp_registry.ledger import spec_fingerprint
+
         outcome = registrar.unregister_server_if(
             "serena",
             lambda current: headroom_installed_matching(registrar.name, current),
+            on_removed=lambda removed: clear_install(
+                registrar.name,
+                "serena",
+                expected_fingerprint=spec_fingerprint(removed),
+            ),
         )
         if outcome == "removed":
-            clear_install(registrar.name, "serena")
             return "removed"
         if outcome == "not_matched":
             return "not_headroom_owned"
@@ -3520,15 +3526,23 @@ def _remove_headroom_installed_retrieve_mcp(registrar: Any) -> str:
 
 def _remove_headroom_installed_mcp(registrar: Any, name: str) -> str:
     """Retire a matching ledger-owned entry without claiming user configuration."""
-    from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+    from headroom.mcp_registry.ledger import (
+        clear_install,
+        headroom_installed_matching,
+        spec_fingerprint,
+    )
 
     if callable(getattr(type(registrar), "unregister_server_if", None)):
         outcome = registrar.unregister_server_if(
             name,
             lambda current: headroom_installed_matching(registrar.name, current),
+            on_removed=lambda removed: clear_install(
+                registrar.name,
+                name,
+                expected_fingerprint=spec_fingerprint(removed),
+            ),
         )
         if outcome == "removed":
-            clear_install(registrar.name, name)
             return "removed"
         if outcome == "not_matched":
             return "not_headroom_owned"
@@ -3612,12 +3626,18 @@ def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
         at_user_scope = {"scope": SCOPE_USER}
 
     if not at_user_scope and callable(getattr(type(registrar), "unregister_server_if", None)):
+        from headroom.mcp_registry.ledger import spec_fingerprint
+
         outcome = registrar.unregister_server_if(
             "tokensave",
             lambda current: headroom_installed_matching(registrar.name, current),
+            on_removed=lambda removed: clear_install(
+                registrar.name,
+                "tokensave",
+                expected_fingerprint=spec_fingerprint(removed),
+            ),
         )
         if outcome == "removed":
-            clear_install(registrar.name, "tokensave")
             return "removed"
         if outcome == "not_matched":
             return "not_headroom_owned"

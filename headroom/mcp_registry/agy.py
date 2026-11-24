@@ -227,9 +227,14 @@ class AgyRegistrar(MCPRegistrar):
         self,
         server_name: str,
         predicate: Callable[[ServerSpec], bool],
+        *,
+        on_removed: Callable[[ServerSpec], None] | None = None,
     ) -> str:
         """Atomically verify ownership and remove ``server_name`` under one config lock.
 
+        When ``on_removed`` is provided, it runs while the config lock is still
+        held right after the removal write succeeds, so ledger cleanup stays
+        serialized against concurrent registrations of a replacement entry.
         Returns ``"removed"`` when ``predicate(current)`` matched and the entry
         was deleted, ``"not_matched"`` when absent/unreadable/non-matching, or
         ``"failed"`` if locking or writing failed.
@@ -268,6 +273,8 @@ class AgyRegistrar(MCPRegistrar):
                 except OSError as exc:
                     logger.debug("agy: could not write %s: %s", self._config_file, exc)
                     return "failed"
+                if on_removed is not None:
+                    on_removed(current)
                 return "removed"
         except OSError as exc:
             logger.debug("agy: could not lock %s: %s", self._config_file, exc)
@@ -369,14 +376,19 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     return entry
 
 
+_ALLOWED_ENTRY_KEYS = frozenset({"command", "args", "env"})
+
+
 def _try_entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec | None:
     """Convert a raw JSON MCP entry into a ServerSpec without coercing invalid types.
 
-    Returning ``None`` for non-string ``command``/``args``/``env`` values keeps
-    read-only status non-throwing while preventing type coercion (for example,
-    JSON ``false`` turning into ``"False"``) from matching an install-ledger
-    fingerprint and deleting user-edited entries on unwrap.
+    Returning ``None`` for non-string ``command``/``args``/``env`` values or
+    extra user-added keys (such as ``cwd``) keeps read-only status non-throwing
+    while preventing edited entries from matching an install-ledger fingerprint
+    and being deleted on unwrap.
     """
+    if not set(entry).issubset(_ALLOWED_ENTRY_KEYS):
+        return None
     raw_command = entry.get("command")
     if not isinstance(raw_command, str):
         return None
