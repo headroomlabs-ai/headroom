@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use headroom_proxy::inbound_auth::ProxyToken;
+use headroom_proxy::inbound_auth::{ProxyToken, RELAY_PROOF_HEADER};
 use headroom_proxy::{build_app, AppState, Config};
 use tower::util::ServiceExt;
 use wiremock::matchers::any;
@@ -45,6 +45,11 @@ async fn send(
     config.proxy_token = token.and_then(ProxyToken::new);
     let app = build_app(AppState::new(config).unwrap());
     let mut builder = Request::builder().method(method).uri(path);
+    // What a client on this machine sends; a test that names its own Host
+    // replaces it.
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        builder = builder.header("host", "127.0.0.1:8787");
+    }
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
@@ -260,17 +265,118 @@ async fn local_caller_keeps_the_rewritten_upstream_host() {
 }
 
 #[tokio::test]
-async fn loopback_peer_with_a_foreign_host_is_not_relayed_as_local() {
+async fn loopback_peer_with_a_foreign_host_is_refused_without_a_token() {
     // A browser reaching the port through a name that resolves to
-    // 127.0.0.1: loopback peer, foreign Host.
-    let host = upstream_host(
+    // 127.0.0.1: loopback peer, foreign Host. Relaying it would hand the
+    // upstream a caller it cannot tell from a remote token holder.
+    let up = upstream().await;
+    let status = send(
+        &up,
         None,
-        LOCAL,
-        "/admin/upstream",
+        Some(LOCAL),
+        "GET",
+        "/v1/messages/batches",
         &[("host", "evil.example:8787")],
     )
     .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(up.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn loopback_peer_with_a_foreign_host_needs_the_token() {
+    let up = upstream().await;
+    let refused = send(
+        &up,
+        Some(TOKEN),
+        Some(LOCAL),
+        "GET",
+        "/v1/messages/batches",
+        &[("host", "evil.example:8787")],
+    )
+    .await;
+    assert_eq!(refused, StatusCode::UNAUTHORIZED);
+    assert!(up.received_requests().await.unwrap().is_empty());
+
+    let host = upstream_host(
+        Some(TOKEN),
+        LOCAL,
+        "/v1/messages/batches",
+        &[
+            ("host", "evil.example:8787"),
+            ("x-headroom-proxy-token", TOKEN),
+        ],
+    )
+    .await;
     assert_eq!(host, "headroom-remote.invalid");
+}
+
+/// The relay-proof header the upstream received for one request.
+async fn upstream_proof(
+    token: Option<&str>,
+    peer: &str,
+    headers: &[(&str, &str)],
+) -> Option<String> {
+    let up = upstream().await;
+    let status = send(&up, token, Some(peer), "GET", "/v1/models", headers).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    seen[0]
+        .headers
+        .get(RELAY_PROOF_HEADER)
+        .map(|v| v.to_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn loopback_peer_without_a_host_is_relayed_as_local() {
+    // A raw HTTP/1.0 client on this machine: no Host, which a browser never
+    // omits. It needs no token and reaches the upstream under its loopback
+    // authority, with no relay proof.
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.proxy_token = ProxyToken::new(TOKEN);
+    let app = build_app(AppState::new(config).unwrap());
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .body(Body::empty())
+        .unwrap();
+    let peer: SocketAddr = LOCAL.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    let host = seen[0].headers.get("host").unwrap().to_str().unwrap();
+    assert!(is_loopback_name(host), "{host}");
+    assert!(seen[0].headers.get(RELAY_PROOF_HEADER).is_none());
+}
+
+#[tokio::test]
+async fn authenticated_remote_caller_is_relayed_with_the_proof_not_the_token() {
+    let expected = ProxyToken::new(TOKEN).unwrap().relay_proof();
+    let proof = upstream_proof(
+        Some(TOKEN),
+        REMOTE,
+        &[
+            ("x-headroom-proxy-token", TOKEN),
+            (RELAY_PROOF_HEADER, "forged"),
+        ],
+    )
+    .await;
+    assert_eq!(proof.as_deref(), Some(expected.as_str()));
+}
+
+#[tokio::test]
+async fn proof_is_never_relayed_for_a_caller_the_token_did_not_authenticate() {
+    // A local caller, and a remote one on a token-less (acknowledged open)
+    // bind: neither proved anything, and a forged proof is dropped.
+    assert_eq!(
+        upstream_proof(Some(TOKEN), LOCAL, &[(RELAY_PROOF_HEADER, "forged")]).await,
+        None
+    );
+    assert_eq!(
+        upstream_proof(None, REMOTE, &[(RELAY_PROOF_HEADER, "forged")]).await,
+        None
+    );
 }
 
 #[tokio::test]

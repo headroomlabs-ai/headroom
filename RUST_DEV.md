@@ -110,9 +110,23 @@ Python proxy trusts loopback callers (no token needed, and access to
 
 - With a token set, a non-loopback peer must send it as
   `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`,
-  or gets `401 {"error":"unauthorized"}`. Loopback peers are exempt, as
-  in the Python proxy. The token is removed from the request before it
-  is forwarded (`Authorization` only when it carries the token).
+  or gets `401 {"error":"unauthorized"}`. Loopback peers that name this
+  proxy by a loopback `Host` (`127.0.0.1`, `[::1]`, `localhost`) are
+  exempt, as in the Python proxy; so is a loopback peer that sends no
+  `Host` at all (a raw HTTP/1.0 client; browsers always send one). The token is removed from the request
+  before it is forwarded (`Authorization` only when it carries the token).
+- A loopback peer under any other `Host` (a hosts-file alias, a same-host
+  reverse proxy that keeps the public `Host`, or a browser page whose
+  hostname was pointed at 127.0.0.1) needs the token too; with no token
+  configured it gets `403`.
+- A caller that presented the token is forwarded with
+  `X-Headroom-Front-Proof`, a value derived from the token (never the
+  token itself), and only when `--upstream` is a loopback address or
+  `localhost`. The Python proxy behind the front accepts it in place
+  of the token, so **set the same `HEADROOM_PROXY_TOKEN` for both
+  processes** when the front serves non-local callers: without it the
+  Python proxy refuses what the front relays for them (`403`). The front
+  drops any `X-Headroom-Front-Proof` a client sends.
 - A caller that is not local here (a non-loopback peer, or a loopback
   peer whose `Host` is not a loopback name) is never forwarded with a
   `Host` that may name loopback (including scoped IPv6 such as

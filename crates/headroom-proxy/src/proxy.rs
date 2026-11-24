@@ -679,6 +679,14 @@ pub(crate) async fn forward_http(
         ) {
             outgoing_headers.insert(http::header::HOST, host);
         }
+        // Stands in for the token this front stripped, so the Python proxy
+        // behind it can tell a caller authenticated here from a relayed
+        // page whose hostname was pointed at 127.0.0.1.
+        if let Some(proof) = req.extensions().get::<crate::inbound_auth::RelayProof>() {
+            if crate::inbound_auth::upstream_takes_relay_proof(&state.config.upstream) {
+                outgoing_headers.insert(crate::inbound_auth::RELAY_PROOF_HEADER, proof.0.clone());
+            }
+        }
     }
 
     // ─── COMPRESSION GATE ──────────────────────────────────────────────

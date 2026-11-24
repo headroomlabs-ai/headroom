@@ -25,6 +25,12 @@ pub const PROXY_TOKEN_ENV: &str = "HEADROOM_PROXY_TOKEN";
 /// Same variable and truthy values as the Python bind policy.
 pub const OPEN_BIND_ACK_ENV: &str = "HEADROOM_ALLOW_UNAUTHENTICATED_BIND";
 const PROXY_TOKEN_HEADER: &str = "x-headroom-proxy-token";
+/// Proof, sent upstream, that this front authenticated the caller with the
+/// token. Same name and derivation as Python's `FRONT_RELAY_PROOF_HEADER` /
+/// `front_relay_proof`: the Python proxy behind the front accepts it in
+/// place of the token this front strips. Removed from every inbound request.
+pub const RELAY_PROOF_HEADER: &str = "x-headroom-front-proof";
+const RELAY_PROOF_CONTEXT: &[u8] = b"headroom-front-relay-v1\0";
 
 /// A configured proxy token. `Debug` never prints the value, because
 /// `Config` derives `Debug`.
@@ -41,6 +47,21 @@ impl ProxyToken {
 
     fn matches(&self, provided: &str) -> bool {
         constant_time_eq(provided.as_bytes(), self.0.as_bytes())
+    }
+
+    /// The [`RELAY_PROOF_HEADER`] value for this token: lowercase hex
+    /// SHA-256 of a fixed context and the token. Derived, so the token
+    /// itself never leaves this process.
+    pub fn relay_proof(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(RELAY_PROOF_CONTEXT);
+        hasher.update(self.0.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
@@ -150,11 +171,28 @@ fn is_hello_probe(method: &Method, path: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct NonLocalCaller;
 
+/// Request extension: the [`RELAY_PROOF_HEADER`] value to send upstream,
+/// set only for a non-local caller that presented the token here. Sent
+/// only to a loopback upstream (see [`upstream_takes_relay_proof`]).
+#[derive(Clone, Debug)]
+pub struct RelayProof(pub HeaderValue);
+
 /// `Host` sent upstream in place of one that may name loopback, for a
 /// [`NonLocalCaller`]. A reserved name (RFC 2606), never the caller's own
 /// value: the caller controls that, and the upstream's parser may accept
 /// loopback forms this one does not.
 pub const NON_LOCAL_HOST: &str = "headroom-remote.invalid";
+
+/// Whether the upstream is the Python proxy on this machine, the only
+/// receiver the relay proof is for: a loopback IP literal or `localhost`.
+pub(crate) fn upstream_takes_relay_proof(upstream: &url::Url) -> bool {
+    match upstream.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
 
 /// For a [`NonLocalCaller`]: [`NON_LOCAL_HOST`] when the `Host` that would
 /// be sent may name loopback, else `None` (keep it). That `Host` is the
@@ -211,14 +249,19 @@ fn is_loopback_host_header(value: Option<&str>) -> bool {
 }
 
 /// Router-wide middleware. Marks every caller that is not local with
-/// [`NonLocalCaller`]. When a token is configured, a non-loopback (or
-/// unknown) peer must also present it or gets 401 with no upstream
-/// contact, and the credential is removed before forwarding.
+/// [`NonLocalCaller`]. A loopback peer under a `Host` that does not name
+/// loopback is the shape of a browser page whose hostname was pointed at
+/// 127.0.0.1, so it is treated like a remote peer: with a token configured
+/// it must present it (401 otherwise), and without one it is refused (403).
+/// A non-local caller that presented the token is forwarded with a
+/// [`RelayProof`]; the credential itself is removed before forwarding.
 pub async fn inbound_gate(
     State(token): State<Option<ProxyToken>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    // Only this process may vouch for a caller upstream.
+    req.headers_mut().remove(RELAY_PROOF_HEADER);
     // No ConnectInfo is no evidence of a local caller: fail closed, as
     // Python's is_loopback_host(None) does.
     let peer = req
@@ -226,13 +269,23 @@ pub async fn inbound_gate(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
     let loopback_peer = peer.as_ref().is_some_and(is_loopback);
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    // A browser always sends a Host, so a loopback peer without one (a raw
+    // HTTP/1.0 client on this machine) is not the rebound-page shape: it is
+    // local, like a loopback Host.
+    let local = loopback_peer && (host.is_none() || is_loopback_host_header(host));
+    let mut authenticated = false;
     if let Some(token) = &token {
         // Answered here and empty, never relayed upstream without a
         // credential: the same answer the Python proxy gives it.
         if is_hello_probe(req.method(), req.uri().path()) {
             return StatusCode::OK.into_response();
         }
-        if !loopback_peer && !is_health_probe(req.method(), req.uri().path()) {
+        if !local && !is_health_probe(req.method(), req.uri().path()) {
             let provided = read_proxy_token(req.headers());
             if !provided.is_some_and(|p| token.matches(p)) {
                 tracing::warn!(
@@ -248,20 +301,35 @@ pub async fn inbound_gate(
                 )
                     .into_response();
             }
+            authenticated = true;
         }
         let headers = req.headers_mut();
         headers.remove(PROXY_TOKEN_HEADER);
         if bearer(headers).is_some_and(|b| token.matches(b)) {
             headers.remove(header::AUTHORIZATION);
         }
+    } else if loopback_peer && !local {
+        tracing::warn!(
+            event = "proxy_loopback_host_rejected",
+            method = %req.method(),
+            path = req.uri().path(),
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "request to a loopback listener under a non-loopback Host rejected",
+                "hint": "use 127.0.0.1 or localhost, or set HEADROOM_PROXY_TOKEN and send it",
+            })),
+        )
+            .into_response();
     }
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()));
-    if !(loopback_peer && is_loopback_host_header(host)) {
+    if !local {
         req.extensions_mut().insert(NonLocalCaller);
+        if let (true, Some(token)) = (authenticated, &token) {
+            if let Ok(proof) = HeaderValue::from_str(&token.relay_proof()) {
+                req.extensions_mut().insert(RelayProof(proof));
+            }
+        }
     }
     next.run(req).await
 }
@@ -302,6 +370,33 @@ mod tests {
                 Ok(BindPolicy::OpenAcknowledged)
             );
         }
+    }
+
+    #[test]
+    fn relay_proof_goes_only_to_a_loopback_upstream() {
+        for ok in [
+            "http://127.0.0.1:8788",
+            "http://[::1]:8788",
+            "http://LOCALHOST:1",
+        ] {
+            assert!(upstream_takes_relay_proof(&ok.parse().unwrap()), "{ok}");
+        }
+        for no in [
+            "https://api.anthropic.com",
+            "http://10.0.0.5:8788",
+            "http://localhost.example.com",
+        ] {
+            assert!(!upstream_takes_relay_proof(&no.parse().unwrap()), "{no}");
+        }
+    }
+
+    #[test]
+    fn relay_proof_matches_python() {
+        // headroom.proxy.server.front_relay_proof("abc")
+        assert_eq!(
+            ProxyToken::new("abc").unwrap().relay_proof(),
+            "33d9db219abd5b185118a8980948fe91930384fdf1a44fa3a964fcdb670be2e3"
+        );
     }
 
     #[test]
