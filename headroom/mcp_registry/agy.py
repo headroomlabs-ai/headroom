@@ -107,7 +107,7 @@ class AgyRegistrar(MCPRegistrar):
         entry = servers.get(server_name)
         if not isinstance(entry, dict):
             return None
-        return _entry_to_spec(server_name, entry)
+        return _try_entry_to_spec(server_name, entry)
 
     def has_configured_servers(self) -> bool:
         """Inspect all entries before launching MCP-unsafe print-mode clients.
@@ -154,14 +154,27 @@ class AgyRegistrar(MCPRegistrar):
                     )
 
                 raw_existing = servers.get(spec.name)
-                if isinstance(raw_existing, dict):
-                    existing = _entry_to_spec(spec.name, raw_existing)
-                    if _specs_equivalent(existing, spec):
-                        return RegisterResult(
-                            RegisterStatus.ALREADY, "matches current configuration"
-                        )
-                    if not force:
-                        return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
+                if raw_existing is not None:
+                    existing = (
+                        _try_entry_to_spec(spec.name, raw_existing)
+                        if isinstance(raw_existing, dict)
+                        else None
+                    )
+                    if existing is None:
+                        if not force:
+                            return RegisterResult(
+                                RegisterStatus.MISMATCH,
+                                "existing entry has non-string or malformed fields",
+                            )
+                    else:
+                        if _specs_equivalent(existing, spec):
+                            return RegisterResult(
+                                RegisterStatus.ALREADY, "matches current configuration"
+                            )
+                        if not force:
+                            return RegisterResult(
+                                RegisterStatus.MISMATCH, _diff_specs(existing, spec)
+                            )
 
                 servers[spec.name] = _spec_to_entry(spec)
                 config["mcpServers"] = servers
@@ -305,17 +318,34 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     return entry
 
 
-def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
-    raw_args = entry.get("args", ())
-    args = tuple(str(x) for x in raw_args) if isinstance(raw_args, (list, tuple)) else ()
-    raw_env = entry.get("env", {})
-    env = {str(k): str(v) for k, v in raw_env.items()} if isinstance(raw_env, dict) else {}
-    return ServerSpec(
-        name=name,
-        command=str(entry.get("command", "")),
-        args=args,
-        env=env,
-    )
+def _try_entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec | None:
+    """Convert a raw JSON MCP entry into a ServerSpec without coercing invalid types.
+
+    Returning ``None`` for non-string ``command``/``args``/``env`` values keeps
+    read-only status non-throwing while preventing type coercion (for example,
+    JSON ``false`` turning into ``"False"``) from matching an install-ledger
+    fingerprint and deleting user-edited entries on unwrap.
+    """
+    raw_command = entry.get("command")
+    if not isinstance(raw_command, str):
+        return None
+    raw_args = entry.get("args")
+    if raw_args is None and "args" not in entry:
+        args: tuple[str, ...] = ()
+    elif isinstance(raw_args, list) and all(isinstance(x, str) for x in raw_args):
+        args = tuple(raw_args)
+    else:
+        return None
+    raw_env = entry.get("env")
+    if raw_env is None and "env" not in entry:
+        env: dict[str, str] = {}
+    elif isinstance(raw_env, dict) and all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw_env.items()
+    ):
+        env = dict(raw_env)
+    else:
+        return None
+    return ServerSpec(name=name, command=raw_command, args=args, env=env)
 
 
 def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:

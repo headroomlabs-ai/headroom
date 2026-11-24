@@ -700,4 +700,33 @@ class TestRegistrarSafety:
         result = CliRunner().invoke(mcp_status, [])
         assert result.exit_code == 0, result.output
         assert "AttributeError" not in result.output
+        agy_lines = [line for line in result.output.splitlines() if "Antigravity CLI" in line]
+        assert agy_lines, f"expected Antigravity CLI row in mcp status output:\n{result.output}"
+        assert any("not configured" in line.lower() for line in agy_lines), agy_lines
         assert cfg.read_text(encoding="utf-8") == original_content
+
+    def test_non_string_entry_fields_do_not_coerce_to_matching_spec(self, tmp_path: Path) -> None:
+        """Edited JSON types (e.g. bool false vs 'False') must not match or be deleted."""
+        _write_config(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "serena": {
+                        "command": "uvx",
+                        "args": ["--enable-web-dashboard", False],
+                    }
+                }
+            },
+        )
+        reg = _make_reg(tmp_path)
+        assert reg.get_server("serena") is None
+
+        spec = ServerSpec(
+            name="serena",
+            command="uvx",
+            args=("--enable-web-dashboard", "False"),
+        )
+        result = reg.register_server(spec, force=False)
+        assert result.status == RegisterStatus.MISMATCH
+        # File still preserves the user's edited JSON boolean.
+        assert _read_config(tmp_path)["mcpServers"]["serena"]["args"][-1] is False

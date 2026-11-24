@@ -783,8 +783,13 @@ async def test_double_cancel_with_queued_checkpoint_preserves_checkpoint_and_pre
             assert blocker_started.wait(timeout=5.0)
 
     try:
+        import time
+
         drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(RecordingMetrics()))
+        deadline = time.monotonic() + 5.0
         while not blocker_started.is_set():
+            assert not drain_task.done(), "drain exited before recording the event"
+            assert time.monotonic() < deadline, "drain did not reach record_request"
             await asyncio.sleep(0.005)
         # Let drain_inbox submit _checkpoint_event to the single-worker pool.
         await asyncio.sleep(0.05)
