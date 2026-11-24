@@ -551,10 +551,6 @@ class AnthropicTokenCounter(TokenCounter):
         self.model = model
         self._client = client
         self._encoding: Any = None
-        # True while the tiktoken vocab cannot load yet (offline cold cache, or
-        # a slow download still running). Recoverable, so providers must not
-        # cache this counter.
-        self.vocab_pending = False
         self._count_cache = TokenCountCache()
         self._use_api = client is not None
 
@@ -580,7 +576,6 @@ class AnthropicTokenCounter(TokenCounter):
             self._encoding = load_encoding("cl100k_base")
         except TiktokenLoadError:
             self._encoding = None  # count_text() falls back to a character estimate
-            self.vocab_pending = True
         except ImportError:
             if not self._use_api:
                 warnings.warn(
@@ -832,15 +827,13 @@ class AnthropicProvider(Provider):
         Otherwise falls back to tiktoken approximation.
         """
         model = sanitize_anthropic_model_id(model)
-        cached = self._token_counters.get(model)
-        if cached is not None:
-            return cached
-        counter = AnthropicTokenCounter(model=model, client=self._client, warn=self._warn)
-        # A counter built while the tiktoken vocab cannot load is not cached, so
-        # the next request picks the vocab up once it is cached or downloaded.
-        if not counter.vocab_pending:
-            self._token_counters[model] = counter
-        return counter
+        if model not in self._token_counters:
+            self._token_counters[model] = AnthropicTokenCounter(
+                model=model,
+                client=self._client,
+                warn=self._warn,
+            )
+        return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
         """Get context window limit for a model.

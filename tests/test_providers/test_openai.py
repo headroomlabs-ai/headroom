@@ -264,10 +264,7 @@ class TestGuardedEncodingLoad:
         from headroom.tokenizers import tiktoken_counter
         from headroom.tokenizers.estimator import EstimatingTokenCounter
 
-        loads: list[str] = []
-
         def fake_load_encoding(name: str):
-            loads.append(name)
             raise tiktoken_counter.TiktokenLoadError(f"{name} load timed out")
 
         monkeypatch.setattr(tiktoken_counter, "load_encoding", fake_load_encoding)
@@ -275,8 +272,6 @@ class TestGuardedEncodingLoad:
         counter = provider.get_token_counter("gpt-4o")
         assert isinstance(counter, EstimatingTokenCounter)
         assert counter.count_text("hello world") > 0
-        # Not cached: a later request reaches the loader again, so a download
-        # that lands restores exact counts. The loader itself fails fast while
-        # a timed-out download is still running, so this does not re-block.
-        assert isinstance(provider.get_token_counter("gpt-4o"), EstimatingTokenCounter)
-        assert loads == ["o200k_base", "o200k_base"]
+        # Cached per model: later requests reuse the fallback instead of
+        # re-blocking on the failed download.
+        assert provider.get_token_counter("gpt-4o") is counter

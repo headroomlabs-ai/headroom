@@ -223,18 +223,6 @@ class EstimatingTokenCounter(BaseTokenizer):
         return "EstimatingTokenCounter(auto)"
 
 
-class PendingVocabEstimator(EstimatingTokenCounter):
-    """Estimate that stands in for a BPE vocabulary which cannot load yet.
-
-    Returned when the bounded tiktoken loader refuses a cold-cache download
-    under ``HEADROOM_OFFLINE`` or is still waiting on a slow one. Both recover
-    (a pre-seeded cache, a download that lands), so code that caches token
-    counters must not cache this one: the next lookup retries the load and
-    gets the exact counter once the vocabulary is there. A caller holding one
-    counter for a single measurement still counts in one unit throughout.
-    """
-
-
 class CharacterCounter(BaseTokenizer):
     """Simple character-based counter.
 

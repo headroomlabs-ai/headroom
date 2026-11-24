@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from ..utils import remember_bounded
 from .base import TokenCounter
-from .estimator import EstimatingTokenCounter, PendingVocabEstimator
+from .estimator import EstimatingTokenCounter
 
 if TYPE_CHECKING:
     pass
@@ -218,10 +218,7 @@ class TokenizerRegistry:
                 tokenizer = registry._model_factories[model_lower](model)
             else:
                 tokenizer = registry._create_tokenizer(model, backend)
-            # A stand-in for a vocabulary that cannot load yet is not cached:
-            # the next lookup retries the load and gets the exact counter.
-            if not isinstance(tokenizer, PendingVocabEstimator):
-                remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
+            remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
             return tokenizer
         except Exception as e:
             if fallback:
@@ -376,9 +373,8 @@ class TokenizerRegistry:
             try:
                 load_encoding(get_encoding_for_model(model))
             except TiktokenLoadError as exc:
-                # The loader already logged the timeout or offline refusal once.
-                logger.debug("tiktoken unavailable (%s); using estimation.", exc)
-                return PendingVocabEstimator()
+                logger.warning("tiktoken unavailable (%s); using estimation.", exc)
+                return EstimatingTokenCounter()
             return TiktokenCounter(model)
         except ImportError:
             logger.warning("tiktoken not installed. Install with: pip install tiktoken")
@@ -411,8 +407,7 @@ class TokenizerRegistry:
         proxy. It is not Claude's exact vocab, but it is deterministic,
         consistent before/after, and within ~10-20% of Claude's real counts —
         which is what compression ratios and context-pressure gating need. Falls
-        back to an uncached character estimator while the tiktoken vocab can't
-        be loaded.
+        back to the character estimator if the tiktoken vocab can't be loaded.
         """
         try:
             from .tiktoken_counter import (
@@ -424,8 +419,8 @@ class TokenizerRegistry:
             try:
                 load_encoding("o200k_base")
             except TiktokenLoadError:
-                logger.debug("tiktoken o200k_base unavailable for %s; using char estimator", model)
-                return PendingVocabEstimator(chars_per_token=3.5)
+                logger.info("tiktoken o200k_base unavailable for %s; using char estimator", model)
+                return EstimatingTokenCounter(chars_per_token=3.5)
             return TiktokenCounter(model, encoding="o200k_base")
         except Exception:  # pragma: no cover - defensive; keep counting alive
             return EstimatingTokenCounter(chars_per_token=3.5)
