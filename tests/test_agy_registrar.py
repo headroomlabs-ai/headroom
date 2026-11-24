@@ -482,3 +482,56 @@ class TestRegistrarSafety:
 
         config = _read_config(tmp_path)
         assert set(config["mcpServers"].keys()) == {"existing", "headroom", "serena"}
+
+    def test_agy_and_antigravity_registrars_share_lock_and_preserve_both_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AgyRegistrar and AntigravityRegistrar must serialize access to shared mcp_config.json."""
+        import threading
+
+        import headroom.mcp_registry.agy as agy_mod
+        from headroom.mcp_registry.antigravity import AntigravityRegistrar
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"existing": {"command": "/bin/existing"}}},
+        )
+        agy_reg = _make_reg(tmp_path)
+        ide_reg = AntigravityRegistrar(home_dir=tmp_path)
+        cli_spec = ServerSpec(name="headroom-cli", command="headroom", args=("mcp", "serve"))
+        ide_spec = ServerSpec(name="headroom-ide", command="headroom", args=("mcp", "serve"))
+
+        entered = threading.Event()
+        release = threading.Event()
+        orig_write_json = agy_mod._write_json
+
+        def _paused_agy_write(path: Path, data: dict) -> None:
+            entered.set()
+            release.wait(timeout=0.3)
+            orig_write_json(path, data)
+
+        monkeypatch.setattr(agy_mod, "_write_json", _paused_agy_write)
+
+        results: dict[str, object] = {}
+
+        def _run_agy() -> None:
+            results["agy"] = agy_reg.register_server(cli_spec)
+
+        def _run_ide() -> None:
+            results["ide"] = ide_reg.register_server(ide_spec)
+
+        t1 = threading.Thread(target=_run_agy)
+        t2 = threading.Thread(target=_run_ide)
+        t1.start()
+        assert entered.wait(timeout=5.0)
+        t2.start()
+        t2.join(timeout=0.1)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert results["agy"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        assert results["ide"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        config = _read_config(tmp_path)
+        assert set(config["mcpServers"].keys()) == {"existing", "headroom-cli", "headroom-ide"}

@@ -22,16 +22,19 @@ import json
 import logging
 import os
 import stat
-import sys
 import tempfile
-import threading
-import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
+from .base import (
+    MCPRegistrar,
+    RegisterResult,
+    RegisterStatus,
+    ServerSpec,
+)
+from .base import (
+    config_file_lock as _config_file_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,61 +205,6 @@ class AgyRegistrar(MCPRegistrar):
         except OSError as exc:
             logger.debug("agy: could not lock %s: %s", self._config_file, exc)
             return False
-
-
-_THREAD_LOCKS_GUARD = threading.Lock()
-_THREAD_LOCKS: dict[Path, threading.Lock] = {}
-
-
-def _thread_lock_for(path: Path) -> threading.Lock:
-    key = path.resolve()
-    with _THREAD_LOCKS_GUARD:
-        lock = _THREAD_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _THREAD_LOCKS[key] = lock
-        return lock
-
-
-@contextmanager
-def _config_file_lock(path: Path) -> Iterator[None]:
-    """Serialize read-modify-replace transactions across threads and Headroom processes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f".{path.name}.lock")
-    with _thread_lock_for(lock_path):
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            try:
-                os.chmod(lock_path, 0o600)
-            except OSError:
-                pass
-            if sys.platform == "win32":
-                import msvcrt
-
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"0")
-                os.lseek(fd, 0, os.SEEK_SET)
-                while True:
-                    try:
-                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError:
-                        time.sleep(0.05)
-                try:
-                    yield
-                finally:
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
 
 # ----------------------------------------------------------------------
