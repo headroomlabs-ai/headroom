@@ -198,29 +198,61 @@ def test_recovery_refuses_a_source_owned_by_another_user(
     assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
 
 
+@pytest.mark.parametrize(
+    ("planted", "error"),
+    [
+        ('model = "mine-too"\n', "replaced while it was being pinned"),
+        ('model = "planted"\n', "changed while it was being pinned"),
+    ],
+    ids=["same-content", "different-content"],
+)
 def test_recovery_refuses_a_source_swapped_after_the_owner_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planted: str, error: str
 ) -> None:
-    """The directory pinned must be the one whose owner was checked."""
+    """The directory pinned must be the one whose owner was checked.
+
+    The copy made from a rejected source is removed, so a later
+    `headroom recover codex` cannot offer it as a retained source.
+    """
     target = tmp_path / "codex"
     source = tmp_path / "headroom-codex-home-swapped"
     target.mkdir()
     source.mkdir()
     (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
-    (source / "config.toml").write_text('model = "planted"\n', encoding="utf-8")
+    (source / "config.toml").write_text('model = "mine-too"\n', encoding="utf-8")
     copy_home = codex_recovery._copy_home
 
     def copy_then_swap(src: Path, dest: Path, skipped: list[str]) -> None:
         copy_home(src, dest, skipped)
         if src == source.resolve():
-            # Same content, different directory: only the inode tells them apart.
             src.rename(tmp_path / "original")
             shutil.copytree(tmp_path / "original", src)
+            if planted != 'model = "mine-too"\n':
+                (src / "config.toml").write_text(planted, encoding="utf-8")
 
     monkeypatch.setattr(codex_recovery, "_copy_home", copy_then_swap)
-    with pytest.raises(RuntimeError, match="replaced while it was being pinned"):
+    with pytest.raises(RuntimeError, match=error):
         recover_codex_home(source=source, target=target)
     assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+    assert codex_recovery.discover_retained_sources(target) == []
+
+
+def test_windows_discovery_without_a_locatable_profile_finds_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No profile means no private root; recovery with --target still runs."""
+
+    def no_profile(cls: type[Path]) -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(codex_recovery.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "home", classmethod(no_profile))
+    assert codex_recovery._temp_roots() == []
+
+    target = tmp_path / "codex"
+    target.mkdir()
+    result = CliRunner().invoke(main, ["recover", "codex", "--target", str(target)])
+    assert result.exit_code == 0, result.output
 
 
 def test_discover_dangling_homes_uses_newest_state_not_directory_mtime(

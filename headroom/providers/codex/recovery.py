@@ -80,7 +80,11 @@ def _temp_roots() -> list[Path]:
     """
     temp = Path(tempfile.gettempdir())
     if sys.platform == "win32":
-        return [temp] if temp.resolve().is_relative_to(Path.home().resolve()) else []
+        try:
+            profile = Path.home().resolve()
+        except (RuntimeError, OSError):  # no locatable profile: nothing is private
+            return []
+        return [temp] if temp.resolve().is_relative_to(profile) else []
     roots = [temp]
     if env_tmpdir := os.environ.get("TMPDIR"):
         roots.append(Path(env_tmpdir))
@@ -798,12 +802,18 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     pinned = backup_dir / "source-pinned"
     target_backup = backup_dir / "target-before"
     _copy_home(source, pinned, report.skipped_runtime)
-    if home_fingerprint(source) != before:
-        raise RuntimeError("source Codex home changed while it was being pinned")
     pinned_from = source.lstat()
-    if (pinned_from.st_dev, pinned_from.st_ino) != (checked.st_dev, checked.st_ino):
+    rejected = None
+    if home_fingerprint(source) != before:
+        rejected = "source Codex home changed while it was being pinned"
+    elif (pinned_from.st_dev, pinned_from.st_ino) != (checked.st_dev, checked.st_ino):
         # The directory copied is not the one whose owner was checked.
-        raise RuntimeError("source Codex home was replaced while it was being pinned")
+        rejected = "source Codex home was replaced while it was being pinned"
+    if rejected is not None:
+        # An unverified copy must not stay where discover_retained_sources
+        # would offer it for a later automatic merge.
+        shutil.rmtree(pinned)
+        raise RuntimeError(rejected)
     target_existed = target.exists()
     target_modes: dict[str, int] = {}
     if target_existed:
