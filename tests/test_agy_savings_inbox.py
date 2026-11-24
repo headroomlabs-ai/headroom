@@ -594,35 +594,61 @@ async def test_cancel_during_offloaded_checkpoint_finishes_write_before_unlock(
 
 @pytest.mark.asyncio
 async def test_repeated_cancellation_aborts_stalled_checkpoint_wait(isolated_home, monkeypatch):
-    """A second cancellation (e.g. shutdown timeout) must not hang on a stalled fsync."""
+    """A shutdown timeout exits while keeping .drain.lock held until the checkpoint finishes."""
     import asyncio
-    import os
     import threading
     import time
 
     agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
 
-    in_fsync = threading.Event()
-    release_fsync = threading.Event()
-    real_fsync = os.fsync
+    in_checkpoint = threading.Event()
+    release_checkpoint = threading.Event()
+    real_append = agy_savings_inbox._append_processed
 
-    def _stalled_fsync(fd: int) -> None:
-        in_fsync.set()
-        release_fsync.wait(timeout=5.0)
-        real_fsync(fd)
+    def _stalled_append(path: Path, event_id: str) -> None:
+        # Block BEFORE the event ID becomes visible in .processed.
+        in_checkpoint.set()
+        release_checkpoint.wait(timeout=5.0)
+        real_append(path, event_id)
 
-    monkeypatch.setattr(os, "fsync", _stalled_fsync)
+    monkeypatch.setattr(agy_savings_inbox, "_append_processed", _stalled_append)
 
-    drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(FakeMetrics()))
+    first_metrics = FakeMetrics()
+    drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(first_metrics))
+    peer_task: asyncio.Task[int] | None = None
     try:
         deadline = time.monotonic() + 5.0
-        while not in_fsync.is_set():
-            assert time.monotonic() < deadline, "drain did not reach checkpoint fsync"
+        while not in_checkpoint.is_set():
+            assert time.monotonic() < deadline, "drain did not reach checkpoint"
             await asyncio.sleep(0.005)
 
+        # First cancel (normal shutdown) then second cancel (shutdown timeout).
         drain_task.cancel()
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.gather(drain_task, return_exceptions=True), timeout=0.05)
+        await asyncio.sleep(0.02)
+        assert not drain_task.done()
+
+        drain_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(drain_task, timeout=0.5)
+        assert drain_task.done(), "drain did not exit on repeated cancellation while stalled"
+        assert not release_checkpoint.is_set()
+
+        # Peer drain while checkpoint is still blocked must wait on .drain.lock
+        # and must not replay the already-recorded event.
+        peer_metrics = FakeMetrics()
+        peer_task = asyncio.create_task(agy_savings_inbox.drain_inbox(peer_metrics))
+        await asyncio.sleep(0.1)
+        assert not peer_task.done(), "peer entered replay before stalled checkpoint finished"
+        assert peer_metrics.calls == []
+
+        release_checkpoint.set()
+        peer_recorded = await asyncio.wait_for(peer_task, timeout=5.0)
+        assert peer_recorded == 0
+        assert peer_metrics.calls == []
+        assert len(first_metrics.calls) == 1
+        assert _evt_files() == []
     finally:
-        release_fsync.set()
+        release_checkpoint.set()
         await asyncio.gather(drain_task, return_exceptions=True)
+        if peer_task is not None:
+            await asyncio.gather(peer_task, return_exceptions=True)

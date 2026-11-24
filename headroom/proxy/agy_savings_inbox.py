@@ -31,6 +31,7 @@ import os
 import random
 import sys
 import tempfile
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -83,8 +84,80 @@ def _is_windows_lock_contention(exc: OSError) -> bool:
     )
 
 
+def _unlock_and_close_fd(fd: int) -> None:
+    """Release the OS lock held on ``fd`` and close it."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+class _DrainLockLease:
+    """Owns the open OS lock descriptor until both drain and any in-flight worker finish.
+
+    Normally the lock is released as soon as ``_cross_process_drain_lock`` exits.
+    If repeated cancellation (such as a shutdown timeout) unwinds the drain task
+    while a checkpoint thread is still blocked on disk I/O, ownership transfers to
+    that thread so ``.drain.lock`` stays held until the checkpoint finishes and
+    no peer worker can replay the same event twice.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+        self._lock = threading.Lock()
+        self._pending = 0
+        self._released_by_owner = False
+
+    def begin_offload(self) -> None:
+        with self._lock:
+            self._pending += 1
+
+    def finish_offload(self) -> None:
+        fd_to_close: int | None = None
+        with self._lock:
+            self._pending -= 1
+            if self._released_by_owner and self._pending == 0 and self._fd is not None:
+                fd_to_close = self._fd
+                self._fd = None
+        if fd_to_close is not None:
+            _unlock_and_close_fd(fd_to_close)
+
+    def release(self) -> None:
+        with self._lock:
+            self._released_by_owner = True
+            if self._pending > 0:
+                return
+            fd = self._fd
+            self._fd = None
+        if fd is not None:
+            _unlock_and_close_fd(fd)
+
+    def run_offloaded(self, fn: Callable[..., Any], *args: Any) -> Any:
+        try:
+            return fn(*args)
+        finally:
+            self.finish_offload()
+
+
 @asynccontextmanager
-async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[None]:
+async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[_DrainLockLease]:
     """Serialize inbox claim and replay across worker processes.
 
     Acquiring the OS file lock guarantees that two workers (e.g. uvicorn
@@ -93,6 +166,8 @@ async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[None]:
     """
     lock_path = directory / _DRAIN_LOCK_FILE
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
+    lease: _DrainLockLease | None = None
     try:
         try:
             os.chmod(lock_path, 0o600)
@@ -107,39 +182,34 @@ async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[None]:
             while True:
                 try:
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    acquired = True
                     break
                 except OSError as exc:
                     if not _is_windows_lock_contention(exc):
                         raise
                     await asyncio.sleep(0.05)
-            try:
-                yield
-            finally:
-                try:
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                except OSError:
-                    pass
         else:
             import fcntl
 
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
                     break
                 except OSError as exc:
                     if exc.errno not in _POSIX_LOCK_RETRY_ERRNOS:
                         raise
                     await asyncio.sleep(0.05)
-            try:
-                yield
-            finally:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
+
+        lease = _DrainLockLease(fd)
+        yield lease
     finally:
-        os.close(fd)
+        if lease is not None:
+            lease.release()
+        elif acquired:
+            _unlock_and_close_fd(fd)
+        else:
+            os.close(fd)
 
 
 def inbox_dir() -> Path:
@@ -298,17 +368,24 @@ def _read_event_envelope(event_file: Path) -> dict[str, Any]:
     return envelope
 
 
-async def _run_in_thread_before_unlock(fn: Callable[..., Any], *args: Any) -> Any:
-    """Run a bounded disk helper off the event loop and finish it before unlocking.
+async def _run_in_thread_before_unlock(
+    lease: _DrainLockLease, fn: Callable[..., Any], *args: Any
+) -> Any:
+    """Run a bounded disk helper off the event loop under ``lease``.
 
     Offloading keeps the proxy event loop responsive during backlog replay. On a
     normal cancellation, wait for the single in-flight disk operation to finish
-    before releasing ``.drain.lock`` so no background thread touches ``.processed``
-    or event files after another worker acquires the lock. A second cancellation
-    (such as a lifespan shutdown timeout) aborts the wait immediately so shutdown
-    cannot stall indefinitely on hung disk I/O.
+    before returning. On a second cancellation (such as a lifespan shutdown
+    timeout), stop waiting immediately while ``lease`` keeps ``.drain.lock``
+    held until the worker thread finishes so no peer worker can double-count
+    the in-flight event.
     """
-    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    lease.begin_offload()
+    try:
+        fut = asyncio.ensure_future(asyncio.to_thread(lease.run_offloaded, fn, *args))
+    except BaseException:
+        lease.finish_offload()
+        raise
     try:
         return await asyncio.shield(fut)
     except asyncio.CancelledError:
@@ -362,13 +439,15 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
             except OSError:
                 return 0
 
-            async with _cross_process_drain_lock(directory):
+            async with _cross_process_drain_lock(directory) as lease:
                 processed_path = directory / _PROCESSED_FILE
-                processed_list = await _run_in_thread_before_unlock(_load_processed, processed_path)
+                processed_list = await _run_in_thread_before_unlock(
+                    lease, _load_processed, processed_path
+                )
                 processed_set = set(processed_list)
 
                 try:
-                    files = await _run_in_thread_before_unlock(_list_event_files, directory)
+                    files = await _run_in_thread_before_unlock(lease, _list_event_files, directory)
                 except OSError:
                     return 0
 
@@ -376,27 +455,27 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
                     try:
                         try:
                             envelope = await _run_in_thread_before_unlock(
-                                _read_event_envelope, event_file
+                                lease, _read_event_envelope, event_file
                             )
                         except (OSError, ValueError):
                             # Malformed / unreadable: skip and remove, never fatal.
                             logger.debug("agy savings: dropping malformed %s", event_file.name)
-                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
+                            await _run_in_thread_before_unlock(lease, _safe_unlink, event_file)
                             continue
 
                         event_id = envelope.get("event_id")
                         if not isinstance(event_id, str) or not event_id:
-                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
+                            await _run_in_thread_before_unlock(lease, _safe_unlink, event_file)
                             continue
 
                         if event_id in processed_set:
                             # Crash-window duplicate: already recorded, just remove.
-                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
+                            await _run_in_thread_before_unlock(lease, _safe_unlink, event_file)
                             continue
 
                         kwargs = envelope.get("kwargs")
                         if not isinstance(kwargs, dict):
-                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
+                            await _run_in_thread_before_unlock(lease, _safe_unlink, event_file)
                             continue
 
                         await metrics.record_request(**kwargs)
@@ -405,7 +484,7 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
                         processed_set.add(event_id)
                         processed_list.append(event_id)
                         await _run_in_thread_before_unlock(
-                            _checkpoint_event, processed_path, event_id, event_file
+                            lease, _checkpoint_event, processed_path, event_id, event_file
                         )
                     except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
                         logger.debug("agy savings: error replaying %s: %s", event_file.name, exc)
@@ -413,7 +492,7 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
 
                 if len(processed_list) > MAX_PROCESSED_IDS:
                     await _run_in_thread_before_unlock(
-                        _write_processed, processed_path, list(processed_list)
+                        lease, _write_processed, processed_path, list(processed_list)
                     )
         except Exception as exc:  # noqa: BLE001 - drain never raises out
             logger.debug("agy savings drain failed: %s", exc)
