@@ -232,6 +232,30 @@ class TestWrapAgyNoIntercept:
         # Must not have started servers (no AssertionError bubbled = no start call)
         assert not server_started
 
+    @pytest.mark.parametrize("via_env", [True, False])
+    def test_no_intercept_bypasses_rust_backend_check(
+        self, monkeypatch: pytest.MonkeyPatch, via_env: bool
+    ) -> None:
+        """--no-intercept passthrough must launch agy even when HEADROOM_BACKEND=rust."""
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/agy" if name == "agy" else None)
+        launched: list[list[str]] = []
+
+        def _fake_run(cmd, *args, **kwargs):
+            launched.append(list(cmd))
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        cli_args = ["wrap", "agy", "--no-intercept"]
+        if via_env:
+            monkeypatch.setenv("HEADROOM_BACKEND", "rust")
+        else:
+            cli_args += ["--backend", "rust"]
+
+        result = CliRunner().invoke(_get_main(), cli_args)
+        assert result.exit_code == 0, result.output
+        assert "Python-only" not in result.output
+        assert launched == [["/usr/bin/agy"]]
+
 
 class TestWrapAgySignalTeardown:
     """SIGTERM during the agy run must tear the MITM servers down (and the

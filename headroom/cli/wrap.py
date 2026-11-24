@@ -3487,6 +3487,18 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
             clear_install(registrar.name, "serena", ownership_key=ownership_key)
         return "removed" if found_owned else "not_headroom_owned"
 
+    if callable(getattr(type(registrar), "unregister_server_if", None)):
+        outcome = registrar.unregister_server_if(
+            "serena",
+            lambda current: headroom_installed_matching(registrar.name, current),
+        )
+        if outcome == "removed":
+            clear_install(registrar.name, "serena")
+            return "removed"
+        if outcome == "not_matched":
+            return "not_headroom_owned"
+        return "failed"
+
     current = registrar.get_server("serena")
     if not headroom_installed_matching(registrar.name, current):
         return "not_headroom_owned"
@@ -3509,6 +3521,18 @@ def _remove_headroom_installed_retrieve_mcp(registrar: Any) -> str:
 def _remove_headroom_installed_mcp(registrar: Any, name: str) -> str:
     """Retire a matching ledger-owned entry without claiming user configuration."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    if callable(getattr(type(registrar), "unregister_server_if", None)):
+        outcome = registrar.unregister_server_if(
+            name,
+            lambda current: headroom_installed_matching(registrar.name, current),
+        )
+        if outcome == "removed":
+            clear_install(registrar.name, name)
+            return "removed"
+        if outcome == "not_matched":
+            return "not_headroom_owned"
+        return "failed"
 
     current = registrar.get_server(name)
     if not headroom_installed_matching(registrar.name, current):
@@ -3586,6 +3610,18 @@ def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
         from headroom.mcp_registry.claude import SCOPE_USER
 
         at_user_scope = {"scope": SCOPE_USER}
+
+    if not at_user_scope and callable(getattr(type(registrar), "unregister_server_if", None)):
+        outcome = registrar.unregister_server_if(
+            "tokensave",
+            lambda current: headroom_installed_matching(registrar.name, current),
+        )
+        if outcome == "removed":
+            clear_install(registrar.name, "tokensave")
+            return "removed"
+        if outcome == "not_matched":
+            return "not_headroom_owned"
+        return "failed"
 
     current = registrar.get_server("tokensave", **at_user_scope)
     if not headroom_installed_matching(registrar.name, current):
@@ -10311,16 +10347,6 @@ def agy(
             "Install agy: https://github.com/google/agy (or via your package manager)"
         )
 
-    # Rust backend is Python-only for agy (T11 deferred).
-    effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
-    if effective_backend == "rust":
-        click.echo(
-            "Error: agy MITM transport is Python-only.  "
-            "Rust backend support is deferred (T11).  "
-            "Use the Python backend (omit --backend rust / unset HEADROOM_BACKEND)."
-        )
-        raise SystemExit(1)
-
     if no_intercept:
         # Passthrough: launch agy unchanged, zero modification to its env.
         click.echo()
@@ -10334,6 +10360,16 @@ def agy(
         click.echo()
         result = subprocess.run([agy_bin, *agy_args])
         raise SystemExit(result.returncode)
+
+    # Rust backend is Python-only for agy MITM interception (T11 deferred).
+    effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
+    if effective_backend == "rust":
+        click.echo(
+            "Error: agy MITM transport is Python-only.  "
+            "Rust backend support is deferred (T11).  "
+            "Use the Python backend (omit --backend rust / unset HEADROOM_BACKEND)."
+        )
+        raise SystemExit(1)
 
     # -----------------------------------------------------------------------
     # MITM path
