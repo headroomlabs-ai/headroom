@@ -236,6 +236,13 @@ class AgyRegistrar(MCPRegistrar):
         """
         if not self._config_file.exists():
             return "not_matched"
+        # Fast read-only pre-check: avoid opening a writable lock sidecar when
+        # no matching entry exists (e.g. a symlink into a read-only dotfiles dir
+        # during `wrap agy --no-mcp`). Ownership is re-verified inside the lock
+        # below before any mutation.
+        pre_current = self.get_server(server_name)
+        if pre_current is None or not predicate(pre_current):
+            return "not_matched"
         try:
             with _config_file_lock(self._config_file):
                 if not self._config_file.exists():

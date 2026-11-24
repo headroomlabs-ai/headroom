@@ -755,11 +755,15 @@ class TestRegistrarSafety:
 
         entered = threading.Event()
         release = threading.Event()
+        calls = 0
         orig_matching = ledger_mod.headroom_installed_matching
 
         def _paused_matching(*args, **kwargs) -> bool:
-            entered.set()
-            release.wait(timeout=0.3)
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                release.wait(timeout=5.0)
             return orig_matching(*args, **kwargs)
 
         monkeypatch.setattr(ledger_mod, "headroom_installed_matching", _paused_matching)
@@ -776,13 +780,40 @@ class TestRegistrarSafety:
         t2 = threading.Thread(target=_run_replace)
         t1.start()
         assert entered.wait(timeout=5.0)
+        # Replace completes while unwrap is paused after its initial read,
+        # before unwrap enters the locked deletion transaction.
         t2.start()
-        t2.join(timeout=0.1)
+        t2.join(timeout=5.0)
+        assert not t2.is_alive()
         release.set()
         t1.join(timeout=5.0)
-        t2.join(timeout=5.0)
 
-        assert not t1.is_alive() and not t2.is_alive()
+        assert not t1.is_alive()
         assert results["replace"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
-        final = reg1.get_server("headroom")
-        assert final == replacement_spec
+        assert results["unwrap"] == "not_headroom_owned"
+        assert reg1.get_server("headroom") == replacement_spec
+
+        # Confirm removal works when the entry still matches the ledger.
+        ledger_mod.record_install("agy", replacement_spec)
+        assert wrap_mod._remove_headroom_installed_retrieve_mcp(reg1) == "removed"
+        assert reg1.get_server("headroom") is None
+
+    def test_unregister_server_if_skips_write_lock_when_entry_unmatched_or_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Read-only config with no owned entry must not fail by requiring a write lock."""
+        import headroom.mcp_registry.agy as agy_mod
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"user-tool": {"command": "/bin/user-tool"}}},
+        )
+
+        def _deny_lock(_path: Path):
+            raise PermissionError("read-only directory")
+
+        monkeypatch.setattr(agy_mod, "_config_file_lock", _deny_lock)
+
+        reg = _make_reg(tmp_path)
+        assert reg.unregister_server_if("headroom", lambda _spec: True) == "not_matched"
+        assert reg.unregister_server_if("user-tool", lambda _spec: False) == "not_matched"
