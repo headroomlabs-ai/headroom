@@ -138,12 +138,15 @@ class _InternalService:
 
     def __init__(self) -> None:
         self.hits: list[str] = []
+        self.headers: list[dict[str, str]] = []
         self.port = _free_port()
         hits = self.hits
+        seen_headers = self.headers
 
         class _Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
                 hits.append(self.path)
+                seen_headers.append({k.lower(): v for k, v in self.headers.items()})
                 body = b'{"secret":"internal-only"}'
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -236,27 +239,39 @@ def test_no_route_forwards_to_a_loopback_upstream() -> None:
     assert reached == [], f"routes forwarded to a loopback upstream: {reached}"
 
 
+_GATEWAY = "my-resource.openai.azure.com"
+
+
+@pytest.fixture
+def bundled_pricing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep app startup off the network: LiteLLM reads its bundled price map."""
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+
 @pytest.mark.parametrize("auth", [{"api-key": "x"}, {"Authorization": "Bearer client-token"}])
 def test_alpha_search_dials_the_override_it_checked(
-    monkeypatch: pytest.MonkeyPatch, auth: dict[str, str]
+    monkeypatch: pytest.MonkeyPatch, bundled_pricing: None, auth: dict[str, str]
 ) -> None:
     """One resolution, and its answer is the destination.
 
-    The name resolves publicly once and then stops resolving. A second lookup
-    after the route's check must not happen: when it did, its failure sent the
-    caller's request and credential to the configured provider instead.
+    The gateway name resolves publicly once and then stops resolving. A second
+    lookup after the route's check must not happen: when it did, its failure
+    sent the caller's request and credential to the configured provider.
     """
     from fastapi.responses import JSONResponse
 
     from headroom.proxy.server import HeadroomProxy
 
     lookups: list[object] = []
+    real_getaddrinfo = socket.getaddrinfo
 
     def resolve_once(host: object, *args: object, **kwargs: object) -> list[object]:
+        if host != _GATEWAY:
+            return real_getaddrinfo(host, *args, **kwargs)  # type: ignore[arg-type]
         lookups.append(host)
         if len(lookups) > 1:
-            raise socket.gaierror("no longer resolves")
-        return [(None, None, None, None, ("20.10.10.10", 443))]
+            raise socket.gaierror(socket.EAI_NONAME, "no longer resolves")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("20.10.10.10", 443))]
 
     forwarded: list[str] = []
 
@@ -266,13 +281,38 @@ def test_alpha_search_dials_the_override_it_checked(
 
     monkeypatch.setattr(socket, "getaddrinfo", resolve_once)
     monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
-    headers = {**auth, "x-headroom-base-url": "https://my-resource.openai.azure.com/"}
+    headers = {**auth, "x-headroom-base-url": f"https://{_GATEWAY}/"}
     with TestClient(_app()) as client:
         response = client.post("/v1/alpha/search", headers=headers, json={"q": "x"})
 
     assert response.status_code == 200
-    assert forwarded == ["https://my-resource.openai.azure.com"]
-    assert lookups == ["my-resource.openai.azure.com"]
+    assert forwarded == [f"https://{_GATEWAY}"]
+    assert lookups == [_GATEWAY]
+
+
+@pytest.mark.parametrize("auth", [{"api-key": "x"}, {"Authorization": "Bearer client-token"}])
+def test_alpha_search_forwards_to_the_checked_override_through_the_real_handler(
+    monkeypatch: pytest.MonkeyPatch, bundled_pricing: None, auth: dict[str, str]
+) -> None:
+    """The real passthrough handler delivers the request, and its credential, there."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "127.0.0.1")
+    unreachable_provider = f"http://127.0.0.1:{_free_port()}"
+    with (
+        _InternalService() as gateway,
+        TestClient(_app(openai_api_url=unreachable_provider)) as client,
+    ):
+        response = client.post(
+            "/v1/alpha/search",
+            headers={**auth, "x-headroom-base-url": gateway.url},
+            json={"q": "x"},
+        )
+        hits, received = list(gateway.hits), list(gateway.headers)
+
+    assert response.status_code == 200
+    assert hits == ["/v1/alpha/search"]
+    for name, value in auth.items():
+        assert received[0][name.lower()] == value
+    assert "x-headroom-base-url" not in received[0]
 
 
 def test_operator_allowlist_still_permits_an_internal_override_on_alpha_search(
