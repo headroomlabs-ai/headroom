@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -2010,13 +2011,24 @@ def test_metadata_sync_applies_only_patches_to_version_files(
 
 
 def test_metadata_sync_allowlist_covers_what_version_sync_writes(tmp_path: Path) -> None:
-    repo = _repo_with_allowed_files(tmp_path / "repo")
-    (repo / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n', encoding="utf-8")
-    for name in _allowed_paths():
-        if name.endswith(".json") or name == ".releasemetadata":
-            source = ROOT / name
-            (repo / name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-    (repo / "uv.lock").write_text((ROOT / "uv.lock").read_text(encoding="utf-8"), encoding="utf-8")
+    """Every file version-sync.py changes, including optional ones, is allowlisted.
+
+    The fixture holds every tracked JSON, TOML and lock file of the repository
+    (plus .releasemetadata), so a target the script writes only when it exists
+    is present too.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    tracked = _git(ROOT, "ls-files", "-z").split("\0")
+    for name in tracked:
+        if name and (
+            name == ".releasemetadata" or Path(name).suffix in {".json", ".toml", ".lock"}
+        ):
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / name, repo / name)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "real files")
 
@@ -2038,31 +2050,58 @@ def test_metadata_sync_allowlist_covers_what_version_sync_writes(tmp_path: Path)
     assert {line[3:] for line in changed} <= set(_allowed_paths())
 
 
-def test_metadata_sync_push_step_commits_without_hooks(tmp_path: Path) -> None:
+def _release_remote(tmp_path: Path) -> tuple[Path, Path, str]:
+    """A repo pushed to a bare origin's release branch; returns repo, origin, event SHA."""
     origin = tmp_path / "origin.git"
     repo = _repo_with_allowed_files(tmp_path / "repo")
     _git(tmp_path, "init", "-q", "--bare", str(origin))
     _git(repo, "remote", "add", "origin", str(origin))
+    (repo / "README").write_text("release commit\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "release commit")
     _git(repo, "push", "-q", "origin", "HEAD:refs/heads/release-please--branches--main")
+    return repo, origin, _git(repo, "rev-parse", "HEAD").strip()
+
+
+def _sync_and_push(repo: Path, tmp_path: Path, event_sha: str) -> subprocess.CompletedProcess[str]:
     (tmp_path / "sync.patch").write_text(_patch(repo, "bump"), encoding="utf-8")
-    hook = repo / ".git/hooks/pre-commit"
-    hook.write_text(f"#!/bin/sh\ntouch {tmp_path / 'hook-ran'}\n", encoding="utf-8")
-    hook.chmod(0o755)
     steps = _metadata_sync_push_steps()
     assert _run_step(steps[_APPLY_STEP], repo, tmp_path).returncode == 0
-
-    result = _run_step(
+    return _run_step(
         steps[_PUSH_STEP],
         repo,
         tmp_path,
         SYNC_TOKEN="not-a-real-token",
         GITHUB_REF_NAME="release-please--branches--main",
+        GITHUB_SHA=event_sha,
     )
+
+
+def test_metadata_sync_push_step_leaves_a_rewound_branch_alone(tmp_path: Path) -> None:
+    """If the release branch was rewound to the parent, the sync must not restore it."""
+    repo, origin, event_sha = _release_remote(tmp_path)
+    parent = _git(repo, "rev-parse", "HEAD~1").strip()
+    _git(origin, "update-ref", "refs/heads/release-please--branches--main", parent)
+
+    result = _sync_and_push(repo, tmp_path, event_sha)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    remote_tip = _git(origin, "rev-parse", "release-please--branches--main").strip()
+    assert remote_tip == parent
+
+
+def test_metadata_sync_push_step_commits_without_hooks(tmp_path: Path) -> None:
+    repo, origin, event_sha = _release_remote(tmp_path)
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {tmp_path / 'hook-ran'}\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    result = _sync_and_push(repo, tmp_path, event_sha)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (tmp_path / "hook-ran").exists()
     log = _git(origin, "log", "--format=%s", "release-please--branches--main")
-    assert log.splitlines()[0] == "chore: sync generated version metadata"
+    assert log.splitlines()[:2] == ["chore: sync generated version metadata", "release commit"]
 
 
 @pytest.mark.parametrize(

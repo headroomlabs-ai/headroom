@@ -196,8 +196,13 @@ jobs:
           # This push re-triggers this workflow. version-sync.py is idempotent, so
           # the next run finds no diff and exits in `sync` without pushing — the
           # loop terminates after one no-op run. HEAD is the pushed commit plus
-          # the sync commit, so a branch that moved since fails non-fast-forward.
+          # the sync commit. The lease makes the push land only while the
+          # branch still points at that pushed commit: a branch that moved on,
+          # or was rewound to an ancestor, is left alone instead of having the
+          # discarded commit pushed back.
           GIT_CONFIG_COUNT=1 \
           GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
           GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" \
-            git -c core.hooksPath=/dev/null push --no-verify origin HEAD:"${GITHUB_REF_NAME}"
+            git -c core.hooksPath=/dev/null push --no-verify \
+              --force-with-lease="refs/heads/${GITHUB_REF_NAME}:${GITHUB_SHA}" \
+              origin HEAD:"refs/heads/${GITHUB_REF_NAME}"
