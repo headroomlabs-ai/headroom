@@ -313,18 +313,42 @@ def is_container_host_gateway(host: str | None) -> bool:
     return host.strip() == gateway.strip()
 
 
+def _container_gateway_vouched(request: Request) -> bool:  # type: ignore[valid-type]
+    """Return the app's ``container_gateway_vouched`` flag; False when unset.
+
+    ``create_app`` sets it from the same token and bind decision the security
+    gate uses. An app (or request double) that never set it fails closed.
+    """
+    scope = getattr(request, "scope", None)
+    app = scope.get("app") if isinstance(scope, dict) else None
+    state = getattr(app, "state", None)
+    return bool(getattr(state, "container_gateway_vouched", False))
+
+
 def require_loopback_or_container_gateway(request: Request) -> None:  # type: ignore[valid-type]
-    """FastAPI dependency: allow loopback callers or container host gateway.
+    """FastAPI dependency: allow loopback callers or the vouched-for host gateway.
 
     Used by routes like ``/v1/compress`` and ``/v1/usage``. When running inside
     a container environment (Docker / Podman), incoming host traffic forwarded
     over the container bridge arrives with the host gateway IP (e.g. 172.17.0.1)
     rather than a loopback interface.
 
+    The gateway address alone does not identify the host: a peer container
+    that reaches a port published on a non-loopback interface (the host's IP
+    or the gateway itself) also arrives from the gateway (issue #4794). So the
+    gateway is trusted only when the app vouches for it
+    (``app.state.container_gateway_vouched``, set by ``create_app``).
+
     Enforces two gates:
-    1. Client address must be either loopback (:func:`is_loopback_host`) or
-       the container host default gateway (:func:`is_container_host_gateway`).
-       Arbitrary peer containers on the same bridge network are rejected.
+    1. Client address must be loopback (:func:`is_loopback_host`), or the
+       container host default gateway (:func:`is_container_host_gateway`)
+       while either a proxy token is configured (the security gate has already
+       made every non-loopback caller present it) or
+       ``HEADROOM_ALLOW_UNAUTHENTICATED_BIND`` declares that the runtime
+       publishes the port on host loopback only. Otherwise a gateway peer is
+       rejected. Under the acknowledgement this relies on the publication
+       really being loopback-only: with a ``0.0.0.0`` publication a peer
+       container is indistinguishable from the host.
     2. The inbound ``Host:`` header must name a loopback host
        (:func:`is_loopback_host_header`). This blocks DNS-rebinding attacks and
        rejects callers addressing the container's bridge IP or hostname directly.
@@ -334,7 +358,10 @@ def require_loopback_or_container_gateway(request: Request) -> None:  # type: ig
 
     client = getattr(request, "client", None)
     host = getattr(client, "host", None) if client is not None else None
-    if not (is_loopback_host(host) or is_container_host_gateway(host)):
+    if not (
+        is_loopback_host(host)
+        or (is_container_host_gateway(host) and _container_gateway_vouched(request))
+    ):
         raise HTTPException(status_code=404)
 
     headers = getattr(request, "headers", None)
