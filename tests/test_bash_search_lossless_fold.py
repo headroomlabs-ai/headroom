@@ -11,6 +11,7 @@ compression. Non-search bash commands (cat/build/mutate) are untouched.
 from __future__ import annotations
 
 import json
+import tracemalloc
 
 import pytest
 
@@ -303,6 +304,7 @@ def test_experimental_read_keep_ratio_flag_and_gating(monkeypatch):
 
 # --- directory-prefix fold: grep -rn across many distinct files ---
 from headroom.transforms.lossless_compaction import (  # noqa: E402
+    _ExpansionLimitExceeded,
     compact_lossless,
     search_dir_heading,
     search_dir_unheading,
@@ -473,13 +475,88 @@ def test_mixed_separator_listing_takes_the_smaller_fold() -> None:
     [
         # A lone leading "\" is not a path root: a list of regexes is not a listing.
         "".join(f"{chr(92)}{c}+{chr(92)}s{chr(92)}{c}+\n" for c in "wdS"),
+        f"{chr(92)}bfoo{chr(92)}b\n{chr(92)}bfoo{chr(92)}B\n",
         # The "/" fold's markup rule holds with "\" as a separator too.
         "{{/if}}\n{{/each}}\n",
+        # Regex rules that share a prefix before an escape, with a character no
+        # Windows name can hold or a quantified class.
+        f"^invoice{chr(92)}d*$\n^invoice{chr(92)}w*$\n",
+        f"^invoice{chr(92)}d?$\n^invoice{chr(92)}w?$\n",
+        f"^invoice{chr(92)}d+$\n^invoice{chr(92)}w+$\n",
+        f"^invoice{chr(92)}d{{2}}$\n^invoice{chr(92)}w{{4}}$\n",
+        f"^invoice{chr(92)}d+{chr(92)}.csv$\n^invoice{chr(92)}d+{chr(92)}.txt$\n",
     ],
-    ids=["regexes", "template-closers"],
+    ids=[
+        "regexes",
+        "word-boundaries",
+        "template-closers",
+        "shared-prefix-star",
+        "shared-prefix-optional",
+        "shared-prefix-plus",
+        "shared-prefix-count",
+        "quantified-directory",
+    ],
 )
 def test_backslash_path_fold_skips_non_listings(text) -> None:
     assert _ph(text, backslash=True) == text
+    assert compact_lossless(text, "paths") == text
+
+
+@pytest.mark.parametrize("char", ["*", "?", '"', "|"])
+@pytest.mark.parametrize("row", ["src/a{0}b/{1}.py", "src/app/{1}{0}.py"], ids=["dir", "base"])
+def test_backslash_path_fold_rejects_names_windows_cannot_hold(row, char) -> None:
+    text = "".join(row.format(char, n) + "\n" for n in "xyz").replace("/", chr(92))
+    assert _ph(text, backslash=True) == text
+
+
+def test_backslash_path_fold_keeps_names_that_only_look_like_regexes() -> None:
+    names = ("C++", "[slug]", "(auth)", "{{cookiecutter.name}}", "$out", "d", "w2", "s-3")
+    posix = "".join(f"app/{name}/{base}\n" for name in names for base in ("+page.ts", "Foo$1.kt"))
+    windows = posix.replace("/", chr(92))
+    folded = compact_lossless(windows, "paths")
+    assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
+    assert _puh(folded, backslash=True) == windows
+
+
+@pytest.mark.parametrize("sep", ["/", chr(92)], ids=["slash", "backslash"])
+def test_paths_fold_does_not_decode_text_that_is_not_a_listing(sep) -> None:
+    # A long line ending in a separator is not a header here. Decoding the text
+    # anyway would copy it onto every following row: 5000 * 500 characters.
+    text = "h" * 5000 + sep + "\n" + "".join(f"f{i}.py\n" for i in range(500))
+    tracemalloc.start()
+    try:
+        assert compact_lossless(text, "paths") == text
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 20 * len(text)
+
+
+@pytest.mark.parametrize("sep", ["/", chr(92)], ids=["slash", "backslash"])
+@pytest.mark.parametrize("end", ["", "\n"], ids=["no-newline", "newline"])
+def test_path_unheading_stops_at_its_limit(sep, end) -> None:
+    # The blank line ends the listing, so "note" is passed through.
+    text = "\n".join(["src" + sep, "a.py", "b.py", "c.py", "", "note"]) + end
+    decoded = "\n".join([f"src{sep}{name}.py" for name in "abc"] + ["", "note"]) + end
+    assert _puh(text, len(decoded), backslash=True) == decoded
+    with pytest.raises(_ExpansionLimitExceeded):
+        _puh(text, len(decoded) - 1, backslash=True)
+
+
+def test_paths_fold_bounds_its_verification(monkeypatch) -> None:
+    # A candidate smaller than the content that would decode to 2000 * 1000 characters.
+    content = "x" * 8000
+    bomb = "h" * 2000 + "/\n" + "f\n" * 1000
+    monkeypatch.setattr(
+        "headroom.transforms.lossless_compaction.path_heading", lambda text, **_: bomb
+    )
+    tracemalloc.start()
+    try:
+        assert compact_lossless(content, "paths") == content
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 20 * len(content)
 
 
 def test_windows_listing_takes_the_lossless_paths_fold(tokenizer) -> None:

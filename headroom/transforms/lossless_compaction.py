@@ -462,10 +462,14 @@ _PATH_ROW_RE = re.compile(
 )
 # The same with ``\`` also a separator, for the paths Windows tools print
 # (ripgrep, PowerShell). The root may be ``.\`` or ``..\`` but not a lone
-# ``\``, so a list of regexes such as ``\w+\s\w+`` is not a listing.
+# ``\``, so a list of regexes such as ``\w+\s\w+`` is not a listing. A Windows
+# name cannot hold ``* ? " |`` (``\x22`` is the quote), and a segment that is a
+# regex class with a quantifier (``\d+``, ``\w{2}``) is not a name either, so
+# rules sharing a prefix (``^invoice\d*$``, ``^invoice\w+$``) stay whole lines.
 _PATH_ROW_BACKSLASH_RE = re.compile(
-    r"^(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?(?:(?=[^/\\]*\w)[^/\\\s:<>;]+[/\\])+)"
-    r"(?P<base>[^/\\\s:<>;]+)$"
+    r"^(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?"
+    r"(?:(?=[^/\\]*\w)(?![dDsSwWbB][+{])[^/\\\s:<>;*?\x22|]+[/\\])+)"
+    r"(?P<base>(?![dDsSwWbB][+{])[^/\\\s:<>;*?\x22|]+)$"
 )
 
 
@@ -511,19 +515,22 @@ def path_heading(text: str, *, backslash: bool = False) -> str:
     return _join(out, had_trailing)
 
 
-def path_unheading(text: str, *, backslash: bool = False) -> str:
+def path_unheading(text: str, max_chars: int | None = None, *, backslash: bool = False) -> str:
     """Exact inverse of :func:`path_heading`.
 
     A *header* is a line ending in ``/`` immediately followed by a basename row
     (a non-empty line with no ``/``); it is consumed and re-prefixed onto each
     following basename row until a blank line or another header. ``backslash``
     must match the flag the fold was made with (``\\`` then counts as ``/``).
+    ``max_chars`` bounds the output as in :func:`expand_runs`; without it, one
+    long header can be copied onto every row after it.
     """
     seps = ("/", "\\") if backslash else ("/",)
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
     is_base = [ln != "" and "/" not in ln and not (backslash and "\\" in ln) for ln in lines]
+    budget = _OutputBudget(max_chars, had_trailing)
     out: list[str] = []
     current: str | None = None
     n = len(lines)
@@ -531,6 +538,7 @@ def path_unheading(text: str, *, backslash: bool = False) -> str:
     while i < n:
         line = lines[i]
         if current is not None and is_base[i]:
+            budget.take(len(current) + len(line) + 1)
             out.append(current + line)
             i += 1
             continue
@@ -539,6 +547,7 @@ def path_unheading(text: str, *, backslash: bool = False) -> str:
             i += 1
             continue
         current = None
+        budget.take(len(line) + 1)
         out.append(line)
         i += 1
     return _join(out, had_trailing)
@@ -621,9 +630,12 @@ def compact_lossless(content: str, kind: str) -> str:
             best = content
             for backslash in (False, True) if "\\" in content else (False,):
                 candidate = path_heading(content, backslash=backslash)
-                if path_unheading(candidate, backslash=backslash) == content and _smaller(
-                    candidate, best
-                ):
+                # Size first: text that is not a pure listing comes back
+                # unchanged, and decoding it would copy a line that ends in a
+                # separator onto every row after it.
+                if not _smaller(candidate, best):
+                    continue
+                if path_unheading(candidate, len(content), backslash=backslash) == content:
                     best = candidate
             return best
 
