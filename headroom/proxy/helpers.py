@@ -4055,6 +4055,13 @@ def _tool_search_resident_key(name: Any) -> str:
 # stays as an escape hatch for a future harness that signals deferral by name.
 _CLIENT_TOOL_SEARCH_NAMES: frozenset[str] = frozenset()
 
+# Client-side search tools that can resolve ``defer_loading`` marks. Not a
+# deferral signal on their own (see above), but when marks ARE present, one of
+# these is what resolves them, so the request is coherent rather than orphaned.
+# Claude Code sends ``ToolSearch`` with a deferred ``DeferredToolPlaceholder``
+# and every tool it has loaded, still marked.
+_CLIENT_DEFERRAL_RESOLVER_NAMES: frozenset[str] = frozenset({"toolsearch"})
+
 
 def _client_tool_search_names() -> frozenset[str]:
     """Extra tool names that mean "the client is already deferring".
@@ -4129,7 +4136,9 @@ def request_already_defers_tools(tools: Any) -> bool:
 
     NOT true for a bare client-side tool name such as ``ToolSearch``, which a
     client may send whether or not it is deferring -- see
-    ``_CLIENT_TOOL_SEARCH_NAMES``.
+    ``_CLIENT_TOOL_SEARCH_NAMES``. Paired with ``defer_loading`` marks, such a
+    name is what resolves them, so that request counts as a coherent client
+    deferral and does not log the orphan warning.
 
     Deferring on top of a client that already defers suppresses ITS mechanism
     and inlines the catalog we were trying to keep out, so a miss here costs
@@ -4146,11 +4155,18 @@ def request_already_defers_tools(tools: Any) -> bool:
     """
 
     deferred_without_search_tool = False
+    client_resolver_present = False
     for tool in iter_tool_entries(tools):
         if _is_tool_search_meta_tool(tool):
             return True
         if tool.get("defer_loading") is True:
             deferred_without_search_tool = True
+        elif _tool_search_resident_key(tool.get("name")) in _CLIENT_DEFERRAL_RESOLVER_NAMES:
+            client_resolver_present = True
+    if deferred_without_search_tool and client_resolver_present:
+        # The client defers with its own search tool (Claude Code's
+        # ``ToolSearch``): coherent, nothing to warn about.
+        return True
     if deferred_without_search_tool:
         # Tools marked deferred with no meta-tool we recognize that could
         # resolve them. Two very different causes, and the operator wants to
