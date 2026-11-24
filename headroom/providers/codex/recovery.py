@@ -91,23 +91,24 @@ def _temp_roots() -> list[Path]:
 
 
 @contextmanager
-def _held_source(source: Path) -> Iterator[os.stat_result]:
-    """Hold ``source`` open while it is pinned; yield its metadata.
+def _held_source(source: Path) -> Iterator[tuple[os.stat_result, int | None]]:
+    """Hold ``source`` open while it is pinned; yield its metadata and descriptor.
 
-    On POSIX the directory is opened once (no symlink followed) and the owner
-    and the identity used later both come from that one ``fstat``; holding the
-    descriptor keeps the inode from being reused meanwhile. Windows has no
-    POSIX owner, so only the identity is taken.
+    On POSIX the directory is opened once (no symlink followed); the owner
+    check and the identity used later both come from that one ``fstat``, and
+    the pinning copy reads through the descriptor, so what is copied is the
+    directory that passed the owner check. Windows has no POSIX owner and no
+    ``os.fwalk``, so only the identity is taken and the copy goes by path.
     """
     if sys.platform == "win32":
-        yield source.lstat()
+        yield source.lstat(), None
         return
     fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         held = os.fstat(fd)
         if held.st_uid != os.getuid():
             raise ValueError(f"source Codex home {source} is not owned by the current user")
-        yield held
+        yield held, fd
     finally:
         os.close(fd)
 
@@ -331,6 +332,47 @@ def _copy_home(source: Path, destination: Path, skipped: list[str]) -> None:
         else:
             skipped.append(str(relative))
     _secure_tree(destination)
+
+
+def _copy_held_home(source_fd: int, destination: Path, skipped: list[str]) -> None:
+    """``_copy_home`` for a held directory: every read goes through ``source_fd``.
+
+    Paths are resolved relative to directory descriptors and never through a
+    symlink, so renaming or replacing the source path meanwhile cannot change
+    what is copied. Symlinks are recreated as links, sockets and other special
+    files are recorded in ``skipped``, and file times are kept for the merge.
+    """
+    destination.mkdir(parents=True, exist_ok=False)
+    destination.chmod(0o700)
+    for dirpath, dirnames, filenames, dir_fd in os.fwalk(
+        ".", dir_fd=source_fd, follow_symlinks=False
+    ):
+        relative_dir = Path(dirpath)
+        for name in [*dirnames, *filenames]:
+            relative = relative_dir / name
+            output = destination / relative
+            try:
+                metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                output.symlink_to(os.readlink(name, dir_fd=dir_fd))
+            elif stat.S_ISDIR(metadata.st_mode):
+                output.mkdir(exist_ok=True)
+            elif stat.S_ISREG(metadata.st_mode):
+                _copy_file_at(dir_fd, name, output)
+            else:
+                skipped.append(str(relative))
+    _secure_tree(destination)
+
+
+def _copy_file_at(dir_fd: int, name: str, output: Path) -> None:
+    """Copy regular file ``name`` in ``dir_fd`` to ``output``, keeping its times."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    with os.fdopen(fd, "rb") as src, output.open("xb") as dst:
+        shutil.copyfileobj(src, dst)
+        metadata = os.fstat(src.fileno())
+    os.utime(output, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
 
 
 def _new_backup_dir(target: Path) -> Path:
@@ -810,7 +852,7 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     if source in target.parents or target in source.parents or target == Path(target.anchor):
         raise ValueError("source and target Codex homes must not overlap")
     _reject_target_symlink_traversal(source, target)
-    with _held_source(source) as held:
+    with _held_source(source) as (held, held_fd):
         before = home_fingerprint(source)
         backup_dir = _new_backup_dir(target)
         report = RecoveryReport(source=source, target=target, backup_dir=backup_dir)
@@ -820,12 +862,15 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
         # partial or unverified copy must never carry that name.
         staging = backup_dir / "source-pinned.partial"
         try:
-            _copy_home(source, staging, report.skipped_runtime)
+            if held_fd is None:
+                _copy_home(source, staging, report.skipped_runtime)
+            else:
+                _copy_held_home(held_fd, staging, report.skipped_runtime)
             copied_from = source.lstat()
             if home_fingerprint(source) != before:
                 raise RuntimeError("source Codex home changed while it was being pinned")
             if (copied_from.st_dev, copied_from.st_ino) != (held.st_dev, held.st_ino):
-                # The directory copied is not the one whose owner was checked.
+                # The path no longer names the held directory; refuse it too.
                 raise RuntimeError("source Codex home was replaced while it was being pinned")
         except BaseException:
             # Best effort: a leftover staging dir is never offered for recovery,

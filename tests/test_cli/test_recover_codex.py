@@ -201,17 +201,18 @@ def test_recovery_refuses_a_source_owned_by_another_user(
     ("planted", "error"),
     [
         ('model = "mine-too"\n', "replaced while it was being pinned"),
-        ('model = "planted"\n', "changed while it was being pinned"),
+        ('[mcp_servers.x]\ncommand = "true"\n', "changed while it was being pinned"),
     ],
     ids=["same-content", "different-content"],
 )
 def test_recovery_refuses_a_source_swapped_after_the_owner_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planted: str, error: str
 ) -> None:
-    """The directory pinned must be the one whose owner was checked.
+    """The source path is swapped after its owner was checked, before the copy.
 
-    The copy made from a rejected source is removed, so a later
-    `headroom recover codex` cannot offer it as a retained source.
+    On POSIX the copy reads through the held descriptor, so it holds the
+    checked directory's bytes, never the replacement's. Either way the swap
+    is refused and no copy is left for a later `headroom recover codex`.
     """
     target = tmp_path / "codex"
     source = tmp_path / "headroom-codex-home-swapped"
@@ -219,54 +220,35 @@ def test_recovery_refuses_a_source_swapped_after_the_owner_check(
     source.mkdir()
     (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
     (source / "config.toml").write_text('model = "mine-too"\n', encoding="utf-8")
-    copy_home = codex_recovery._copy_home
+    new_backup_dir = codex_recovery._new_backup_dir
+    fingerprint = codex_recovery.home_fingerprint
+    staging: list[Path] = []
+    copied: list[str] = []
 
-    def copy_then_swap(src: Path, dest: Path, skipped: list[str]) -> None:
-        copy_home(src, dest, skipped)
-        if src == source.resolve():
-            src.rename(tmp_path / "original")
-            shutil.copytree(tmp_path / "original", src)
-            if planted != 'model = "mine-too"\n':
-                (src / "config.toml").write_text(planted, encoding="utf-8")
+    def swap_then_back_up(home: Path) -> Path:
+        resolved = source.resolve()
+        resolved.rename(tmp_path / "original")
+        shutil.copytree(tmp_path / "original", resolved)
+        if planted != 'model = "mine-too"\n':
+            (resolved / "config.toml").write_text(planted, encoding="utf-8")
+        backup_dir = new_backup_dir(home)
+        staging.append(backup_dir / "source-pinned.partial")
+        return backup_dir
 
-    monkeypatch.setattr(codex_recovery, "_copy_home", copy_then_swap)
+    def fingerprint_after_copy(home: Path) -> str:
+        if staging and (staging[0] / "config.toml").exists():
+            copied.append((staging[0] / "config.toml").read_text(encoding="utf-8"))
+        return fingerprint(home)
+
+    monkeypatch.setattr(codex_recovery, "_new_backup_dir", swap_then_back_up)
+    monkeypatch.setattr(codex_recovery, "home_fingerprint", fingerprint_after_copy)
     with pytest.raises(RuntimeError, match=error):
         recover_codex_home(source=source, target=target)
+    if sys.platform != "win32":
+        assert copied == ['model = "mine-too"\n']
     assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
-    assert codex_recovery.discover_retained_sources(target) == []
-
-
-def test_recovery_never_retains_a_replacement_the_copy_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Swapped after the owner check but before the copy: the copy reads the
-    replacement. Recovery must refuse it and keep no copy of it."""
-    target = tmp_path / "codex"
-    source = tmp_path / "headroom-codex-home-swapped"
-    target.mkdir()
-    source.mkdir()
-    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
-    (source / "config.toml").write_text('model = "mine-too"\n', encoding="utf-8")
-    copy_home = codex_recovery._copy_home
-    copied_to: list[Path] = []
-
-    def swap_then_copy(src: Path, dest: Path, skipped: list[str]) -> None:
-        if src == source.resolve():
-            src.rename(tmp_path / "original")
-            src.mkdir()
-            (src / "config.toml").write_text(
-                '[mcp_servers.x]\ncommand = "true"\n', encoding="utf-8"
-            )
-            copied_to.append(dest)
-        copy_home(src, dest, skipped)
-
-    monkeypatch.setattr(codex_recovery, "_copy_home", swap_then_copy)
-    with pytest.raises(RuntimeError, match="while it was being pinned"):
-        recover_codex_home(source=source, target=target)
-    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
-    assert len(copied_to) == 1
-    assert not copied_to[0].exists()
-    assert not (copied_to[0].parent / "source-pinned").exists()
+    assert not staging[0].exists()
+    assert not (staging[0].parent / "source-pinned").exists()
     assert codex_recovery.discover_retained_sources(target) == []
 
 
@@ -280,16 +262,20 @@ def test_recovery_offers_no_snapshot_when_the_pinning_copy_fails_midway(
     source.mkdir()
     (source / "a.jsonl").write_text("{}\n", encoding="utf-8")
     (source / "b.jsonl").write_text("{}\n", encoding="utf-8")
-    copy2 = shutil.copy2
     copies: list[str] = []
 
-    def copy_until_disk_full(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
-        copies.append(str(src))
-        if len(copies) == 2:
-            raise OSError(errno.ENOSPC, "No space left on device", str(dst))
-        return copy2(src, dst, *args, **kwargs)
+    def fail_second_copy(copy: Any) -> Any:
+        def copy_until_disk_full(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+            copies.append(str(src))
+            if len(copies) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device", str(dst))
+            return copy(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(shutil, "copy2", copy_until_disk_full)
+        return copy_until_disk_full
+
+    # The by-path copy (Windows) uses copy2; the held-descriptor copy, copyfileobj.
+    monkeypatch.setattr(shutil, "copy2", fail_second_copy(shutil.copy2))
+    monkeypatch.setattr(shutil, "copyfileobj", fail_second_copy(shutil.copyfileobj))
     with pytest.raises(OSError, match="No space left"):
         recover_codex_home(source=source, target=target)
 
