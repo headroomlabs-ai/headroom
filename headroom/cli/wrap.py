@@ -1600,7 +1600,12 @@ def _setup_headroom_retrieve_mcp_agy(registrar: Any, *, verbose: bool = False) -
     )
 
     spec = build_headroom_spec()
-    owned = headroom_installed_matching(registrar.name, registrar.get_server(spec.name))
+    owned_lookup = (
+        registrar.get_owned_server(spec.name)
+        if callable(getattr(type(registrar), "get_owned_server", None))
+        else registrar.get_server(spec.name)
+    )
+    owned = headroom_installed_matching(registrar.name, owned_lookup)
     result = registrar.register_server(spec, force=owned)
     if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
         click.echo(
@@ -3328,11 +3333,16 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+    serena_owned_lookup = (
+        registrar.get_owned_server("serena")
+        if callable(getattr(type(registrar), "get_owned_server", None))
+        else registrar.get_server("serena")
+    )
     owned_drift = (
         result.status == RegisterStatus.MISMATCH
         and not force
         and headroom_installed_matching(
-            registrar.name, registrar.get_server("serena"), ownership_key=ownership_key
+            registrar.name, serena_owned_lookup, ownership_key=ownership_key
         )
     )
 

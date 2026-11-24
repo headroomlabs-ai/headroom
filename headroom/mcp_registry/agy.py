@@ -108,7 +108,22 @@ class AgyRegistrar(MCPRegistrar):
         entry = servers.get(server_name)
         if not isinstance(entry, dict):
             return None
-        return _try_entry_to_spec(server_name, entry)
+        return _try_entry_to_spec(server_name, entry, allow_extra_keys=True)
+
+    def get_owned_server(self, server_name: str) -> ServerSpec | None:
+        """Return ``ServerSpec`` only when the entry has no extra user-added fields.
+
+        Used by ownership checks (unwrap and automatic forced updates) so an
+        entry with user-added fields such as ``cwd`` is never treated as an
+        unmodified Headroom-owned install.
+        """
+        servers = _read_json(self._config_file).get("mcpServers")
+        if not isinstance(servers, dict):
+            return None
+        entry = servers.get(server_name)
+        if not isinstance(entry, dict):
+            return None
+        return _try_entry_to_spec(server_name, entry, allow_extra_keys=False)
 
     def has_configured_servers(self) -> bool:
         """Inspect all entries before launching MCP-unsafe print-mode clients.
@@ -157,7 +172,7 @@ class AgyRegistrar(MCPRegistrar):
                 raw_existing = servers.get(spec.name)
                 if raw_existing is not None:
                     existing = (
-                        _try_entry_to_spec(spec.name, raw_existing)
+                        _try_entry_to_spec(spec.name, raw_existing, allow_extra_keys=True)
                         if isinstance(raw_existing, dict)
                         else None
                     )
@@ -245,7 +260,7 @@ class AgyRegistrar(MCPRegistrar):
         # no matching entry exists (e.g. a symlink into a read-only dotfiles dir
         # during `wrap agy --no-mcp`). Ownership is re-verified inside the lock
         # below before any mutation.
-        pre_current = self.get_server(server_name)
+        pre_current = self.get_owned_server(server_name)
         if pre_current is None or not predicate(pre_current):
             return "not_matched"
         try:
@@ -379,15 +394,18 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
 _ALLOWED_ENTRY_KEYS = frozenset({"command", "args", "env"})
 
 
-def _try_entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec | None:
+def _try_entry_to_spec(
+    name: str, entry: dict[str, Any], *, allow_extra_keys: bool = False
+) -> ServerSpec | None:
     """Convert a raw JSON MCP entry into a ServerSpec without coercing invalid types.
 
-    Returning ``None`` for non-string ``command``/``args``/``env`` values or
-    extra user-added keys (such as ``cwd``) keeps read-only status non-throwing
-    while preventing edited entries from matching an install-ledger fingerprint
-    and being deleted on unwrap.
+    Returning ``None`` for non-string ``command``/``args``/``env`` values keeps
+    read-only status non-throwing while preventing type coercion from matching
+    an install-ledger fingerprint. When ``allow_extra_keys=False`` (ownership
+    checks), extra user-added keys such as ``cwd`` also return ``None`` so
+    edited entries are never deleted or forcibly overwritten.
     """
-    if not set(entry).issubset(_ALLOWED_ENTRY_KEYS):
+    if not allow_extra_keys and not set(entry).issubset(_ALLOWED_ENTRY_KEYS):
         return None
     raw_command = entry.get("command")
     if not isinstance(raw_command, str):

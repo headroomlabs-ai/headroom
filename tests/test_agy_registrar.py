@@ -912,6 +912,13 @@ class TestRegistrarSafety:
         config["mcpServers"]["headroom"]["cwd"] = "/tmp/my-project"
         _write_config(tmp_path, config)
 
+        # Compatible entry with extra 'cwd' stays usable for status and wrap
+        # reuse (ALREADY without overwriting 'cwd'), while ownership rejects it.
+        assert reg.get_server("headroom") == installed_spec
+        assert reg.get_owned_server("headroom") is None
+        assert reg.register_server(installed_spec, force=False).status == RegisterStatus.ALREADY
+        assert _read_config(tmp_path)["mcpServers"]["headroom"]["cwd"] == "/tmp/my-project"
+
         result = CliRunner().invoke(wrap_mod.unwrap_agy, [])
         assert result.exit_code == 0, result.output
         assert "Removed Headroom MCP retrieve tool" not in result.output
