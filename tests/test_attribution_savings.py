@@ -524,7 +524,12 @@ def test_a_replaced_resolver_is_not_overridden_by_the_legacy_field(tmp_path, mon
 
 @pytest.mark.parametrize(
     ("tenant_header", "expected"),
-    [("Authorization", None), ("X-Api-Key", None), ("X-Org-Id", "acme")],
+    [
+        ("Authorization", None),
+        ("X-Api-Key", None),
+        ("X-Goog-Api-Key", None),
+        ("X-Org-Id", "acme"),
+    ],
 )
 def test_tenant_from_a_credential_header_never_reaches_the_ledger(
     tmp_path, monkeypatch, tenant_header, expected

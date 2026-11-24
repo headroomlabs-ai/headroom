@@ -55,7 +55,8 @@ def test_resolves_builtins_from_headers():
 
 
 @pytest.mark.parametrize(
-    "header", ["Authorization", "X-Api-Key", "Cookie", "X-Headroom-Proxy-Token"]
+    "header",
+    ["Authorization", "X-Api-Key", "Cookie", "X-Headroom-Proxy-Token", "X-Goog-Api-Key"],
 )
 def test_tenant_is_never_read_from_a_credential_header(monkeypatch, header):
     from headroom.proxy.tenant_key import TENANT_KEY_HEADER_ENV_VAR

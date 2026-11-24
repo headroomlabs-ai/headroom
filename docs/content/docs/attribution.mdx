@@ -19,7 +19,7 @@ publish it as a label with `register_dimension`, and everything below picks it u
 |---|---|
 | `project` | `X-Headroom-Project` (sent by `headroom wrap`) or a `/p/<name>` base-URL prefix |
 | `client` | The harness: `X-Client`, else the User-Agent (`claude-code`, `codex`, `cursor`, …) |
-| `tenant` | The tenant-id header (`HEADROOM_TENANT_KEY_HEADER`), when sent |
+| `tenant` | The tenant-id header (`HEADROOM_TENANT_KEY_HEADER`), when sent. A header that carries a credential (`Authorization`, `Cookie`, an API key such as `X-Goog-Api-Key`, or any name with a `key`, `token` or `secret` part) is never read, and the proxy logs a warning once |
 
 A dimension with nothing to report is left off the request — never filled with a
 placeholder — so unattributed traffic changes only the totals. Reports that split by a

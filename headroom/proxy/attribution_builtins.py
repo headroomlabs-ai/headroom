@@ -15,7 +15,11 @@ new trust assumption:
 
 from __future__ import annotations
 
+import logging
+
 from headroom.proxy.attribution import AttributionRequest, _register_if_absent
+
+logger = logging.getLogger("headroom.proxy")
 
 
 def resolve_project(request: AttributionRequest) -> str | None:
@@ -30,10 +34,26 @@ def resolve_client(request: AttributionRequest) -> str | None:
     return classify_client(request.headers)
 
 
+_warned_tenant_headers: set[str] = set()
+
+
+def _warn_credential_tenant_header(header: str) -> None:
+    key = header.lower()
+    if key in _warned_tenant_headers:
+        return
+    _warned_tenant_headers.add(key)
+    logger.warning(
+        "attribution: tenant header %r names a credential; no tenant label is recorded", header
+    )
+
+
 def resolve_tenant(request: AttributionRequest) -> str | None:
     import os
 
-    from headroom.proxy.internal_header_policy import is_credential_header
+    from headroom.proxy.internal_header_policy import (
+        is_credential_header,
+        is_credential_tag_key,
+    )
     from headroom.proxy.tenant_key import (
         DEFAULT_TENANT_KEY_HEADER,
         TENANT_KEY_HEADER_ENV_VAR,
@@ -42,7 +62,10 @@ def resolve_tenant(request: AttributionRequest) -> str | None:
 
     header = os.environ.get(TENANT_KEY_HEADER_ENV_VAR, "").strip() or DEFAULT_TENANT_KEY_HEADER
     # A label is persisted, so a misconfigured header must not turn a secret into one.
-    if is_credential_header(header):
+    # ``is_credential_header`` names the client-auth headers; the name-component rule
+    # also catches provider keys such as ``x-goog-api-key``.
+    if is_credential_header(header) or is_credential_tag_key(header):
+        _warn_credential_tenant_header(header)
         return None
     raw = request.header(header)
     if not raw:
