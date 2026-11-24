@@ -82,6 +82,11 @@ _REFRESH_RESERVE = 2
 _REFRESH_AFTER_S = 60.0
 _REMEMBER_MAX_ENTRIES = 8192
 _REMEMBER_MAX_PER_CLIENT = 32
+# Answers that say the name has no address, as opposed to a resolver that is
+# slow or failing (EAI_AGAIN, EAI_FAIL): these drop a remembered host.
+_NO_ADDRESS_ERRORS = frozenset(
+    code for code in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", None)) if code is not None
+)
 
 # Lookups made outside any request are charged here, apart from every client.
 _INTERNAL_CLIENT = "internal"
@@ -171,7 +176,7 @@ class _Resolver:
                     self._remember(host, addresses, owner)
                     return
                 self._forget(host)
-            elif isinstance(error, socket.gaierror) and error.errno == socket.EAI_NONAME:
+            elif isinstance(error, socket.gaierror) and error.errno in _NO_ADDRESS_ERRORS:
                 self._forget(host)
 
     def _remember(self, host: str, addresses: tuple[str, ...], owner: str) -> None:
@@ -181,7 +186,7 @@ class _Resolver:
             self._memory.move_to_end(host)
             return
         if self._remembered_by.get(owner, 0) >= _REMEMBER_MAX_PER_CLIENT:
-            return
+            self._forget(next(h for h, e in self._memory.items() if e.owner == owner))
         while len(self._memory) >= _REMEMBER_MAX_ENTRIES:
             self._forget(next(iter(self._memory)))
         self._memory[host] = _Remembered(addresses, time.monotonic(), owner)
@@ -531,11 +536,31 @@ def _judge_answer(connect_host: str, infos: list, scope: dict[str, UpstreamPin] 
     return _record_validated_addresses(connect_host, addresses, scope)
 
 
-def _from_memory(connect_host: str, scope: dict[str, UpstreamPin] | None) -> bool | None:
+PROXIED_BASE_URLS_ENV = "HEADROOM_PROXIED_BASE_URLS"
+
+
+def _listed_for_proxy(url: str) -> bool:
+    allow = allowlisted_destinations(PROXIED_BASE_URLS_ENV)
+    if allow is None:
+        return False
+    parsed = urlparse((url or "").strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return destination_listed(allow, parsed.scheme, parsed.hostname or "", port)
+
+
+def _from_memory(url: str, connect_host: str, scope: dict[str, UpstreamPin] | None) -> bool | None:
     """Answer a remembered host at once; refresh it in the background when due.
 
-    ``None`` when the host is not remembered and has to be looked up.
+    ``None`` when the host is not remembered and has to be looked up. A
+    destination listed in ``HEADROOM_PROXIED_BASE_URLS`` is always looked up:
+    its connection leaves through the outbound proxy by name, so no pin binds
+    it, and only an answer from this request keeps the check current.
     """
+    if _listed_for_proxy(url):
+        return None
     remembered = _RESOLVER.remembered(connect_host)
     if remembered is None:
         return None
@@ -565,7 +590,7 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
     decided = _check_before_lookup(url)
     if isinstance(decided, bool):
         return decided
-    remembered = _from_memory(decided, scope)
+    remembered = _from_memory(url, decided, scope)
     if remembered is not None:
         return remembered
     lookup = _RESOLVER.start(decided, _UPSTREAM_CLIENT.get(), refresh=False)
@@ -579,6 +604,11 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
         # lookup. Operators can allowlist split-horizon/internal endpoints.
         return False
     return _judge_answer(decided, infos, scope)
+
+
+def _consume_outcome(future: asyncio.Future[list]) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 async def is_safe_upstream_url_async(url: str) -> bool:
@@ -595,7 +625,7 @@ async def is_safe_upstream_url_async(url: str) -> bool:
     decided = _check_before_lookup(url)
     if isinstance(decided, bool):
         return decided
-    remembered = _from_memory(decided, scope)
+    remembered = _from_memory(url, decided, scope)
     if remembered is not None:
         return remembered
     lookup = _RESOLVER.start(decided, _UPSTREAM_CLIENT.get(), refresh=False)
@@ -604,9 +634,11 @@ async def is_safe_upstream_url_async(url: str) -> bool:
     try:
         # Shielded: the lookup may be shared with other callers, and timing out
         # or being cancelled here must not cancel it for them.
-        infos = await asyncio.wait_for(
-            asyncio.shield(asyncio.wrap_future(lookup)), _resolve_timeout_seconds()
-        )
+        # The wrapper is consumed when it settles, so a failure that lands
+        # after this caller gave up is not reported as never retrieved.
+        waited = asyncio.wrap_future(lookup)
+        waited.add_done_callback(_consume_outcome)
+        infos = await asyncio.wait_for(asyncio.shield(waited), _resolve_timeout_seconds())
     except (OSError, asyncio.TimeoutError):
         return False
     return _judge_answer(decided, infos, scope)

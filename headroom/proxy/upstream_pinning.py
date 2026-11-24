@@ -82,12 +82,11 @@ import httpcore
 import httpx
 
 from headroom.proxy.upstream_guard import (
+    PROXIED_BASE_URLS_ENV,
     allowlisted_destinations,
     destination_listed,
     guarded_pin,
 )
-
-PROXIED_BASE_URLS_ENV = "HEADROOM_PROXIED_BASE_URLS"
 
 
 def proxied_upstream_listed(url: httpx.URL) -> bool:

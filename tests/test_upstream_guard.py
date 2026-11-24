@@ -1627,3 +1627,106 @@ def test_lookups_outside_a_request_are_not_charged_to_a_client(
     assert is_safe_upstream_url("https://batch.example/v1") is True
     assert charged == [upstream_guard._INTERNAL_CLIENT]
     assert not charged[0].startswith("peer:")
+
+
+def _answers(monkeypatch: pytest.MonkeyPatch, host: str, outcomes: list[object]) -> None:
+    """Make ``host`` resolve to each outcome in turn: an address, or an error to raise."""
+    real_getaddrinfo = socket.getaddrinfo
+    pending = iter(outcomes)
+
+    def resolve(name: object, *args: object, **kwargs: object) -> list[object]:
+        if name != host:
+            return real_getaddrinfo(name, *args, **kwargs)  # type: ignore[arg-type]
+        outcome = next(pending)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (outcome, 0))]
+
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+
+
+async def test_a_lookup_failing_after_the_caller_gave_up_is_not_left_unretrieved(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import gc
+
+    from headroom.proxy.upstream_guard import is_safe_upstream_url_async
+
+    def slow_then_unavailable(*args: object, **kwargs: object) -> list[object]:
+        slow_zone.release.wait(5)
+        raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_then_unavailable)
+    loop = asyncio.get_running_loop()
+    reports: list[object] = []
+    loop.set_exception_handler(lambda _loop, context: reports.append(context.get("message")))
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+    assert await is_safe_upstream_url_async("https://flaky.example/v1") is False
+
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "5")
+    other = asyncio.create_task(is_safe_upstream_url_async("https://flaky.example/v1"))
+    await asyncio.sleep(0.05)
+    slow_zone.release.set()
+    assert await other is False
+    await asyncio.sleep(0.05)
+    gc.collect()
+    await asyncio.sleep(0.05)
+
+    assert reports == []
+
+
+@pytest.mark.parametrize(
+    ("error", "still_served"),
+    [
+        pytest.param(getattr(socket, "EAI_NODATA", socket.EAI_NONAME), False, id="no-address"),
+        pytest.param(socket.EAI_AGAIN, True, id="temporary-failure"),
+    ],
+)
+def test_only_a_definitive_answer_drops_a_remembered_host(
+    monkeypatch: pytest.MonkeyPatch, error: int, still_served: bool
+) -> None:
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setattr(upstream_guard, "_REFRESH_AFTER_S", 0.0)
+    _answers(
+        monkeypatch,
+        "gw.example",
+        ["20.10.10.10", socket.gaierror(error, "refresh"), socket.gaierror(error, "lookup")],
+    )
+    assert is_safe_upstream_url("https://gw.example/v1") is True
+    _drain()
+    assert is_safe_upstream_url("https://gw.example/v1") is True  # served; refresh runs
+    _drain()
+
+    assert is_safe_upstream_url("https://gw.example/v1") is still_served
+
+
+def test_a_destination_left_to_the_outbound_proxy_is_never_answered_from_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The proxy resolves it by name, so only this request's own answer may admit it."""
+    monkeypatch.setenv("HEADROOM_PROXIED_BASE_URLS", "gw.example")
+    _answers(monkeypatch, "gw.example", ["20.10.10.10", "10.0.0.5"])
+    assert is_safe_upstream_url("https://gw.example/v1") is True
+    _drain()
+
+    assert is_safe_upstream_url("https://gw.example/v1") is False
+
+
+def test_a_network_at_its_quota_replaces_its_own_oldest_name(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setattr(upstream_guard, "_REMEMBER_MAX_PER_CLIENT", 2)
+    _remember_names(_LEGIT, ["old.legit.example", "mid.legit.example", "new.legit.example"])
+    slow_zone.calls.clear()
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+
+    assert is_safe_upstream_url("https://new.legit.example/v1") is True
+    assert is_safe_upstream_url("https://mid.legit.example/v1") is True
+    assert slow_zone.calls == [], "remembered names should be answered without a lookup"
+    is_safe_upstream_url("https://old.legit.example/v1")
+    assert slow_zone.calls == ["old.legit.example"]
