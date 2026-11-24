@@ -6,12 +6,16 @@ import numpy as np
 import pytest
 
 from headroom.memory.adapters.cache import LRUMemoryCache
-from headroom.memory.adapters.hnsw import HNSWVectorIndex
+from headroom.memory.adapters.hnsw import HNSWVectorIndex, _check_hnswlib_available
 from headroom.memory.adapters.sqlite import SQLiteMemoryStore
 from headroom.memory.config import MemoryConfig
 from headroom.memory.core import HierarchicalMemory
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemoryFilter
+
+# HierarchicalMemory requires hnswlib. The probe runs hnswlib in a subprocess and
+# can fail on some CI CPUs or under timeout, so skip instead of erroring at setup.
+pytestmark = pytest.mark.skipif(not _check_hnswlib_available(), reason="hnswlib not available")
 
 
 @pytest.fixture
