@@ -139,15 +139,17 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
         if not raw_messages:
             return []
 
-        # Count tokens
-        token_count = self._count_tokens(raw_messages)
+        # One counter for the threshold check, the pipeline and the saving:
+        # token_count - tokens_after is only meaningful in one unit (#5037).
+        token_counter = self._provider.get_token_counter(self._model)
+        token_count = self._count_tokens(raw_messages, token_counter)
 
         if token_count <= self._threshold:
             return list(raw_messages)
 
         # Apply compression
-        compressed = self._apply_compression(raw_messages)
-        tokens_after = self._count_tokens(compressed)
+        compressed = self._apply_compression(raw_messages, token_counter)
+        tokens_after = self._count_tokens(compressed, token_counter)
 
         self._compression_count += 1
         self._total_tokens_saved += token_count - tokens_after
@@ -187,23 +189,29 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
         """Clear all messages from history."""
         self._base.clear()
 
-    def _count_tokens(self, messages: list[BaseMessage]) -> int:
+    def _count_tokens(self, messages: list[BaseMessage], token_counter: Any = None) -> int:
         """Count tokens in messages using provider's tokenizer.
 
         Args:
             messages: List of messages to count.
+            token_counter: The counter to count with; resolved from the
+                provider when omitted. Pass the same one to every count that
+                is compared with this one.
 
         Returns:
             Total token count.
         """
-        token_counter = self._provider.get_token_counter(self._model)
+        if token_counter is None:
+            token_counter = self._provider.get_token_counter(self._model)
         total = 0
         for msg in messages:
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             total += token_counter.count_text(content)
         return total
 
-    def _apply_compression(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+    def _apply_compression(
+        self, messages: list[BaseMessage], token_counter: Any = None
+    ) -> list[BaseMessage]:
         """Apply live-zone-only compression to messages.
 
         After PR-B1, message-dropping is no longer a strategy — only
@@ -212,6 +220,8 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
 
         Args:
             messages: Messages to compress.
+            token_counter: The caller's counter for this read, handed to the
+                pipeline so its decisions use the same unit.
 
         Returns:
             Messages with their live-zone content compressed where
@@ -228,6 +238,7 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
         result = pipeline.apply(
             messages=openai_messages,
             model=self._model,
+            token_counter=token_counter,
             model_limit=self._threshold,
         )
 
