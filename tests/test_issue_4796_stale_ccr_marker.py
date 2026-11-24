@@ -194,24 +194,91 @@ def test_sqlite_probe_failure_keeps_a_cached_result(tmp_path):
 
     backend = SQLiteBackend(tmp_path / "store.db")
     store = CompressionStore(max_entries=4, backend=backend)
-    set_request_compression_store(store)
+    cache = CompressionCache()
+    hash_key = store.store("the original tool output", "the compressed view")
+    cache.put("k", f"head <<ccr:{hash_key}>>", 0.2, "x")
+    assert cache.get("k", store) is not None
+
+    backend._conn.set_authorizer(lambda *args: sqlite3.SQLITE_DENY)
     try:
-        hash_key = store.store("the original tool output", "the compressed view")
-        cache = CompressionCache()
-        cache.put("k", f"head <<ccr:{hash_key}>>", 0.2, "x")
-        assert cache.get("k") is not None
-
-        backend._conn.set_authorizer(lambda *args: sqlite3.SQLITE_DENY)
-        try:
-            result = cache.get("k")
-        finally:
-            backend._conn.set_authorizer(None)
-
-        assert result is not None, "an unanswered check is not a miss"
-        assert cache.stats["cache_evictions"] == 0
-        assert store.exists(hash_key), "the original is untouched"
+        result = cache.get("k", store)
     finally:
-        clear_request_compression_store()
+        backend._conn.set_authorizer(None)
+
+    assert result is not None, "an unanswered check is not a miss"
+    assert cache.stats["cache_evictions"] == 0
+    assert store.exists(hash_key), "the original is untouched"
+
+
+def test_router_cache_hit_survives_unknown_sqlite_probe_in_both_paths(tmp_path, monkeypatch):
+    """The post-get retrievability guard must preserve an unknown probe too."""
+    sqlite3 = pytest.importorskip("sqlite3")
+    from headroom.cache.backends.sqlite import SQLiteBackend
+
+    backend = SQLiteBackend(tmp_path / "router-store.db")
+    store = CompressionStore(max_entries=4, backend=backend)
+    router = ContentRouter(ContentRouterConfig(ccr_inject_marker=False))
+    monkeypatch.setattr(router, "_kompress_model_ready", lambda: True)
+    calls: list[str] = []
+
+    def compress(content, context="", bias=1.0, **kwargs):
+        calls.append(content)
+        hash_key = store.store(content, "compressed view")
+        return SimpleNamespace(
+            original=content,
+            compressed=f"compressed copy <<ccr:{hash_key}>>",
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.KOMPRESS,
+            strategy_chain=[],
+        )
+
+    monkeypatch.setattr(router, "compress", compress)
+    string_args = (payload("sqlite-string"), Tokenizer())
+    first = tool_output(router.apply(*string_args, compression_store=store))
+    backend._conn.set_authorizer(lambda *args: sqlite3.SQLITE_DENY)
+    try:
+        assert tool_output(router.apply(*string_args, compression_store=store)) == first
+    finally:
+        backend._conn.set_authorizer(None)
+    assert len(calls) == 1, "string path must preserve cache on unknown liveness"
+
+    block_message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "sqlite-block",
+                "content": tool_log("sqlite-block"),
+            }
+        ],
+    }
+    block_args = ([block_message], Tokenizer())
+    first_blocks = router.apply(*block_args, compression_store=store)
+    original_block_text = first_blocks.messages[-1]["content"][0]["content"]
+    backend._conn.set_authorizer(lambda *args: sqlite3.SQLITE_DENY)
+    try:
+        second_blocks = router.apply(*block_args, compression_store=store)
+    finally:
+        backend._conn.set_authorizer(None)
+    assert second_blocks.messages[-1]["content"][0]["content"] == original_block_text
+    assert len(calls) == 2, "block path must preserve cache on unknown liveness"
+
+
+def test_same_text_replacement_survives_stale_probe(monkeypatch):
+    """An identical-text replacement is a new entry and must not be dropped."""
+    cache = CompressionCache()
+    text = "head <<ccr:0123456789abcdef>>"
+    cache.put("k", text, 0.2, "x")
+
+    class Store:
+        def all_live(self, hash_keys):
+            cache.put("k", text, 0.2, "x")
+            return False
+
+    store = Store()
+    cache._drop_if_a_marker_died("k", store)
+    assert cache.get("k", store) == (text, 0.2, "x")
+    assert cache.stats["cache_evictions"] == 0
 
 
 def test_a_successful_zero_exists_is_a_definite_miss_despite_a_failing_write():

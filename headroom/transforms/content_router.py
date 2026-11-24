@@ -2052,16 +2052,15 @@ class CompressionCache:
         stale one would have been expired by its marker ttl anyway.
         """
         with self._lock:
-            entry = self._results.get(key)
-            if entry is None or not entry[5]:
+            probed_entry = self._results.get(key)
+            if probed_entry is None or not probed_entry[5]:
                 return
-            compressed = entry[0]
+            compressed = probed_entry[0]
         if _ccr_markers_live(compressed, compression_store):
             return
         with self._lock:
-            entry = self._results.get(key)
-            if entry is None or entry[0] != compressed:
-                return  # replaced meanwhile; that text has its own markers
+            if self._results.get(key) is not probed_entry:
+                return  # replaced meanwhile, even if the text is identical
             self._drop_locked(key)
             self._evictions += 1
 
@@ -8102,7 +8101,14 @@ class ContentRouter(Transform):
         if not marker_hashes:
             return True
         store = cls._resolve_ccr_store(compression_store)
-        exists_fn = getattr(store, "exists", None) if store is not None else None
+        if store is None:
+            return True
+        all_live = getattr(store, "all_live", None)
+        if all_live is not None:
+            # Unknown means the store could not answer; preserve the cached
+            # result just as CompressionCache.get() does.
+            return all_live(marker_hashes) is not False
+        exists_fn = getattr(store, "exists", None)
         if exists_fn is None:
             return True
         return all(bool(exists_fn(hash_key)) for hash_key in marker_hashes)
