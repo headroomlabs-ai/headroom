@@ -22,7 +22,7 @@ from headroom.transforms.content_router import (
     _bash_command_is_search,
     _bash_program,
 )
-from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_compaction import expand_runs, search_unheading
 
 SEARCH = frozenset({"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"})
 GREP = "".join(
@@ -176,7 +176,13 @@ TOMCAT_LOG = "\n".join(
 )
 
 
-@pytest.mark.parametrize("send", [_openai, _anthropic])
+def _openai_text_blocks(command: str, content: str, tokenizer, config=None):
+    # Some OpenAI-compatible clients send tool output as a list of text blocks.
+    out, transforms = _openai(command, [{"type": "text", "text": content}], tokenizer, config)
+    return out[0]["text"], transforms
+
+
+@pytest.mark.parametrize("send", [_openai, _anthropic, _openai_text_blocks])
 @pytest.mark.parametrize(
     "config",
     [
@@ -194,6 +200,21 @@ def test_timestamped_search_stays_whole_without_ccr(send, config, tokenizer):
     out, transforms = send("grep INFO logs/catalina.out", TOMCAT_LOG, tokenizer, config())
     assert "router:bash:search_verbatim" in transforms
     assert out == TOMCAT_LOG
+
+
+def test_lossless_mode_still_folds_repeated_timestamped_matches(tokenizer):
+    # Lossless mode has no markers either, but it never compresses lossily,
+    # so its reversible run fold must still get the chance to shrink repeats.
+    repeated = "\n".join(
+        "02-Sep-2026 14:00:00.123 INFO [main] org.apache.catalina.core.ContainerBase handled"
+        for _ in range(100)
+    )
+    out, transforms = _openai(
+        "grep INFO logs/catalina.out", repeated, tokenizer, ContentRouterConfig(lossless=True)
+    )
+    assert "router:bash:search_verbatim" not in transforms
+    assert len(out) < len(repeated)
+    assert expand_runs(out) == repeated
 
 
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----

@@ -7813,8 +7813,10 @@ class ContentRouter(Transform):
         skips timestamp rows, so the payload falls through to the log
         compressor, which drops rows. Without a retrieval marker (``--no-ccr``)
         there is no way to get them back, so keep the matches verbatim instead.
+        Lossless mode never reaches lossy compression, so its own reversible
+        folds still run.
         """
-        if self.config.ccr_enabled and self.config.ccr_inject_marker:
+        if self.config.lossless or (self.config.ccr_enabled and self.config.ccr_inject_marker):
             return False
         if not isinstance(content, str) or len(content) < 200:
             return False
@@ -8517,6 +8519,16 @@ class ContentRouter(Transform):
                         if route_counts is not None:
                             route_counts["shell_small_result"] = (
                                 route_counts.get("shell_small_result", 0) + 1
+                            )
+                        continue
+                    if self._bash_search_keep_verbatim(
+                        _shell_name, _msg_tool_id, block.get("text", "")
+                    ):
+                        new_blocks.append(block)
+                        transforms_applied.append("router:bash:search_verbatim")
+                        if route_counts is not None:
+                            route_counts["bash_search_verbatim"] = (
+                                route_counts.get("bash_search_verbatim", 0) + 1
                             )
                         continue
                 text_content = block.get("text", "")
