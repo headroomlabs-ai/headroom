@@ -22,7 +22,6 @@ import logging
 import math
 import os
 import re
-import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -410,34 +409,54 @@ def _report_load_busy(model_id: str, budget: float, *, stage: str) -> None:
     )
 
 
-def _import_bounded(model_id: str, deadline: float, loader: Callable[[], Any]) -> Any:
-    """Run a first-time import, but not for longer than the remaining budget.
+# One in-flight import per module stack, so a stalled import is not re-entered by
+# every caller that times out behind it.
+_inflight_imports: dict[str, tuple[threading.Thread, dict[str, Any]]] = {}
+_inflight_imports_guard = threading.Lock()
+
+
+def _import_bounded(model_id: str, deadline: float, key: str, loader: Callable[[], Any]) -> Any:
+    """Run (or join) ``loader``, but not for longer than the remaining budget.
 
     ``import transformers`` pulls torch in through ``dlopen``; importlib
     serialises a module's first import behind a per-module lock, so a caller that
     merely *imports* can wait just as long as one waiting on our model lock.
     Running it here means a busy-import caller reaches its timeout instead of
     inheriting someone else's minute-scale page-in.
+
+    ``sys.modules`` is not a readiness check: importlib publishes the module
+    *before* running ``exec_module``, so ``"transformers" in sys.modules`` is
+    already true for the whole window this is meant to cover. Every path goes
+    through here instead.
     """
-    box: dict[str, Any] = {}
+    with _inflight_imports_guard:
+        entry = _inflight_imports.get(key)
+        if entry is not None and "value" in entry[1]:
+            return entry[1]["value"]
+        if entry is None or not entry[0].is_alive():
+            box: dict[str, Any] = {}
 
-    def _run() -> None:
-        try:
-            box["value"] = loader()
-        except OfflineEgressBlocked as exc:
-            # A refusal is a BaseException on purpose; keep it out of the broad
-            # handler below so nothing here can look like a swallow.
-            box["error"] = exc
-            raise
-        except BaseException as exc:  # relayed to the caller's thread below
-            box["error"] = exc
+            def _run(box: dict[str, Any] = box) -> None:
+                try:
+                    box["value"] = loader()
+                except OfflineEgressBlocked as exc:
+                    # A refusal is a BaseException on purpose; keep it out of the
+                    # broad handler below so nothing here can look like a swallow.
+                    box["error"] = exc
+                    raise
+                except BaseException as exc:  # relayed to the caller's thread below
+                    box["error"] = exc
 
-    worker = threading.Thread(target=_run, name="kompress-import", daemon=True)
-    worker.start()
+            worker = threading.Thread(target=_run, name="kompress-import", daemon=True)
+            entry = (worker, box)
+            _inflight_imports[key] = entry
+            worker.start()
+
+    worker, box = entry
     worker.join(max(deadline - time.monotonic(), 0.0))
     if worker.is_alive():
-        # The import keeps running on its own; the next caller finds it in
-        # sys.modules instead of paying for it again.
+        # The import keeps running on its own; the next caller joins this thread
+        # instead of paying for the import again.
         _report_load_busy(model_id, 0.0, stage="import")
         raise KompressModelBusy(model_id)
     error = box.get("error")
@@ -446,7 +465,7 @@ def _import_bounded(model_id: str, deadline: float, loader: Callable[[], Any]) -
     return box["value"]
 
 
-def _import_ml_stack() -> tuple[Any, Any]:
+def _load_ml_stack() -> tuple[Any, Any]:
     """``(torch, transformers.AutoTokenizer)`` for a first-touch load."""
     import torch
     from transformers import AutoTokenizer
@@ -454,19 +473,22 @@ def _import_ml_stack() -> tuple[Any, Any]:
     return torch, AutoTokenizer
 
 
+def _load_auto_tokenizer() -> Any:
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer
+
+
+def _import_ml_stack(model_id: str, deadline: float) -> tuple[Any, Any]:
+    stack: tuple[Any, Any] = _import_bounded(
+        model_id, deadline, "torch+transformers", _load_ml_stack
+    )
+    return stack
+
+
 def _import_auto_tokenizer(model_id: str, deadline: float) -> Any:
-    """``transformers.AutoTokenizer``, bounded when this is a first import."""
-    if "transformers" in sys.modules:
-        from transformers import AutoTokenizer
-
-        return AutoTokenizer
-
-    def _load() -> Any:
-        from transformers import AutoTokenizer
-
-        return AutoTokenizer
-
-    return _import_bounded(model_id, deadline, _load)
+    """``transformers.AutoTokenizer``, bounded whatever the import is doing."""
+    return _import_bounded(model_id, deadline, "transformers", _load_auto_tokenizer)
 
 
 _execution_semaphores: dict[str, threading.BoundedSemaphore] = {}
@@ -1323,15 +1345,9 @@ def _load_kompress_pytorch(
     if deadline is None:
         deadline = time.monotonic() + _load_lock_budget_seconds()
 
-    if "torch" in sys.modules and "transformers" in sys.modules:
-        import torch
-        from transformers import AutoTokenizer
-    else:
-        # First touch of the ML stack: minutes of dlopen on a degraded
-        # filesystem, so it spends the same contention budget as the lock.
-        torch, AutoTokenizer = _import_bounded(  # type: ignore[misc]
-            model_id, deadline, _import_ml_stack
-        )
+    # First touch of the ML stack is minutes of dlopen on a degraded filesystem,
+    # so it spends the same contention budget as the lock.
+    torch, AutoTokenizer = _import_ml_stack(model_id, deadline)
 
     with _kompress_load_lock(model_id, deadline):
         if model_id in _kompress_cache:
