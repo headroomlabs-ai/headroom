@@ -9,6 +9,7 @@ way a user would from the shell.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import shutil
 import sqlite3
@@ -2343,22 +2344,38 @@ def test_pids_from_netstat_reads_probed_listeners_whatever_the_locale() -> None:
     assert wrap_mod._pids_from_netstat(output, 8787) == {4242, 4244}
 
 
+def _proc_hex(ip: str) -> str:
+    """``ip`` as /proc/net/tcp writes it: the raw bytes, in host byte order, as hex."""
+    raw = ipaddress.IPv4Address(ip).packed
+    return (raw[::-1] if sys.byteorder == "little" else raw).hex().upper()
+
+
 def test_pids_from_proc_reads_probed_listeners_from_kernel_tables(tmp_path: Path) -> None:
-    """Linux fallback: socket inodes from /proc/net/tcp, owners from /proc/<pid>/fd."""
+    """Linux fallback: socket inodes from /proc/net/tcp, owners from /proc/<pid>/fd.
+
+    Only 127.0.0.1 and 0.0.0.0 count; 1.0.0.127 (127.0.0.1 with its bytes
+    swapped) and a LAN address do not.
+    """
+    lo, anyaddr = _proc_hex("127.0.0.1"), _proc_hex("0.0.0.0")
+    swapped, lan = _proc_hex("1.0.0.127"), _proc_hex("192.168.0.5")
+    rest = "00000000:00000000 00:00000000 00000000  501 0"
     (tmp_path / "net").mkdir()
     (tmp_path / "net" / "tcp").write_text(
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-        "   0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501 0 1111\n"
-        "   1: 0500A8C0:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501 0 2222\n"
-        "   2: 0100007F:2253 0100007F:C350 01 00000000:00000000 00:00000000 00000000  501 0 3333\n",
+        f"   0: {lo}:2253 00000000:0000 0A {rest} 1111\n"
+        f"   1: {lan}:2253 00000000:0000 0A {rest} 2222\n"
+        f"   2: {lo}:2253 {lo}:C350 01 {rest} 3333\n"
+        f"   3: {swapped}:2253 00000000:0000 0A {rest} 4444\n"
+        f"   4: {anyaddr}:2253 00000000:0000 0A {rest} 5555\n",
         encoding="ascii",
     )
-    for pid, inode in (("4242", "1111"), ("555", "2222"), ("777", "3333")):
+    owners = (("4242", "1111"), ("555", "2222"), ("777", "3333"), ("888", "4444"), ("999", "5555"))
+    for pid, inode in owners:
         (tmp_path / pid / "fd").mkdir(parents=True)
         os.symlink(f"socket:[{inode}]", tmp_path / pid / "fd" / "3")
     (tmp_path / "self").mkdir()  # non-numeric entries are skipped
 
-    assert wrap_mod._pids_from_proc(8787, tmp_path) == {4242}
+    assert wrap_mod._pids_from_proc(8787, tmp_path) == {4242, 999}
 
 
 def test_pids_from_proc_skips_a_descriptor_that_closes_during_the_scan(
@@ -2368,7 +2385,8 @@ def test_pids_from_proc_skips_a_descriptor_that_closes_during_the_scan(
     (tmp_path / "net").mkdir()
     (tmp_path / "net" / "tcp").write_text(
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-        "   0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501 0 1111\n",
+        f"   0: {_proc_hex('127.0.0.1')}:2253 00000000:0000 0A "
+        "00000000:00000000 00:00000000 00000000  501 0 1111\n",
         encoding="ascii",
     )
     fds = tmp_path / "4242" / "fd"
@@ -2416,6 +2434,7 @@ def test_listening_pids_runs_netstat_from_the_windows_system_dir(
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
+    monkeypatch.setitem(sys.modules, "psutil", None)  # force the netstat branch
     monkeypatch.setattr(wrap_mod, "run", run)
     monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
     monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))

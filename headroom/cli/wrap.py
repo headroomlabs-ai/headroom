@@ -25,6 +25,7 @@ import atexit
 import errno
 import importlib.util
 import io
+import ipaddress
 import json
 import os
 import re
@@ -4640,9 +4641,18 @@ def _pids_from_netstat(output: str, port: int) -> set[int]:
     return pids
 
 
-# 127.0.0.1 and 0.0.0.0 as /proc/net/tcp writes them (host byte order).
-_PROC_PROBED_HOSTS = {"0100007F", "7F000001", "00000000"}
 _PROC_TCP_LISTEN = "0A"
+
+
+def _proc_ipv4(hex_host: str) -> str | None:
+    """Dotted IPv4 for a /proc/net/tcp address: hex of the raw bytes in host order."""
+    try:
+        raw = bytes.fromhex(hex_host)
+    except ValueError:
+        return None
+    if len(raw) != 4:
+        return None
+    return str(ipaddress.IPv4Address(raw[::-1] if sys.byteorder == "little" else raw))
 
 
 def _pids_from_proc(port: int, proc: Path = Path("/proc")) -> set[int] | None:
@@ -4662,7 +4672,7 @@ def _pids_from_proc(port: int, proc: Path = Path("/proc")) -> set[int] | None:
         if len(cols) < 10 or cols[3] != _PROC_TCP_LISTEN:
             continue
         host, _, hex_port = cols[1].partition(":")
-        if host in _PROC_PROBED_HOSTS and hex_port == f"{port:04X}":
+        if hex_port == f"{port:04X}" and _reaches_probe(f"{_proc_ipv4(host)}:{port}", port):
             sockets.add(f"socket:[{cols[9]}]")
     pids: set[int] = set()
     if not sockets:
