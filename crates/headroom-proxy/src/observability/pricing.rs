@@ -355,16 +355,51 @@ pub fn lookup_card(model: &str) -> Option<PriceCard> {
 /// id (`qwen/qwen3.8-27b` bills differently on OpenRouter and Groq).
 pub fn lookup_card_on(model: &str, upstream: Option<llm_prices::Provider>) -> Option<PriceCard> {
     let table = book();
-    for key in candidates(model) {
-        if let Some(card) = table.get(&key) {
-            return Some(*card);
+    let vendored = |id: &str| {
+        candidates(id)
+            .iter()
+            .find_map(|key| table.get(key).copied())
+    };
+    if let Some(card) = vendored(model) {
+        return Some(card);
+    }
+    // A system inference-profile ARN names the same profile as its bare
+    // id, so after a vendored miss it prices exactly like that id.
+    let id = system_inference_profile_id(model).unwrap_or(model);
+    if id != model {
+        if let Some(card) = vendored(id) {
+            return Some(card);
         }
     }
-    if let Some(card) = llm_prices_card(model, upstream) {
+    if let Some(card) = llm_prices_card(id, upstream) {
         return Some(card);
     }
     warn_once(model);
     None
+}
+
+/// The profile id inside a system-defined Bedrock inference-profile ARN
+/// (`arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-8`
+/// -> `us.anthropic.claude-opus-4-8`), regional prefix kept. Application
+/// inference profiles (`application-inference-profile/<opaque id>`) and
+/// ids without a geo prefix are not system profiles and return `None`.
+fn system_inference_profile_id(model: &str) -> Option<&str> {
+    let model = model.trim();
+    let mut parts = model.splitn(6, ':');
+    let (arn, partition, service) = (parts.next()?, parts.next()?, parts.next()?);
+    let (_region, _account, resource) = (parts.next()?, parts.next()?, parts.next()?);
+    if !arn.eq_ignore_ascii_case("arn")
+        || !partition.to_ascii_lowercase().starts_with("aws")
+        || !service.eq_ignore_ascii_case("bedrock")
+    {
+        return None;
+    }
+    let (kind, id) = resource.split_once('/')?;
+    let lower = id.to_ascii_lowercase();
+    (kind.eq_ignore_ascii_case("inference-profile")
+        && !id.contains('/')
+        && strip_geo_prefix(&lower).len() < lower.len())
+    .then_some(id)
 }
 
 /// The pricing provider for a ledger lane: Bedrock and Vertex lanes
@@ -650,6 +685,31 @@ mod tests {
     fn llm_prices_fallback_keeps_colon_variant_miss() {
         assert!(lookup_card("us.anthropic.claude-opus-4-8-v1:priority").is_none());
         assert!(lookup_card("us.anthropic.claude-opus-4-8-v1:").is_none());
+    }
+
+    /// A system inference-profile ARN prices like its bare profile id;
+    /// opaque application profiles stay unpriced.
+    #[test]
+    fn system_inference_profile_arn_prices_like_its_id() {
+        use llm_prices::Provider;
+        let id = "us.anthropic.claude-opus-4-8";
+        let arn =
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-8";
+        assert!(book().get(id).is_none(), "fixture guard");
+        let bare = lookup_card_on(id, Some(Provider::Bedrock)).expect("bare id priced");
+        let via_arn = lookup_card_on(arn, Some(Provider::Bedrock)).expect("ARN priced");
+        assert_eq!(bare, via_arn);
+        assert!(
+            (bare.base.input - 5.5e-6).abs() < 1e-15 && (bare.base.output - 27.5e-6).abs() < 1e-15
+        );
+        assert_eq!(system_inference_profile_id(arn), Some(id));
+        for opaque in [
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5f6",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/a1b2c3d4e5f6",
+        ] {
+            assert_eq!(system_inference_profile_id(opaque), None);
+            assert!(lookup_card_on(opaque, Some(Provider::Bedrock)).is_none());
+        }
     }
 
     /// The same open-weight id bills at each upstream's own rate.
