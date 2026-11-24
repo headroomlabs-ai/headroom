@@ -68,6 +68,11 @@ _WIN_LOCK_RETRY_ERRNOS = frozenset(
     if (code := getattr(errno, name, None)) is not None
 )
 _WIN_LOCK_RETRY_WINERRORS = frozenset({32, 33})  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+_POSIX_LOCK_RETRY_ERRNOS = frozenset(
+    code
+    for name in ("EAGAIN", "EWOULDBLOCK", "EACCES", "EINTR")
+    if (code := getattr(errno, name, None)) is not None
+)
 
 
 def _is_windows_lock_contention(exc: OSError) -> bool:
@@ -118,7 +123,14 @@ async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[None]:
         else:
             import fcntl
 
-            await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in _POSIX_LOCK_RETRY_ERRNOS:
+                        raise
+                    await asyncio.sleep(0.05)
             try:
                 yield
             finally:

@@ -278,3 +278,85 @@ print(count)
     c2 = int(out2.strip())
     assert c1 + c2 == 1, f"expected 1 combined record across two workers, got {c1} + {c2}"
     assert _evt_files() == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_contended_drain_leaves_no_pending_lock_and_allows_other_worker(
+    isolated_home, monkeypatch
+):
+    """Cancelling a drain waiting on a contended lock must leave no in-flight lock op."""
+    import asyncio
+    import os
+    import sys
+
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+    inbox = agy_savings_inbox.inbox_dir()
+    lock_path = inbox / ".drain.lock"
+
+    holder_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    in_flight = 0
+    errors_after_cancel: list[BaseException] = []
+    cancelled = False
+
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            if os.fstat(holder_fd).st_size == 0:
+                os.write(holder_fd, b"0")
+            os.lseek(holder_fd, 0, os.SEEK_SET)
+            msvcrt.locking(holder_fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            real_flock = fcntl.flock
+
+            def _spy_flock(fd: int, op: int) -> None:
+                nonlocal in_flight
+                in_flight += 1
+                try:
+                    real_flock(fd, op)
+                except OSError as exc:
+                    if cancelled:
+                        errors_after_cancel.append(exc)
+                    raise
+                finally:
+                    in_flight -= 1
+
+            monkeypatch.setattr(fcntl, "flock", _spy_flock)
+
+        contended_metrics = FakeMetrics()
+        drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(contended_metrics))
+        await asyncio.sleep(0.1)
+        assert not drain_task.done()
+
+        drain_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain_task
+        cancelled = True
+
+        assert in_flight == 0, "blocking flock call is still in flight after cancellation"
+        assert contended_metrics.calls == []
+    finally:
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(holder_fd, 0, os.SEEK_SET)
+            msvcrt.locking(holder_fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            # Use real_flock so the spy doesn't count the test harness's own unlock.
+            real_flock(holder_fd, fcntl.LOCK_UN)
+        os.close(holder_fd)
+
+    assert errors_after_cancel == []
+
+    # Another worker can now acquire the lock and drain the event cleanly.
+    other_metrics = FakeMetrics()
+    recorded = await agy_savings_inbox.drain_inbox(other_metrics)
+    assert recorded == 1
+    assert other_metrics.calls == [_FUNNEL_KWARGS]
+    assert _evt_files() == []
