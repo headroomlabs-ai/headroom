@@ -301,23 +301,21 @@ def _read_event_envelope(event_file: Path) -> dict[str, Any]:
 async def _run_in_thread_before_unlock(fn: Callable[..., Any], *args: Any) -> Any:
     """Run a bounded disk helper off the event loop and finish it before unlocking.
 
-    Offloading keeps the proxy event loop responsive during backlog replay. If
-    the drain task is cancelled while a disk write is in flight, wait for that
-    bounded call to finish before releasing ``.drain.lock`` so no background
-    thread touches ``.processed`` or event files after another worker acquires
-    the lock.
+    Offloading keeps the proxy event loop responsive during backlog replay. On a
+    normal cancellation, wait for the single in-flight disk operation to finish
+    before releasing ``.drain.lock`` so no background thread touches ``.processed``
+    or event files after another worker acquires the lock. A second cancellation
+    (such as a lifespan shutdown timeout) aborts the wait immediately so shutdown
+    cannot stall indefinitely on hung disk I/O.
     """
     fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(fut)
     except asyncio.CancelledError:
-        while not fut.done():
-            try:
-                await asyncio.shield(fut)
-            except asyncio.CancelledError:
-                continue
-            except Exception:  # noqa: BLE001
-                break
+        try:
+            await asyncio.shield(fut)
+        except Exception:  # noqa: BLE001
+            pass
         raise
 
 

@@ -590,3 +590,39 @@ async def test_cancel_during_offloaded_checkpoint_finishes_write_before_unlock(
     assert recorded == 1
     assert [c["project"] for c in second_metrics.calls] == ["second"]
     assert _evt_files() == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_aborts_stalled_checkpoint_wait(isolated_home, monkeypatch):
+    """A second cancellation (e.g. shutdown timeout) must not hang on a stalled fsync."""
+    import asyncio
+    import os
+    import threading
+    import time
+
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+
+    in_fsync = threading.Event()
+    release_fsync = threading.Event()
+    real_fsync = os.fsync
+
+    def _stalled_fsync(fd: int) -> None:
+        in_fsync.set()
+        release_fsync.wait(timeout=5.0)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _stalled_fsync)
+
+    drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(FakeMetrics()))
+    try:
+        deadline = time.monotonic() + 5.0
+        while not in_fsync.is_set():
+            assert time.monotonic() < deadline, "drain did not reach checkpoint fsync"
+            await asyncio.sleep(0.005)
+
+        drain_task.cancel()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.gather(drain_task, return_exceptions=True), timeout=0.05)
+    finally:
+        release_fsync.set()
+        await asyncio.gather(drain_task, return_exceptions=True)
