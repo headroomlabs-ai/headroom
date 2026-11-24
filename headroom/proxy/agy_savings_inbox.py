@@ -363,18 +363,22 @@ def _read_event_envelope(event_file: Path) -> dict[str, Any]:
 
 
 async def _run_in_thread_before_unlock(
-    lease: _DrainLockLease, fn: Callable[..., Any], *args: Any
+    lease: _DrainLockLease,
+    fn: Callable[..., Any],
+    *args: Any,
+    cancellable: bool = True,
 ) -> Any:
     """Run a bounded disk helper off the event loop under ``lease``.
 
     Offloading keeps the proxy event loop responsive during backlog replay. On a
     normal cancellation, wait for the single in-flight disk operation to finish
     before returning. On a second cancellation (such as a lifespan shutdown
-    timeout), stop waiting immediately while ``lease`` keeps ``.drain.lock``
-    held until any already-started worker finishes so no peer worker can
-    double-count the in-flight event. If the queued executor job is cancelled
-    before it ever starts, the done callback marks it aborted and releases the
-    lease immediately so ``.drain.lock`` is never orphaned.
+    timeout), stop waiting immediately:
+    - when ``cancellable=True`` (reads / pre-record ops), cancel ``fut`` so a
+      still-queued helper releases ``.drain.lock`` immediately via ``_on_done``;
+    - when ``cancellable=False`` (post-record checkpoint), leave a queued
+      checkpoint scheduled so it still persists ``.processed``, unlinks the
+      event, and releases ``.drain.lock`` once a worker runs it.
     """
     state_lock = threading.Lock()
     started = False
@@ -420,18 +424,19 @@ async def _run_in_thread_before_unlock(
     except BaseException:
         # Submission can raise after the pool already enqueued `_run` (e.g.
         # ThreadPoolExecutor failing to spawn another OS thread). Coordinate
-        # with `_run` under state_lock so exactly one path runs `fn(*args)`
-        # while `.drain.lock` stays held.
-        run_inline = False
+        # with `_run` under state_lock so exactly one path owns the lease.
+        claimed = False
         with state_lock:
             if not started:
                 cancelled_before_start = True
-                run_inline = True
-        if run_inline:
-            try:
-                return fn(*args)
-            finally:
-                _finish_once()
+                claimed = True
+        if claimed:
+            if not cancellable:
+                try:
+                    return fn(*args)
+                finally:
+                    _finish_once()
+            _finish_once()
         raise
     fut.add_done_callback(_on_done)
     try:
@@ -440,11 +445,11 @@ async def _run_in_thread_before_unlock(
         try:
             await asyncio.shield(fut)
         except asyncio.CancelledError:
-            # Second cancellation (e.g. shutdown timeout): cancel `fut` so a
-            # still-queued helper releases the lease immediately via `_on_done`,
-            # while an already-started helper keeps the lease until its own
-            # `finally:` completes.
-            fut.cancel()
+            # Second cancellation (e.g. shutdown timeout): cancel queued reads
+            # immediately, but preserve queued post-record checkpoints so the
+            # worker still commits `.processed` before releasing `.drain.lock`.
+            if cancellable:
+                fut.cancel()
             raise
         except Exception:  # noqa: BLE001
             pass
@@ -539,7 +544,12 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
                         processed_set.add(event_id)
                         processed_list.append(event_id)
                         await _run_in_thread_before_unlock(
-                            lease, _checkpoint_event, processed_path, event_id, event_file
+                            lease,
+                            _checkpoint_event,
+                            processed_path,
+                            event_id,
+                            event_file,
+                            cancellable=False,
                         )
                     except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
                         logger.debug("agy savings: error replaying %s: %s", event_file.name, exc)

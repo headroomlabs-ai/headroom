@@ -747,3 +747,72 @@ async def test_submission_error_after_enqueue_completes_checkpoint_once_under_lo
     # If a busy worker later dequeues the enqueued checkpoint callable, it is a no-op.
     func, args = captured_checkpoint
     assert func(*args) is None
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_with_queued_checkpoint_preserves_checkpoint_and_prevents_duplicate(
+    isolated_home,
+):
+    """Double-cancelling while a post-record checkpoint is queued must not drop the checkpoint."""
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+
+    loop = asyncio.get_running_loop()
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(pool)
+
+    def _occupy_worker() -> None:
+        blocker_started.set()
+        release_blocker.wait(timeout=5.0)
+
+    recorded_events: list[dict] = []
+    blocker_fut: concurrent.futures.Future | None = None
+
+    class RecordingMetrics:
+        async def record_request(self, **kwargs) -> None:
+            nonlocal blocker_fut
+            recorded_events.append(kwargs)
+            # Occupy the sole executor worker just as record_request returns so
+            # the subsequent _checkpoint_event is queued behind it.
+            blocker_fut = pool.submit(_occupy_worker)
+            assert blocker_started.wait(timeout=5.0)
+
+    try:
+        drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(RecordingMetrics()))
+        while not blocker_started.is_set():
+            await asyncio.sleep(0.005)
+        # Let drain_inbox submit _checkpoint_event to the single-worker pool.
+        await asyncio.sleep(0.05)
+
+        # Cancel twice (normal shutdown + shutdown timeout) while checkpoint is queued.
+        drain_task.cancel()
+        await asyncio.sleep(0.01)
+        drain_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(drain_task, timeout=1.0)
+
+        # Release the busy worker so the queued checkpoint can finish, then drain again.
+        release_blocker.set()
+        assert blocker_fut is not None
+        blocker_fut.result(timeout=5.0)
+
+        # Re-drain with a fresh sink: the checkpoint must have persisted the ID
+        # and unlinked the event, so no duplicate record is produced.
+        class SecondMetrics:
+            async def record_request(self, **kwargs) -> None:
+                recorded_events.append(kwargs)
+
+        second_count = await asyncio.wait_for(
+            agy_savings_inbox.drain_inbox(SecondMetrics()), timeout=5.0
+        )
+        assert second_count == 0
+        assert len(recorded_events) == 1
+        assert _evt_files() == []
+    finally:
+        release_blocker.set()
+        pool.shutdown(wait=True)
