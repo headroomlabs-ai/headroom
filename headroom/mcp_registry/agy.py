@@ -306,6 +306,55 @@ class AgyRegistrar(MCPRegistrar):
             logger.debug("agy: could not lock %s: %s", self._config_file, exc)
             return "failed"
 
+    def confirm_server_if(
+        self,
+        server_name: str,
+        predicate: Callable[[ServerSpec], bool],
+        *,
+        on_confirmed: Callable[[ServerSpec], None] | None = None,
+    ) -> bool:
+        """Verify ``server_name`` still matches ``predicate``, optionally running ``on_confirmed`` under lock.
+
+        When ``on_confirmed`` is provided (e.g. recording ledger ownership after a
+        handshake), both the re-read check and ``on_confirmed`` run inside
+        ``_config_file_lock`` so a concurrent replacement cannot have its ledger
+        fingerprint overwritten by the earlier setup. Extra user-added keys such
+        as ``cwd`` remain valid for confirming a compatible server, but
+        ``on_confirmed`` only runs when the entry has no extra keys.
+        """
+        if on_confirmed is None:
+            current = self.get_server(server_name)
+            return current is not None and predicate(current)
+        if not self._config_file.exists():
+            return False
+        try:
+            with _config_file_lock(self._config_file):
+                if not self._config_file.exists():
+                    return False
+                try:
+                    config = _read_json_for_write(self._config_file)
+                except (_MalformedConfigError, OSError) as exc:
+                    logger.debug("agy: could not confirm %s: %s", self._config_file, exc)
+                    return False
+                servers = config.get("mcpServers")
+                if not isinstance(servers, dict):
+                    return False
+                raw_entry = servers.get(server_name)
+                if not isinstance(raw_entry, dict):
+                    return False
+                current = _try_entry_to_spec(server_name, raw_entry, allow_extra_keys=True)
+                if current is None or not predicate(current):
+                    return False
+                is_strict = (
+                    _try_entry_to_spec(server_name, raw_entry, allow_extra_keys=False) is not None
+                )
+                if is_strict:
+                    on_confirmed(current)
+                return True
+        except OSError as exc:
+            logger.debug("agy: could not lock %s: %s", self._config_file, exc)
+            return False
+
 
 # ----------------------------------------------------------------------
 # JSON helpers (private to this module; do NOT import from claude.py)

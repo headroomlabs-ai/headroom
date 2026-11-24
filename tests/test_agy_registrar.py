@@ -1000,3 +1000,105 @@ class TestRegistrarSafety:
         assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg1) is False
         assert reg1.get_server("headroom") == replacement_spec
         assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True
+
+    def test_retrieve_setup_successful_handshake_aborts_if_entry_replaced_during_handshake(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the entry is replaced during a passing handshake, setup must fail and not prime cache."""
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+        from headroom.ccr.mcp_server import CCR_TOOL_NAME
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        setup_spec = ServerSpec(name="headroom", command="/setup/headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/replacement/headroom",
+            args=("mcp", "serve", "--different"),
+        )
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: setup_spec)
+
+        def _replace_during_passing_handshake(*_args, **_kwargs) -> bool:
+            assert (
+                reg2.register_server(replacement_spec, force=True).status
+                == RegisterStatus.REGISTERED
+            )
+            ledger_mod.record_install("agy", replacement_spec)
+            return True
+
+        monkeypatch.setattr(
+            wrap_mod, "_smoke_verify_mcp_handshake", _replace_during_passing_handshake
+        )
+
+        assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg1) is False
+        assert reg1.get_server("headroom") == replacement_spec
+        assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True
+        tool_cache = reg1.cache_dir / "headroom" / f"{CCR_TOOL_NAME}.json"
+        assert not tool_cache.exists()
+
+    def test_retrieve_setup_post_handshake_check_and_ledger_write_share_config_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A replacement registered after the post-handshake check must keep its ledger ownership."""
+        import threading
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        setup_spec = ServerSpec(name="headroom", command="/setup/headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/replacement/headroom",
+            args=("mcp", "serve", "--newer"),
+        )
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: setup_spec)
+        monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **k: True)
+
+        entered_record = threading.Event()
+        release_record = threading.Event()
+        orig_record = ledger_mod.record_install
+
+        def _paused_record(agent: str, spec: ServerSpec, *args, **kwargs) -> None:
+            if spec == setup_spec and not entered_record.is_set():
+                entered_record.set()
+                release_record.wait(timeout=5.0)
+            orig_record(agent, spec, *args, **kwargs)
+
+        monkeypatch.setattr(ledger_mod, "record_install", _paused_record)
+
+        setup_results: list[bool] = []
+
+        def _run_setup() -> None:
+            setup_results.append(wrap_mod._setup_headroom_retrieve_mcp_agy(reg1))
+
+        def _run_replace() -> None:
+            assert (
+                reg2.register_server(replacement_spec, force=True).status
+                == RegisterStatus.REGISTERED
+            )
+            ledger_mod.record_install("agy", replacement_spec)
+
+        t1 = threading.Thread(target=_run_setup)
+        t2 = threading.Thread(target=_run_replace)
+        t1.start()
+        assert entered_record.wait(timeout=5.0)
+        t2.start()
+        t2.join(timeout=0.1)
+        assert t2.is_alive(), "replacement did not block on config lock during post-handshake write"
+        release_record.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert setup_results == [True]
+        assert reg1.get_server("headroom") == replacement_spec
+        assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True

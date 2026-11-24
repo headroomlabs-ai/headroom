@@ -1629,15 +1629,28 @@ def _setup_headroom_retrieve_mcp_agy(registrar: Any, *, verbose: bool = False) -
         return False
 
     if _smoke_verify_mcp_handshake(spec.command, list(spec.args), dict(spec.env)):
-        # An identical user-installed spec can be used without claiming ownership.
-        if result.status == RegisterStatus.REGISTERED or owned:
-            # Avoid overwriting a replacement entry's ledger record if another
-            # registrar replaced the config entry while the handshake ran.
-            still_ours = (
-                registrar.get_owned_server(spec.name) == spec if supports_locked_ownership else True
+        # Verify the entry we just handshaked is still the configured server
+        # and record ledger ownership under the same config lock so a concurrent
+        # replacement cannot be primed or have its fingerprint overwritten.
+        should_record = result.status == RegisterStatus.REGISTERED or owned
+        if callable(getattr(type(registrar), "confirm_server_if", None)):
+            confirmed = registrar.confirm_server_if(
+                spec.name,
+                lambda current: current == spec,
+                on_confirmed=(
+                    (lambda confirmed_spec: record_install(registrar.name, confirmed_spec))
+                    if should_record
+                    else None
+                ),
             )
-            if still_ours:
-                record_install(registrar.name, spec)
+            if not confirmed:
+                click.echo(
+                    "  MCP retrieve tool: headroom MCP entry changed during handshake — "
+                    "leaving recoverable compression disabled."
+                )
+                return False
+        elif should_record:
+            record_install(registrar.name, spec)
         _prime_agy_retrieve_tool_cache(registrar)
         if verbose:
             click.echo(
