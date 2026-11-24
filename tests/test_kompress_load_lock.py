@@ -16,11 +16,13 @@ every existing passthrough/fallback handler already covers it -- and a wait that
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import logging
 import sys
 import threading
 import time
+from types import ModuleType
 
 import pytest
 
@@ -215,6 +217,8 @@ class _PausedTransformersImport:
         self.stall_seconds = stall_seconds
         self.entered = threading.Event()
         self.release = threading.Event()
+        self._saved_entry: ModuleType | None = None
+        self._fake: ModuleType | None = None
 
     def find_spec(self, fullname, path=None, target=None):  # noqa: D102 - meta_path hook
         if fullname != "transformers":
@@ -231,7 +235,9 @@ class _PausedTransformersImport:
 
     def __enter__(self) -> _PausedTransformersImport:
         _drain_import_threads()
-        sys.modules.pop("transformers", None)
+        # Whatever was in sys.modules["transformers"] belongs to the process, not
+        # to this test; it goes back exactly as it was on exit.
+        self._saved_entry = sys.modules.pop("transformers", None)
         sys.meta_path.insert(0, self)
         self.thread = threading.Thread(target=self._import, daemon=True)
         self.thread.start()
@@ -248,13 +254,16 @@ class _PausedTransformersImport:
         _drain_import_threads()
         if self in sys.meta_path:
             sys.meta_path.remove(self)
-        sys.modules.pop("transformers", None)
+        # Restore the process's own entry; only drop what this test created.
+        entry = sys.modules.pop("transformers", None)
+        if entry is not self._fake or self._saved_entry is None:
+            if self._saved_entry is not None:
+                sys.modules["transformers"] = self._saved_entry
 
     def _import(self) -> None:
-        try:
-            import transformers  # noqa: F401 - stalled inside exec_module
-        except Exception:  # noqa: BLE001 - the finder may refuse the import
-            pass
+        import transformers  # noqa: F401 - stalled inside exec_module
+
+        self.release.wait(self.stall_seconds)
 
 
 def test_zero_budget_caller_does_not_wait_for_a_cold_transformers_import(monkeypatch, caplog):
@@ -303,3 +312,52 @@ def test_deadline_holds_while_transformers_is_still_initialising(monkeypatch, ca
 
     assert elapsed < 1.0, f"{backend} waited {elapsed:.2f}s for an initialising import"
     assert any("stage=import" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_paused_import_restores_a_primed_sys_modules_entry(monkeypatch):
+    """A pre-existing ``transformers`` entry must survive the paused import.
+
+    ``_PausedTransformersImport`` temporarily owns ``sys.modules["transformers"]``
+    while it stalls the import; when the process already had an entry there (a
+    real import in another test, or a sentinel), that object has to come back
+    untouched -- not deleted, not replaced by the finder's fake.
+    """
+    original = ModuleType("transformers")
+    original.AutoTokenizer = object  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", original)
+    monkeypatch.setattr(kc, "_selected_backend", lambda: "onnx")
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
+    monkeypatch.setenv(ENV, "0")
+    thread = _hold_lock_for(3.0)
+
+    with caplog_v2() as records:
+        with _PausedTransformersImport():
+            # While paused, the finder's fake is what a caller sees; the budget
+            # must still fire on it rather than trusting the entry.
+            assert sys.modules["transformers"] is not original
+            with pytest.raises(kc.KompressModelBusy):
+                kc._load_kompress("kompress-primed-entry")
+        assert sys.modules["transformers"] is original
+    thread.join(5.0)
+
+    assert any("stage=import" in r.getMessage() for r in records), records
+
+
+@contextlib.contextmanager
+def caplog_v2():
+    """Minimal warning capture: caplog is per-test, this is usable inside a with."""
+    import logging as _logging
+
+    records: list[_logging.LogRecord] = []
+    handler = _logging.Handler()
+    handler.emit = lambda record: records.append(record)  # type: ignore[method-assign]
+    logger = _logging.getLogger(kc.__name__)
+    logger.addHandler(handler)
+    old_level = logger.level
+    logger.setLevel(_logging.WARNING)
+    try:
+        yield records
+    finally:
+        logger.setLevel(old_level)
+        logger.removeHandler(handler)
