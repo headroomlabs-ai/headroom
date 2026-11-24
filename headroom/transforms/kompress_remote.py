@@ -67,7 +67,7 @@ from .kompress_compressor import (
     KompressConfig,
     KompressResult,
     ccr_retrieval_marker,
-    payload_tokens,
+    payload_token_counts,
     store_kompress_in_ccr,
 )
 
@@ -341,8 +341,7 @@ class RemoteKompressCompressor:
                 )
                 # Whole original against whole marked candidate, one unit,
                 # and the accounting reports that measurement.
-                original_tokens = payload_tokens(content)
-                compressed_tokens = payload_tokens(marked)
+                original_tokens, compressed_tokens = payload_token_counts(content, marked)
                 if compressed_tokens >= original_tokens:
                     return self._passthrough(content, n_words)
                 result.cache_key = cache_key

@@ -152,3 +152,41 @@ def test_no_ccr_mode_ships_unmarked_lossy_unchanged(monkeypatch):
     assert "Retrieve more" not in result.compressed
     [batched] = compressor.compress_batch([SINGLE_TOKEN_SOURCE], batch_size=8)
     assert batched.compressed_tokens == 59
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batched"])
+def test_a_vocab_arriving_mid_gate_does_not_mix_units(monkeypatch, batched):
+    # The reviewer's repro: offline with a cold cache, cl100k_base is seeded
+    # right after the original is counted. Two separate counts then compared
+    # 597 characters with 106 BPE tokens and shipped a candidate that grew
+    # from 100 to 106 tokens. One unit per comparison: this pass counts both
+    # sides in characters, and once the vocab is there both sides are BPE.
+    from headroom.tokenizers import tiktoken_counter
+    from headroom.tokenizers.tiktoken_counter import TiktokenVocabNotCached
+
+    real = pytest.importorskip("tiktoken").get_encoding("cl100k_base")
+    loads = []
+
+    def _arrives_after_first_load(_name):
+        loads.append(_name)
+        if len(loads) == 1:
+            raise TiktokenVocabNotCached("cold cache")
+        return real
+
+    monkeypatch.setattr(kc, "_payload_encoder", None)
+    monkeypatch.setattr(tiktoken_counter, "load_encoding", _arrives_after_first_load)
+    _install(monkeypatch, drop=41)
+    compressor = _compressor(monkeypatch)
+
+    def run():
+        if batched:
+            return compressor.compress_batch([SINGLE_TOKEN_SOURCE], batch_size=8)[0]
+        return compressor.compress(SINGLE_TOKEN_SOURCE)
+
+    during = run()
+    assert during.original_tokens == len(SINGLE_TOKEN_SOURCE)
+    assert during.compressed_tokens == len(during.compressed)
+
+    after = run()
+    assert after.compressed == SINGLE_TOKEN_SOURCE
+    assert after.compression_ratio == 1.0
