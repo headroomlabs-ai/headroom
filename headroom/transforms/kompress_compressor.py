@@ -424,7 +424,12 @@ def _import_bounded(model_id: str, deadline: float, loader: Callable[[], Any]) -
     def _run() -> None:
         try:
             box["value"] = loader()
-        except BaseException as exc:  # re-raised in the caller's thread below
+        except OfflineEgressBlocked as exc:
+            # A refusal is a BaseException on purpose; keep it out of the broad
+            # handler below so nothing here can look like a swallow.
+            box["error"] = exc
+            raise
+        except BaseException as exc:  # relayed to the caller's thread below
             box["error"] = exc
 
     worker = threading.Thread(target=_run, name="kompress-import", daemon=True)
