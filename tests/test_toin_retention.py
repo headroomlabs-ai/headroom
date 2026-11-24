@@ -497,6 +497,102 @@ def test_versioned_store_writes_a_sibling_over_the_pre_upgrade_file(tmp_path) ->
     assert reloaded.loaded_pre_upgrade is False
 
 
+def test_configured_v3_path_stays_independent_of_legacy_store(tmp_path) -> None:
+    """``storage_path='toin.v3.json'`` must not import another store's data.
+
+    Opening ``toin.v3.json`` reads/writes it in place with no pre-upgrade
+    fallback, so saving under a different configured path (which lands in
+    its own ``<name>.v3.json``) cannot leak into the ``toin.v3.json`` store.
+    """
+    legacy = tmp_path / "toin_legacy.json"
+    v3 = tmp_path / "toin.v3.json"
+
+    saved = ToolIntelligenceNetwork(TOINConfig(storage_path=str(legacy), auto_save_interval=0))
+    saved.record_compression(
+        tool_signature=_signature(0),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+        tenant_key="acme.corp",
+    )
+    saved.save()
+    assert saved._patterns
+
+    opened = ToolIntelligenceNetwork(TOINConfig(storage_path=str(v3), auto_save_interval=0))
+    assert opened._backend._path == v3
+    assert opened._backend._pre_upgrade_path is None
+    assert opened._backend.loaded_pre_upgrade is False
+    assert opened._patterns == {}
+    assert not v3.exists()
+
+
+def test_explicit_backend_writes_v3_sibling_keeps_legacy_rollback(tmp_path) -> None:
+    """An explicit backend given ``toin.json`` writes ``toin.v3.json`` in place of legacy.
+
+    The unversioned file stays untouched as the rollback view; a previous
+    release opening the legacy path reads its own layout, not v3 data.
+    """
+    base = tmp_path / "toin.json"
+    base.write_text(json.dumps({"version": "2.0", "patterns": {}}), encoding="utf-8")
+    v3 = tmp_path / "toin.v3.json"
+
+    backend = FileSystemTOINBackend(str(base), store_version="3.0")
+    assert backend._path == v3
+    assert backend._pre_upgrade_path == base
+
+    toin = ToolIntelligenceNetwork(
+        TOINConfig(storage_path="", auto_save_interval=0), backend=backend
+    )
+    toin.record_compression(
+        tool_signature=_signature(1),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+        tenant_key="acme.corp",
+    )
+    toin.save()
+
+    assert v3.is_file()
+    assert json.loads(base.read_text(encoding="utf-8"))["version"] == "2.0"
+    # Legacy reader opens its own layout, not the v3 store.
+    assert FileSystemTOINBackend(str(base)).load()["version"] == "2.0"
+
+
+def test_explicit_backend_without_store_version_writes_unversioned(tmp_path) -> None:
+    """An explicit backend on ``toin.v3.json`` with no store_version writes in place.
+
+    It must not double the suffix (``toin.v3.v3.json``) nor treat ``toin.json``
+    as a pre-upgrade source: the names ``toin.json`` and ``toin.v3.json`` are
+    independent stores.
+    """
+    v3 = tmp_path / "toin.v3.json"
+    backend = FileSystemTOINBackend(str(v3))
+    assert backend._path == v3
+    assert backend._pre_upgrade_path is None
+
+    toin = ToolIntelligenceNetwork(
+        TOINConfig(storage_path="", auto_save_interval=0), backend=backend
+    )
+    toin.record_compression(
+        tool_signature=_signature(2),
+        original_count=10,
+        compressed_count=5,
+        original_tokens=100,
+        compressed_tokens=50,
+        strategy="test",
+        tenant_key="acme.corp",
+    )
+    toin.save()
+
+    assert v3.is_file()
+    assert not (tmp_path / "toin.v3.v3.json").exists()
+    assert not (tmp_path / "toin.json").exists()
+
+
 def test_filesystem_backend_writes_compact_json(tmp_path) -> None:
     path = tmp_path / "toin.json"
     FileSystemTOINBackend(str(path)).save({"patterns": {"a": {"value": 1}}})

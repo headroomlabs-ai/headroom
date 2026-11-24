@@ -8,7 +8,9 @@ version-suffixed sibling (``toin.json`` -> ``toin.v3.json``) and the
 unversioned path is only read, as the pre-upgrade layout. A released
 reader that does not know the new version therefore never opens the new
 file: rolling back loads the last pre-upgrade store instead of
-reinterpreting keys under its old tenant resolver.
+reinterpreting keys under its old tenant resolver. A path that already
+carries the version is written in place, so ``toin.json`` and
+``toin.v3.json`` stay independent stores.
 """
 
 from __future__ import annotations
@@ -22,10 +24,24 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _versioned_path(path: Path, store_version: str) -> Path:
-    """Version-suffixed sibling: ``toin.json`` + ``3.0`` -> ``toin.v3.json``."""
+def _version_paths(path: Path, store_version: str) -> tuple[Path, Path | None]:
+    """Return ``(versioned_write_path, base_rollback_path)``.
+
+    ``toin.json`` + ``3.0`` -> write ``toin.v3.json``, rollback ``toin.json``.
+    A path that already carries the version (``toin.v3.json``) is written in
+    place with no pre-upgrade source, so a caller who names the v3 file
+    explicitly never doubles the suffix or reads another store's data.
+    """
     major = store_version.split(".", 1)[0]
-    return path.with_name(f"{path.stem}.v{major}{path.suffix}")
+    versioned_suffix = f".v{major}{path.suffix}"
+    if path.name.endswith(versioned_suffix):
+        # The caller already named the versioned file (e.g. ``toin.v3.json``).
+        # Write it in place and do not treat the unversioned sibling as a
+        # pre-upgrade source: ``toin.json`` and ``toin.v3.json`` must stay
+        # independent stores, otherwise opening ``toin.v3.json`` would import
+        # the legacy ``toin.json`` store across namespaces.
+        return path, None
+    return path.with_name(f"{path.stem}{versioned_suffix}"), path
 
 
 class FileSystemTOINBackend:
@@ -41,9 +57,12 @@ class FileSystemTOINBackend:
         path: Path to the JSON storage file.
         max_load_bytes: Maximum file size in bytes for loading and saving.
             None disables the limit.
-        store_version: On-disk layout version. When set, writes go to a
-            version-suffixed sibling and ``path`` is read only as the
-            pre-upgrade store. None keeps the unversioned single-file layout.
+        store_version: On-disk layout version. When set on an unversioned
+            path, writes go to a version-suffixed sibling and ``path`` is read
+            only as the pre-upgrade store. When the path already carries that
+            version (``toin.v3.json``), it is written in place with no
+            pre-upgrade source, keeping the two files independent. None keeps
+            the unversioned single-file layout.
     """
 
     def __init__(
@@ -58,8 +77,7 @@ class FileSystemTOINBackend:
         self._pre_upgrade_path: Path | None = None
         self._loaded_pre_upgrade = False
         if store_version:
-            self._pre_upgrade_path = self._path
-            self._path = _versioned_path(self._path, store_version)
+            self._path, self._pre_upgrade_path = _version_paths(self._path, store_version)
 
     def _read_path(self) -> Path:
         """Path to load: this version's store, else the pre-upgrade one."""
