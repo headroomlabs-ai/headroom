@@ -29,10 +29,20 @@ from headroom.transforms import kompress_compressor as kc
 ENV = kc.KOMPRESS_LOAD_LOCK_TIMEOUT_ENV
 
 
+def _drain_import_threads(timeout: float = 5.0) -> None:
+    """Let in-flight import workers finish: one still holding the module lock
+    would make the next test's import look like it never started."""
+    for worker, _box in list(kc._inflight_imports.values()):
+        worker.join(timeout)
+    kc._inflight_imports.clear()
+
+
 @pytest.fixture(autouse=True)
 def _clean_lock(monkeypatch):
     """Guarantee the module lock is free, so a leaked test cannot poison others."""
     monkeypatch.delenv(ENV, raising=False)
+    # A cached import result would skip the import stage these tests measure.
+    _drain_import_threads()
     if kc._kompress_lock.locked():  # pragma: no cover - defensive
         kc._kompress_lock.release()
     yield
@@ -191,82 +201,17 @@ def test_auto_dispatch_spends_one_budget_not_two(monkeypatch, caplog):
     assert elapsed < 0.4, f"waited {elapsed:.2f}s for a 0.25s budget"
 
 
-class _BlockingTransformersImport:
-    """Hold ``import transformers`` open, the way a cold page-in does."""
-
-    def __init__(self, stall_seconds: float = 3.0) -> None:
-        self.stall_seconds = stall_seconds
-        self.entered = threading.Event()
-        self.release = threading.Event()
-
-    def find_spec(self, fullname, path=None, target=None):  # noqa: D102 - meta_path hook
-        if fullname != "transformers":
-            return None
-        self.entered.set()
-        self.release.wait(self.stall_seconds)
-        return None
-
-    def __enter__(self) -> _BlockingTransformersImport:
-        sys.modules.pop("transformers", None)
-        sys.meta_path.insert(0, self)
-        self.thread = threading.Thread(target=self._import, daemon=True)
-        self.thread.start()
-        assert self.entered.wait(5.0), "the blocking finder never ran"
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.release.set()
-        self.thread.join(5.0)
-        if self in sys.meta_path:
-            sys.meta_path.remove(self)
-        sys.modules.pop("transformers", None)
-
-    def _import(self) -> None:
-        try:
-            import transformers  # noqa: F401 - deliberately blocked
-        except Exception:  # noqa: BLE001 - the finder refuses the import
-            pass
-
-
-def test_zero_budget_caller_does_not_wait_for_a_cold_transformers_import(monkeypatch, caplog):
-    """A busy caller must reach its timeout *before* the import, not after it.
-
-    importlib serialises a module's first import behind its own per-module lock,
-    so a caller that starts by importing ``transformers`` inherits whoever is
-    mid-import -- the 156.9 s/2.8 s stall from #4967 -- and only then reaches the
-    lock it can time out on. With no budget that wait must collapse to nothing.
-    """
-    monkeypatch.setenv(ENV, "0")
-    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
-    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
-    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
-    monkeypatch.setattr(
-        kc, "_load_kompress_pytorch", lambda *a, **k: pytest.fail("reached a second backend")
-    )
-    thread = _hold_lock_for(2.0)
-
-    with caplog.at_level(logging.WARNING, logger=kc.__name__):
-        with _BlockingTransformersImport():
-            started = time.monotonic()
-            with pytest.raises(kc.KompressModelBusy):
-                kc._load_kompress("kompress-cold-import")
-            elapsed = time.monotonic() - started
-    thread.join(5.0)
-
-    assert elapsed < 1.0, f"waited {elapsed:.2f}s inside a concurrent import"
-    assert any("stage=import" in r.getMessage() for r in caplog.records), caplog.text
-
-
-class _PausingTransformersInit:
-    """Publish ``transformers`` and then stall inside ``exec_module``.
+class _PausedTransformersImport:
+    """Publish ``transformers`` and stall inside ``exec_module``.
 
     importlib puts the module in ``sys.modules`` *before* running its body, so
-    "already imported" and "still initialising" look identical from the outside.
-    That window is where a caller that trusts ``sys.modules`` waits for a
-    minute-scale ``dlopen`` (#4967).
+    "already imported" and "still initialising" look identical from outside; that
+    window is where a caller trusting ``sys.modules`` waits out a minute-scale
+    ``dlopen`` (#4967). The spec is ours rather than the real package, so the
+    import finishes instantly on release and leaves nothing running behind it.
     """
 
-    def __init__(self, stall_seconds: float = 5.0) -> None:
+    def __init__(self, stall_seconds: float = 20.0) -> None:
         self.stall_seconds = stall_seconds
         self.entered = threading.Event()
         self.release = threading.Event()
@@ -284,17 +229,23 @@ class _PausingTransformersInit:
         self.release.wait(self.stall_seconds)
         module.AutoTokenizer = object
 
-    def __enter__(self) -> _PausingTransformersInit:
+    def __enter__(self) -> _PausedTransformersImport:
+        _drain_import_threads()
         sys.modules.pop("transformers", None)
         sys.meta_path.insert(0, self)
         self.thread = threading.Thread(target=self._import, daemon=True)
         self.thread.start()
-        assert self.entered.wait(5.0), "transformers never started initialising"
+        assert self.entered.wait(20.0), "transformers never started initialising"
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.release.set()
-        self.thread.join(5.0)
+        self.thread.join(20.0)
+        # Drain while the finder is still installed: a worker that started behind
+        # the stall then resolves against this module instead of loading the real
+        # package in the background, which would hold the module lock into the
+        # next test.
+        _drain_import_threads()
         if self in sys.meta_path:
             sys.meta_path.remove(self)
         sys.modules.pop("transformers", None)
@@ -304,6 +255,29 @@ class _PausingTransformersInit:
             import transformers  # noqa: F401 - stalled inside exec_module
         except Exception:  # noqa: BLE001 - the finder may refuse the import
             pass
+
+
+def test_zero_budget_caller_does_not_wait_for_a_cold_transformers_import(monkeypatch, caplog):
+    """A busy caller must reach its timeout *before* the import, not after it."""
+    monkeypatch.setenv(ENV, "0")
+    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
+    monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
+    monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
+    monkeypatch.setattr(
+        kc, "_load_kompress_pytorch", lambda *a, **k: pytest.fail("reached a second backend")
+    )
+    thread = _hold_lock_for(3.0)
+
+    with caplog.at_level(logging.WARNING, logger=kc.__name__):
+        with _PausedTransformersImport():
+            started = time.monotonic()
+            with pytest.raises(kc.KompressModelBusy):
+                kc._load_kompress("kompress-cold-import")
+            elapsed = time.monotonic() - started
+    thread.join(5.0)
+
+    assert elapsed < 1.0, f"waited {elapsed:.2f}s inside a concurrent import"
+    assert any("stage=import" in r.getMessage() for r in caplog.records), caplog.text
 
 
 @pytest.mark.parametrize("backend", ["onnx", "pytorch"])
@@ -320,7 +294,7 @@ def test_deadline_holds_while_transformers_is_still_initialising(monkeypatch, ca
     thread = _hold_lock_for(3.0)
 
     with caplog.at_level(logging.WARNING, logger=kc.__name__):
-        with _PausingTransformersInit():
+        with _PausedTransformersImport():
             started = time.monotonic()
             with pytest.raises(kc.KompressModelBusy):
                 kc._load_kompress(f"kompress-initialising-{backend}")

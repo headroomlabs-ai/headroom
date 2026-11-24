@@ -1124,6 +1124,10 @@ def _load_kompress_onnx(
     instead of hitting the network.
     """
     stage_ms: StageTimings = {}
+    if model_id in _kompress_cache:
+        # Already loaded: no import, no lock, no budget.
+        return _kompress_cache[model_id]
+
     if deadline is None:
         deadline = time.monotonic() + _load_lock_budget_seconds()
     # Imported BEFORE the lock on purpose. This import pulls torch in through
@@ -1342,6 +1346,10 @@ def _load_kompress_pytorch(
     When ``allow_download`` is ``False`` weights and tokenizer are loaded from
     the local cache only; a cache miss raises :class:`KompressModelNotCached`.
     """
+    if model_id in _kompress_cache:
+        # Already loaded: no import, no lock, no budget.
+        return _kompress_cache[model_id]
+
     if deadline is None:
         deadline = time.monotonic() + _load_lock_budget_seconds()
 
