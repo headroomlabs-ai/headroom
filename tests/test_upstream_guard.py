@@ -16,7 +16,10 @@ from pathlib import Path
 import httpcore
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.routing import WebSocketRoute
+from starlette.websockets import WebSocketDisconnect
 
 from headroom.providers.proxy_targets import select_passthrough_base_url
 from headroom.proxy.server import ProxyConfig, create_app
@@ -151,7 +154,15 @@ class _InternalService:
                 self.end_headers()
                 self.wfile.write(body)
 
-            do_GET = do_POST  # noqa: N815
+            # Every method a route might forward with, so a forwarded PUT or
+            # DELETE is recorded rather than answered 501 and missed.
+            do_GET = do_PUT = do_PATCH = do_DELETE = do_POST  # noqa: N815
+
+            def do_HEAD(self) -> None:  # noqa: N802
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
             def log_message(self, *args: object) -> None:
                 return
@@ -202,35 +213,79 @@ def test_alpha_search_rejects_a_caller_named_loopback_upstream() -> None:
     assert "internal-only" not in response.text
 
 
+# A body most provider handlers accept, so a route that validates its body
+# before resolving the upstream is still driven past that check.
+_PROVIDER_SHAPED_BODY = {
+    "model": "gpt-4o-mini",
+    "max_tokens": 8,
+    "messages": [{"role": "user", "content": "x"}],
+    "input": "x",
+    "contents": [{"role": "user", "parts": [{"text": "x"}]}],
+    "query": "x",
+}
+_PROBE_BODIES = ({"q": "x"}, _PROVIDER_SHAPED_BODY)
+_BODY_METHODS = {"POST", "PUT", "PATCH"}
+_UNLOCK_HEADERS = ({"api-key": "x"}, {"x-goog-api-key": "x"})
+
+
+def _route_probes(app: FastAPI) -> tuple[set[tuple[str, str]], set[str]]:
+    """Every (method, path) of the HTTP routes, and every WebSocket path."""
+    http: set[tuple[str, str]] = set()
+    websocket: set[str] = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if not path:
+            continue
+        path = re.sub(r"\{[^}]+\}", "probe", path)
+        if isinstance(route, WebSocketRoute):
+            websocket.add(path)
+            continue
+        for method in getattr(route, "methods", None) or ():
+            http.add((method, path))
+    return http, websocket
+
+
 def test_no_route_forwards_to_a_loopback_upstream() -> None:
     """Sweep the whole route table -- the guard must hold everywhere.
 
     This is the generalisation of the fix: a future route that resolves a
     caller-named upstream without validating it fails here rather than in a
-    CVE.
+    CVE. Every method a route accepts is tried, body-carrying methods with a
+    provider-shaped body as well as a minimal one, and WebSocket routes are
+    opened too.
     """
-    app = _app()
-    probes: set[tuple[str, str]] = set()
-    for route in app.routes:
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None) or set()
-        if not path:
-            continue
-        path = re.sub(r"\{[^}]+\}", "probe", path)
-        for method in ("POST", "GET"):
-            if method in methods:
-                probes.add((method, path))
-                break
+    # A short connect timeout and no connect retries bound each probe that
+    # falls through to a real upstream, so a slow network cannot stall the sweep.
+    app = _app(connect_timeout_seconds=1, retry_max_attempts=1)
+    http_probes, ws_probes = _route_probes(app)
 
-    assert len(probes) > 50, "route discovery found suspiciously few routes"
+    assert len(http_probes) > 50, "route discovery found suspiciously few routes"
+    assert {method for method, _ in http_probes} >= {"GET", "POST", "PUT", "DELETE"}
+    assert ws_probes, "route discovery found no WebSocket routes"
 
-    with _InternalService() as internal, TestClient(app) as client:
-        for method, path in sorted(probes):
-            for unlock in ({"api-key": "x"}, {"x-goog-api-key": "x"}):
+    # Route errors are not the subject: a 500 is a response like any other,
+    # and only a hit on the internal service fails the sweep.
+    with (
+        _InternalService() as internal,
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        for method, path in sorted(http_probes):
+            bodies = _PROBE_BODIES if method in _BODY_METHODS else (None,)
+            for unlock in _UNLOCK_HEADERS:
                 headers = {**unlock, "x-headroom-base-url": internal.url}
-                try:
-                    client.request(method, path, headers=headers, json={"q": "x"})
-                except Exception:  # noqa: BLE001 - route errors are not the subject
+                for body in bodies:
+                    client.request(method, path, headers=headers, json=body)
+
+        # The WebSocket handlers pick and dial their upstream at the handshake,
+        # before the first client frame, so opening the socket is the probe.
+        for path in sorted(ws_probes):
+            for unlock in _UNLOCK_HEADERS:
+                headers = {**unlock, "x-headroom-base-url": internal.url}
+                # A refused handshake closes the socket; that is not a forward.
+                with (
+                    contextlib.suppress(WebSocketDisconnect),
+                    client.websocket_connect(path, headers=headers),
+                ):
                     pass
         reached = list(internal.hits)
 
