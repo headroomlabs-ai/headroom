@@ -76,13 +76,20 @@ HEADROOM_HOST=127.0.0.1 HEADROOM_PORT=8788 python -m headroom.proxy &  # or your
 
 # 2. Run the Rust proxy on the previously-public port (8787) pointing at it.
 #    The Python proxy sees every relayed request as coming from 127.0.0.1,
-#    so the Rust proxy enforces HEADROOM_PROXY_TOKEN itself (see below).
-./target/release/headroom-proxy --listen 0.0.0.0:8787 --upstream http://127.0.0.1:8788 &
+#    so the Rust proxy enforces HEADROOM_PROXY_TOKEN itself, and
+#    --python-upstream tells it the upstream is the Python proxy (see below).
+./target/release/headroom-proxy --listen 0.0.0.0:8787 \
+    --upstream http://127.0.0.1:8788 --python-upstream true &
 
-# 3. End users keep hitting :8787 unchanged, now sending the token.
+# 3. End users keep hitting :8787 unchanged, now sending the token. Remote
+#    callers reach it through your TLS terminator: the token is a bearer
+#    credential and must not cross the network in plaintext.
 # 4. Confirm passthrough, locally and as a remote caller would:
-curl -si http://127.0.0.1:8787/v1/models
-curl -si -H "X-Headroom-Proxy-Token: $HEADROOM_PROXY_TOKEN" http://<this-host>:8787/v1/models
+curl -si 'http://127.0.0.1:8787/v1/models'
+curl -si -H "X-Headroom-Proxy-Token: $HEADROOM_PROXY_TOKEN" \
+    'https://<your-proxy-hostname>/v1/models'
+#    (A plaintext http://<lan-ip>:8787 check is only for an isolated test
+#    network with a disposable token.)
 # 5. Rollback = stop the Rust proxy and rebind Python back to 8787.
 ```
 
@@ -99,6 +106,7 @@ curl -si -H "X-Headroom-Proxy-Token: $HEADROOM_PROXY_TOKEN" http://<this-host>:8
 | `--max-body-bytes` |  | `100MB` | for buffered cases; streams bypass |
 | `--log-level` |  | `info` | `RUST_LOG`-style filter |
 | `--rewrite-host` / `--no-rewrite-host` | | rewrite | rewrite Host to upstream (default) |
+| `--python-upstream` | `HEADROOM_PROXY_PYTHON_UPSTREAM` | `false` | the upstream is the Headroom Python proxy: relay non-local callers under `headroom-remote.invalid` and send the relay proof (below); leave off for any other backend |
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
 | `--stats` | `HEADROOM_PROXY_STATS` | `true` | native savings stats + `/dashboard` (below) |
 | `--stats-path` | `HEADROOM_PROXY_STATS_PATH` | `~/.headroom/native_stats.json` | ledger persistence (honours `HEADROOM_WORKSPACE_DIR`) |
@@ -124,14 +132,19 @@ Python proxy trusts loopback callers (no token needed, and access to
   reverse proxy that keeps the public `Host`, or a browser page whose
   hostname was pointed at 127.0.0.1) needs the token too; with no token
   configured it gets `403`.
-- A caller that presented the token is forwarded with
-  `X-Headroom-Front-Proof`, a value derived from the token (never the
-  token itself), and only when `--upstream` is a loopback address or
-  `localhost`. The Python proxy behind the front accepts it in place
-  of the token, so **set the same `HEADROOM_PROXY_TOKEN` for both
-  processes** when the front serves non-local callers: without it the
-  Python proxy refuses what the front relays for them (`403`). The front
-  drops any `X-Headroom-Front-Proof` a client sends.
+- With `--python-upstream`, a caller that presented the token is
+  forwarded with `X-Headroom-Front-Proof`, a value derived from the token
+  (never the token itself), and only when `--upstream` is a loopback
+  address or `localhost`. Python proxies that verify the proof accept it
+  in place of the token the front strips; that verification ships in the
+  Python security-gate change that follows this one. Until then the
+  Python proxy ignores the header and never forwards it upstream, in any
+  `HEADROOM_STRIP_INTERNAL_HEADERS` mode. **Set the same
+  `HEADROOM_PROXY_TOKEN` for both processes** when the front serves
+  non-local callers: a verifying Python proxy refuses what the front
+  relays for them otherwise (`403`). The front drops any
+  `X-Headroom-Front-Proof` a client sends, and never sends one without
+  `--python-upstream`.
 - A caller that is not local here (a non-loopback peer, or a loopback
   peer whose `Host` is not a loopback name) is never forwarded with a
   `Host` that may name loopback (including scoped IPv6 such as
@@ -139,10 +152,15 @@ Python proxy trusts loopback callers (no token needed, and access to
   name resolves to: that `Host` is replaced with
   `headroom-remote.invalid`, so the Python proxy's local-only routes
   (`/admin`, `/debug`, `/settings`, ...) stay closed to it, with or
-  without a token.
+  without a token. With `--python-upstream` the relayed `Host` is always
+  `headroom-remote.invalid`, even under `--no-rewrite-host`; without it a
+  public `Host` kept by `--no-rewrite-host` reaches the backend as sent,
+  so a same-host gateway can still route on it.
 - `GET /healthz`, `/healthz/upstream`, `/health`, `/livez` and `/readyz`
-  stay reachable without the token, and `GET`/`HEAD /api/hello` is
-  answered locally with an empty `200`.
+  stay reachable without the token, and also from a loopback peer under
+  a public `Host` when no token is configured (a monitor behind a
+  same-host reverse proxy). `GET`/`HEAD /api/hello` is answered locally
+  with an empty `200`. No other route is exempt.
 - A non-loopback `--listen` with no token refuses to start. Set
   `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` only when something else
   already restricts who can reach the port.
