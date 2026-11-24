@@ -149,12 +149,6 @@ class _DrainLockLease:
         if fd is not None:
             _unlock_and_close_fd(fd)
 
-    def run_offloaded(self, fn: Callable[..., Any], *args: Any) -> Any:
-        try:
-            return fn(*args)
-        finally:
-            self.finish_offload()
-
 
 @asynccontextmanager
 async def _cross_process_drain_lock(directory: Path) -> AsyncIterator[_DrainLockLease]:
@@ -377,15 +371,56 @@ async def _run_in_thread_before_unlock(
     normal cancellation, wait for the single in-flight disk operation to finish
     before returning. On a second cancellation (such as a lifespan shutdown
     timeout), stop waiting immediately while ``lease`` keeps ``.drain.lock``
-    held until the worker thread finishes so no peer worker can double-count
-    the in-flight event.
+    held until any already-started worker finishes so no peer worker can
+    double-count the in-flight event. If the queued executor job is cancelled
+    before it ever starts, the done callback marks it aborted and releases the
+    lease immediately so ``.drain.lock`` is never orphaned.
     """
+    state_lock = threading.Lock()
+    started = False
+    cancelled_before_start = False
+    finished = False
+
+    def _finish_once() -> None:
+        nonlocal finished
+        with state_lock:
+            if finished:
+                return
+            finished = True
+        lease.finish_offload()
+
+    def _run() -> Any:
+        nonlocal started
+        with state_lock:
+            if cancelled_before_start:
+                return None
+            started = True
+        try:
+            return fn(*args)
+        finally:
+            _finish_once()
+
+    def _on_done(done_fut: asyncio.Future[Any]) -> None:
+        nonlocal cancelled_before_start
+        if not done_fut.cancelled():
+            _finish_once()
+            return
+        should_release_now = False
+        with state_lock:
+            if not started:
+                cancelled_before_start = True
+                should_release_now = True
+        if should_release_now:
+            _finish_once()
+
     lease.begin_offload()
     try:
-        fut = asyncio.ensure_future(asyncio.to_thread(lease.run_offloaded, fn, *args))
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.run_in_executor(None, _run)
     except BaseException:
-        lease.finish_offload()
+        _finish_once()
         raise
+    fut.add_done_callback(_on_done)
     try:
         return await asyncio.shield(fut)
     except asyncio.CancelledError:

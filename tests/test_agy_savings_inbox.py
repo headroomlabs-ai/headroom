@@ -652,3 +652,53 @@ async def test_repeated_cancellation_aborts_stalled_checkpoint_wait(isolated_hom
         await asyncio.gather(drain_task, return_exceptions=True)
         if peer_task is not None:
             await asyncio.gather(peer_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_helper_before_start_releases_drain_lock(isolated_home, monkeypatch):
+    """If a queued disk helper is cancelled before starting, .drain.lock must be released."""
+    import asyncio
+
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+
+    loop = asyncio.get_running_loop()
+    real_run_in_executor = loop.run_in_executor
+    queued_future: asyncio.Future | None = None
+    queued_fn = None
+    queued_ready = asyncio.Event()
+
+    def _intercept_run_in_executor(executor, func, *args):
+        nonlocal queued_future, queued_fn
+        if queued_future is None:
+            queued_future = loop.create_future()
+            queued_fn = (func, args)
+            queued_ready.set()
+            return queued_future
+        return real_run_in_executor(executor, func, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", _intercept_run_in_executor)
+
+    first_metrics = FakeMetrics()
+    drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(first_metrics))
+    await asyncio.wait_for(queued_ready.wait(), timeout=5.0)
+    assert queued_future is not None and queued_fn is not None
+
+    # Simulate shutdown cancelling the drain and event-loop teardown cancelling
+    # the queued executor future before any worker thread starts it.
+    drain_task.cancel()
+    await asyncio.sleep(0)
+    queued_future.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(drain_task, timeout=5.0)
+
+    # Restore real executor and confirm a peer immediately acquires .drain.lock.
+    monkeypatch.setattr(loop, "run_in_executor", real_run_in_executor)
+    peer_metrics = FakeMetrics()
+    recorded = await asyncio.wait_for(agy_savings_inbox.drain_inbox(peer_metrics), timeout=5.0)
+    assert recorded == 1
+    assert len(peer_metrics.calls) == 1
+    assert _evt_files() == []
+
+    # Even if the cancelled queued callable were somehow dequeued later, it is a no-op.
+    func, args = queued_fn
+    assert func(*args) is None
