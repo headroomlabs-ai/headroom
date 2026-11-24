@@ -1664,6 +1664,50 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
+def test_codex_session_launch_settings_do_not_send_headroom_provider_as_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #5025: `headroom init codex` leaves Headroom's own provider selected. Its
+    # base_url is the local proxy, so it must not become X-Headroom-Base-Url.
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    config_file = codex_home / "config.toml"
+    original_config = (
+        'model_provider = "headroom"\n'
+        'openai_base_url = "http://127.0.0.1:8787/v1"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "http://127.0.0.1:8787/v1"\n'
+        "requires_openai_auth = true\n"
+        "supports_websockets = true\n"
+    )
+    config_file.write_text(original_config, encoding="utf-8")
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("resume", "session-id"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert args == (
+        "--config",
+        'model_providers.headroom.base_url="http://127.0.0.1:9898/v1"',
+        "--config",
+        "model_providers.headroom.supports_websockets=true",
+        "resume",
+        "session-id",
+    )
+    assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+    assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:9898/v1"
+    assert display == [
+        "OPENAI_BASE_URL=http://127.0.0.1:9898/v1",
+        wrap_mod._CODEX_EMBEDDED_MODE_NOTE,
+    ]
+    assert config_file.read_text(encoding="utf-8") == original_config
+
+
 def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
     """#2358: quoted segments are silently ignored by Codex's --config parser."""
     assert (

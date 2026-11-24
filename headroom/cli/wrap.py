@@ -3373,12 +3373,17 @@ def _codex_session_launch_settings(
                 f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
             )
         )
-        env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
-        display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
-        overrides.append(
-            f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
-            f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
-        )
+        # Headroom's own table (left by `headroom init codex` or a persistent
+        # install) points at the local proxy, not at a real upstream. Sending
+        # it as X-Headroom-Base-Url makes the proxy reject every request as an
+        # unsafe loopback upstream (#5025), so only real custom providers get it.
+        if provider != "headroom":
+            env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
+            display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
+            overrides.append(
+                f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
+                f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
+            )
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
