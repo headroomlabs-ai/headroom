@@ -341,7 +341,7 @@ def _native_responses_client():  # noqa: ANN202
     seen: list[dict[str, object]] = []
 
     # Loopback client so the proxy-token middleware treats this as a local call.
-    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
         proxy = app.state.proxy
         transport = _NativeCapturingTransport()
         proxy.http_client = httpx.AsyncClient(transport=transport)

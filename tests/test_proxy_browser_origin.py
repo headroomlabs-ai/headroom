@@ -20,7 +20,12 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from headroom.proxy.server import (  # noqa: E402
+    FRONT_RELAY_PROOF_HEADER,
+    ProxyConfig,
+    create_app,
+    front_relay_proof,
+)
 
 OPERATOR_SECRET = "operator-held-secret"
 FOREIGN_ORIGIN = "https://page.example"
@@ -85,7 +90,8 @@ def _client() -> tuple[TestClient, _Capturing]:
     transport = _Capturing()
     app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
     # The browser and the proxy share the host, so the peer is loopback.
-    return TestClient(app, client=("127.0.0.1", 51000)), transport
+    # base_url sets the Host a local client sends (TestClient defaults to "testserver").
+    return TestClient(app, client=("127.0.0.1", 51000), base_url="http://127.0.0.1:8787"), transport
 
 
 _ROUTES = {
@@ -198,6 +204,167 @@ def test_loopback_peer_with_a_repointed_hostname_is_refused() -> None:
 
     assert resp.status_code == 403
     assert transport.requests == []
+
+
+REBOUND_HOST = "page.example:8787"
+_PATH = "/v1/messages/batches"  # a passthrough GET forwarded with the operator credential
+
+
+@pytest.mark.parametrize(
+    "browser_headers",
+    [
+        # fetch() from the page itself: same-origin, so no Origin header.
+        {"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
+        # A window the page opened through a cross-site redirect.
+        {
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+        },
+        # A browser that sends no Sec-Fetch-* headers.
+        {"User-Agent": "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Version/15.6 Safari/605.1.15"},
+    ],
+)
+def test_loopback_peer_under_a_foreign_host_is_refused(browser_headers: dict[str, str]) -> None:
+    client, transport = _client()
+
+    resp = client.get(_PATH, headers={"Host": REBOUND_HOST, **browser_headers})
+
+    assert resp.status_code == 403
+    assert "page.example" in resp.json()["hint"]
+    assert "HEADROOM_WS_ORIGINS" in resp.json()["hint"]
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    ("listed", "host"),
+    [
+        ("http://page.example:8787", REBOUND_HOST),
+        # TLS ends at a reverse proxy on this host: the page is https, the proxy sees http.
+        ("https://dash.example", "dash.example"),
+        ("https://Dash.Example.", "dash.example:443"),
+    ],
+)
+def test_listed_host_is_accepted_whatever_the_scheme(
+    monkeypatch: pytest.MonkeyPatch, listed: str, host: str
+) -> None:
+    monkeypatch.setenv("HEADROOM_WS_ORIGINS", listed)
+    client, transport = _client()
+
+    resp = client.get(_PATH, headers={"Host": host})
+
+    assert resp.status_code == 200, resp.text
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1:8787",  # CLIs, SDKs, coding agents, the dashboard
+        "localhost:8787",
+        "[::1]:8787",
+        "host.docker.internal:8787",  # a container on Docker Desktop
+    ],
+)
+def test_local_hosts_still_forward(host: str) -> None:
+    client, transport = _client()
+
+    resp = client.get(_PATH, headers={"Host": host})
+
+    assert resp.status_code == 200, resp.text
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        # A network's DNS can answer the alias too: a page under it is not local.
+        {"Host": "host.docker.internal:8787", "Sec-Fetch-Site": "same-origin"},
+        {"Host": "host.docker.internal:8787", "Referer": "http://host.docker.internal:8787/"},
+        # Not this proxy's port.
+        {"Host": "host.docker.internal:9999"},
+    ],
+)
+def test_container_alias_counts_only_without_browser_provenance_on_our_port(
+    headers: dict[str, str],
+) -> None:
+    client, transport = _client()
+
+    resp = client.get(_PATH, headers=headers)
+
+    assert resp.status_code == 403
+    assert transport.requests == []
+
+
+RELAY_HOST = "headroom-remote.invalid"
+
+
+@pytest.mark.parametrize("proof", [None, "0" * 64, front_relay_proof("another-token")])
+def test_rust_front_relay_host_without_its_proof_is_refused(
+    monkeypatch: pytest.MonkeyPatch, proof: str | None
+) -> None:
+    # Without the proof the relay Host is just a foreign name: a front that
+    # relays a rebound page must not turn it into a trusted caller.
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "proxy-token")
+    client, transport = _client()
+    headers = {"Host": RELAY_HOST}
+    if proof is not None:
+        headers[FRONT_RELAY_PROOF_HEADER] = proof
+
+    resp = client.get(_PATH, headers=headers)
+
+    assert resp.status_code == 403
+    assert transport.requests == []
+
+
+def test_rust_front_relay_without_a_token_anywhere_is_a_remote_caller() -> None:
+    # A token-less front (acknowledged open bind) has nothing to prove with:
+    # its remote callers reach the data plane but never the local-only routes.
+    client, transport = _client()
+
+    resp = client.get(_PATH, headers={"Host": RELAY_HOST})
+    admin = client.get("/debug/tasks", headers={"Host": RELAY_HOST})
+
+    assert resp.status_code == 200, resp.text
+    assert len(transport.requests) == 1
+    assert admin.status_code == 404
+
+
+def test_rust_front_relay_with_its_proof_forwards_without_the_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "proxy-token")
+    client, transport = _client()
+
+    resp = client.get(
+        _PATH,
+        headers={"Host": RELAY_HOST, FRONT_RELAY_PROOF_HEADER: front_relay_proof("proxy-token")},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(transport.requests) == 1
+    assert FRONT_RELAY_PROOF_HEADER not in transport.requests[0].headers
+
+
+def test_proxy_token_is_required_for_a_listed_non_loopback_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A same-host reverse proxy relays remote callers from loopback: its listed
+    # name lets them past the Host check but not past the token.
+    monkeypatch.setenv("HEADROOM_WS_ORIGINS", "https://dash.example")
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "proxy-token")
+    client, transport = _client()
+
+    refused = client.get(_PATH, headers={"Host": "dash.example"})
+    local = client.get(_PATH)
+    with_token = client.get(
+        _PATH, headers={"Host": "dash.example", "X-Headroom-Proxy-Token": "proxy-token"}
+    )
+
+    assert refused.status_code == 401
+    assert local.status_code == 200, local.text
+    assert with_token.status_code == 200, with_token.text
+    assert len(transport.requests) == 2
 
 
 def test_origin_listed_only_for_cors_still_forwards_when_both_lists_are_set(

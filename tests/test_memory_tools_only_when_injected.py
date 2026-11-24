@@ -271,7 +271,7 @@ async def _post(app: Any, kind: str, tools: list[dict[str, Any]], call: str) -> 
     app.state.proxy.http_client = mock
     app.state.proxy.http_client_h1 = mock
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8787") as client:
         response = await client.post(
             spec["url"],
             json={**spec["body"], "tools": tools},
@@ -375,7 +375,7 @@ def _ws_exchange(
     }
     received: list[dict[str, Any]] = []
     with patch.dict(sys.modules, {"websockets": websockets_module}):
-        client = TestClient(app, client=("127.0.0.1", 12345))
+        client = TestClient(app, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 12345))
         with client.websocket_connect(
             "/v1/responses",
             headers={"authorization": "Bearer FAKE-KEY", "x-headroom-user-id": "user-1"},
