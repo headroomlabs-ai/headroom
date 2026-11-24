@@ -36,9 +36,11 @@ class TiktokenVocabNotCached(TiktokenLoadError):
     """Raised when ``HEADROOM_OFFLINE`` refused a cold-cache vocab download.
 
     A :class:`TiktokenLoadError`, so every caller that already falls back to
-    estimation on a stalled download does the same here. It is not
-    remembered: pre-seeding ``TIKTOKEN_CACHE_DIR`` or turning the switch off
-    makes the next load succeed, so callers must not cache their fallback.
+    estimation on a stalled download does the same here. The loader does not
+    remember it: pre-seeding ``TIKTOKEN_CACHE_DIR`` or turning the switch off
+    makes the next load succeed. Token counters that the registry and the
+    providers already cached keep their estimate for the life of the process,
+    so that every count within one request uses the same unit.
     """
 
 
@@ -186,7 +188,17 @@ def _get_encoding(encoding_name: str):
                 )
             del _pending_loads[encoding_name]
     if pending is not None:
-        return _loaded_encoding(encoding_name, pending[1])
+        done = pending[1]
+        err = done.get("err")
+        if err is not None and not isinstance(err, OfflineEgressBlocked):
+            # The caller was already told this load timed out and fell back to
+            # estimation; its late failure keeps that fallback instead of
+            # surfacing the worker's raw transport error. Not remembered: the
+            # pending entry is gone, so the next call starts a fresh load.
+            raise TiktokenLoadError(
+                f"tiktoken encoding {encoding_name!r} failed to load after timing out: {err!r}"
+            ) from err
+        return _loaded_encoding(encoding_name, done)
 
     try:
         if not _install_read_file_guard():

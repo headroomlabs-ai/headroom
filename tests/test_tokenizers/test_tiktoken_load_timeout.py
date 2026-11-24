@@ -110,3 +110,56 @@ def test_a_slow_download_that_lands_is_adopted(monkeypatch: pytest.MonkeyPatch) 
     finally:
         tc._get_encoding.cache_clear()
         tc._pending_loads.clear()
+
+
+def test_a_timed_out_load_that_then_fails_stays_a_load_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reviewer's repro: online, a load times out and its worker then
+    fails with a transport error. Callers catch TiktokenLoadError and fall
+    back to estimation, so the late failure must arrive as one, not as the
+    worker's raw error, and a later successful load must still return the
+    exact vocabulary."""
+    import threading
+
+    tiktoken = pytest.importorskip("tiktoken")
+    requests = pytest.importorskip("requests")
+    from headroom.providers import openai as openai_provider
+    from headroom.providers.openai import OpenAIProvider, OpenAITokenCounter
+
+    release = threading.Event()
+    state = {"fail": True}
+    encoding = type("_Words", (), {"encode": lambda self, text, **_kw: text.split()})()
+
+    def _get_encoding(_name: str) -> object:
+        if state["fail"]:
+            release.wait(5.0)
+            raise requests.ConnectionError("vocab host unreachable")
+        return encoding
+
+    monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.1")
+    monkeypatch.setattr(tiktoken, "get_encoding", _get_encoding)
+    openai_provider._get_encoding.cache_clear()
+    try:
+        provider = OpenAIProvider()
+        fallback = provider.get_token_counter("gpt-4o")
+        assert isinstance(fallback, EstimatingTokenCounter)
+
+        worker = tc._pending_loads["o200k_base"][0]
+        release.set()
+        worker.join(5.0)
+        assert not worker.is_alive()
+        assert provider.get_token_counter("gpt-4o") is fallback
+        with pytest.raises(tc.TiktokenLoadError) as excinfo:
+            tc.load_encoding("o200k_base")
+        assert isinstance(excinfo.value.__cause__, requests.ConnectionError)
+
+        state["fail"] = False
+        assert tc.load_encoding("o200k_base") is encoding
+        openai_provider._get_encoding.cache_clear()
+        exact = OpenAIProvider().get_token_counter("gpt-4o")
+        assert isinstance(exact, OpenAITokenCounter)
+        assert exact.count_text("one two three") == 3
+    finally:
+        release.set()
+        openai_provider._get_encoding.cache_clear()
