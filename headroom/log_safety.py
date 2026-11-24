@@ -278,7 +278,11 @@ def safe_id(value: object) -> str:
 # Control characters a log line must not carry raw: every C0 control but tab
 # (line breaks end a record; ESC starts a terminal escape sequence), DEL, and
 # the non-ASCII characters ``str.splitlines`` also breaks on.
-_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+_CONTROL_CODES = (*range(0x00, 0x09), *range(0x0A, 0x20), 0x7F, 0x85, 0x2028, 0x2029)
+# str.translate table: one dict lookup per character, no regex.
+_CONTROL_ESCAPES = {
+    code: chr(code).encode("unicode_escape").decode("ascii") for code in _CONTROL_CODES
+}
 _LOG_TOKEN_UNSAFE = re.compile(r"[\s\x00-\x1f\x7f\x85\\]")
 _TRACEBACK_INDENT = "    "
 # The record layout of proxy.log and the proxy's stderr; `headroom perf` parses it.
@@ -292,7 +296,7 @@ def _escape_char(match: re.Match[str]) -> str:
 
 def escape_controls(text: str) -> str:
     """``text`` with line breaks and other control characters (not tab) escaped."""
-    return _CONTROL.sub(_escape_char, text)
+    return text.translate(_CONTROL_ESCAPES)
 
 
 def log_token(value: object) -> str:
