@@ -176,13 +176,37 @@ TOMCAT_LOG = "\n".join(
 )
 
 
+# `grep -A1`: 12 groups of 19 matches plus one context row, with an unmatched
+# row skipped between groups and grep's `--` separator printed there.
+TOMCAT_CONTEXT = "\n--\n".join(
+    "\n".join(TOMCAT_LOG.split("\n")[g * 20 : g * 20 + 20]) for g in range(12)
+)
+
+
 def _openai_text_blocks(command: str, content: str, tokenizer, config=None):
     # Some OpenAI-compatible clients send tool output as a list of text blocks.
     out, transforms = _openai(command, [{"type": "text", "text": content}], tokenizer, config)
     return out[0]["text"], transforms
 
 
-@pytest.mark.parametrize("send", [_openai, _anthropic, _openai_text_blocks])
+def _openai_split_text_blocks(command: str, content: str, tokenizer, config=None):
+    # Two text blocks, the second starting halfway through the second row.
+    cut = content.index("\n") + 1 + 20
+    blocks = [{"type": "text", "text": content[:cut]}, {"type": "text", "text": content[cut:]}]
+    out, transforms = _openai(command, blocks, tokenizer, config)
+    return "".join(block["text"] for block in out), transforms
+
+
+@pytest.mark.parametrize(
+    "send", [_openai, _anthropic, _openai_text_blocks, _openai_split_text_blocks]
+)
+@pytest.mark.parametrize(
+    "command, output",
+    [
+        pytest.param("grep INFO logs/catalina.out", TOMCAT_LOG, id="matches"),
+        pytest.param("grep -A1 matched logs/catalina.out", TOMCAT_CONTEXT, id="context"),
+    ],
+)
 @pytest.mark.parametrize(
     "config",
     [
@@ -193,13 +217,13 @@ def _openai_text_blocks(command: str, content: str, tokenizer, config=None):
         ),
     ],
 )
-def test_timestamped_search_stays_whole_without_ccr(send, config, tokenizer):
+def test_timestamped_search_stays_whole_without_ccr(send, command, output, config, tokenizer):
     # Timestamp rows are not path:line:content, so the search fold leaves them
     # to the log compressor. Without a retrieval marker the dropped rows could
     # not be fetched back, so the matches must reach the model as they are.
-    out, transforms = send("grep INFO logs/catalina.out", TOMCAT_LOG, tokenizer, config())
+    out, transforms = send(command, output, tokenizer, config())
     assert "router:bash:search_verbatim" in transforms
-    assert out == TOMCAT_LOG
+    assert out == output
 
 
 def test_lossless_mode_still_folds_repeated_timestamped_matches(tokenizer):

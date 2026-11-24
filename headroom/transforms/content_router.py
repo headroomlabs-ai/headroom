@@ -7827,7 +7827,8 @@ class ContentRouter(Transform):
             return False
         from .lossless_compaction import _TIMESTAMP_ROW_RE
 
-        rows = [line for line in content.split("\n")[:100] if line.strip()]
+        # `--` is the group separator grep prints with -A/-B/-C.
+        rows = [line for line in content.split("\n")[:100] if line.strip() and line != "--"]
         return len(rows) >= 2 and all(_TIMESTAMP_ROW_RE.match(line) for line in rows)
 
     def _content_cache_key(
@@ -8164,6 +8165,8 @@ class ContentRouter(Transform):
         new_blocks = []
         any_compressed = False
         role = message.get("role", "")
+        # Set on the first tool text block from the whole result.
+        search_verbatim: bool | None = None
 
         # Top-level text blocks are fragments of one tool result. Measure the
         # whole result so splitting a large log cannot activate the small-result
@@ -8521,9 +8524,20 @@ class ContentRouter(Transform):
                                 route_counts.get("shell_small_result", 0) + 1
                             )
                         continue
-                    if self._bash_search_keep_verbatim(
-                        _shell_name, _msg_tool_id, block.get("text", "")
-                    ):
+                    if search_verbatim is None:
+                        # Judge the whole result: a fragment may start mid-row.
+                        search_verbatim = self._bash_search_keep_verbatim(
+                            _shell_name,
+                            _msg_tool_id,
+                            "".join(
+                                b["text"]
+                                for b in content_blocks
+                                if isinstance(b, dict)
+                                and b.get("type") == "text"
+                                and isinstance(b.get("text"), str)
+                            ),
+                        )
+                    if search_verbatim:
                         new_blocks.append(block)
                         transforms_applied.append("router:bash:search_verbatim")
                         if route_counts is not None:
