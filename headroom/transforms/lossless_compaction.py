@@ -92,6 +92,36 @@ _TIMESTAMP_ROW_RE = re.compile(
     r")"
 )
 
+# A clock can also sit MID-line, behind a prefix no start-anchored pattern can
+# know: ``git blame`` (``c75ebdee6 (Dev One  2026-07-02 19:04:14 -0700  3) ...``),
+# ``git log --date=iso`` and Java's default log (``Nov 24, 2026 10:46:15 AM
+# org.Foo main``). The grep-row split then cuts the ``HH:MM:SS`` at its two
+# colons: the "path" ends in the hour, ``line`` is the minute and the content
+# starts with the second. The hour has to open a token (after a space, ``[`` or
+# ``=``, or the ``T`` of an ISO date), so a path such as ``logs/2026/11/24`` is
+# not read as a clock.
+_CLOCK_HOUR_RE = re.compile(r"(?:^|(?<=[\s\[=])|(?<=\dT))\d{1,2}$")
+_CLOCK_SECOND_RE = re.compile(r"[0-5]\d(?!\d)")
+
+
+def _grep_row(line: str) -> re.Match[str] | None:
+    """``_GREP_ROW_RE`` match for ``line``; ``None`` for a log record that only looks like one."""
+    if _TIMESTAMP_ROW_RE.match(line):
+        return None
+    m = _GREP_ROW_RE.match(line)
+    # Almost every path ends in a letter, so that is the cheap first test.
+    if m and line[m.end(1) - 1].isdigit():
+        path, minute, content = m.groups()
+        if (
+            len(minute) == 2
+            and minute < "60"
+            and _CLOCK_HOUR_RE.search(path)
+            and _CLOCK_SECOND_RE.match(content)
+        ):
+            return None
+    return m
+
+
 # unified-diff ``index <sha>..<sha> <mode>`` line. The diff still applies
 # without it (git only uses it for rename/blob bookkeeping).
 _DIFF_INDEX_RE = re.compile(r"^index [0-9a-fA-F]+\.\.[0-9a-fA-F]+( [0-7]+)?$")
@@ -314,7 +344,7 @@ def search_heading(text: str) -> str:
     out: list[str] = []
     current_path: str | None = None
     for line in lines:
-        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
+        m = _grep_row(line)
         if m:
             path = m.group("path")
             if path != current_path:
@@ -392,7 +422,7 @@ def search_dir_heading(text: str, *, backslash: bool = False) -> str:
     out: list[str] = []
     current_dir: str | None = None
     for line in lines:
-        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
+        m = _grep_row(line)
         path = m.group("path") if m else ""
         cut = max(path.rfind(sep) for sep in separators) + 1
         if m and cut:

@@ -33,6 +33,33 @@ def _ruby_logger_log() -> str:
     )
 
 
+def _git_blame_log() -> str:
+    """``git blame`` rows: the author and commit time come before the code, so no
+    start-anchored pattern sees the clock. Consecutive lines of one commit share
+    everything up to the hour."""
+    return "\n".join(
+        f"c75ebdee6 (Dev One  2026-07-02 19:04:14 -0700 {n:>2}) def helper_{n}(value): return value"
+        for n in range(1, 61)
+    )
+
+
+def _java_util_logging_log() -> str:
+    """java.util.logging's default SimpleFormatter prints a timestamp line, then
+    ``LEVEL: message``; ``grep`` for the logger keeps only the timestamp lines."""
+    return "\n".join(
+        f"Sep 02, 2026 2:{m:02d}:10 PM com.example.OrderService process" for m in range(60)
+    )
+
+
+def _prefixed_iso_log() -> str:
+    """CI job logs and logfmt put a name or a key in front of an ISO timestamp; a prefix
+    with a "/" also reaches the directory fold."""
+    job = [f"build-7 2026-09-02T14:{m:02d}:10Z step {m} done" for m in range(60)]
+    logfmt = [f'time="2026-09-02T15:{m:02d}:10Z" level=info msg="ok {m}"' for m in range(60)]
+    slashed = [f"releases/v1 2026-09-02T16:{m:02d}:10Z published {m}" for m in range(60)]
+    return "\n".join(job + logfmt + slashed)
+
+
 _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maximum
 
 
@@ -64,6 +91,10 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
             for m in range(60)
         ),
         _ruby_logger_log(),
+        _git_blame_log(),
+        _java_util_logging_log(),
+        _prefixed_iso_log(),
+        "\n".join(f"svc=api [14:{m:02d}:10.123] handled request {m}" for m in range(60)),
     ],
     ids=[
         "iso-datetime",
@@ -76,6 +107,10 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
         "access-log",
         "access-log-longest-host",
         "ruby-logger",
+        "git-blame",
+        "java-util-logging",
+        "prefixed-iso-t",
+        "bracketed-mid-line",
     ],
 )
 def test_timestamped_logs_are_never_folded(sample: str) -> None:
@@ -90,8 +125,9 @@ def test_timestamped_logs_are_never_folded(sample: str) -> None:
         ("logs/controller.log", "E0902 14:30:{s:02d}.000000       1 reflector.go:100] list failed"),
         ("/var/log/nginx/access.log", '10.0.0.7 - - [02/Sep/2026:14:30:{s:02d} +0000] "GET /" 500'),
         ("log/production.log", "I, [2026-09-02T14:30:{s:02d}.000000 #1]  INFO -- : 200 OK"),
+        ("logs/app.log", "Sep 02, 2026 2:30:{s:02d} PM com.example.OrderService process"),
     ],
-    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger"],
+    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger", "java-util-logging"],
 )
 def test_grep_rows_over_those_logs_still_fold(path: str, row: str) -> None:
     """``grep -n`` output starts with the file path, so it is not a log row."""
@@ -140,3 +176,46 @@ def test_kill_switch_is_read_live_not_cached_at_import() -> None:
         os.environ.pop("HEADROOM_LOSSLESS_COMPACTION", None)
         if prior is not None:
             os.environ["HEADROOM_LOSSLESS_COMPACTION"] = prior
+
+
+@pytest.mark.parametrize(
+    ("path", "content", "lines"),
+    [
+        ("logs/2026/11/24", "30 items processed", range(15, 55)),  # "24" follows a "/"
+        ("chunk12", "30 files copied", range(15, 55)),  # "12" is part of a name
+        ("data/part-7", "45 rows kept", range(15, 55)),  # "-7" is a suffix
+        ("notes/v2.10", "15 entries", range(15, 55)),  # "10" follows a "."
+        ("deploy 14", "75 items", range(15, 55)),  # 75 is not a second
+        ("deploy 14", "105 items", range(15, 55)),  # three digits are not a second
+        ("deploy 14", "10 items", range(1, 10)),  # a one-digit minute is not a clock
+        ("tasks 3", "30 items", range(60, 100)),  # 60 and up is not a minute
+    ],
+    ids=[
+        "after-slash",
+        "in-name",
+        "suffix",
+        "after-dot",
+        "bad-second",
+        "long-second",
+        "one-digit-minute",
+        "minute-60-up",
+    ],
+)
+def test_grep_rows_that_only_resemble_a_clock_still_fold(
+    path: str, content: str, lines: range
+) -> None:
+    """A clock is a token-opening hour, a minute 00-59 and a second 00-59, in that order."""
+    grep = "\n".join(f"{path}:{lines[i % len(lines)]}:{content}" for i in range(40))
+    out = compact_lossless(grep, "search")
+    assert len(out) < len(grep)
+    assert out.split("\n")[0] == path
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["deploy ", "svc [", "ts=", "run-3 2026-09-02T", "c75ebdee6 (Dev One  2026-07-02 "],
+)
+def test_an_hour_that_opens_a_token_is_a_clock(prefix: str) -> None:
+    """After a space, ``[``, ``=`` or an ISO ``T`` the same shape is a clock, not a path."""
+    rows = "\n".join(f"{prefix}14:{m:02d}:10 x" for m in range(10, 50))
+    assert compact_lossless(rows, "search") == rows
