@@ -54,9 +54,11 @@ at it; end users notice nothing.
 make build-proxy
 ./target/release/headroom-proxy --help
 
-# Run against a local upstream (listens on 127.0.0.1:8787 by default)
+# Run in front of the Headroom Python proxy (listens on 127.0.0.1:8787 by default).
+# --python-upstream true (or HEADROOM_PROXY_PYTHON_UPSTREAM=true) declares the
+# upstream is the Python proxy; leave it off for any other backend.
 ./target/release/headroom-proxy \
-    --upstream http://127.0.0.1:8788
+    --upstream http://127.0.0.1:8788 --python-upstream true
 
 # Health checks
 curl -s http://127.0.0.1:8787/healthz            # => {"ok":true,...}
@@ -83,7 +85,8 @@ HEADROOM_HOST=127.0.0.1 HEADROOM_PORT=8788 python -m headroom.proxy &  # or your
 
 # 3. End users keep hitting :8787 unchanged, now sending the token. Remote
 #    callers reach it through your TLS terminator: the token is a bearer
-#    credential and must not cross the network in plaintext.
+#    credential and must not cross the network in plaintext. The terminator
+#    must keep the client's Host (see "Inbound authentication" below).
 # 4. Confirm passthrough, locally and as a remote caller would:
 curl -si 'http://127.0.0.1:8787/v1/models'
 curl -si -H "X-Headroom-Proxy-Token: $HEADROOM_PROXY_TOKEN" \
@@ -161,6 +164,16 @@ Python proxy trusts loopback callers (no token needed, and access to
   a public `Host` when no token is configured (a monitor behind a
   same-host reverse proxy). `GET`/`HEAD /api/hello` is answered locally
   with an empty `200`. No other route is exempt.
+- A loopback peer under a loopback `Host` is indistinguishable from a
+  client on this machine. A same-host TLS terminator or reverse proxy
+  (nginx, Caddy, ...) in front of the Rust proxy must therefore keep the
+  client's original `Host` (nginx: `proxy_set_header Host $host;`), so its
+  callers need the token; if it rewrites `Host` to `127.0.0.1` or
+  `localhost`, every caller it relays counts as local, skips the token and
+  reaches the Python proxy's local-only routes. Alternatively, have it
+  forward to the front on a non-loopback address. The front logs
+  `event=proxy_loopback_listen_with_token` at startup as a reminder when
+  it listens on loopback with a token configured.
 - A non-loopback `--listen` with no token refuses to start. Set
   `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` only when something else
   already restricts who can reach the port.
