@@ -67,7 +67,11 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
-from headroom.cli.port_discovery import proxy_port_option, warn_codex_provider_port_change
+from headroom.cli.port_discovery import (
+    loopback_port,
+    proxy_port_option,
+    warn_codex_provider_port_change,
+)
 from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
@@ -3376,8 +3380,9 @@ def _codex_session_launch_settings(
         # Headroom's own table (left by `headroom init codex` or a persistent
         # install) points at the local proxy, not at a real upstream. Sending
         # it as X-Headroom-Base-Url makes the proxy reject every request as an
-        # unsafe loopback upstream (#5025), so only real custom providers get it.
-        if provider != "headroom":
+        # unsafe loopback upstream (#5025). A user's remote gateway that is
+        # merely named `headroom` is still a real upstream and keeps it.
+        if provider != "headroom" or loopback_port(upstream) is None:
             env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
             display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
             overrides.append(

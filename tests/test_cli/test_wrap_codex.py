@@ -1708,6 +1708,43 @@ def test_codex_session_launch_settings_do_not_send_headroom_provider_as_upstream
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
+def test_codex_session_launch_settings_keep_remote_provider_named_headroom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A user's own remote gateway may also be named `headroom` (recovery keeps
+    # it); only the local proxy route drops the upstream header, not this one.
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "headroom"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "https://gateway.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("resume", "session-id"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert args == (
+        "--config",
+        'model_providers.headroom.base_url="http://127.0.0.1:9898/v1"',
+        "--config",
+        "model_providers.headroom.supports_websockets=true",
+        "--config",
+        'model_providers.headroom.env_http_headers.X-Headroom-Base-Url="HEADROOM_CODEX_UPSTREAM_BASE_URL"',
+        "resume",
+        "session-id",
+    )
+    assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://gateway.example/v1"
+    assert "HEADROOM_CODEX_UPSTREAM_BASE_URL=https://gateway.example/v1" in display
+
+
 def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
     """#2358: quoted segments are silently ignored by Codex's --config parser."""
     assert (
