@@ -1730,3 +1730,53 @@ def test_a_network_at_its_quota_replaces_its_own_oldest_name(
     assert slow_zone.calls == [], "remembered names should be answered without a lookup"
     is_safe_upstream_url("https://old.legit.example/v1")
     assert slow_zone.calls == ["old.legit.example"]
+
+
+_IDN_SPELLINGS = ("faß.example", "xn--fa-hia.example")
+
+
+@pytest.mark.parametrize("listed", _IDN_SPELLINGS)
+@pytest.mark.parametrize("requested", _IDN_SPELLINGS)
+async def test_guard_and_transport_agree_on_every_spelling_of_a_proxied_idn(
+    monkeypatch: pytest.MonkeyPatch, listed: str, requested: str
+) -> None:
+    """A name forwarded by the proxy is never answered from memory, in any spelling."""
+    from headroom.proxy.upstream_pinning import GuardedUpstreamRefusingTransport
+
+    monkeypatch.setenv("HEADROOM_PROXIED_BASE_URLS", listed)
+    _answers(monkeypatch, "xn--fa-hia.example", ["20.10.10.10", "10.0.0.5"])
+    url = f"https://{requested}/v1"
+    assert is_safe_upstream_url(url) is True
+
+    # The transport lets the guarded request leave through the proxy by name ...
+    forwarded: list[str] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        forwarded.append(str(request.url))
+        return httpx.Response(200)
+
+    transport = GuardedUpstreamRefusingTransport(
+        httpx.MockTransport(upstream), "proxy route", via_proxy=True
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        assert (await client.get(url)).status_code == 200
+    assert forwarded == ["https://xn--fa-hia.example/v1"]
+
+    # ... so the guard must look the name up again rather than reuse its answer.
+    _drain()
+    assert is_safe_upstream_url(url) is False
+
+
+@pytest.mark.parametrize("env", ["HEADROOM_PROXIED_BASE_URLS", "HEADROOM_ALLOWED_BASE_URLS"])
+def test_a_malformed_destination_entry_is_skipped_not_fatal(
+    monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    from headroom.proxy.upstream_guard import allowlisted_destinations, destination_listed
+
+    _answers(monkeypatch, "public.example", ["20.10.10.10"])
+    monkeypatch.setenv(env, "[::1, gw.example")
+
+    allow = allowlisted_destinations(env)
+    assert allow is not None and destination_listed(allow, "https", "gw.example", None)
+    if env == "HEADROOM_PROXIED_BASE_URLS":
+        assert is_safe_upstream_url("https://public.example/v1") is True

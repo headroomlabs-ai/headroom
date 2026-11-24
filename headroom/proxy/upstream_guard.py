@@ -37,7 +37,9 @@ import from any handler without risking an import cycle.
 from __future__ import annotations
 
 import asyncio
+import functools
 import ipaddress
+import logging
 import os
 import socket
 import threading
@@ -48,6 +50,8 @@ from concurrent.futures import TimeoutError as _FutureTimeout
 from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_BASE_URLS_ENV = "HEADROOM_ALLOWED_BASE_URLS"
 
@@ -379,37 +383,52 @@ def clear_validated_addresses() -> None:
 
 def allowlisted_destinations(
     env: str = ALLOWED_BASE_URLS_ENV,
-) -> tuple[set[str], set[tuple[str, str, int]]] | None:
-    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset."""
+) -> tuple[frozenset[str], frozenset[tuple[str, str, int]]] | None:
+    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset.
+
+    Hosts are kept as the name the connection dials (lower-case IDNA A-label),
+    so every spelling of a host matches the same entry.
+    """
     raw = os.environ.get(env)
     if not raw or not raw.strip():
         return None
+    return _parse_destinations(env, raw)
+
+
+@functools.lru_cache(maxsize=16)
+def _parse_destinations(
+    env: str, raw: str
+) -> tuple[frozenset[str], frozenset[tuple[str, str, int]]]:
     hosts: set[str] = set()
     origins: set[tuple[str, str, int]] = set()
     for item in raw.split(","):
         item = item.strip()
         if not item:
             continue
-        if "://" not in item:
-            parsed = urlparse(f"//{item}")
-            if parsed.hostname:
-                hosts.add(parsed.hostname.lower())
-            continue
-        parsed = urlparse(item)
-        if parsed.scheme.lower() not in _SAFE_SCHEMES or not parsed.hostname:
-            continue
         try:
+            parsed = urlparse(item if "://" in item else f"//{item}")
             port = parsed.port
         except ValueError:
+            parsed = None
+        host = _connect_name(parsed.hostname or "") if parsed is not None else None
+        if parsed is None or not host:
+            logger.warning("ignoring malformed %s entry: %r", env, item)
+            continue
+        if "://" not in item:
+            hosts.add(host)
+            continue
+        scheme = parsed.scheme.lower()
+        if scheme not in _SAFE_SCHEMES:
+            logger.warning("ignoring %s entry with an unsupported scheme: %r", env, item)
             continue
         if port is None:
-            port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
-        origins.add((parsed.scheme.lower(), parsed.hostname.lower(), port))
-    return hosts, origins
+            port = 443 if scheme in {"https", "wss"} else 80
+        origins.add((scheme, host, port))
+    return frozenset(hosts), frozenset(origins)
 
 
 def destination_listed(
-    allow: tuple[set[str], set[tuple[str, str, int]]],
+    allow: tuple[frozenset[str], frozenset[tuple[str, str, int]]],
     scheme: str,
     host: str,
     port: int | None,
@@ -420,12 +439,13 @@ def destination_listed(
     origin, with the scheme's default port filled in when ``port`` is ``None``.
     """
     hosts, origins = allow
-    if host.lower() in hosts:
+    host = _connect_name(host) or ""
+    if host in hosts:
         return True
     scheme = scheme.lower()
     if port is None:
         port = 443 if scheme in {"https", "wss"} else 80
-    return (scheme, host.lower(), port) in origins
+    return (scheme, host, port) in origins
 
 
 # RFC 6052 well-known prefix. A DNS64 resolver answers a host that has only an
@@ -539,7 +559,14 @@ def _judge_answer(connect_host: str, infos: list, scope: dict[str, UpstreamPin] 
 PROXIED_BASE_URLS_ENV = "HEADROOM_PROXIED_BASE_URLS"
 
 
-def _listed_for_proxy(url: str) -> bool:
+def proxied_destination_listed(url: str) -> bool:
+    """Whether ``url``'s destination is listed in ``HEADROOM_PROXIED_BASE_URLS``.
+
+    The one matcher for that list: the guard asks it whether a host may be
+    answered from memory, and the outbound transport asks it whether a guarded
+    request may leave through the proxy by name, so the two cannot disagree
+    about a destination.
+    """
     allow = allowlisted_destinations(PROXIED_BASE_URLS_ENV)
     if allow is None:
         return False
@@ -559,7 +586,7 @@ def _from_memory(url: str, connect_host: str, scope: dict[str, UpstreamPin] | No
     its connection leaves through the outbound proxy by name, so no pin binds
     it, and only an answer from this request keeps the check current.
     """
-    if _listed_for_proxy(url):
+    if proxied_destination_listed(url):
         return None
     remembered = _RESOLVER.remembered(connect_host)
     if remembered is None:
