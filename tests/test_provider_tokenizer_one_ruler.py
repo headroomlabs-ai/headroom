@@ -15,12 +15,17 @@ disagree, the subtraction is a difference of two rulers and the result is noise
 ``/v1/chat/completions`` is a multi-provider passthrough, so Kimi, Gemini,
 Mistral and Cohere models all reach ``OpenAIProvider``. It used to hand them a
 guessed ``o200k_base`` encoding, which mis-counted Kimi by ~19%.
+
+``/v1/messages`` builds its pipeline with ``AnthropicProvider``, which counted
+Claude with ``cl100k_base`` x 1.1 while the registry prices Claude against
+``o200k_base``: 403 vs 367 tokens on the same messages (#5037).
 """
 
 from __future__ import annotations
 
 import pytest
 
+from headroom.providers.anthropic import AnthropicProvider, AnthropicTokenCounter
 from headroom.providers.openai import OpenAIProvider, OpenAITokenCounter
 from headroom.tokenizers import get_tokenizer
 
@@ -92,3 +97,84 @@ def test_an_explicit_encoding_mapping_is_still_honored() -> None:
     )
     # cl100k_base, not the o200k_base unknown-model default.
     assert counter.count_text("hello world") > 0
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-6",
+        "claude-opus-4-7",
+        "claude-3-5-haiku-20241022",
+    ],
+)
+def test_claude_pipeline_ruler_equals_handler_ruler(model: str) -> None:
+    """``/v1/messages``: the pipeline counts via ``AnthropicProvider``, the
+    handler via the registry. Both must be one ruler, as for ``OpenAIProvider``.
+    """
+    provider_count = AnthropicProvider(warn=False).get_token_counter(model).count_messages(MESSAGES)
+    registry_count = get_tokenizer(model).count_messages(MESSAGES)
+
+    assert provider_count == registry_count, (
+        f"{model}: pipeline counted {provider_count}, handler counted "
+        f"{registry_count} -- tokens_saved would be a difference of two rulers"
+    )
+
+
+def test_issue_5037_repro_claude_counts_match() -> None:
+    """The exact repro from #5037 (367 vs 403 on main)."""
+    messages = [{"role": "user", "content": "def hello(name):\n    return name.upper()\n" * 40}]
+    handler = get_tokenizer("claude-sonnet-4-5")
+    pipeline = AnthropicProvider(warn=False).get_token_counter("claude-sonnet-4-5")
+
+    assert pipeline.count_messages(messages) == handler.count_messages(messages)
+
+
+def test_claude_with_an_api_client_keeps_the_token_count_api() -> None:
+    """A client means Claude's real tokenizer: that counter must stay.
+
+    The Token Count API is the accurate ruler, not a second approximation, so
+    it is not folded into the registry. Callers that compare against it pass
+    the same counter through ``TransformPipeline.apply(token_counter=...)``.
+    """
+
+    class _Usage:
+        input_tokens = 42
+
+    class _Messages:
+        def count_tokens(self, **_: object) -> _Usage:
+            return _Usage()
+
+    class _Client:
+        messages = _Messages()
+
+    counter = AnthropicProvider(client=_Client()).get_token_counter("claude-sonnet-4-5")
+
+    assert isinstance(counter, AnthropicTokenCounter)
+    assert counter.count_messages(MESSAGES) == 42
+
+
+def test_no_client_warning_still_points_at_the_same_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deferring to the registry must not move the advice warning's location.
+
+    It used to be raised from ``AnthropicTokenCounter.__init__`` with
+    ``stacklevel=4``: the caller of whoever asked for the counter.
+    """
+    import inspect
+    import warnings
+
+    import headroom.providers.anthropic as anthropic_mod
+
+    monkeypatch.setattr(anthropic_mod, "_FALLBACK_WARNING_SHOWN", False)
+
+    def asks_for_a_counter() -> None:
+        AnthropicProvider(warn=True).get_token_counter("claude-sonnet-4-5")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        expected_line = inspect.currentframe().f_lineno + 1  # type: ignore[union-attr]
+        asks_for_a_counter()  # <- the frame the warning must point at
+
+    (warning,) = [w for w in caught if "No client provided" in str(w.message)]
+    assert warning.filename == __file__
+    assert warning.lineno == expected_line

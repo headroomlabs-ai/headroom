@@ -206,7 +206,7 @@ class TransformPipeline:
         Uses provider's tokenizer if available, otherwise falls back to
         the tokenizer registry which auto-detects the best backend per model:
         - OpenAI models: tiktoken (exact)
-        - Anthropic models: calibrated estimation (~3.5 chars/token)
+        - Anthropic models: tiktoken o200k_base as a proxy for Claude's tokenizer
         - Open models: HuggingFace tokenizer (if installed)
         - Unknown models: character-based estimation
         """

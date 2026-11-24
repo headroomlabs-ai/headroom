@@ -145,7 +145,7 @@ These are kept even if they exceed the K budget.
 ## Provider Interactions
 
 - CacheAligner maximizes Anthropic/OpenAI prefix cache hit rates
-- Token counting uses model-specific tokenizers (tiktoken for OpenAI, calibrated estimation for Anthropic)
+- Token counting uses model-specific tokenizers (tiktoken for OpenAI; for Anthropic, tiktoken `o200k_base` as a proxy for Claude's private tokenizer, or Anthropic's Token Count API when the SDK is given an Anthropic client)
 - Compression works with all providers -- no provider-specific limitations
 - Compressed content is valid JSON -- downstream tools and parsers work unchanged
 
