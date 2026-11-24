@@ -22,6 +22,21 @@ from typing import Any, Protocol, runtime_checkable
 CCR_TOOL_NAME = "headroom_retrieve"
 
 
+def is_headroom_retrieve_name(name: object) -> bool:
+    """True if a tool name is the headroom_retrieve tool.
+
+    Matches the bare name or an MCP-namespaced ``*__headroom_retrieve``
+    suffix (e.g. ``mcp__headroom__headroom_retrieve``). A single trailing
+    ``retrieve`` fragment without the ``__`` boundary (e.g.
+    ``xheadroom_retrieve``) does NOT match -- only an exact bare name or a
+    proper namespaced suffix does.
+
+    ``name`` may come from untrusted request JSON; a non-str value (e.g.
+    int) would raise on ``.endswith``, so this guards with ``isinstance``.
+    """
+    return isinstance(name, str) and (name == CCR_TOOL_NAME or name.endswith(f"__{CCR_TOOL_NAME}"))
+
+
 @runtime_checkable
 class _HashOwnershipStore(Protocol):
     """Structural type for verify_ownership()'s store dependency.
