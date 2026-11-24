@@ -89,6 +89,39 @@ def test_blocks_non_globally_routable_and_embedded_forms(label: str, url: str) -
     assert is_safe_upstream_url(url) is False, label
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[2002:a9fe:a9fe::]/",  # embeds 169.254.169.254
+        "http://[2002:a00:1::]/",  # embeds 10.0.0.1
+        "http://[2002:7f00:1::]/",  # embeds 127.0.0.1
+    ],
+)
+def test_6to4_is_refused_without_the_stdlib_tables(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """Python releases before the 2024 `ipaddress` table fix call 2002::/16 global.
+
+    Simulate such a release so the guard is shown not to depend on it.
+    """
+    import ipaddress
+
+    real_is_global = ipaddress.IPv6Address.is_global
+    real_is_private = ipaddress.IPv6Address.is_private
+    six_to_four = ipaddress.IPv6Network("2002::/16")
+
+    def old_is_global(self: ipaddress.IPv6Address) -> bool:
+        return True if self in six_to_four else real_is_global.fget(self)  # type: ignore[attr-defined]
+
+    def old_is_private(self: ipaddress.IPv6Address) -> bool:
+        return False if self in six_to_four else real_is_private.fget(self)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(ipaddress.IPv6Address, "is_global", property(old_is_global))
+    monkeypatch.setattr(ipaddress.IPv6Address, "is_private", property(old_is_private))
+
+    assert is_safe_upstream_url(url) is False
+
+
 def test_multicast_is_still_blocked() -> None:
     """`is_global` is True for multicast, so the category checks must remain."""
     assert is_safe_upstream_url("http://224.0.0.1/") is False

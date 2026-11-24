@@ -175,7 +175,8 @@ def _reexec_with_malloc_tuning() -> None:
     if not missing:
         return
     os.environ.update(missing)
-    os.execv(sys.executable, [sys.executable, "-m", "headroom.cli", *sys.argv[1:]])
+    # -P keeps the working directory off sys.path in the replacement process.
+    os.execv(sys.executable, [sys.executable, "-P", "-m", "headroom.cli", *sys.argv[1:]])
 
 
 def _get_env_int_optional(name: str) -> int | None:
