@@ -683,13 +683,17 @@ async def test_cancelled_queued_helper_before_start_releases_drain_lock(isolated
     await asyncio.wait_for(queued_ready.wait(), timeout=5.0)
     assert queued_future is not None and queued_fn is not None
 
-    # Simulate shutdown cancelling the drain and event-loop teardown cancelling
-    # the queued executor future before any worker thread starts it.
+    # Simulate real proxy shutdown: cancel the drain task, then cancel it a
+    # second time when the shutdown timeout expires while the helper is still
+    # queued in the executor. Do not cancel queued_future directly.
     drain_task.cancel()
     await asyncio.sleep(0)
-    queued_future.cancel()
+    assert not drain_task.done()
+
+    drain_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(drain_task, timeout=5.0)
+    assert queued_future.cancelled()
 
     # Restore real executor and confirm a peer immediately acquires .drain.lock.
     monkeypatch.setattr(loop, "run_in_executor", real_run_in_executor)
@@ -701,4 +705,45 @@ async def test_cancelled_queued_helper_before_start_releases_drain_lock(isolated
 
     # Even if the cancelled queued callable were somehow dequeued later, it is a no-op.
     func, args = queued_fn
+    assert func(*args) is None
+
+
+@pytest.mark.asyncio
+async def test_submission_error_after_enqueue_completes_checkpoint_once_under_lock(
+    isolated_home, monkeypatch
+):
+    """If executor submission raises after enqueueing a checkpoint, complete it once under lock."""
+    import asyncio
+
+    agy_savings_inbox.emit_event(**_FUNNEL_KWARGS)
+
+    loop = asyncio.get_running_loop()
+    real_run_in_executor = loop.run_in_executor
+    captured_checkpoint = None
+
+    def _failing_checkpoint_submit(executor, func, *args):
+        nonlocal captured_checkpoint
+        # Fail only on the checkpoint submission (after record_request ran).
+        if captured_checkpoint is None and len(first_metrics.calls) == 1:
+            captured_checkpoint = (func, args)
+            raise RuntimeError("can't start new thread")
+        return real_run_in_executor(executor, func, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", _failing_checkpoint_submit)
+
+    first_metrics = FakeMetrics()
+    recorded = await agy_savings_inbox.drain_inbox(first_metrics)
+    assert recorded == 1
+    assert len(first_metrics.calls) == 1
+    assert captured_checkpoint is not None
+    assert _evt_files() == []
+
+    # Peer drain sees the event already checkpointed and unlinked (no duplicate).
+    monkeypatch.setattr(loop, "run_in_executor", real_run_in_executor)
+    peer_metrics = FakeMetrics()
+    assert await agy_savings_inbox.drain_inbox(peer_metrics) == 0
+    assert peer_metrics.calls == []
+
+    # If a busy worker later dequeues the enqueued checkpoint callable, it is a no-op.
+    func, args = captured_checkpoint
     assert func(*args) is None

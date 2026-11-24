@@ -418,7 +418,20 @@ async def _run_in_thread_before_unlock(
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.run_in_executor(None, _run)
     except BaseException:
-        _finish_once()
+        # Submission can raise after the pool already enqueued `_run` (e.g.
+        # ThreadPoolExecutor failing to spawn another OS thread). Coordinate
+        # with `_run` under state_lock so exactly one path runs `fn(*args)`
+        # while `.drain.lock` stays held.
+        run_inline = False
+        with state_lock:
+            if not started:
+                cancelled_before_start = True
+                run_inline = True
+        if run_inline:
+            try:
+                return fn(*args)
+            finally:
+                _finish_once()
         raise
     fut.add_done_callback(_on_done)
     try:
@@ -426,6 +439,13 @@ async def _run_in_thread_before_unlock(
     except asyncio.CancelledError:
         try:
             await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            # Second cancellation (e.g. shutdown timeout): cancel `fut` so a
+            # still-queued helper releases the lease immediately via `_on_done`,
+            # while an already-started helper keeps the lease until its own
+            # `finally:` completes.
+            fut.cancel()
+            raise
         except Exception:  # noqa: BLE001
             pass
         raise
