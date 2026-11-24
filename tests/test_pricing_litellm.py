@@ -157,6 +157,9 @@ def test_litellm_minimax_preregistration_safety_net(monkeypatch) -> None:
     )
     monkeypatch.setattr(litellm_pricing, "LITELLM_AVAILABLE", True)
     monkeypatch.setattr(litellm_pricing, "litellm", fake_litellm)
+    # Registration records the bare rows it makes; restore that record with the
+    # catalog, or later tests treat an upstream bare row as Headroom's copy.
+    monkeypatch.setattr(litellm_pricing, "_mirrored_bare_rows", set())
 
     litellm_pricing._register_minimax_pricing()
 
