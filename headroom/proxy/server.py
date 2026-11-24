@@ -6071,11 +6071,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         counters but never the per-request metadata.
         """
         # Opportunistically drain the agy cross-process savings inbox so the
-        # dashboard reflects any pending agy events promptly. Best-effort.
+        # dashboard reflects any pending agy events promptly. Skip when this
+        # process is itself an AGY emitter (HEADROOM_AGY_INBOX_EMIT=1), matching
+        # the lifespan periodic-drain guard so wrapper /stats calls never consume
+        # events intended for the shared proxy.
         try:
             from headroom.proxy import agy_savings_inbox
 
-            await agy_savings_inbox.drain_inbox(proxy.metrics)
+            if not agy_savings_inbox.agy_emit_enabled():
+                await agy_savings_inbox.drain_inbox(proxy.metrics)
         except Exception:  # noqa: BLE001 - never let a drain error break /stats
             pass
 

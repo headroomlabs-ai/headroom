@@ -107,6 +107,34 @@ def test_emitting_process_never_drains(
     assert started is expect_drain
 
 
+async def test_emitting_process_stats_does_not_drain_shared_inbox(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling /stats on an emitting wrapper app must leave inbox events for the shared proxy."""
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy import server as server_mod
+    from headroom.proxy.server import ProxyConfig
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(isolated_home / ".headroom"))
+    monkeypatch.setenv("HEADROOM_AGY_INBOX_EMIT", "1")
+
+    agy_savings_inbox.emit_event(**_event("proj-shared", tokens_saved=900, input_tokens=1500))
+
+    with TestClient(server_mod.create_app(ProxyConfig(optimize=False))) as client:
+        resp = client.get("/stats")
+        assert resp.status_code == 200
+
+    # Shared proxy (emit disabled) must still find and record the pending event.
+    monkeypatch.delenv("HEADROOM_AGY_INBOX_EMIT", raising=False)
+    tracker = SavingsTracker(path=str(isolated_home / "proxy_savings.json"))
+    metrics = PrometheusMetrics(savings_tracker=tracker)
+    recorded = await agy_savings_inbox.drain_inbox(metrics)
+    assert recorded == 1
+    assert metrics.tokens_saved_total == 900
+
+
 async def test_drain_moves_token_hero_and_per_project(isolated_home: Path) -> None:
     tracker = SavingsTracker(path=str(isolated_home / "proxy_savings.json"))
     metrics = PrometheusMetrics(savings_tracker=tracker)
