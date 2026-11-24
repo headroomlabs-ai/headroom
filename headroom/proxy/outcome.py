@@ -36,6 +36,7 @@ from headroom.log_safety import describe_exception
 from headroom.proxy.conversation_savings import get_conversation_savings
 from headroom.proxy.savings import ItemMeasure, get_item_ledger
 from headroom.proxy.tool_schema_savings_policy import (
+    TOOL_SCHEMA_SAVINGS_TAGS,
     headline_tokens_saved,
     tool_schema_saved_from_tags,
 )
@@ -521,6 +522,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         enabled_dimensions,
         get_current_attribution,
         get_current_conversation,
+        header_name_for,
         merge_attribution,
         normalize_attribution,
     )
@@ -828,10 +830,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         if project_tag:
             log_tags["project"] = project_tag
         for dimension, label in attribution.items():
+            # The stats reader sums these tags as savings, so only the proxy
+            # writes them: a label of the same name never reaches them.
+            if dimension in TOOL_SCHEMA_SAVINGS_TAGS:
+                continue
             # A listed dimension's label is its resolver's, which outranks the
-            # ``X-Headroom-<name>`` tag a client sent. Any other label never
-            # replaces a tag the handler set.
-            if dimension in listed:
+            # ``X-Headroom-<name>`` tag a client sent. ``extract_tags`` keys
+            # that tag by the header's own spelling, so a tag under any other
+            # key was set by the handler and is never replaced.
+            client_key = header_name_for(dimension)[len("x-headroom-") :]
+            if dimension in listed and (dimension not in log_tags or dimension == client_key):
                 log_tags[dimension] = label
             else:
                 log_tags.setdefault(dimension, label)

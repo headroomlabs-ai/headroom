@@ -132,7 +132,9 @@ register_dimension("region", lambda request: request.header("x-region"))
 `replace=True` takes over a built-in. The new resolver is then the only source of that
 label in `by_dimension` and `OutcomeSnapshot.attribution`: the harness or project the
 proxy detects itself no longer overrides it. In request-log tags its label wins too, but
-when it finds nothing the tag still shows what the proxy detected.
+when it finds nothing the tag still shows what the proxy detected. A label never
+replaces a tag the proxy sets itself, such as `tool_search_deferred_tokens`, so a
+dimension that shares its name cannot change the savings the proxy reports.
 
 Two older records keep what the proxy detected. The `projects` totals are one. The
 ledger is the other, for `client` only: each event has a single `client` key, which is

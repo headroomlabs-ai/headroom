@@ -576,6 +576,36 @@ def test_a_resolved_label_outranks_the_client_header_tag_in_the_request_log(tmp_
         attribution.unregister_dimension("user")
 
 
+@pytest.mark.parametrize("server_value", [70, None])
+def test_a_listed_label_never_replaces_a_tag_the_proxy_owns(tmp_path, monkeypatch, server_value):
+    from headroom.proxy import attribution
+    from headroom.proxy.helpers import extract_tags
+    from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+
+    monkeypatch.setenv(
+        attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "default,tool_search_deferred_tokens"
+    )
+    headers = {"X-Headroom-Tool-Search-Deferred-Tokens": "1"}
+    request = attribution.AttributionRequest(headers={k.lower(): v for k, v in headers.items()})
+    labels = attribution.resolve_attribution(request)
+    assert labels["tool_search_deferred_tokens"] == "1"
+
+    tags = extract_tags(headers)
+    if server_value is not None:
+        tags["tool_search_deferred_tokens"] = server_value
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        proxy = client.app.state.proxy
+        sink = _LogSink()
+        with monkeypatch.context() as patch:
+            patch.setattr(proxy, "logger", sink, raising=False)
+            set_current_attribution(labels)
+            _emit(proxy, tags=tags)
+            set_current_attribution(None)
+    logged = sink.entries[-1].tags
+    assert logged.get("tool_search_deferred_tokens") == server_value
+    assert tool_schema_saved_from_tags(logged) == (server_value or 0)
+
+
 def test_open_labels_book_a_builtin_dimension_that_is_not_selected(tmp_path, monkeypatch):
     from headroom.proxy import attribution
 
