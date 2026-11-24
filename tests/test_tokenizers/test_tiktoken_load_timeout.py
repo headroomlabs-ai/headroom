@@ -21,10 +21,10 @@ from headroom.tokenizers.registry import TokenizerRegistry
 @pytest.fixture(autouse=True)
 def _reset_encoding_state():
     tc._get_encoding.cache_clear()
-    tc._load_failed.clear()
+    tc._pending_loads.clear()
     yield
     tc._get_encoding.cache_clear()
-    tc._load_failed.clear()
+    tc._pending_loads.clear()
 
 
 def _stalled_get_encoding(_name: str):
@@ -55,7 +55,7 @@ def test_failed_encoding_short_circuits(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(tc.TiktokenLoadError):
         tc.load_encoding("stall-enc-2")
 
-    # A second request must fail instantly via the _load_failed short-circuit,
+    # A second request must fail instantly while the timed-out load is still running,
     # not wait out the timeout again (this is what makes it not "every request").
     start = time.perf_counter()
     with pytest.raises(tc.TiktokenLoadError):
@@ -79,3 +79,34 @@ def test_registry_falls_back_to_estimator_on_stall(monkeypatch: pytest.MonkeyPat
 
     counter = TokenizerRegistry()._create_tiktoken("gpt-4")
     assert isinstance(counter, EstimatingTokenCounter)
+
+
+def test_a_slow_download_that_lands_is_adopted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Online, a timed-out load fails fast while its download runs, and the
+    first call after it finishes returns the encoding without a restart."""
+    tiktoken = pytest.importorskip("tiktoken")
+    sentinel = object()
+
+    def _slow(_name: str) -> object:
+        time.sleep(0.5)
+        return sentinel
+
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.1")
+    monkeypatch.setattr(tiktoken, "get_encoding", _slow)
+    try:
+        with pytest.raises(tc.TiktokenLoadError):
+            tc.load_encoding("slow-enc")
+        start = time.perf_counter()
+        with pytest.raises(tc.TiktokenLoadError):
+            tc.load_encoding("slow-enc")
+        assert time.perf_counter() - start < 0.1  # no second wait while it runs
+
+        deadline = time.monotonic() + 5.0
+        while tc._pending_loads["slow-enc"][0].is_alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert tc.load_encoding("slow-enc") is sentinel
+        assert "slow-enc" not in tc._pending_loads
+    finally:
+        tc._get_encoding.cache_clear()
+        tc._pending_loads.clear()

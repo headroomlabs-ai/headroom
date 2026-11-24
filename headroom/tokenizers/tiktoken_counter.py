@@ -36,14 +36,18 @@ class TiktokenVocabNotCached(TiktokenLoadError):
     """Raised when ``HEADROOM_OFFLINE`` refused a cold-cache vocab download.
 
     A :class:`TiktokenLoadError`, so every caller that already falls back to
-    estimation on a stalled download does the same here. Unlike a timeout it
-    is not remembered: pre-seeding ``TIKTOKEN_CACHE_DIR`` or turning the switch
-    off makes the next load succeed.
+    estimation on a stalled download does the same here. It is not
+    remembered: pre-seeding ``TIKTOKEN_CACHE_DIR`` or turning the switch off
+    makes the next load succeed, so callers must not cache their fallback.
     """
 
 
-# Encoding names whose bounded load already timed out — don't block on them again.
-_load_failed: set[str] = set()
+# Loads that outlived their bounded wait, by encoding name, with the result box
+# their worker fills. While the worker runs, later calls fail fast instead of
+# blocking again (GH #956); once it finishes, the next call adopts its result,
+# so a slow download that does land restores exact counts without a restart.
+_pending_loads: dict[str, tuple[threading.Thread, dict[str, Any]]] = {}
+_pending_lock = threading.Lock()
 
 # Marks the thread running one of Headroom's own vocab loads, so the read_file
 # guard below refuses Headroom's downloads and leaves a host application's own
@@ -163,9 +167,9 @@ def _get_encoding(encoding_name: str):
     Bounded by ``HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS`` (default 10s): tiktoken's
     vocab download has no network timeout, so we run the load on a worker thread
     and raise :class:`TiktokenLoadError` if it doesn't finish in time, letting
-    callers fall back to estimation rather than hang the request (GH #956). The
-    first timed-out encoding is remembered so later calls fail fast instead of
-    re-blocking on every request.
+    callers fall back to estimation rather than hang the request (GH #956). A
+    timed-out load keeps running in the background: later calls fail fast
+    while it does, and the first call after it finishes returns its encoding.
 
     Under ``HEADROOM_OFFLINE`` a cached vocab still loads, and a cold cache
     raises :class:`TiktokenVocabNotCached` instead of downloading. The refusal
@@ -173,8 +177,16 @@ def _get_encoding(encoding_name: str):
     """
     import tiktoken
 
-    if encoding_name in _load_failed:
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
+    with _pending_lock:
+        pending = _pending_loads.get(encoding_name)
+        if pending is not None:
+            if pending[0].is_alive():
+                raise TiktokenLoadError(
+                    f"tiktoken encoding {encoding_name!r} is still loading after timing out"
+                )
+            del _pending_loads[encoding_name]
+    if pending is not None:
+        return _loaded_encoding(encoding_name, pending[1])
 
     try:
         if not _install_read_file_guard():
@@ -198,15 +210,21 @@ def _get_encoding(encoding_name: str):
     worker.join(_load_timeout_seconds())
 
     if worker.is_alive():
-        _load_failed.add(encoding_name)
+        with _pending_lock:
+            _pending_loads[encoding_name] = (worker, box)
         logger.warning(
             "tiktoken encoding %r did not load within %.1fs (likely a stalled vocab "
-            "download); falling back to token estimation. Pre-populate TIKTOKEN_CACHE_DIR "
-            "or tune HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS.",
+            "download); falling back to token estimation until it finishes. Pre-populate "
+            "TIKTOKEN_CACHE_DIR or tune HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS.",
             encoding_name,
             _load_timeout_seconds(),
         )
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} load timed out")
+    return _loaded_encoding(encoding_name, box)
+
+
+def _loaded_encoding(encoding_name: str, box: dict[str, Any]) -> Any:
+    """Return a finished worker's encoding, or raise what it raised."""
     if "err" in box:
         err = box["err"]
         if isinstance(err, OfflineEgressBlocked):

@@ -911,7 +911,7 @@ def tiktoken_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setitem(
         tiktoken.registry.ENCODING_CONSTRUCTORS, _FAKE_ENCODING, _fake_encoding_constructor
     )
-    monkeypatch.setattr(tiktoken_counter, "_load_failed", set())
+    monkeypatch.setattr(tiktoken_counter, "_pending_loads", {})
     tiktoken_counter._get_encoding.cache_clear()
     yield cache
     tiktoken_counter._get_encoding.cache_clear()
@@ -963,8 +963,7 @@ class TestTiktokenVocabOffline:
     def test_a_refusal_is_not_remembered(
         self, offline: None, no_sockets: None, tiktoken_cache: Path, vocab_downloads: list[str]
     ) -> None:
-        """Pre-seeding the cache after a refusal works without a restart,
-        unlike a timed-out download, which is remembered on purpose."""
+        """Pre-seeding the cache after a refusal works without a restart."""
         from headroom.tokenizers.tiktoken_counter import TiktokenVocabNotCached, load_encoding
 
         with pytest.raises(TiktokenVocabNotCached):
