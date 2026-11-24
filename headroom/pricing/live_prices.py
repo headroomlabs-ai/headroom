@@ -127,10 +127,15 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
     Each fetched row replaces the current one whole, so a rate upstream has
     retired (a dropped long-context tier) goes with it. Alias rows are resolved
     to their target's prices, after Headroom's own rows (DeepSeek off-peak
-    rates) are laid on, so aliases inherit those too. Only rows that differ
-    are applied, in one ``dict.update``: request threads iterating
-    ``litellm.model_cost`` never see it change size mid-merge. Returns how
-    many rows changed.
+    rates) are laid on, so aliases inherit those too. Returns how many rows
+    changed.
+
+    The live table is never changed in place. A request thread may be
+    iterating it (litellm rebuilds its lowercase name index that way), and
+    growing the dict, even in one ``dict.update``, fails that iteration, so
+    the model reads as unmapped. The merged table is built aside and bound to
+    ``litellm.model_cost`` in one assignment; a reader already holding the old
+    table finishes on it.
     """
     from headroom.pricing.litellm_pricing import deepseek_rows, litellm, mirrored_rows
 
@@ -150,7 +155,7 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
     if not changed:
         return 0
     try:
-        current.update(changed)
+        litellm.model_cost = {**current, **changed}
         # litellm infers a bare model's provider from per-provider name sets
         # built at import, and caches a lowercase index of the keys; new models
         # need both, or `cost_per_token` cannot place them.

@@ -92,6 +92,44 @@ def test_refresh_prices_a_model_the_bundled_table_lacks(monkeypatch, isolated_ca
     assert live_prices.refresh_litellm_prices() == 0
 
 
+def test_a_refresh_does_not_break_a_lookup_already_reading_the_table(isolated_catalog):
+    """A lookup that is iterating the table when a refresh lands still prices its model.
+
+    litellm resolves a mixed-case name by rebuilding a lowercase index, which
+    iterates ``litellm.model_cost``. Growing that dict in place, even in one
+    ``dict.update``, made the running iteration fail and the model read as
+    unmapped. A key whose ``lower()`` blocks pauses the rebuild mid-iteration.
+    """
+    started, resume = threading.Event(), threading.Event()
+
+    class PausingKey(str):
+        def lower(self) -> str:
+            started.set()
+            resume.wait(5)
+            return str(self).lower()
+
+    litellm.model_cost[PausingKey("headroom-test-pause")] = {"input_cost_per_token": 0.0}
+    litellm.utils._invalidate_model_cost_lowercase_map()
+    found: list[object] = []
+
+    def lookup() -> None:
+        try:
+            info = litellm.get_model_info("GPT-4O", custom_llm_provider="openai")
+            found.append(info["input_cost_per_token"])
+        except Exception as exc:  # noqa: BLE001 - the failure is what is asserted
+            found.append(exc)
+
+    reader = threading.Thread(target=lookup)
+    reader.start()
+    assert started.wait(5)
+    live_prices.merge_litellm_prices({NEW_MODEL: NEW_ROW})
+    resume.set()
+    reader.join(5)
+
+    assert found == [pytest.approx(2.5e-06)]
+    assert litellm.model_cost[NEW_MODEL]["input_cost_per_token"] == NEW_ROW["input_cost_per_token"]
+
+
 def test_refresh_keeps_headroom_deepseek_off_peak_rates(monkeypatch, isolated_catalog):
     model, ours = next(iter(_DEEPSEEK_V4_PRICING.items()))
     table = dict(litellm.model_cost)
