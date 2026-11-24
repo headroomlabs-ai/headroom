@@ -550,28 +550,33 @@ class OpenAIProvider(Provider):
         the same request — savings become a difference of two rulers. Defer to
         the registry so each model has exactly one tokenizer. For OpenAI models,
         fall back to estimation when a vocabulary cannot load within the bounded
-        timeout; the cached fallback prevents subsequent requests from blocking.
+        timeout. That fallback is not cached: the bounded loader fails fast while
+        the vocabulary cannot load, and the next request gets the exact counter
+        once it is cached or a slow download has landed.
         """
-        if model not in self._token_counters:
-            if _lookup_encoding_name(model, self._encodings) is None:
-                from headroom.tokenizers import get_tokenizer
+        cached = self._token_counters.get(model)
+        if cached is not None:
+            return cached
 
-                self._token_counters[model] = cast(Any, get_tokenizer(model))
-            else:
-                from ..tokenizers.tiktoken_counter import TiktokenLoadError
+        from ..tokenizers.estimator import PendingVocabEstimator
 
-                try:
-                    self._token_counters[model] = OpenAITokenCounter(
-                        model=model, custom_encodings=self._encodings
-                    )
-                except TiktokenLoadError as exc:
-                    logger.warning(
-                        "tiktoken unavailable for %s (%s); using estimation.", model, exc
-                    )
-                    from ..tokenizers.estimator import EstimatingTokenCounter
+        counter: TokenCounter
+        if _lookup_encoding_name(model, self._encodings) is None:
+            from headroom.tokenizers import get_tokenizer
 
-                    self._token_counters[model] = EstimatingTokenCounter()
-        return self._token_counters[model]
+            counter = cast(Any, get_tokenizer(model))
+        else:
+            from ..tokenizers.tiktoken_counter import TiktokenLoadError
+
+            try:
+                counter = OpenAITokenCounter(model=model, custom_encodings=self._encodings)
+            except TiktokenLoadError as exc:
+                # The loader already logged the timeout or offline refusal once.
+                logger.debug("tiktoken unavailable for %s (%s); using estimation.", model, exc)
+                counter = cast(Any, PendingVocabEstimator())
+        if not isinstance(counter, PendingVocabEstimator):
+            self._token_counters[model] = counter
+        return counter
 
     def get_context_limit(self, model: str) -> int:
         """Get context limit for an OpenAI model.
