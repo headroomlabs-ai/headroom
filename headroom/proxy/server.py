@@ -920,18 +920,15 @@ _BROWSER_PROVENANCE_HEADERS = ("origin", "referer", "sec-fetch-site", "sec-fetch
 _ORIGIN_LIST_ENVS = ("HEADROOM_WS_ORIGINS", "HEADROOM_CORS_ORIGINS")
 
 
-def _host_key(
-    host: str, port: int | None, default_ports: tuple[int, ...]
-) -> tuple[str, int | None]:
-    host = host.lower().rstrip(".")
-    return host, None if port in default_ports else port
+_SCHEME_DEFAULT_PORTS = {"http": 80, "ws": 80, "https": 443, "wss": 443}
 
 
 def _listed_hosts() -> set[tuple[str, int | None]]:
-    """``host[:port]`` of every origin in HEADROOM_WS_ORIGINS / HEADROOM_CORS_ORIGINS.
+    """``(host, port)`` of every origin in HEADROOM_WS_ORIGINS / HEADROOM_CORS_ORIGINS.
 
-    The scheme is ignored: the proxy runs without ``proxy_headers``, so behind a
-    TLS-terminating reverse proxy it sees ``http`` for an ``https`` page.
+    The port is the origin's explicit port, else its scheme's default (``None``
+    for an unknown scheme). The scheme itself is not compared (see
+    :func:`_is_listed_host`).
     """
     hosts: set[tuple[str, int | None]] = set()
     for env in _ORIGIN_LIST_ENVS:
@@ -945,12 +942,14 @@ def _listed_hosts() -> set[tuple[str, int | None]]:
             except ValueError:
                 continue
             if parts.hostname:
-                default = {"http": (80,), "ws": (80,), "https": (443,), "wss": (443,)}
-                hosts.add(_host_key(parts.hostname, port, default.get(parts.scheme.lower(), ())))
+                if port is None:
+                    port = _SCHEME_DEFAULT_PORTS.get(parts.scheme.lower())
+                hosts.add((parts.hostname.lower().rstrip("."), port))
     return hosts
 
 
 def _host_header_key(host_header: str) -> tuple[str, int | None] | None:
+    """``(host, port)`` of a ``Host`` header; ``port`` is ``None`` when it names none."""
     try:
         parts = urlsplit(f"//{host_header.strip()}")
         port = parts.port
@@ -958,7 +957,25 @@ def _host_header_key(host_header: str) -> tuple[str, int | None] | None:
         return None
     if not parts.hostname:
         return None
-    return _host_key(parts.hostname, port, (80, 443))
+    return parts.hostname.lower().rstrip("."), port
+
+
+def _is_listed_host(host_header: str) -> bool:
+    """Whether a ``Host`` names an origin listed in HEADROOM_WS_ORIGINS / HEADROOM_CORS_ORIGINS.
+
+    Compared by host and port, not scheme: the proxy runs without
+    ``proxy_headers``, so behind a TLS-terminating reverse proxy it sees
+    ``http`` for an ``https`` page. A ``Host`` without a port matches a listed
+    origin on either scheme's default port.
+    """
+    key = _host_header_key(host_header)
+    if key is None:
+        return False
+    host, port = key
+    return any(
+        listed_host == host and (listed_port == port or (port is None and listed_port in (80, 443)))
+        for listed_host, listed_port in _listed_hosts()
+    )
 
 
 def front_relay_proof(token: str) -> str:
@@ -998,8 +1015,7 @@ def _loopback_trusted(
     key = _host_header_key(host_header) if host_header else None
     if key is None or key[0] not in _CONTAINER_HOST_ALIASES:
         return False
-    port = key[1] if key[1] is not None else 80
-    return port == own_port and not any(headers.get(h) for h in _BROWSER_PROVENANCE_HEADERS)
+    return key[1] == own_port and not any(headers.get(h) for h in _BROWSER_PROVENANCE_HEADERS)
 
 
 def _own_port(scope: Mapping[str, Any]) -> int | None:
@@ -1007,11 +1023,21 @@ def _own_port(scope: Mapping[str, Any]) -> int | None:
     return server[1] if server and len(server) > 1 else None
 
 
+def _host_with_default_port(host_header: str | None, scope: Mapping[str, Any]) -> str | None:
+    """``host_header`` with the connection scheme's default port when it names none."""
+    key = _host_header_key(host_header) if host_header else None
+    if key is None or key[1] is not None:
+        return host_header
+    default = _SCHEME_DEFAULT_PORTS.get(str(scope.get("scheme", "http")))
+    return f"{host_header}:{default}" if default else host_header
+
+
 def _request_loopback_trusted(request: Request) -> bool:
     client = getattr(request, "client", None)
     peer = getattr(client, "host", None) if client is not None else None
     headers = request.headers
-    return _loopback_trusted(peer, headers.get("host"), headers, _own_port(request.scope))
+    host = _host_with_default_port(headers.get("host"), request.scope)
+    return _loopback_trusted(peer, host, headers, _own_port(request.scope))
 
 
 def _refused_loopback_host(request: Request) -> str | None:
@@ -1029,10 +1055,7 @@ def _refused_loopback_host(request: Request) -> str | None:
     if not is_loopback_host(peer) or _request_loopback_trusted(request):
         return None
     host_header = request.headers.get("host") or ""
-    key = _host_header_key(host_header)
-    if key is not None and key in _listed_hosts():
-        return None
-    return host_header
+    return None if _is_listed_host(host_header) else host_header
 
 
 def _is_refused_browser_request(request: Request) -> bool:
@@ -3580,7 +3603,8 @@ class WebSocketAuthMiddleware:
         # the DNS-rebinding defence — a browser on this machine coerced into
         # opening a socket to 127.0.0.1 still sends ``Host: attacker.com``. A
         # missing peer address (UDS, adapters) is not loopback (fails closed).
-        if _loopback_trusted(client_host, headers.get("host"), headers, _own_port(scope)):
+        host = _host_with_default_port(headers.get("host"), scope)
+        if _loopback_trusted(client_host, host, headers, _own_port(scope)):
             # Exempt from the token, not from the scrub: a loopback client that
             # sends the token anyway must not have it forwarded upstream.
             scrub_proxy_token_headers(scope, self.token_bytes)
@@ -4790,7 +4814,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         unproven_relay = not _proxy_token and _host_header_key(
             request.headers.get("host") or ""
         ) == (_FRONT_RELAY_HOST, None)
-        refused_host = None if front_relay or unproven_relay else _refused_loopback_host(request)
+        # Health probes answer every caller, as the token check below lets
+        # them: the Rust front relays a remote monitor's probe without a proof.
+        health_probe = request.method == "GET" and request.url.path in _AUTH_EXEMPT_PATHS
+        refused_host = (
+            None
+            if front_relay or unproven_relay or health_probe
+            else _refused_loopback_host(request)
+        )
         if refused_host is not None:
             logger.warning(
                 "event=proxy_loopback_host_rejected method=%s path=%s host=%s",

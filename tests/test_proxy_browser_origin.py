@@ -72,7 +72,7 @@ class _Capturing(httpx.AsyncBaseTransport):
         return httpx.Response(200, json=body)
 
 
-def _client() -> tuple[TestClient, _Capturing]:
+def _client(base_url: str = "http://127.0.0.1:8787") -> tuple[TestClient, _Capturing]:
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -91,7 +91,7 @@ def _client() -> tuple[TestClient, _Capturing]:
     app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
     # The browser and the proxy share the host, so the peer is loopback.
     # base_url sets the Host a local client sends (TestClient defaults to "testserver").
-    return TestClient(app, client=("127.0.0.1", 51000), base_url="http://127.0.0.1:8787"), transport
+    return TestClient(app, client=("127.0.0.1", 51000), base_url=base_url), transport
 
 
 _ROUTES = {
@@ -243,6 +243,8 @@ def test_loopback_peer_under_a_foreign_host_is_refused(browser_headers: dict[str
         # TLS ends at a reverse proxy on this host: the page is https, the proxy sees http.
         ("https://dash.example", "dash.example"),
         ("https://Dash.Example.", "dash.example:443"),
+        # An explicit port is kept on both sides, even a scheme's other default.
+        ("https://dash.example:80", "dash.example:80"),
     ],
 )
 def test_listed_host_is_accepted_whatever_the_scheme(
@@ -296,6 +298,22 @@ def test_container_alias_counts_only_without_browser_provenance_on_our_port(
     assert transport.requests == []
 
 
+@pytest.mark.parametrize(
+    ("base_url", "host"),
+    [
+        ("http://127.0.0.1:443", "host.docker.internal:443"),
+        ("https://127.0.0.1", "host.docker.internal"),  # no port: the scheme's default
+    ],
+)
+def test_container_alias_matches_the_listener_port(base_url: str, host: str) -> None:
+    client, transport = _client(base_url)
+
+    resp = client.get(_PATH, headers={"Host": host})
+
+    assert resp.status_code == 200, resp.text
+    assert len(transport.requests) == 1
+
+
 RELAY_HOST = "headroom-remote.invalid"
 
 
@@ -328,6 +346,20 @@ def test_rust_front_relay_without_a_token_anywhere_is_a_remote_caller() -> None:
     assert resp.status_code == 200, resp.text
     assert len(transport.requests) == 1
     assert admin.status_code == 404
+
+
+@pytest.mark.parametrize("path", ["/health", "/livez", "/readyz"])
+def test_health_probe_relayed_without_a_proof_still_answers(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    # The Rust front relays a remote monitor's probe without the token, so
+    # without a proof; health probes answer every caller.
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "proxy-token")
+    client, _ = _client()
+
+    resp = client.get(path, headers={"Host": RELAY_HOST})
+
+    assert resp.status_code != 403, resp.text
 
 
 def test_rust_front_relay_with_its_proof_forwards_without_the_proof(
