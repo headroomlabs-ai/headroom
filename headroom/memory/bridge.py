@@ -82,10 +82,9 @@ _HTML_ATTRIBUTE = (
     r"(?:[ \t]*=[ \t]*(?:[^ \t\n\"'=<>`]+|'[^']*'|\"[^\"]*\"))?"
 )
 _HTML_TYPE_7_RE = re.compile(
-    rf"(?:<(?P<open>{_HTML_TAG_NAME})(?:{_HTML_ATTRIBUTE})*[ \t]*/?>"
-    rf"|</(?P<close>{_HTML_TAG_NAME})[ \t]*>)[ \t]*$"
+    rf" {{0,3}}(?:<(?:{_HTML_TAG_NAME})(?:{_HTML_ATTRIBUTE})*[ \t]*/?>"
+    rf"|</(?:{_HTML_TAG_NAME})[ \t]*>)[ \t]*$"
 )
-_HTML_TYPE_7_EXCLUDED_TAGS = {"pre", "script", "style", "textarea"}
 
 
 def _markdown_structure(
@@ -125,13 +124,7 @@ def _markdown_structure(
                 in_paragraph = False
                 break
         else:
-            type_7_match = _HTML_TYPE_7_RE.match(line) if not in_paragraph else None
-            type_7_tag = (
-                (type_7_match.group("open") or type_7_match.group("close")).lower()
-                if type_7_match
-                else None
-            )
-            if type_7_tag is not None and type_7_tag not in _HTML_TYPE_7_EXCLUDED_TAGS:
+            if not in_paragraph and _HTML_TYPE_7_RE.match(line):
                 block = (_HTML_BLOCKS[-1][1], index, True)
                 in_paragraph = False
             elif heading_match := _HEADING_RE.match(line):
@@ -144,7 +137,7 @@ def _markdown_structure(
             else:
                 # Other paragraph-ending constructs (setext underlines, indented code,
                 # containers, and link references) are deliberately not modelled. A tag
-                # after one, or an indented tag, retains PR head non-type-7 behavior.
+                # after one retains PR head non-type-7 behavior.
                 in_paragraph = True
 
     if block is not None and block[2]:
