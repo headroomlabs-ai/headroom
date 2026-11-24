@@ -237,6 +237,44 @@ def test_recovery_refuses_a_source_swapped_after_the_owner_check(
     assert codex_recovery.discover_retained_sources(target) == []
 
 
+def test_recovery_never_retains_a_replacement_the_copy_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Swapped after the owner check but before the copy: the copy reads the
+    replacement. Recovery must refuse it and keep no trace of it."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-swapped"
+    target.mkdir()
+    source.mkdir()
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    (source / "config.toml").write_text('model = "mine-too"\n', encoding="utf-8")
+    copy_home = codex_recovery._copy_home
+
+    def swap_then_copy(src: Path, dest: Path, skipped: list[str]) -> None:
+        if src == source.resolve():
+            src.rename(tmp_path / "original")
+            src.mkdir()
+            (src / "config.toml").write_text(
+                '[mcp_servers.x]\ncommand = "true"\n', encoding="utf-8"
+            )
+        copy_home(src, dest, skipped)
+
+    monkeypatch.setattr(codex_recovery, "_copy_home", swap_then_copy)
+    with pytest.raises(RuntimeError, match="while it was being pinned"):
+        recover_codex_home(source=source, target=target)
+    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+    assert codex_recovery.discover_retained_sources(target) == []
+    recovery_files = [p for p in tmp_path.rglob("*") if "mcp_servers" in _text_or_empty(p)]
+    assert recovery_files == [source / "config.toml"]
+
+
+def _text_or_empty(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def test_windows_discovery_without_a_locatable_profile_finds_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
