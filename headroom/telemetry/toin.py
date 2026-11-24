@@ -1766,6 +1766,9 @@ class ToolIntelligenceNetwork:
         # Step 1: Serialize under lock (fast in-memory operation)
         with self._lock:
             data = self.export_patterns()
+            owner_token = getattr(self._backend, "_owner_token", None)
+            if owner_token is not None:
+                data["owner"] = owner_token()
 
         # Step 2: Write outside lock (slow I/O operation)
         try:
@@ -1831,6 +1834,13 @@ class ToolIntelligenceNetwork:
         there would keep a credential at rest after it was removed from
         every pattern this version keeps, so the same sanitizing pass is
         applied to the file itself.
+
+        Sanitizing the in-memory data and rewriting the rollback file are
+        separate concerns: if the rollback rewrite fails (e.g. the legacy
+        file is mounted read-only), the sanitized import still lands and a
+        warning is surfaced so an operator can redact the rollback copy
+        externally. Never aborting the whole import on a rollback rewrite
+        failure avoids stranding the legacy history on the next load.
         """
         pre_upgrade_path = getattr(self._backend, "pre_upgrade_path", None)
         if pre_upgrade_path is None or not getattr(self._backend, "loaded_pre_upgrade", False):
@@ -1853,9 +1863,22 @@ class ToolIntelligenceNetwork:
                 rewritten = True
 
         if rewritten:
-            from .backends import FileSystemTOINBackend
+            try:
+                from .backends import FileSystemTOINBackend
 
-            FileSystemTOINBackend(str(pre_upgrade_path)).save(data)
+                FileSystemTOINBackend(str(pre_upgrade_path)).save(data)
+            except OSError as e:
+                logger.warning(
+                    "TOIN rollback file could not be rewritten; sanitized "
+                    "patterns are still imported, but %s still holds raw "
+                    "query text. Redact it externally before rollback.",
+                    pre_upgrade_path,
+                    extra={
+                        "event": "toin_rollback_rewrite_failed",
+                        "path": str(pre_upgrade_path),
+                        "error": str(e),
+                    },
+                )
         return rewritten
 
     def _maybe_auto_save(self) -> None:

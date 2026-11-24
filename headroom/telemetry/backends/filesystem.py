@@ -15,6 +15,7 @@ carries the version is written in place, so ``toin.json`` and
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import tempfile
@@ -28,13 +29,15 @@ def _version_paths(path: Path, store_version: str) -> tuple[Path, Path | None]:
     """Return ``(versioned_write_path, base_rollback_path)``.
 
     ``toin.json`` + ``3.0`` -> write ``toin.v3.json``, rollback ``toin.json``.
-    A path that already carries the version (``toin.v3.json``) is written in
-    place with no pre-upgrade source, so a caller who names the v3 file
-    explicitly never doubles the suffix or reads another store's data.
+    A path that already carries the version (``toin.v3.json``, or the
+    extensionless ``toin.v3``) is written in place with no pre-upgrade
+    source, so a caller who names the v3 file explicitly never doubles the
+    version marker or reads another store's data.
     """
     major = store_version.split(".", 1)[0]
-    versioned_suffix = f".v{major}{path.suffix}"
-    if path.name.endswith(versioned_suffix):
+    versioned_marker = f".v{major}"
+    versioned_suffix = f"{versioned_marker}{path.suffix}"
+    if path.name.endswith(versioned_marker) or path.name.endswith(versioned_suffix):
         # The caller already named the versioned file (e.g. ``toin.v3.json``).
         # Write it in place and do not treat the unversioned sibling as a
         # pre-upgrade source: ``toin.json`` and ``toin.v3.json`` must stay
@@ -76,6 +79,12 @@ class FileSystemTOINBackend:
         self._max_load_bytes = max_load_bytes
         self._pre_upgrade_path: Path | None = None
         self._loaded_pre_upgrade = False
+        # Owner identity: the path the caller configured, before versioning.
+        # Two backends configured at different paths (``toin.json`` and
+        # ``toin.v3.json``) can derive to the same versioned write target;
+        # stamping the owner lets save() refuse to clobber another proxy's
+        # store instead of silently overwriting it.
+        self._owner = self._path
         if store_version:
             self._path, self._pre_upgrade_path = _version_paths(self._path, store_version)
 
@@ -94,6 +103,40 @@ class FileSystemTOINBackend:
     def loaded_pre_upgrade(self) -> bool:
         """True when the last load read the pre-upgrade file, not this layout's."""
         return self._loaded_pre_upgrade
+
+    def _owner_token(self) -> str:
+        """Stable token identifying the configured path this backend owns.
+
+        Derived from the caller-supplied path (before versioning), so every
+        process pointed at the same configured path agrees, and two processes
+        pointed at different configured paths disagree.
+        """
+        return hashlib.sha256(str(self._owner).encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _refuse_foreign_store(self) -> None:
+        """Refuse to overwrite a store a different configured path owns.
+
+        ``toin.json`` and an explicitly named ``toin.v3.json`` both derive to
+        the same versioned write target. Whoever gets there first owns it; the
+        second must not silently replace that history with its own. A file with
+        no ``owner`` key predates this check and stays writable, so upgrades
+        and the pre-upgrade rewrite path are unaffected.
+        """
+        if not self._path.exists():
+            return
+        try:
+            with open(self._path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+        if not isinstance(existing, dict):
+            return
+        owner = existing.get("owner")
+        if isinstance(owner, str) and owner and owner != self._owner_token():
+            raise ValueError(
+                f"TOIN store {self._path} is owned by a differently configured "
+                "path; refusing to overwrite another instance's history"
+            )
 
     def load(self) -> dict[str, Any]:
         """Load TOIN data from the JSON file.
@@ -148,6 +191,7 @@ class FileSystemTOINBackend:
                     f"Existing TOIN data file {self._path} exceeds the configured "
                     f"size limit ({self._max_load_bytes} bytes); refusing to overwrite it"
                 )
+            self._refuse_foreign_store()
             self._path.parent.mkdir(parents=True, exist_ok=True)
 
             fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, prefix=".toin_", suffix=".tmp")

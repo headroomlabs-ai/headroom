@@ -159,6 +159,10 @@ export function savingsPath(explicit?: string): string {
 }
 
 export function toinPath(explicit?: string): string {
+  // Mirrors headroom/paths.py::toin_path. This is the CONFIGURED path, not
+  // the file the current release writes: the Python backend appends the
+  // layout version (toin.v3.json) and keeps this path read-only as the
+  // pre-upgrade store, so a rolled-back release reads its own layout.
   return resolve(
     explicit,
     HEADROOM_TOIN_PATH_ENV,

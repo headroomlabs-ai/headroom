@@ -218,6 +218,60 @@ def test_legacy_raw_query_keys_are_removed_on_load(tmp_path) -> None:
     assert "status:* user:*" not in on_disk
 
 
+def test_legacy_rewrite_failure_keeps_sanitized_import(tmp_path, monkeypatch, caplog) -> None:
+    """Sanitized patterns import even when the rollback file cannot be rewritten.
+
+    When the pre-upgrade file is read-only (or otherwise unwritable), the
+    sanitized import must still land in memory and be persisted to the
+    versioned sibling. A warning is surfaced so an operator can redact the
+    rollback copy externally; the failure never strands the legacy history
+    on the next load.
+    """
+    path = tmp_path / "toin.json"
+    payload = {
+        "version": "2.0",
+        "patterns": {
+            "unknown|unknown|abc": {
+                "tool_signature_hash": "abc",
+                "query_pattern_frequency": {
+                    "raw prompt containing secret source code": 4,
+                    "1a2b3c4d:* 5e6f7a8b:*": 2,
+                },
+                "common_query_patterns": [
+                    "raw prompt containing secret source code",
+                    "1a2b3c4d:* 5e6f7a8b:*",
+                ],
+            }
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8", newline="\n")
+
+    original_save = FileSystemTOINBackend.save
+
+    def fail_rollback_save(self, data):
+        # Only the rollback file is unwritable; the v3 sibling must still save.
+        if self._path == path:
+            raise OSError("rollback mount is read-only")
+        original_save(self, data)
+
+    monkeypatch.setattr(FileSystemTOINBackend, "save", fail_rollback_save, raising=False)
+
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+    pattern = next(iter(toin._patterns.values()))
+    assert pattern.query_pattern_frequency == {"1a2b3c4d:* 5e6f7a8b:*": 2}
+
+    # Sanitized import survived; rollback file still holds the raw text.
+    [warning] = [
+        r for r in caplog.records if getattr(r, "event", None) == "toin_rollback_rewrite_failed"
+    ]
+    assert "raw prompt containing secret source code" in path.read_text(encoding="utf-8")
+    # The versioned sibling was written with the sanitized data.
+    assert _current_store_path(path).is_file()
+    assert "raw prompt containing secret source code" not in _current_store_path(path).read_text(
+        encoding="utf-8"
+    )
+
+
 def _record(toin: ToolIntelligenceNetwork, index: int) -> None:
     toin.record_compression(
         tool_signature=_signature(index),
@@ -240,7 +294,7 @@ def _saved_store(path: Path, count: int) -> dict:
     for index in range(count):
         _record(toin, index)
     data = toin.export_patterns()
-    path.write_text(json.dumps(data), encoding="utf-8")
+    path.write_text(json.dumps(data), encoding="utf-8", newline="\n")
     return data
 
 
@@ -591,6 +645,65 @@ def test_explicit_backend_without_store_version_writes_unversioned(tmp_path) -> 
     assert v3.is_file()
     assert not (tmp_path / "toin.v3.v3.json").exists()
     assert not (tmp_path / "toin.json").exists()
+
+
+def test_configured_path_cannot_clobber_another_instance_stores(tmp_path, caplog) -> None:
+    """Two proxies deriving to the same write target do not overwrite each other.
+
+    Proxy B is configured at ``toin.v3.json`` and writes it in place; proxy A
+    is configured at ``toin.json`` and derives the same file. A must refuse
+    rather than replace B's history, and B's store must survive untouched.
+    """
+    v3 = tmp_path / "toin.v3.json"
+    legacy = tmp_path / "toin.json"
+
+    backend_b = FileSystemTOINBackend(str(v3))
+    toin_b = ToolIntelligenceNetwork(
+        TOINConfig(storage_path="", auto_save_interval=0), backend=backend_b
+    )
+    for index in range(3):
+        _record(toin_b, index)
+    toin_b.save()
+    b_before = v3.read_text(encoding="utf-8")
+
+    # Proxy A loads its own legacy file, which falls back to it because the
+    # v3 sibling is not A's store yet (it spells no owner A recognises).
+    legacy.write_text(json.dumps(_saved_store(legacy, 2)), encoding="utf-8", newline="\n")
+
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        toin_a = ToolIntelligenceNetwork(TOINConfig(storage_path=str(legacy), auto_save_interval=0))
+    toin_a.save()
+
+    assert v3.read_text(encoding="utf-8") == b_before
+    [failure] = [r for r in caplog.records if getattr(r, "event", None) == "toin_save_failed"]
+    assert "owned by a differently configured path" in failure.error
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected_write", "expected_pre_upgrade"),
+    [
+        ("toin.json", "toin.v3.json", "toin.json"),
+        ("toin.v3.json", "toin.v3.json", None),
+        ("toin.v3", "toin.v3", None),
+        ("toin", "toin.v3", "toin"),
+    ],
+)
+def test_version_paths_never_double_the_version_marker(
+    tmp_path, configured, expected_write, expected_pre_upgrade
+) -> None:
+    """Only an unversioned path derives the versioned sibling.
+
+    An extensionless ``toin.v3`` must be read as already versioned: without
+    the extension-aware check, ``path.suffix`` is ``.v3`` and the derived
+    sibling becomes ``toin.v3.v3``, leaving the configured file stale.
+    """
+    source = tmp_path / configured
+    backend = FileSystemTOINBackend(str(source), store_version="3.0")
+
+    assert backend._path == tmp_path / expected_write
+    assert backend._pre_upgrade_path == (
+        tmp_path / expected_pre_upgrade if expected_pre_upgrade else None
+    )
 
 
 def test_filesystem_backend_writes_compact_json(tmp_path) -> None:
