@@ -76,7 +76,9 @@ def test_exhausted_budget_rejects_every_generation_http_route_before_upstream(
 ) -> None:
     upstream_calls: list[str] = []
 
-    with TestClient(_budget_exhausted_app(), client=("127.0.0.1", 50000)) as client:
+    with TestClient(
+        _budget_exhausted_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 50000)
+    ) as client:
         proxy = client.app.state.proxy
 
         async def _unexpected_retry(method, url, request_headers, request_body, **kwargs):  # noqa: ANN001, ANN202
