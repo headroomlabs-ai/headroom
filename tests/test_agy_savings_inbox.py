@@ -465,3 +465,128 @@ asyncio.run(agy_savings_inbox.drain_inbox(CrashingDurableMetrics()))
     assert recorded == 1
     assert sink_path.read_text(encoding="utf-8").splitlines() == ["first", "second"]
     assert _evt_files() == []
+
+
+@pytest.mark.asyncio
+async def test_drain_keeps_event_loop_responsive_while_checkpointing_per_event(
+    isolated_home, monkeypatch
+):
+    """Offloaded per-event fsync lets an asyncio heartbeat run while preserving checkpoint order."""
+    import asyncio
+    import os
+    import time
+
+    inbox = agy_savings_inbox.inbox_dir()
+    event_count = 100
+    for i in range(event_count):
+        eid = f"evt-{i:03d}"
+        (inbox / f"evt-{i:03d}.json").write_text(
+            json.dumps({"v": 1, "event_id": eid, "kwargs": {**_FUNNEL_KWARGS, "project": eid}}),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    real_fsync = os.fsync
+
+    def _slow_fsync(fd: int) -> None:
+        time.sleep(0.005)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _slow_fsync)
+
+    processed_path = inbox / ".processed"
+    seen: list[str] = []
+
+    class OrderCheckingMetrics:
+        async def record_request(self, **kwargs) -> None:
+            if seen:
+                prev_id = seen[-1]
+                assert processed_path.exists()
+                assert prev_id in processed_path.read_text(encoding="utf-8").splitlines()
+                assert not (inbox / f"{prev_id}.json").exists()
+            seen.append(kwargs["project"])
+
+    heartbeat_ticks = 0
+    stop_heartbeat = False
+
+    async def _heartbeat() -> None:
+        nonlocal heartbeat_ticks
+        while not stop_heartbeat:
+            await asyncio.sleep(0.01)
+            if not stop_heartbeat:
+                heartbeat_ticks += 1
+
+    hb_task = asyncio.create_task(_heartbeat())
+    try:
+        recorded = await agy_savings_inbox.drain_inbox(OrderCheckingMetrics())
+    finally:
+        stop_heartbeat = True
+        await hb_task
+
+    assert recorded == event_count
+    assert len(seen) == event_count
+    assert heartbeat_ticks >= 5, (
+        f"event loop was blocked during replay: heartbeat only ticked {heartbeat_ticks} time(s)"
+    )
+    assert _evt_files() == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_offloaded_checkpoint_finishes_write_before_unlock(
+    isolated_home, monkeypatch
+):
+    """Cancelling during an offloaded checkpoint finishes that write before releasing the lock."""
+    import asyncio
+    import os
+    import threading
+    import time
+
+    inbox = agy_savings_inbox.inbox_dir()
+    for name in ("first", "second"):
+        (inbox / f"evt-{name}.json").write_text(
+            json.dumps(
+                {"v": 1, "event_id": f"id-{name}", "kwargs": {**_FUNNEL_KWARGS, "project": name}}
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    in_fsync = threading.Event()
+    fsync_finished = False
+    real_fsync = os.fsync
+
+    def _slow_first_fsync(fd: int) -> None:
+        nonlocal fsync_finished
+        if not in_fsync.is_set():
+            in_fsync.set()
+            time.sleep(0.1)
+            real_fsync(fd)
+            fsync_finished = True
+            return
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _slow_first_fsync)
+
+    first_metrics = FakeMetrics()
+    drain_task = asyncio.create_task(agy_savings_inbox.drain_inbox(first_metrics))
+
+    deadline = time.monotonic() + 5.0
+    while not in_fsync.is_set():
+        assert time.monotonic() < deadline, "drain did not reach checkpoint fsync"
+        await asyncio.sleep(0.005)
+
+    drain_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await drain_task
+
+    assert fsync_finished is True, "drain returned and unlocked while checkpoint write was running"
+    assert [c["project"] for c in first_metrics.calls] == ["first"]
+    assert "id-first" in (inbox / ".processed").read_text(encoding="utf-8").splitlines()
+    assert not (inbox / "evt-first.json").exists()
+    assert (inbox / "evt-second.json").exists()
+
+    second_metrics = FakeMetrics()
+    recorded = await agy_savings_inbox.drain_inbox(second_metrics)
+    assert recorded == 1
+    assert [c["project"] for c in second_metrics.calls] == ["second"]
+    assert _evt_files() == []

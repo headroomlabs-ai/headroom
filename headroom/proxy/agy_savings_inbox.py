@@ -31,7 +31,7 @@ import os
 import random
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -278,6 +278,49 @@ def _append_processed(path: Path, event_id: str) -> None:
         logger.debug("agy savings processed-file append failed: %s", exc)
 
 
+def _checkpoint_event(processed_path: Path, event_id: str, event_file: Path) -> None:
+    """Persist ``event_id`` to ``.processed`` and unlink ``event_file`` in order."""
+    _append_processed(processed_path, event_id)
+    _safe_unlink(event_file)
+
+
+def _list_event_files(directory: Path) -> list[Path]:
+    """Return sorted pending event files in ``directory``."""
+    return sorted(directory.glob("evt-*.json"))
+
+
+def _read_event_envelope(event_file: Path) -> dict[str, Any]:
+    """Read and parse one JSON event file."""
+    raw = event_file.read_text(encoding="utf-8")
+    envelope = json.loads(raw)
+    if not isinstance(envelope, dict):
+        raise ValueError("event envelope must be a JSON object")
+    return envelope
+
+
+async def _run_in_thread_before_unlock(fn: Callable[..., Any], *args: Any) -> Any:
+    """Run a bounded disk helper off the event loop and finish it before unlocking.
+
+    Offloading keeps the proxy event loop responsive during backlog replay. If
+    the drain task is cancelled while a disk write is in flight, wait for that
+    bounded call to finish before releasing ``.drain.lock`` so no background
+    thread touches ``.processed`` or event files after another worker acquires
+    the lock.
+    """
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        while not fut.done():
+            try:
+                await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001
+                break
+        raise
+
+
 def _write_processed(path: Path, ids: list[str]) -> None:
     """Atomically persist the processed-id list, pruned to the newest N."""
 
@@ -323,56 +366,57 @@ async def drain_inbox(metrics: Any, *, max_events: int = 1000) -> int:
 
             async with _cross_process_drain_lock(directory):
                 processed_path = directory / _PROCESSED_FILE
-                processed_list = _load_processed(processed_path)
+                processed_list = await _run_in_thread_before_unlock(_load_processed, processed_path)
                 processed_set = set(processed_list)
 
                 try:
-                    files = sorted(directory.glob("evt-*.json"))
+                    files = await _run_in_thread_before_unlock(_list_event_files, directory)
                 except OSError:
                     return 0
 
-                try:
-                    for event_file in files[:max_events]:
+                for event_file in files[:max_events]:
+                    try:
                         try:
-                            try:
-                                raw = event_file.read_text(encoding="utf-8")
-                                envelope = json.loads(raw)
-                            except (OSError, ValueError):
-                                # Malformed / unreadable: skip and remove, never fatal.
-                                logger.debug("agy savings: dropping malformed %s", event_file.name)
-                                _safe_unlink(event_file)
-                                continue
-
-                            event_id = envelope.get("event_id")
-                            if not isinstance(event_id, str) or not event_id:
-                                _safe_unlink(event_file)
-                                continue
-
-                            if event_id in processed_set:
-                                # Crash-window duplicate: already recorded, just remove.
-                                _safe_unlink(event_file)
-                                continue
-
-                            kwargs = envelope.get("kwargs")
-                            if not isinstance(kwargs, dict):
-                                _safe_unlink(event_file)
-                                continue
-
-                            await metrics.record_request(**kwargs)
-                            recorded += 1
-
-                            processed_set.add(event_id)
-                            processed_list.append(event_id)
-                            _append_processed(processed_path, event_id)
-                            _safe_unlink(event_file)
-                        except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
-                            logger.debug(
-                                "agy savings: error replaying %s: %s", event_file.name, exc
+                            envelope = await _run_in_thread_before_unlock(
+                                _read_event_envelope, event_file
                             )
+                        except (OSError, ValueError):
+                            # Malformed / unreadable: skip and remove, never fatal.
+                            logger.debug("agy savings: dropping malformed %s", event_file.name)
+                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
                             continue
-                finally:
-                    if len(processed_list) > MAX_PROCESSED_IDS:
-                        _write_processed(processed_path, processed_list)
+
+                        event_id = envelope.get("event_id")
+                        if not isinstance(event_id, str) or not event_id:
+                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
+                            continue
+
+                        if event_id in processed_set:
+                            # Crash-window duplicate: already recorded, just remove.
+                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
+                            continue
+
+                        kwargs = envelope.get("kwargs")
+                        if not isinstance(kwargs, dict):
+                            await _run_in_thread_before_unlock(_safe_unlink, event_file)
+                            continue
+
+                        await metrics.record_request(**kwargs)
+                        recorded += 1
+
+                        processed_set.add(event_id)
+                        processed_list.append(event_id)
+                        await _run_in_thread_before_unlock(
+                            _checkpoint_event, processed_path, event_id, event_file
+                        )
+                    except Exception as exc:  # noqa: BLE001 - one bad event never aborts drain
+                        logger.debug("agy savings: error replaying %s: %s", event_file.name, exc)
+                        continue
+
+                if len(processed_list) > MAX_PROCESSED_IDS:
+                    await _run_in_thread_before_unlock(
+                        _write_processed, processed_path, list(processed_list)
+                    )
         except Exception as exc:  # noqa: BLE001 - drain never raises out
             logger.debug("agy savings drain failed: %s", exc)
 
