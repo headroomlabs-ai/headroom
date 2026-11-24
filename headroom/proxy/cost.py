@@ -808,7 +808,12 @@ def build_session_summary(
     # the card read "-39666.1%". A baseline that small is a cancellation
     # artifact, not a measurement, so report no percentage rather than one that
     # is wrong by three orders of magnitude.
-    _baseline_is_meaningful = cost_without > max(0.01, 0.05 * cost_with)
+    # The same holds when spend leaves out traffic the tracker could not price:
+    # savings estimated for that traffic would be measured against a baseline
+    # missing its spend, and an unpriced-only session would read 100%.
+    _baseline_is_meaningful = cost_without > max(0.01, 0.05 * cost_with) and cost_stats.get(
+        "spend_complete", True
+    )
     savings_pct_cost = (
         round(total_saved_usd / cost_without * 100, 1) if _baseline_is_meaningful else 0.0
     )
@@ -967,20 +972,12 @@ class CostTracker:
         # so the compression-only figure stays available; `stats()` reports both
         # the split and the sum.
         self._tool_saved_by_model: dict[str, int] = {}
-        # Cache-aware counterfactual buckets for the deferred schemas. Had the
-        # schemas been sent, they would have ridden the SAME prefix as the rest
-        # of the request — cold-written at the provider's cache-write rate,
-        # read at its cache-read rate on warm turns, re-written when the TTL
-        # expired. The observed request's own cache mix is the best available
-        # estimate of that rhythm (a TTL expiry shows up as a write-heavy mix
-        # on the real request, so the counterfactual re-write is captured per
-        # request, not modelled). Priced in stats() via _get_cache_prices —
-        # LiteLLM's per-model catalog — so the rates stay provider-agnostic.
-        # Floats: shares of a request's schema tokens, not whole tokens.
-        self._tool_saved_read_by_model: dict[str, float] = {}
-        self._tool_saved_write_5m_by_model: dict[str, float] = {}
-        self._tool_saved_write_1h_by_model: dict[str, float] = {}
-        self._tool_saved_list_by_model: dict[str, float] = {}
+        # Dollar value of the deferred schemas, priced per request by
+        # headroom.pricing.counterfactual.price_savings with the request's own
+        # provider and cache mix: the figure the savings tracker and ledger
+        # book for the same request. Its basis is the weakest seen.
+        self._tool_savings_usd_by_model: dict[str, float] = {}
+        self._tool_savings_basis: str | None = None
         self._tokens_sent_by_model: dict[str, int] = {}
         # Of _tokens_sent_by_model: the part that is the provider's own billed
         # count (the rest is Headroom's tokenizer estimate), and how many
@@ -1006,8 +1003,9 @@ class CostTracker:
         self._folded_output_usd = 0.0
         self._folded_savings_usd = 0.0
         self._folded_cache_aware_savings_usd = 0.0
-        self._folded_tool_savings_usd = 0.0
-        self._folded_tool_savings_basis: str | None = None
+        # Set when a request's tool savings were priced but its spend could
+        # not be: the spend total then misses traffic the savings include.
+        self._savings_outran_spend = False
 
     def reset_runtime(self) -> None:
         """Reset in-memory cost/token counters for local test/debug use."""
@@ -1023,10 +1021,8 @@ class CostTracker:
         self._saved_list_by_tier.clear()
         self._tier_crossing_by_model.clear()
         self._tool_saved_by_model.clear()
-        self._tool_saved_read_by_model.clear()
-        self._tool_saved_write_5m_by_model.clear()
-        self._tool_saved_write_1h_by_model.clear()
-        self._tool_saved_list_by_model.clear()
+        self._tool_savings_usd_by_model.clear()
+        self._tool_savings_basis = None
         self._tokens_sent_by_model.clear()
         self._provider_tokens_sent_by_model.clear()
         self._provider_requests_by_model.clear()
@@ -1041,8 +1037,7 @@ class CostTracker:
         self._folded_output_usd = 0.0
         self._folded_savings_usd = 0.0
         self._folded_cache_aware_savings_usd = 0.0
-        self._folded_tool_savings_usd = 0.0
-        self._folded_tool_savings_basis = None
+        self._savings_outran_spend = False
 
     def estimate_cost(
         self,
@@ -1129,6 +1124,7 @@ class CostTracker:
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
         provider_reported: bool = False,
+        provider: str | None = None,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -1156,6 +1152,9 @@ class CostTracker:
                 counted both.
             provider_reported: True when ``tokens_sent`` is the provider's own
                 billed input (uncached + cache read + cache write).
+            provider: The request's wire provider. It places a model the name
+                does not identify in its cache-pricing family, as for the
+                savings tracker.
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1233,31 +1232,40 @@ class CostTracker:
             self._saved_list_by_tier[wkey] = self._saved_list_by_tier.get(wkey, 0.0) + c_list
         if tool_schema_saved > 0:
             # Deferred schemas sit in the cached PREFIX, ahead of every cache
-            # breakpoint, so on a warm turn they are entirely a cache read --
-            # not a pro-rata slice of the request's mix. The region argument is
-            # what encodes that; splitting proportionally (as this did) handed
-            # them a share of the write bucket they never would have occupied.
-            read_part, w5m_part, w1h_part, list_part = _bucket_by_cache_mix(
+            # breakpoint, so on a warm turn they are entirely a cache read.
+            # Priced here, per request, by the same call and inputs (provider,
+            # cache mix, fallback rate) the savings tracker uses, so the session
+            # summary cannot disagree with telemetry and the ledger.
+            from headroom.pricing.counterfactual import (
+                CacheMix,
+                Region,
+                price_savings,
+                weakest_basis,
+            )
+            from headroom.proxy.savings_tracker import DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
+
+            priced = price_savings(
                 tool_schema_saved,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=write_eff,
-                cache_write_5m_tokens=write_5m_eff,
-                cache_write_1h_tokens=write_1h_eff,
-                uncached_tokens=uncached_tokens,
-                region="prefix",
+                model=model,
+                mix=CacheMix.from_usage(
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    cache_write_5m_tokens=cache_write_5m_tokens,
+                    cache_write_1h_tokens=cache_write_1h_tokens,
+                    uncached_input_tokens=uncached_tokens,
+                    cache_inferred=cache_inferred,
+                ),
+                region=Region.PREFIX,
+                local_tokens=tokens_sent,
+                provider=provider,
+                fallback_rate_per_token=DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
             )
-            self._tool_saved_read_by_model[key] = (
-                self._tool_saved_read_by_model.get(key, 0.0) + read_part
+            self._tool_savings_usd_by_model[key] = (
+                self._tool_savings_usd_by_model.get(key, 0.0) + priced.usd
             )
-            self._tool_saved_write_5m_by_model[key] = (
-                self._tool_saved_write_5m_by_model.get(key, 0.0) + w5m_part
-            )
-            self._tool_saved_write_1h_by_model[key] = (
-                self._tool_saved_write_1h_by_model.get(key, 0.0) + w1h_part
-            )
-            self._tool_saved_list_by_model[key] = (
-                self._tool_saved_list_by_model.get(key, 0.0) + list_part
-            )
+            self._tool_savings_basis = weakest_basis(self._tool_savings_basis, priced.basis)
+            if priced.usd > 0 and self._get_cache_prices(model) is None:
+                self._savings_outran_spend = True
         self._tokens_sent_by_model[key] = self._tokens_sent_by_model.get(key, 0) + tokens_sent
         if provider_reported:
             self._provider_tokens_sent_by_model[key] = (
@@ -1292,7 +1300,6 @@ class CostTracker:
                 write_1h=write_1h_eff,
                 uncached=uncached_tokens,
                 output=output_tokens,
-                tool_schema_saved=tool_schema_saved,
             )
 
         # Populate _costs so check_budget() has real data to enforce against.
@@ -1551,7 +1558,6 @@ class CostTracker:
         write_1h: int,
         uncached: int,
         output: int,
-        tool_schema_saved: int,
     ) -> None:
         """Price one request whose label was folded, with the read-time formulas."""
         prices = self._get_cache_prices(model)
@@ -1571,8 +1577,9 @@ class CostTracker:
         out_price = self._get_output_price(model, long_context=long_context)
         if out_price:
             self._folded_output_usd += max(0, output) * out_price
-        # Cache-aware compression and tool-schema savings: same buckets and
-        # same price lookups as the record-time maps and stats() use.
+        # Cache-aware compression savings: same buckets and same price lookups
+        # as the record-time maps and stats() use. Tool-schema savings are
+        # priced per request in record_tokens, folded or not.
         if tokens_saved > 0:
             _r, c5, c1, cl = _bucket_by_cache_mix(
                 tokens_saved,
@@ -1586,53 +1593,6 @@ class CostTracker:
             ca = self._get_cache_prices(model, long_context=long_context, for_billing=False)
             if ca:
                 self._folded_cache_aware_savings_usd += c5 * ca[1] + c1 * ca[2] + cl * ca[3]
-        if tool_schema_saved > 0:
-            rd, t5, t1, tl = _bucket_by_cache_mix(
-                tool_schema_saved,
-                cache_read_tokens=cache_read,
-                cache_write_tokens=write,
-                cache_write_5m_tokens=write_5m,
-                cache_write_1h_tokens=write_1h,
-                uncached_tokens=uncached,
-                region="prefix",
-            )
-            priced = self._tool_savings_prices(model)
-            if priced:
-                tp, basis = priced
-                self._folded_tool_savings_usd += rd * tp[0] + t5 * tp[1] + t1 * tp[2] + tl * tp[3]
-                from headroom.pricing.counterfactual import weakest_basis
-
-                self._folded_tool_savings_basis = weakest_basis(
-                    self._folded_tool_savings_basis, basis
-                )
-
-    def _tool_savings_prices(
-        self, model: str
-    ) -> tuple[tuple[float, float, float, float], str] | None:
-        """Prices (cache read, 5m write, 1h write, uncached) for deferred tool tokens, and their basis.
-
-        The rates :func:`headroom.pricing.counterfactual.price_savings` gives the
-        savings tracker and ledger: the catalog's when it prices ``model``, else
-        the blended fallback rate split by the model family's cache ratios, else
-        that rate flat. Without the fallback a model newer than the price table
-        showed tool savings in telemetry and the ledger but none here.
-        """
-        try:
-            from headroom.pricing.counterfactual import (
-                BASIS_LIST,
-                _fallback_cache_rates,
-                resolve_rates,
-            )
-            from headroom.proxy.savings_tracker import DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-
-            fallback = float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
-            rates = resolve_rates(model) or _fallback_cache_rates(model, None, fallback)
-        except (ImportError, TypeError, ValueError) as e:
-            _warn_pricing_once("tool_rates", "Failed to resolve tool-savings rates", model, e)
-            return None
-        if rates is None:
-            return (fallback, fallback, fallback, fallback), BASIS_LIST
-        return (rates.read, rates.write_5m, rates.write_1h, rates.uncached), rates.basis
 
     def _get_cache_prices(
         self, model: str, *, long_context: bool = False, for_billing: bool = True
@@ -1864,38 +1824,20 @@ class CostTracker:
         # them a write premium they never paid. Expiry cycles still come from
         # real traffic (an expired window is a write-heavy request) instead of
         # being modelled.
-        # Rates come from _tool_savings_prices, the same rates the savings
-        # tracker and ledger use, never a hardcoded multiplier. Reported as its
-        # OWN key rather than widening ``savings_usd``: that figure feeds budget
-        # enforcement, and the session summary widens the cost card from this
-        # key instead.
+        # Priced per request in record_tokens with the savings tracker's own
+        # call, never a hardcoded multiplier. Reported as its OWN key rather
+        # than widening ``savings_usd``: that figure feeds budget enforcement,
+        # and the session summary widens the cost card from this key instead.
         from headroom.pricing.counterfactual import weakest_basis
 
-        tool_savings_usd = self._folded_tool_savings_usd
-        tool_bases = [self._folded_tool_savings_basis]
-        tool_models = (
-            set(self._tool_saved_read_by_model)
-            | set(self._tool_saved_write_5m_by_model)
-            | set(self._tool_saved_write_1h_by_model)
-            | set(self._tool_saved_list_by_model)
+        tool_savings_usd = sum(
+            usd
+            for model, usd in self._tool_savings_usd_by_model.items()
+            if not model.startswith("passthrough:")
         )
-        for model in tool_models:
-            # ``other`` holds folded requests, already priced by their own
-            # names at record time; a passthrough request is not Headroom's.
-            if model == OTHER_MODEL or model.startswith("passthrough:"):
-                continue
-            priced = self._tool_savings_prices(model)
-            if not priced:
-                continue
-            prices, basis = priced
-            tool_bases.append(basis)
-            cr_price, cw5_price, cw1h_price, uncached_price = prices
-            tool_savings_usd += (
-                self._tool_saved_read_by_model.get(model, 0.0) * cr_price
-                + self._tool_saved_write_5m_by_model.get(model, 0.0) * cw5_price
-                + self._tool_saved_write_1h_by_model.get(model, 0.0) * cw1h_price
-                + self._tool_saved_list_by_model.get(model, 0.0) * uncached_price
-            )
+        # A model the tracker cannot price adds nothing to spend, yet its tool
+        # savings are estimated; a percentage against that spend is inflated.
+        spend_complete = not self._savings_outran_spend
 
         return {
             # Sum of the per-model rows above, so the payload reconciles with
@@ -1931,7 +1873,11 @@ class CostTracker:
             # Weakest basis behind ``tool_savings_usd`` (see
             # headroom.pricing.counterfactual), e.g. ``fallback+provider-ratio``
             # for a model newer than the price table.
-            "tool_savings_basis": weakest_basis(*tool_bases),
+            "tool_savings_basis": weakest_basis(self._tool_savings_basis),
+            # False when tool savings were estimated for traffic whose spend
+            # could not be priced: a percentage against this spend would be
+            # inflated (an unpriced-only session would read 100%).
+            "spend_complete": spend_complete,
             # Budget config passthrough — surfaces in /stats["cost"] so
             # `headroom doctor` can report whether a budget is set.
             "budget_limit_usd": self.budget_limit_usd,

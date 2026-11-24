@@ -768,6 +768,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # compression only while its own headline counted both layers.
             tool_schema_saved=tool_search_saved,
             provider_reported=input_provider_reported,
+            # Prices the tool savings as metrics.record_request does above.
+            provider=outcome.provider,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

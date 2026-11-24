@@ -371,36 +371,92 @@ class _Capture(logging.Handler):
         self.records.append(record)
 
 
-def test_session_summary_prices_tool_savings_for_a_model_missing_from_the_price_table(
-    monkeypatch: pytest.MonkeyPatch,
+_WARM = {"cache_read_tokens": 150_000, "uncached_tokens": 500}
+
+
+def _record_tool_savings(model: str, provider: str | None, usage: dict) -> CostTracker:
+    tracker = CostTracker()
+    tracker.record_tokens(
+        model,
+        tokens_saved=0,
+        tokens_sent=sum(usage.values()),
+        tool_schema_saved=100_000,
+        provider=provider,
+        **usage,
+    )
+    return tracker
+
+
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        # A model newer than the price table, placed by its name.
+        ("claude-not-yet-in-catalog-9", None),
+        # An opaque gateway alias, placed only by the request's provider.
+        ("production-chat", "anthropic"),
+        # An alias that happens to share the overflow bucket's name.
+        ("other", "anthropic"),
+    ],
+)
+def test_session_summary_prices_tool_savings_as_the_savings_tracker_does(
+    monkeypatch: pytest.MonkeyPatch, model: str, provider: str | None
 ) -> None:
     """The session summary values deferred tool tokens as telemetry and the ledger do.
 
-    A model newer than the price table used to get $0 tool savings here while
-    the savings tracker priced the same request at its family's cache ratios.
+    It used to price them separately: $0 for a model missing from the price
+    table, the flat fallback for an alias known only by its provider, and
+    nothing for a model literally named ``other``.
     """
     from headroom.pricing.counterfactual import BASIS_FALLBACK_PROVIDER_RATIO
     from headroom.proxy.savings_tracker import estimate_request_savings_usd
 
     _patch_litellm(monkeypatch, {})
-    model = "claude-not-yet-in-catalog-9"
-    usage = {"cache_read_tokens": 150_000, "uncached_tokens": 500}
-    tracker = CostTracker()
-    tracker.record_tokens(
-        model, tokens_saved=0, tokens_sent=150_500, tool_schema_saved=100_000, **usage
-    )
-    stats = tracker.stats()
+    stats = _record_tool_savings(model, provider, _WARM).stats()
     telemetry = estimate_request_savings_usd(
         model,
         tool_schema_tokens_saved=100_000,
-        cache_read_tokens=usage["cache_read_tokens"],
-        uncached_input_tokens=usage["uncached_tokens"],
+        cache_read_tokens=_WARM["cache_read_tokens"],
+        uncached_input_tokens=_WARM["uncached_tokens"],
+        provider=provider,
     )
 
     # 100K cached-prefix tokens at the $3/M fallback and Claude's 0.1x read ratio.
     assert stats["tool_savings_usd"] == pytest.approx(0.03)
     assert stats["tool_savings_usd"] == pytest.approx(telemetry["tool_schema"])
     assert stats["tool_savings_basis"] == BASIS_FALLBACK_PROVIDER_RATIO
+
+
+def test_tool_savings_without_a_cache_breakdown_are_labelled_no_mix(monkeypatch):
+    """A catalogued request with no cache breakdown is priced at list, and says so."""
+    from headroom.pricing.counterfactual import BASIS_NO_MIX
+
+    _patch_litellm(monkeypatch, {"m": {"input_cost_per_token": 1e-6}})
+    stats = _record_tool_savings("m", None, {"uncached_tokens": 0}).stats()
+
+    assert stats["tool_savings_usd"] == pytest.approx(0.1)
+    assert stats["tool_savings_basis"] == BASIS_NO_MIX
+
+
+def test_session_card_shows_no_savings_rate_when_spend_misses_priced_savings(monkeypatch):
+    """Savings estimated for traffic whose spend is unpriced must not read as 100%."""
+    from types import SimpleNamespace
+
+    from headroom.proxy.cost import build_session_summary
+
+    _patch_litellm(monkeypatch, {})
+    tracker = _record_tool_savings("claude-not-yet-in-catalog-9", None, _WARM)
+    proxy = SimpleNamespace(
+        config=SimpleNamespace(mode="token"),
+        logger=SimpleNamespace(_logs=[]),
+        cost_tracker=tracker,
+    )
+    metrics = SimpleNamespace(requests_by_model={}, tokens_saved_total=0)
+
+    cost = build_session_summary(proxy, metrics, {}, total_tokens_before=0)["cost"]
+
+    assert cost["total_saved_usd"] == pytest.approx(0.03)
+    assert cost["with_headroom_usd"] == 0.0
+    assert cost["savings_pct"] == 0.0
 
 
 def test_cache_rate_failure_warns_once_per_model(monkeypatch: pytest.MonkeyPatch) -> None:
