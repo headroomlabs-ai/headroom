@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import tempfile
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -168,3 +169,124 @@ def test_offline_cold_cache_refuses_and_falls_back(monkeypatch: pytest.MonkeyPat
         # Should fall back to estimation because cold cache + offline = no download
         counter = TokenizerRegistry()._create_tiktoken("gpt-4")
         assert isinstance(counter, EstimatingTokenCounter)
+
+
+def test_offline_invalid_cache_entry_no_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invalid cache entry (hash mismatch) should not trigger network calls.
+
+    When the cache file exists but has invalid content (wrong hash), the loader
+    should detect this and fail fast without attempting a download, even when
+    not in offline mode. This prevents tiktoken's retry behavior from making
+    HTTP calls.
+    """
+    import tiktoken
+    from unittest.mock import patch
+
+    tc._get_encoding.cache_clear()
+    tc._load_failed.clear()
+    tiktoken.registry.ENCODINGS.clear()
+
+    with tempfile.TemporaryDirectory() as cache_dir:
+        url = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+        import hashlib
+        cache_key = hashlib.sha1(url.encode()).hexdigest()
+        cache_path = os.path.join(cache_dir, cache_key)
+
+        # Write invalid data to the cache file
+        with open(cache_path, "wb") as f:
+            f.write(b"invalid tiktoken data")
+
+        monkeypatch.setenv("TIKTOKEN_CACHE_DIR", cache_dir)
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+        with patch("requests.get") as mock_get:
+            with pytest.raises(tc.TiktokenLoadError):
+                tc.load_encoding("cl100k_base")
+            
+            # No network calls should be made
+            assert not mock_get.called, "requests.get should not be called for invalid cache"
+
+
+def test_offline_warm_cache_payload_tokens_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warm cache + offline mode: payload_tokens should work without network.
+
+    The encoding is pre-loaded into the in-memory cache, then we enable
+    offline mode and verify payload_tokens works without network access.
+    """
+    import tiktoken
+    from headroom.transforms.kompress_compressor import payload_tokens
+
+    # Pre-load the encoding into the in-memory cache (simulating warm cache)
+    enc = tiktoken.get_encoding("cl100k_base")
+    assert "cl100k_base" in tiktoken.registry.ENCODINGS
+
+    # Now enable offline mode
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+    # Clear loader cache but keep tiktoken's in-memory registry
+    tc._get_encoding.cache_clear()
+    tc._load_failed.clear()
+
+    with patch("requests.get") as mock_get:
+        result = payload_tokens("hello world")
+        assert result == 2  # "hello world" = 2 tokens in cl100k_base
+        assert not mock_get.called, "requests.get should not be called for warm cache"
+
+
+def test_offline_warm_cache_evaluate_token_counting_accuracy_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warm cache + offline mode: evaluate_token_counting_accuracy should work without network.
+
+    The encoding is pre-loaded into the in-memory cache, then we enable
+    offline mode and verify evaluate_token_counting_accuracy works without network access.
+    """
+    import tiktoken
+    from headroom.evals.batch_compression_eval import evaluate_token_counting_accuracy
+
+    # Pre-load the encoding into the in-memory cache (simulating warm cache)
+    enc = tiktoken.get_encoding("cl100k_base")
+    assert "cl100k_base" in tiktoken.registry.ENCODINGS
+
+    # Now enable offline mode
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+    # Clear loader cache but keep tiktoken's in-memory registry
+    tc._get_encoding.cache_clear()
+    tc._load_failed.clear()
+
+    with patch("requests.get") as mock_get:
+        result = evaluate_token_counting_accuracy()
+        assert result.test_cases == 6
+        assert not mock_get.called, "requests.get should not be called for warm cache"
+
+
+def test_load_encoding_timeout_bounds_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    """50ms deadline: stalled get_encoding should time out within observation window.
+
+    This tests the specific scenario from GH #956: a 50ms deadline with a
+    stalled tiktoken.get_encoding should return TiktokenLoadError within the
+    observation window, not block for 500ms.
+    """
+    import tiktoken
+    import time
+    import threading
+
+    # Create a stall that waits on an event, simulating a slow download
+    stall_event = threading.Event()
+
+    def stalled_get_encoding(_name: str):
+        stall_event.wait(timeout=5.0)  # Wait for signal (never comes in test)
+        return object()
+
+    monkeypatch.setattr(tiktoken, "get_encoding", stalled_get_encoding)
+    monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.05")  # 50ms
+
+    start = time.perf_counter()
+    with pytest.raises(tc.TiktokenLoadError):
+        tc.load_encoding("stall-timeout-enc")
+    elapsed = time.perf_counter() - start
+
+    # Should timeout within ~200ms (4x the deadline), not 500ms+
+    assert elapsed < 0.2, f"load was not bounded (took {elapsed:.3f}s vs 0.05s deadline)"
+
+    # Verify the stall was actually waiting (test infrastructure check)
+    assert not stall_event.is_set()

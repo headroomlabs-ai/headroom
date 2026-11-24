@@ -128,9 +128,9 @@ def _encoding_cached_locally(encoding_name: str) -> bool:
     except Exception:
         pass
 
-    # Check on-disk cache
+    # Check on-disk cache by actually trying to load it
     # The encoding constructors use specific URLs; we need to check if the
-    # cached file exists for the expected URL.
+    # cached file exists for the expected URL and is valid.
     # For o200k_base, cl100k_base, p50k_base, r50k_base, gpt2, o200k_harmony
     url_map = {
         "o200k_base": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
@@ -139,6 +139,15 @@ def _encoding_cached_locally(encoding_name: str) -> bool:
         "p50k_base": "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",
         "r50k_base": "https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken",
         "gpt2": "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/vocab.bpe",
+    }
+    # Expected hashes from tiktoken's encoding constructors
+    hash_map = {
+        "o200k_base": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+        "o200k_harmony": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+        "cl100k_base": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+        "p50k_base": "94b5ca7dff4d00767bc256fdd1b27e5b17361d7b8a5f968547f9f23eb70d2069",
+        "r50k_base": "306cd27f03c1a714eca7108e03d66b7dc042abe8c258b44c199a7ed9838dd930",
+        "gpt2": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",  # vocab.bpe hash
     }
     url = url_map.get(encoding_name)
     if not url:
@@ -150,7 +159,25 @@ def _encoding_cached_locally(encoding_name: str) -> bool:
 
     cache_key = hashlib.sha1(url.encode()).hexdigest()
     cache_path = os.path.join(cache_dir, cache_key)
-    return os.path.exists(cache_path)
+    
+    # File must exist AND be valid (not a hash mismatch)
+    if not os.path.exists(cache_path):
+        return False
+    
+    # Validate the cache file hash without triggering a download
+    # read_file_cached triggers a download on hash mismatch, so we check manually
+    expected_hash = hash_map.get(encoding_name)
+    if expected_hash:
+        try:
+            with open(cache_path, "rb", buffering=0) as f:
+                data = f.read()
+            actual_hash = hashlib.sha256(data).hexdigest()
+            if actual_hash != expected_hash:
+                return False
+        except Exception:
+            return False
+    
+    return True
 
 
 @lru_cache(maxsize=8)
@@ -169,6 +196,7 @@ def _get_encoding(encoding_name: str):
     vocabularies.
     """
     import tiktoken
+    from headroom.offline import is_offline
 
     if encoding_name in _load_failed:
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
@@ -181,6 +209,12 @@ def _get_encoding(encoding_name: str):
         except BaseException as exc:  # noqa: BLE001
             _load_failed.add(encoding_name)
             raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to load from local cache") from exc
+
+    # If offline mode is enabled and the encoding is not cached locally,
+    # fail fast without attempting a network request.
+    if is_offline():
+        _load_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} not in local cache and HEADROOM_OFFLINE=1")
 
     box: dict[str, Any] = {}
 

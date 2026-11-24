@@ -1353,12 +1353,10 @@ def evaluate_token_counting_accuracy(
         # the actual token count from the response. For now, we compare
         # against a reference tokenizer.
         try:
-            import tiktoken
-
-            guard_egress("load tiktoken encoding", destination="tiktoken encoding cl100k_base")
-            enc = tiktoken.get_encoding("cl100k_base")
+            from headroom.tokenizers.tiktoken_counter import load_encoding
+            enc = load_encoding("cl100k_base")
             actual = len(enc.encode(text))
-        except ImportError:
+        except Exception:
             # Fallback: assume estimate is close
             actual = len(text) // 4
 
