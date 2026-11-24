@@ -785,6 +785,8 @@ jobs:
         with:
           workspaces: ". -> target"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.9"
       - name: Run agy suite on Windows
         shell: bash
         # This lane has no prefetch-model dependency and no HuggingFace cache
@@ -805,7 +807,8 @@ jobs:
           uv run --locked --no-build-isolation-package headroom-ai --extra proxy --extra dev python -m pytest \
             tests/test_agy_ca.py tests/test_agy_ca_concurrency.py \
             tests/test_agy_dispatch.py tests/test_agy_terminator.py tests/test_agy_routing_boundary.py \
-            tests/test_agy_retrieve.py tests/test_agy_stats.py tests/test_agy_registrar.py \
+            tests/test_agy_retrieve.py tests/test_agy_retrieve_exposure_gate.py \
+            tests/test_agy_stats.py tests/test_agy_registrar.py \
             tests/test_agy_savings_inbox.py tests/test_agy_savings_integration.py \
             tests/test_mcp_registry/test_antigravity_registrar.py \
             tests/test_proxy_google_cloudcode_route_aliases.py tests/test_wrap_agy.py -q

@@ -302,8 +302,6 @@ async def test_cancelled_contended_drain_leaves_no_pending_lock_and_allows_other
         if sys.platform == "win32":
             import msvcrt
 
-            if os.fstat(holder_fd).st_size == 0:
-                os.write(holder_fd, b"0")
             os.lseek(holder_fd, 0, os.SEEK_SET)
             msvcrt.locking(holder_fd, msvcrt.LK_NBLCK, 1)
         else:
@@ -360,3 +358,36 @@ async def test_cancelled_contended_drain_leaves_no_pending_lock_and_allows_other
     assert recorded == 1
     assert other_metrics.calls == [_FUNNEL_KWARGS]
     assert _evt_files() == []
+
+
+def test_conftest_preserves_runner_headroom_offline_opt_in():
+    """When pytest is launched with HEADROOM_OFFLINE=1, the opt-in reaches the test body."""
+    import os
+    import subprocess
+    import sys
+
+    if os.environ.get("_HEADROOM_OFFLINE_CHILD_PROBE") == "1":
+        assert os.environ.get("HEADROOM_OFFLINE") == "1"
+        return
+
+    env = {
+        **os.environ,
+        "_HEADROOM_OFFLINE_CHILD_PROBE": "1",
+        "HEADROOM_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"{__file__}::test_conftest_preserves_runner_headroom_offline_opt_in",
+            "-q",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr

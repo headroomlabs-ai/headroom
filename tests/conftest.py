@@ -136,9 +136,15 @@ def _scrub_developer_copilot_tokens(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _scrub_developer_headroom_env(monkeypatch, tmp_path, tmp_path_factory):
+    # Preserve an explicit HEADROOM_OFFLINE opt-in set by the test runner (e.g.
+    # offline CI lanes like agy-windows or local air-gapped runs). Tests that
+    # exercise online behavior clear HEADROOM_OFFLINE explicitly via monkeypatch.
+    inherited_offline = os.environ.get("HEADROOM_OFFLINE")
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
+    if inherited_offline is not None:
+        monkeypatch.setenv("HEADROOM_OFFLINE", inherited_offline)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
     # test its own store so proxy/CLI startup cannot load developer settings and
