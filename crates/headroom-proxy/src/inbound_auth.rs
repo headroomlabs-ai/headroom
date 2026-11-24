@@ -210,33 +210,43 @@ pub(crate) fn host_override_for_non_local(
     if python_upstream {
         return Some(HeaderValue::from_static(NON_LOCAL_HOST));
     }
-    let effective = match outgoing {
-        Some(h) => h.to_str().ok().map(str::to_owned),
-        None => upstream.host_str().map(|h| match upstream.port() {
-            Some(port) => format!("{h}:{port}"),
-            None => h.to_owned(),
-        }),
+    let replace = match outgoing {
+        // A Host the caller chose (`--no-rewrite-host`): never one the
+        // Python proxy would trust as local, container aliases included.
+        Some(h) => {
+            let value = h.to_str().ok();
+            may_name_loopback(value) || value.is_some_and(names_container_host_alias)
+        }
+        // The upstream URL's own authority: a generic backend configured as
+        // `http://host.docker.internal:4000` keeps the name it routes on.
+        None => may_name_loopback(
+            upstream
+                .host_str()
+                .map(|h| match upstream.port() {
+                    Some(port) => format!("{h}:{port}"),
+                    None => h.to_owned(),
+                })
+                .as_deref(),
+        ),
     };
-    may_name_loopback(effective.as_deref()).then(|| HeaderValue::from_static(NON_LOCAL_HOST))
+    replace.then(|| HeaderValue::from_static(NON_LOCAL_HOST))
 }
 
-/// Conservative superset of what the Python proxy treats as a local
+/// Conservative superset of what the Python proxy treats as a loopback
 /// `Host`: anything [`is_loopback_host_header`] accepts, an unreadable
-/// value, any value with an IPv6 zone (`%`), since Python's `ipaddress`
-/// accepts scoped literals such as `[::1%lo]`, and the container host
-/// aliases, which Python trusts from a loopback peer (Docker Desktop
-/// delivers container callers to the host from 127.0.0.1).
+/// value, and any value with an IPv6 zone (`%`), since Python's
+/// `ipaddress` accepts scoped literals such as `[::1%lo]`.
 fn may_name_loopback(value: Option<&str>) -> bool {
     match value {
         None => true,
-        Some(v) => {
-            v.contains('%') || is_loopback_host_header(Some(v)) || names_container_host_alias(v)
-        }
+        Some(v) => v.contains('%') || is_loopback_host_header(Some(v)),
     }
 }
 
 /// Python's `_CONTAINER_HOST_ALIASES`, on any port; case and a trailing
-/// dot ignored.
+/// dot ignored. The Python proxy trusts them from a loopback peer (Docker
+/// Desktop delivers container callers to the host from 127.0.0.1); this
+/// front does not, they only decide which caller-chosen `Host` it relays.
 fn names_container_host_alias(value: &str) -> bool {
     let host = value.trim();
     let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
@@ -498,6 +508,10 @@ mod tests {
                 "{host}"
             );
         }
+        // A generic upstream addressed by a container name keeps it (default
+        // Host rewriting); only a caller-chosen alias is replaced.
+        let container = up("http://host.docker.internal:4000");
+        assert!(host_override_for_non_local(None, &container, false).is_none());
         // A generic loopback backend keeps a public Host it may route on.
         assert!(
             host_override_for_non_local(Some(&hv("proxy.example")), &loopback, false).is_none()
