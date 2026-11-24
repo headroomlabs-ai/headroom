@@ -4036,6 +4036,11 @@ class OpenAIHandlerMixin:
             "verbosity": body.get("verbosity"),
             "modalities": body.get("modalities"),
         }
+        # Voice and output format shape an audio reply as much as modalities
+        # does; without them a voice/format change replays other audio (#4276).
+        # Only keyed when sent, so requests without audio keep their old keys.
+        if body.get("audio") is not None:
+            cache_key_fields["audio"] = body["audio"]
         # Snapshot the lookup messages too. `messages` is the primary cache
         # key component, but the pre_compress hook below reassigns it, so
         # caching the response under the live `messages` would store it under a
@@ -5557,7 +5562,7 @@ class OpenAIHandlerMixin:
 
                     if tokens_saved > 0:
                         logger.info(
-                            f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                            f"[{request_id}] {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                             f"(saved {tokens_saved:,} tokens) via {request_backend.name}"
                         )
 
@@ -6190,7 +6195,7 @@ class OpenAIHandlerMixin:
 
                 if tokens_saved > 0:
                     logger.info(
-                        f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                        f"[{request_id}] {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                         f"(saved {tokens_saved:,} tokens)"
                     )
 
@@ -7739,7 +7744,7 @@ class OpenAIHandlerMixin:
                     )
 
                     logger.info(
-                        f"[{request_id}] /v1/responses {model}: {total_input_tokens:,} tokens"
+                        f"[{request_id}] /v1/responses {safe_id(model)}: {total_input_tokens:,} tokens"
                     )
 
                     # Capture Codex rate-limit window data from response headers

@@ -243,8 +243,17 @@ class CCRToolInjector:
             ),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
-            # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
-            re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})\]", re.IGNORECASE),
+            # Generic fallback: any bracket compression marker with hash (exactly 24 chars).
+            # The gaps exclude `[`, `]` and newline and are bounded, so the scan is
+            # linear: an unbounded `.*?compressed.*?hash=` is cubic on a line of
+            # repeated "[compressed " with no hash (event-loop stall, tool_result text).
+            # Trade-off: a marker with more than 200 chars between `[` and
+            # "compressed" (or between "compressed" and "hash="), or with `[`/`]`
+            # inside, no longer matches this fallback. No compressor emits one.
+            re.compile(
+                r"\[[^\[\]\n]{0,200}?compressed[^\[\]\n]{0,200}?hash=([a-f0-9]{24})\]",
+                re.IGNORECASE,
+            ),
             # SmartCrusher markers: the row-drop summary
             # `<<ccr:HASH N_rows_offloaded>>` and the opaque-blob form
             # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a

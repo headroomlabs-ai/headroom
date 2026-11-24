@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 from collections.abc import Mapping
@@ -1426,8 +1427,13 @@ def is_copilot_completions_path(path: str) -> bool:
     return bool(engine) and "/" not in engine
 
 
+def _ends_in_version_segment(base_url: str) -> bool:
+    """Return whether the URL path ends in a numeric API version, such as /v4."""
+    return re.search(r"/v[0-9]+$", urlparse(base_url).path) is not None
+
+
 def build_copilot_upstream_url(base_url: str, path: str) -> str:
-    """Build an upstream URL, normalizing GitHub Copilot's non-/v1 path layout."""
+    """Build an upstream URL, respecting versioned bases and Copilot's path layout."""
 
     normalized_base = base_url.rstrip("/")
     normalized_path = path if path.startswith("/") else f"/{path}"
@@ -1455,6 +1461,11 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
             normalized_path = normalized_path[3:]
     else:
         reset_request_routed_to_copilot()
+        # Custom OpenAI-compatible bases can already carry a vendor API version.
+        # Checked only here: a Copilot override such as GITHUB_COPILOT_API_URL may
+        # end in /vN, and its native paths above must reach it unchanged.
+        if _ends_in_version_segment(normalized_base) and normalized_path.startswith("/v1/"):
+            normalized_path = normalized_path[3:]
     return f"{normalized_base}{normalized_path}"
 
 
