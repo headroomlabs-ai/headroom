@@ -308,3 +308,31 @@ def test_ccr_backend_probe_preserves_live_redis_health_guard(
 
     assert wrap_mod._ccr_backend_is_cross_process() is True
     assert redis_client._GUARDS.get("ccr") is live_guard
+
+
+def test_exposure_gate_rejects_replacement_command_even_with_existing_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacing the headroom command after confirmation must leave exposure False."""
+    from headroom.cli import wrap as wrap_mod
+    from headroom.mcp_registry.base import ServerSpec
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+    monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+    monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **k: True)
+
+    reg1 = _registrar(tmp_path)
+    reg2 = _registrar(tmp_path)
+    assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg1) is True
+    assert _agy_exposes_retrieve_tool(reg1) is True
+
+    # Replace the configured headroom command after confirmation while the
+    # primed retrieve-tool cache already exists.
+    replacement = ServerSpec(
+        name="headroom",
+        command="/other/unverified-headroom",
+        args=("mcp", "serve"),
+    )
+    reg2.register_server(replacement, force=True)
+
+    assert _agy_exposes_retrieve_tool(reg1) is False

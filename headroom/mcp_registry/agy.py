@@ -312,17 +312,17 @@ class AgyRegistrar(MCPRegistrar):
         predicate: Callable[[ServerSpec], bool],
         *,
         on_confirmed: Callable[[ServerSpec], None] | None = None,
+        on_verified: Callable[[ServerSpec], None] | None = None,
     ) -> bool:
-        """Verify ``server_name`` still matches ``predicate``, optionally running ``on_confirmed`` under lock.
+        """Verify ``server_name`` still matches ``predicate`` under the config lock.
 
-        When ``on_confirmed`` is provided (e.g. recording ledger ownership after a
-        handshake), both the re-read check and ``on_confirmed`` run inside
-        ``_config_file_lock`` so a concurrent replacement cannot have its ledger
-        fingerprint overwritten by the earlier setup. Extra user-added keys such
-        as ``cwd`` remain valid for confirming a compatible server, but
-        ``on_confirmed`` only runs when the entry has no extra keys.
+        ``on_confirmed`` (e.g. recording ledger ownership) runs under
+        ``_config_file_lock`` only when the entry has no extra user-added keys.
+        ``on_verified`` (e.g. priming the retrieve tool cache) runs under the
+        same lock whenever ``predicate(current)`` holds, binding cache priming
+        to the verified server entry.
         """
-        if on_confirmed is None:
+        if on_confirmed is None and on_verified is None:
             current = self.get_server(server_name)
             return current is not None and predicate(current)
         if not self._config_file.exists():
@@ -348,10 +348,20 @@ class AgyRegistrar(MCPRegistrar):
                 is_strict = (
                     _try_entry_to_spec(server_name, raw_entry, allow_extra_keys=False) is not None
                 )
-                if is_strict:
+                if on_confirmed is not None and is_strict:
                     on_confirmed(current)
+                if on_verified is not None:
+                    on_verified(current)
                 return True
         except OSError as exc:
+            if on_confirmed is None and on_verified is not None:
+                # Read-only config with an unowned compatible server: verify
+                # read-only and prime cache without failing on the lock sidecar.
+                current = self.get_server(server_name)
+                if current is not None and predicate(current):
+                    on_verified(current)
+                    return True
+                return False
             logger.debug("agy: could not lock %s: %s", self._config_file, exc)
             return False
 

@@ -1642,6 +1642,7 @@ def _setup_headroom_retrieve_mcp_agy(registrar: Any, *, verbose: bool = False) -
                     if should_record
                     else None
                 ),
+                on_verified=lambda _verified_spec: _prime_agy_retrieve_tool_cache(registrar),
             )
             if not confirmed:
                 click.echo(
@@ -1649,9 +1650,10 @@ def _setup_headroom_retrieve_mcp_agy(registrar: Any, *, verbose: bool = False) -
                     "leaving recoverable compression disabled."
                 )
                 return False
-        elif should_record:
-            record_install(registrar.name, spec)
-        _prime_agy_retrieve_tool_cache(registrar)
+        else:
+            if should_record:
+                record_install(registrar.name, spec)
+            _prime_agy_retrieve_tool_cache(registrar)
         if verbose:
             click.echo(
                 "  MCP retrieve tool: headroom MCP registered persistently "
@@ -1770,7 +1772,7 @@ def _ccr_backend_is_cross_process() -> bool:
             redis_client._GUARDS["ccr"] = prev_guard
 
 
-def _agy_exposes_retrieve_tool(registrar: Any) -> bool:
+def _agy_exposes_retrieve_tool(registrar: Any, expected_spec: Any = None) -> bool:
     """True iff agy will actually expose ``headroom_retrieve`` as a callable tool.
 
     A successful wrap↔child ``initialize`` handshake is necessary but NOT
@@ -1780,7 +1782,8 @@ def _agy_exposes_retrieve_tool(registrar: Any) -> bool:
     cache and agy rejects the call with "Unknown tool: headroom_retrieve".
 
     Positive exposure requires ALL of:
-      1. a live ``headroom`` entry in ``mcp_config.json`` (registrar.get_server),
+      1. a live ``headroom`` entry in ``mcp_config.json`` matching the verified
+         retrieve server spec (``expected_spec`` or ``build_headroom_spec()``),
       2. an agy-written tool-cache file for ``headroom_retrieve``, and
       3. a cross-process CCR backend (so the child can resolve hashes).
 
@@ -1790,8 +1793,11 @@ def _agy_exposes_retrieve_tool(registrar: Any) -> bool:
     avoids a stale-cache false positive.
     """
     from headroom.ccr.mcp_server import CCR_TOOL_NAME
+    from headroom.mcp_registry import build_headroom_spec
 
-    if registrar.get_server("headroom") is None:
+    current = registrar.get_server("headroom")
+    target_spec = expected_spec if expected_spec is not None else build_headroom_spec()
+    if current is None or current != target_spec:
         return False
     # Cache lives under agy's app-data dir (cache_dir), NOT the migrated config
     # dir — agy writes <appdata>/mcp/<server>/<tool>.json regardless of which
