@@ -6,19 +6,25 @@ It supports multiple encodings:
 - o200k_base: GPT-4o, GPT-4o-mini
 - p50k_base: Codex models, text-davinci-002/003
 - r50k_base: GPT-3 models (davinci, curie, etc.)
+- gpt2: GPT-2 (requires both vocab.bpe and encoder.json)
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
+import multiprocessing as mp
 import os
 import tempfile
-import threading
 from functools import lru_cache
 from typing import Any
 
-from headroom.offline import guard_egress
+import tiktoken
+
+from headroom.offline import guard_egress, is_offline
+
 from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
 logger = logging.getLogger(__name__)
@@ -34,8 +40,13 @@ class TiktokenLoadError(RuntimeError):
     """
 
 
-# Encoding names whose bounded load already timed out — don't block on them again.
-_load_failed: set[str] = set()
+# Encoding names whose bounded *download* already timed out — don't block on them again.
+# We do NOT add disk-load misses here; they remain retryable once the vocabulary is added.
+# Track failed DOWNLOADS separately from disk load misses
+# _download_failed: download failures (network issues, etc.) - blocks retries
+# _disk_load_failed: disk load timeout/miss - does NOT block retries, retryable after vocab available
+_download_failed: set[str] = set()
+_disk_load_failed: set[str] = set()
 
 
 def _load_timeout_seconds() -> float:
@@ -89,7 +100,7 @@ MODEL_TO_ENCODING = {
     "code-davinci-001": "p50k_base",
     "code-cushman-002": "p50k_base",
     "code-cushman-001": "p50k_base",
-    # Legacy GPT-3 (r50k_base)
+    # Legacy GPT-3 (p50k_base for davinci-002/003, r50k_base for older)
     "text-davinci-003": "p50k_base",
     "text-davinci-002": "p50k_base",
     "text-davinci-001": "r50k_base",
@@ -106,6 +117,119 @@ MODEL_TO_ENCODING = {
 DEFAULT_ENCODING = "cl100k_base"
 
 
+# Encoding constructor metadata from tiktoken_ext.openai_public
+_ENCODING_URLS = {
+    "o200k_base": (
+        "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+    ),
+    "o200k_harmony": (
+        "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+    ),
+    "cl100k_base": (
+        "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",
+    ),
+    "p50k_base": (
+        "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",
+    ),
+    "r50k_base": (
+        "https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken",
+    ),
+    "gpt2": (
+        "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/vocab.bpe",
+        "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/encoder.json",
+    ),
+}
+
+_ENCODING_HASHES = {
+    "o200k_base": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+    "o200k_harmony": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+    "cl100k_base": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+    "p50k_base": "94b5ca7dff4d00767bc256fdd1b27e5b17361d7b8a5f968547f9f23eb70d2069",
+    "r50k_base": "306cd27f03c1a714eca7108e03d66b7dc042abe8c258b44c199a7ed9838dd930",
+    "gpt2_vocab": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+    "gpt2_encoder": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783",
+}
+
+_ENCODING_SPECIAL_TOKENS = {
+    "o200k_base": {"<|endoftext|>": 199999, "<|endofprompt|>": 200018},
+    "o200k_harmony": {
+        "<|endoftext|>": 199999,
+        "<|endofprompt|>": 200018,
+        "<|startoftext|>": 199998,
+        "<|reserved_200000|>": 200000,
+        "<|reserved_200001|>": 200001,
+        "<|return|>": 200002,
+        "<|constrain|>": 200003,
+        "<|reserved_200004|>": 200004,
+        "<|channel|>": 200005,
+        "<|start|>": 200006,
+        "<|end|>": 200007,
+        "<|message|>": 200008,
+        "<|reserved_200009|>": 200009,
+        "<|reserved_200010|>": 200010,
+        "<|reserved_200011|>": 200011,
+        "<|call|>": 200012,
+    }
+    | {f"<|reserved_{i}|>": i for i in range(200013, 201088)},
+    "cl100k_base": {
+        "<|endoftext|>": 100257,
+        "<|fim_prefix|>": 100258,
+        "<|fim_middle|>": 100259,
+        "<|fim_suffix|>": 100260,
+        "<|endofprompt|>": 100276,
+    },
+    "p50k_base": {"<|endoftext|>": 50256},
+    "r50k_base": {"<|endoftext|>": 50256},
+    "p50k_edit": {
+        "<|endoftext|>": 50256,
+        "<|fim_prefix|>": 50281,
+        "<|fim_middle|>": 50282,
+        "<|fim_suffix|>": 50283,
+    },
+    "gpt2": {"<|endoftext|>": 50256},
+}
+
+_ENCODING_PAT_STR = {
+    "o200k_base": "|".join(
+        [
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""\p{N}{1,3}""",
+            r""" ?[^\s\p{L}\p{N}]+[\r\n/]*""",
+            r"""\s*[\r\n]+""",
+            r"""\s+(?!\S)""",
+            r"""\s+""",
+        ]
+    ),
+    "o200k_harmony": "|".join(
+        [
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""\p{N}{1,3}""",
+            r""" ?[^\s\p{L}\p{N}]+[\r\n/]*""",
+            r"""\s*[\r\n]+""",
+            r"""\s+(?!\S)""",
+            r"""\s+""",
+        ]
+    ),
+    "cl100k_base": r"""(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s""",
+    "p50k_base": r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s""",
+    "r50k_base": r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s""",
+    "p50k_edit": r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s""",
+    "gpt2": r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s""",
+}
+
+_ENCODING_EXPLICIT_N_VOCAB = {
+    "o200k_base": 200019,
+    "o200k_harmony": 201088,
+    "cl100k_base": 100277,
+    "p50k_base": 50281,
+    "r50k_base": 50257,
+    "p50k_edit": 50284,
+    "gpt2": 50257,
+}
+
+
 def _tiktoken_cache_dir() -> str:
     """Get the tiktoken cache directory, matching tiktoken's logic."""
     if "TIKTOKEN_CACHE_DIR" in os.environ:
@@ -115,159 +239,262 @@ def _tiktoken_cache_dir() -> str:
     return os.path.join(tempfile.gettempdir(), "data-gym-cache")
 
 
+def _cache_key(url: str) -> str:
+    """Compute tiktoken's cache key for a URL (SHA1 of the URL)."""
+    return hashlib.sha1(url.encode()).hexdigest()
+
+
+def _check_hash(data: bytes, expected_hash: str) -> bool:
+    """Verify SHA256 hash matches expected."""
+    return hashlib.sha256(data).hexdigest() == expected_hash
+
+
+def _read_cached_file(path: str, expected_hash: str | None = None) -> bytes | None:
+    """Read a cached file if it exists and hash matches.
+
+    Returns None if file doesn't exist or hash mismatches.
+    Does NOT trigger any download.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb", buffering=0) as f:
+            data = f.read()
+    except OSError:
+        return None
+    if expected_hash and not _check_hash(data, expected_hash):
+        return None
+    return data
+
+
+def _load_mergeable_ranks_from_tiktoken_file(path: str) -> dict[bytes, int]:
+    """Load mergeable ranks from a .tiktoken file (base64-encoded tokens with ranks)."""
+    ret: dict[bytes, int] = {}
+    with open(path, "rb") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                token, rank = line.split()
+                ret[base64.b64decode(token)] = int(rank)
+            except Exception as e:
+                raise ValueError(f"Error parsing line {line!r} in {path}") from e
+    return ret
+
+
+def _load_mergeable_ranks_from_data_gym(
+    vocab_path: str, encoder_path: str
+) -> dict[bytes, int]:
+    """Load mergeable ranks from GPT-2 style vocab.bpe + encoder.json (data-gym format)."""
+    # From tiktoken/load.py data_gym_to_mergeable_bpe_ranks
+    rank_to_intbyte = [b for b in range(2**8) if chr(b).isprintable() and chr(b) != " "]
+    data_gym_byte_to_byte = {chr(b): b for b in rank_to_intbyte}
+    n = 0
+    for b in range(2**8):
+        if b not in rank_to_intbyte:
+            rank_to_intbyte.append(b)
+            data_gym_byte_to_byte[chr(2**8 + n)] = b
+            n += 1
+    assert len(rank_to_intbyte) == 2**8
+
+    with open(vocab_path, encoding="utf-8") as f:
+        vocab_bpe_contents = f.read()
+    bpe_merges = [tuple(merge_str.split()) for merge_str in vocab_bpe_contents.split("\n")[1:-1]]
+
+    def decode_data_gym(value: str) -> bytes:
+        return bytes(data_gym_byte_to_byte[b] for b in value)
+
+    bpe_ranks: dict[bytes, int] = {bytes([b]): i for i, b in enumerate(rank_to_intbyte)}
+
+    n = len(bpe_ranks)
+    for first, second in bpe_merges:
+        bpe_ranks[decode_data_gym(first) + decode_data_gym(second)] = n
+        n += 1
+
+    with open(encoder_path, encoding="utf-8") as f:
+        encoder_json = json.load(f)
+    encoder_json_loaded = {decode_data_gym(k): v for k, v in encoder_json.items()}
+    encoder_json_loaded.pop(b"<|endoftext|>", None)
+    encoder_json_loaded.pop(b"<|startoftext|>", None)
+
+    assert bpe_ranks == encoder_json_loaded, "vocab.bpe and encoder.json mismatch"
+    return bpe_ranks
+
+
 def _encoding_cached_locally(encoding_name: str) -> tuple[bool, bool]:
     """Check if a tiktoken encoding is available in local cache (memory or disk).
 
     Returns (is_cached, has_invalid_cache_entry).
     - is_cached: True if the encoding can be loaded without network access.
-    - has_invalid_cache_entry: True if a cache file exists but is invalid (hash mismatch).
+    - has_invalid_cache_entry: True if a cache file exists but is invalid (hash mismatch)
+      OR if a partial cache exists (e.g., only vocab.bpe for GPT-2 without encoder.json).
     """
     # Check in-memory cache first
     try:
         import tiktoken
+
         if encoding_name in tiktoken.registry.ENCODINGS:
             return True, False
     except Exception:
         pass
 
     # Check on-disk cache
-    # The encoding constructors use specific URLs; we need to check if the
-    # cached file exists for the expected URL and is valid.
-    url_map = {
-        "o200k_base": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
-        "o200k_harmony": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
-        "cl100k_base": "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",
-        "p50k_base": "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",
-        "r50k_base": "https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken",
-        "gpt2": "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/vocab.bpe",
-    }
-    # Expected hashes from tiktoken's encoding constructors
-    hash_map = {
-        "o200k_base": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
-        "o200k_harmony": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
-        "cl100k_base": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
-        "p50k_base": "94b5ca7dff4d00767bc256fdd1b27e5b17361d7b8a5f968547f9f23eb70d2069",
-        "r50k_base": "306cd27f03c1a714eca7108e03d66b7dc042abe8c258b44c199a7ed9838dd930",
-        "gpt2": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",  # vocab.bpe hash
-    }
-    url = url_map.get(encoding_name)
-    if not url:
+    urls = _ENCODING_URLS.get(encoding_name)
+    if not urls:
         return False, False
 
     cache_dir = _tiktoken_cache_dir()
     if cache_dir == "":
         return False, False
 
-    cache_key = hashlib.sha1(url.encode()).hexdigest()
-    cache_path = os.path.join(cache_dir, cache_key)
+    has_invalid = False
 
-    # File must exist AND be valid (not a hash mismatch)
+    # GPT-2 is the only encoding with multiple files (vocab.bpe + encoder.json)
+    if encoding_name == "gpt2" and isinstance(urls, tuple):
+        all_exist = True
+        for i, url in enumerate(urls):
+            cache_path = os.path.join(cache_dir, _cache_key(url))
+            if i == 0:  # vocab.bpe
+                expected_hash = _ENCODING_HASHES.get("gpt2_vocab")
+            else:  # encoder.json
+                expected_hash = _ENCODING_HASHES.get("gpt2_encoder")
+            if not os.path.exists(cache_path):
+                all_exist = False
+                # Partial cache exists - treat as invalid (cache-only, no download)
+                has_invalid = True
+            elif expected_hash:
+                data = _read_cached_file(cache_path, expected_hash)
+                if data is None:
+                    has_invalid = True
+        if not all_exist:
+            # Partial cache: has some files but not all - cache-only, no download
+            return True, True
+        return True, has_invalid
+
+    # Single file encodings (.tiktoken) - urls may be a single-element tuple or string
+    url = urls[0] if isinstance(urls, tuple) else urls
+    cache_path = os.path.join(cache_dir, _cache_key(url))
     if not os.path.exists(cache_path):
         return False, False
 
-    # Validate the cache file hash without triggering a download
-    # read_file_cached triggers a download on hash mismatch, so we check manually
-    expected_hash = hash_map.get(encoding_name)
+    expected_hash = _ENCODING_HASHES.get(encoding_name)
     if expected_hash:
-        try:
-            with open(cache_path, "rb", buffering=0) as f:
-                data = f.read()
-            actual_hash = hashlib.sha256(data).hexdigest()
-            if actual_hash != expected_hash:
-                return False, True  # Cache exists but invalid
-        except Exception:
-            return False, True  # Cache exists but invalid (corrupted)
+        data = _read_cached_file(cache_path, expected_hash)
+        if data is None:
+            return False, True
 
     return True, False
 
 
-@lru_cache(maxsize=8)
-def _get_encoding(encoding_name: str):
-    """Get a tiktoken encoding, cached for performance.
+def _build_encoding_from_cache(encoding_name: str):
+    """Construct a tiktoken Encoding directly from local cache files.
 
-    Bounded by ``HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS`` (default 10s): tiktoken's
-    vocab download has no network timeout, so we run the load on a worker thread
-    and raise :class:`TiktokenLoadError` if it doesn't finish in time, letting
-    callers fall back to estimation rather than hang the request (GH #956). The
-    first timed-out encoding is remembered so later calls fail fast instead of
-    re-blocking on every request.
-
-    If the encoding is already cached in memory, it is loaded
-    without calling ``guard_egress``, allowing fast offline operation with pre-populated
-    vocabularies. If only a disk cache entry exists, the load is still bounded by the
-    configured timeout to prevent a stalled constructor from blocking indefinitely.
+    This bypasses tiktoken's download logic entirely. Raises if cache files
+    are missing or invalid.
     """
-    import tiktoken
-    from headroom.offline import is_offline
+    from tiktoken.core import Encoding
 
-    if encoding_name in _load_failed:
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
+    urls = _ENCODING_URLS.get(encoding_name)
+    if not urls:
+        raise ValueError(f"Unknown encoding {encoding_name}")
 
-    # Fast path: encoding already in memory cache
+    cache_dir = _tiktoken_cache_dir()
+
+    # GPT-2 is the only encoding with multiple files (vocab.bpe + encoder.json)
+    if encoding_name == "gpt2" and isinstance(urls, tuple):
+        # GPT-2: two files
+        vocab_path = os.path.join(cache_dir, _cache_key(urls[0]))
+        encoder_path = os.path.join(cache_dir, _cache_key(urls[1]))
+        mergeable_ranks = _load_mergeable_ranks_from_data_gym(vocab_path, encoder_path)
+    else:
+        # Single file encodings (.tiktoken) - urls may be a single-element tuple or string
+        url = urls[0] if isinstance(urls, tuple) else urls
+        cache_path = os.path.join(cache_dir, _cache_key(url))
+        mergeable_ranks = _load_mergeable_ranks_from_tiktoken_file(cache_path)
+
+    special_tokens = _ENCODING_SPECIAL_TOKENS.get(encoding_name, {})
+    pat_str = _ENCODING_PAT_STR.get(encoding_name, _ENCODING_PAT_STR["cl100k_base"])
+    explicit_n_vocab = _ENCODING_EXPLICIT_N_VOCAB.get(encoding_name)
+
+    return Encoding(
+        name=encoding_name,
+        pat_str=pat_str,
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_tokens,
+        explicit_n_vocab=explicit_n_vocab,
+    )
+
+
+def _load_encoding_worker(encoding_name: str, queue: mp.Queue) -> None:
+    """Worker function to load encoding in a separate process.
+
+    Uses multiprocessing so we can actually terminate on timeout.
+    Does cache check AND load inside the timeout boundary.
+    """
     try:
+        import tiktoken
+
+        # Fast path: already in memory
         if encoding_name in tiktoken.registry.ENCODINGS:
-            return tiktoken.get_encoding(encoding_name)
-    except Exception:
-        pass
+            queue.put(("ok", encoding_name))
+            return
 
-    # Check disk cache (may be slow if constructor stalls) - use bounded load
-    is_cached, has_invalid_cache = _encoding_cached_locally(encoding_name)
-    if is_cached:
-        # Load from disk cache with timeout to prevent stall
-        box: dict[str, Any] = {}
+        # Check local cache FIRST (inside the timeout boundary)
+        # This includes filesystem I/O: file open, read, hash verification
+        is_cached, has_invalid = _encoding_cached_locally(encoding_name)
+        if is_cached:
+            # Load directly from cache files - NO network possible
+            enc = _build_encoding_from_cache(encoding_name)
+            # Register in tiktoken's in-memory cache for future fast loads
+            tiktoken.registry.ENCODINGS[encoding_name] = enc
+            queue.put(("ok", encoding_name))
+            return
 
-        def _load_from_disk() -> None:
-            try:
-                box["enc"] = tiktoken.get_encoding(encoding_name)
-            except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
-                box["err"] = exc
+        if has_invalid:
+            queue.put(("invalid_cache", encoding_name))
+            return
 
-        worker = threading.Thread(target=_load_from_disk, name=f"tiktoken-disk-load-{encoding_name}", daemon=True)
-        worker.start()
-        worker.join(_load_timeout_seconds())
+        # Not cached, would need download - but we don't do that here
+        queue.put(("not_cached", encoding_name))
 
-        if worker.is_alive():
-            _load_failed.add(encoding_name)
-            logger.warning(
-                "tiktoken encoding %r did not load from disk cache within %.1fs (stalled constructor); "
-                "falling back to token estimation. Pre-populate TIKTOKEN_CACHE_DIR "
-                "or tune HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS.",
-                encoding_name,
-                _load_timeout_seconds(),
-            )
-            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load timed out")
-        if "err" in box:
-            _load_failed.add(encoding_name)
-            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to load from local cache") from box["err"]
-        return box["enc"]
+    except BaseException as exc:  # noqa: BLE001
+        queue.put(("error", str(exc)))
 
-    # If there's an invalid cache entry on disk, fail fast without attempting
-    # a network request. This keeps disk loading cache-only and bounded.
-    if has_invalid_cache:
-        _load_failed.add(encoding_name)
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} has invalid cache entry; not attempting download")
 
-    # If offline mode is enabled and the encoding is not cached locally,
-    # fail fast without attempting a network request.
-    if is_offline():
-        _load_failed.add(encoding_name)
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} not in local cache and HEADROOM_OFFLINE=1")
+def _download_worker(enc_name: str, q: mp.Queue) -> None:
+    """Download a tiktoken encoding in a subprocess."""
+    try:
+        guard_egress("load tiktoken encoding", destination=f"tiktoken encoding {enc_name}")
+        import tiktoken as _tiktoken
 
-    box: dict[str, Any] = {}
+        _tiktoken.get_encoding(enc_name)
+        q.put(("ok", enc_name))
+    except BaseException as exc:  # noqa: BLE001
+        q.put(("error", str(exc)))
 
-    def _load() -> None:
-        try:
-            guard_egress("load tiktoken encoding", destination=f"tiktoken encoding {encoding_name}")
-            box["enc"] = tiktoken.get_encoding(encoding_name)
-        except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
-            box["err"] = exc
 
-    worker = threading.Thread(target=_load, name=f"tiktoken-load-{encoding_name}", daemon=True)
-    worker.start()
-    worker.join(_load_timeout_seconds())
+def _get_encoding_with_timeout(encoding_name: str, ctx: Any) -> Any:
+    """Load a tiktoken encoding with a bounded timeout.
 
-    if worker.is_alive():
-        _load_failed.add(encoding_name)
+    Uses a subprocess to prevent a stalled vocab download from blocking
+    the caller indefinitely (GH #956).
+    """
+    if is_offline() and encoding_name not in _download_failed:
+        raise TiktokenLoadError(
+            f"tiktoken encoding {encoding_name!r} not in local cache and HEADROOM_OFFLINE=1"
+        )
+
+    # Online mode, not cached: need to download. Use bounded load with guard_egress.
+    queue = ctx.Queue()
+
+    proc = ctx.Process(target=_download_worker, args=(encoding_name, queue), daemon=True)
+    proc.start()
+    proc.join(_load_timeout_seconds())
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(1.0)
+        _download_failed.add(encoding_name)
         logger.warning(
             "tiktoken encoding %r did not load within %.1fs (likely a stalled vocab "
             "download); falling back to token estimation. Pre-populate TIKTOKEN_CACHE_DIR "
@@ -276,9 +503,122 @@ def _get_encoding(encoding_name: str):
             _load_timeout_seconds(),
         )
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} load timed out")
-    if "err" in box:
-        raise box["err"]
-    return box["enc"]
+
+    if proc.exitcode != 0:
+        _download_failed.add(encoding_name)
+        logger.warning(
+            "tiktoken encoding %r download process exited with code %d",
+            encoding_name,
+            proc.exitcode,
+        )
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} download failed")
+
+    try:
+        result = queue.get_nowait()
+    except Exception as e:
+        _download_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} download returned no result") from e
+
+    status = result[0]
+    if status == "ok":
+        return tiktoken.get_encoding(encoding_name)
+    elif status == "error":
+        _download_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to download: {result[1]}")
+    else:
+        _download_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} download returned unknown status: {status}")
+
+
+@lru_cache(maxsize=8)
+def _get_encoding(encoding_name: str):
+    """Get a tiktoken encoding, cached for performance.
+
+    Bounded by ``HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS`` (default 10s): tiktoken's
+    vocab download has no network timeout, so we run the load in a worker process
+    and raise :class:`TiktokenLoadError` if it doesn't finish in time, letting
+    callers fall back to estimation rather than hang the request (GH #956).
+
+    If the encoding is already cached in memory, it is loaded
+    without calling ``guard_egress``, allowing fast offline operation with pre-populated
+    vocabularies. If only a disk cache entry exists, the load is still bounded by the
+    configured timeout to prevent a stalled constructor from blocking indefinitely.
+    """
+    # Fast path: encoding already in memory cache
+    try:
+        if encoding_name in tiktoken.registry.ENCODINGS:
+            return tiktoken.get_encoding(encoding_name)
+    except Exception:
+        pass
+
+    # Check if this encoding previously failed to DOWNLOAD
+    if encoding_name in _download_failed:
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to download")
+
+    # Try to load from disk cache with timeout using multiprocessing (can actually terminate)
+    # This moves the cache check AND the load inside the timeout boundary
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_load_encoding_worker, args=(encoding_name, queue), daemon=True)
+    proc.start()
+    proc.join(_load_timeout_seconds())
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(1.0)
+        logger.warning(
+            "tiktoken encoding %r did not load from disk cache within %.1fs (stalled constructor); "
+            "falling back to token estimation. Pre-populate TIKTOKEN_CACHE_DIR "
+            "or tune HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS.",
+            encoding_name,
+            _load_timeout_seconds(),
+        )
+        # Do NOT add to _download_failed - disk load timeout is retryable
+        # Add to _disk_load_failed for tracking
+        _disk_load_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load timed out")
+
+    if proc.exitcode != 0:
+        logger.warning(
+            "tiktoken encoding %r disk load process exited with code %d",
+            encoding_name,
+            proc.exitcode,
+        )
+        _disk_load_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load failed")
+
+    try:
+        result = queue.get_nowait()
+    except Exception as e:
+        _disk_load_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load returned no result") from e
+
+    status = result[0]
+    if status == "ok":
+        return tiktoken.get_encoding(encoding_name)
+    elif status == "invalid_cache":
+        # If online, try to download fresh; if offline, fail fast (cache-only)
+        if is_offline():
+            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} has invalid cache entry and HEADROOM_OFFLINE=1")
+        # Online: fall through to download attempt
+        pass
+    elif status == "not_cached":
+        # Not cached locally - will try download if online
+        pass
+    elif status == "error":
+        _disk_load_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to load from local cache: {result[1]}")
+    else:
+        _disk_load_failed.add(encoding_name)
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load returned unknown status: {status}")
+
+    # If we got here, encoding is not cached locally
+    # If offline, fail fast
+    if is_offline():
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} not in local cache and HEADROOM_OFFLINE=1")
+
+    # Online mode, not cached: need to download. Use bounded load with guard_egress.
+    return _get_encoding_with_timeout(encoding_name, ctx)
 
 
 def load_encoding(encoding_name: str) -> Any:
@@ -315,11 +655,7 @@ def get_encoding_for_model(model: str) -> str:
         return MODEL_TO_ENCODING[model]
 
     # Try prefix matching for versioned models. Ordered most-specific first
-    # so that, e.g., "gpt-4o-*" resolves before "gpt-4-*". Each prefix maps
-    # directly to its encoding: scanning MODEL_TO_ENCODING for the first key
-    # that merely starts with the prefix is order-dependent and wrong — the
-    # "gpt-4" prefix would match the "gpt-4o" dict entry first and return
-    # o200k_base instead of cl100k_base for unknown gpt-4 snapshots.
+    # so that, e.g., "gpt-4o-*" resolves before "gpt-4-*".
     for prefix, encoding in (
         ("gpt-4o", "o200k_base"),
         # chatgpt-4o-latest and dated chatgpt-4o-* aliases are GPT-4o.

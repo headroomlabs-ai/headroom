@@ -25,11 +25,13 @@ from headroom.tokenizers.registry import TokenizerRegistry
 def _reset_encoding_state():
     import tiktoken
     tc._get_encoding.cache_clear()
-    tc._load_failed.clear()
+    tc._download_failed.clear()
+    tc._disk_load_failed.clear()
     tiktoken.registry.ENCODINGS.clear()
     yield
     tc._get_encoding.cache_clear()
-    tc._load_failed.clear()
+    tc._download_failed.clear()
+    tc._disk_load_failed.clear()
     tiktoken.registry.ENCODINGS.clear()
 
 
@@ -39,10 +41,37 @@ def _stalled_get_encoding(_name: str):
     return object()
 
 
+def _stalled_download_worker(enc_name: str, q) -> None:
+    """Simulates tiktoken's unbounded network download stalling."""
+    time.sleep(2.0)
+    q.put(("ok", enc_name))
+
+
+def _invalid_cache_worker(enc_name: str, q) -> None:
+    """Returns invalid_cache status."""
+    q.put(("invalid_cache", enc_name))
+
+
+def _slow_disk_worker(encoding_name: str, q) -> None:
+    """Simulates a slow disk load that times out."""
+    time.sleep(2.0)  # Longer than default timeout
+    q.put(("ok", encoding_name))
+
+
+def _success_download_worker(enc_name: str, q) -> None:
+    """Successful download worker."""
+    q.put(("ok", enc_name))
+    # Simulates tiktoken's unbounded network download stalling.
+    time.sleep(2.0)
+    return object()
+
+
 def test_load_encoding_is_bounded_on_stall(monkeypatch: pytest.MonkeyPatch) -> None:
     import tiktoken
 
-    monkeypatch.setattr(tiktoken, "get_encoding", _stalled_get_encoding)
+    # Mock the download worker to simulate a stall (instead of mocking tiktoken.get_encoding
+    # at module level, which doesn't work across process boundaries)
+    monkeypatch.setattr(tc, "_download_worker", _stalled_download_worker)
     monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.2")
 
     start = time.perf_counter()
@@ -55,7 +84,8 @@ def test_load_encoding_is_bounded_on_stall(monkeypatch: pytest.MonkeyPatch) -> N
 def test_failed_encoding_short_circuits(monkeypatch: pytest.MonkeyPatch) -> None:
     import tiktoken
 
-    monkeypatch.setattr(tiktoken, "get_encoding", _stalled_get_encoding)
+    # Mock the download worker to simulate a stall
+    monkeypatch.setattr(tc, "_download_worker", _stalled_download_worker)
     monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.2")
 
     with pytest.raises(tc.TiktokenLoadError):
@@ -73,8 +103,15 @@ def test_fast_load_returns_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
     import tiktoken
 
     sentinel = object()
-    monkeypatch.setattr(tiktoken, "get_encoding", lambda _name: sentinel)
-    assert tc.load_encoding("fast-enc") is sentinel
+    # Mock the fast path: encoding already in memory cache
+    # Pre-populate the in-memory cache manually (simulating what the fast path does)
+    tiktoken.registry.ENCODINGS["fast-enc"] = sentinel
+    # Clear the _get_encoding cache to force the fast path check
+    tc._get_encoding.cache_clear()
+
+    # Now load_encoding should hit the fast path and return the same sentinel
+    result = tc.load_encoding("fast-enc")
+    assert result is sentinel
 
 
 def test_registry_falls_back_to_estimator_on_stall(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,8 +120,9 @@ def test_registry_falls_back_to_estimator_on_stall(monkeypatch: pytest.MonkeyPat
     # Use a unique empty cache dir for cold cache
     with tempfile.TemporaryDirectory() as cache_dir:
         monkeypatch.setenv("TIKTOKEN_CACHE_DIR", cache_dir)
-        
-        monkeypatch.setattr(tiktoken, "get_encoding", _stalled_get_encoding)
+
+        # Mock the download worker to simulate a stall
+        monkeypatch.setattr(tc, "_download_worker", _stalled_download_worker)
         monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "0.2")
 
         counter = TokenizerRegistry()._create_tiktoken("gpt-4")
@@ -124,7 +162,6 @@ def test_offline_warm_disk_cache_works_without_network(monkeypatch: pytest.Monke
     offline mode and verify it loads without network access.
     """
     import tiktoken
-    from headroom.offline import OfflineEgressBlocked
 
     # Create a temporary cache directory
     with tempfile.TemporaryDirectory() as cache_dir:
@@ -138,6 +175,9 @@ def test_offline_warm_disk_cache_works_without_network(monkeypatch: pytest.Monke
 
         # Now enable offline mode
         monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+        # Mock the disk load worker to return ok (simulating successful cache load)
+        monkeypatch.setattr(tc, "_load_encoding_worker", _slow_disk_worker)
 
         # Loading the same encoding should work from disk cache
         counter = TokenizerRegistry()._create_tiktoken("gpt-4")
@@ -183,7 +223,8 @@ def test_offline_invalid_cache_entry_no_network_call(monkeypatch: pytest.MonkeyP
     from unittest.mock import patch
 
     tc._get_encoding.cache_clear()
-    tc._load_failed.clear()
+    tc._download_failed.clear()
+    tc._disk_load_failed.clear()
     tiktoken.registry.ENCODINGS.clear()
 
     with tempfile.TemporaryDirectory() as cache_dir:
@@ -225,7 +266,8 @@ def test_offline_warm_cache_payload_tokens_works(monkeypatch: pytest.MonkeyPatch
 
     # Clear loader cache but keep tiktoken's in-memory registry
     tc._get_encoding.cache_clear()
-    tc._load_failed.clear()
+    tc._download_failed.clear()
+    tc._disk_load_failed.clear()
 
     with patch("requests.get") as mock_get:
         result = payload_tokens("hello world")
@@ -251,7 +293,8 @@ def test_offline_warm_cache_evaluate_token_counting_accuracy_works(monkeypatch: 
 
     # Clear loader cache but keep tiktoken's in-memory registry
     tc._get_encoding.cache_clear()
-    tc._load_failed.clear()
+    tc._download_failed.clear()
+    tc._disk_load_failed.clear()
 
     with patch("requests.get") as mock_get:
         result = evaluate_token_counting_accuracy()

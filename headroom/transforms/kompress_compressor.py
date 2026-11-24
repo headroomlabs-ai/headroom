@@ -30,7 +30,7 @@ from typing import Any, Literal
 
 from ..config import TransformResult
 from ..log_safety import describe_exception, safe_id
-from ..offline import OFFLINE_ENV, OfflineEgressBlocked, guard_egress
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     _resolve_revision,

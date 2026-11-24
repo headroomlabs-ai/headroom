@@ -363,13 +363,14 @@ class TokenizerRegistry:
         falls back to estimation instead of hanging later inside a request (GH #956).
         """
         try:
+            from headroom.offline import OfflineEgressBlocked
+
             from .tiktoken_counter import (
                 TiktokenCounter,
                 TiktokenLoadError,
                 get_encoding_for_model,
                 load_encoding,
             )
-            from headroom.offline import OfflineEgressBlocked
 
             try:
                 load_encoding(get_encoding_for_model(model))
