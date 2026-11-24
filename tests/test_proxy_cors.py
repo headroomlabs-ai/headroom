@@ -75,8 +75,11 @@ def test_loopback_origins_allowed_on_any_port(monkeypatch: pytest.MonkeyPatch, o
 def test_cross_origin_pages_rejected(monkeypatch: pytest.MonkeyPatch, origin: str) -> None:
     monkeypatch.delenv("HEADROOM_CORS_ORIGINS", raising=False)
     resp = _preflight(_make_client(), origin)
-    # A disallowed origin is never echoed back, so the browser blocks the read.
-    assert resp.headers.get("access-control-allow-origin") != origin
+    # No allow-origin header at all, so the browser blocks the read. Checking
+    # only that the origin is not echoed would accept a "*" answer. Today the
+    # security gate refuses these origins before CORS runs; this assertion
+    # still holds if the gate ever lets one through to a "*" CORS layer.
+    assert resp.headers.get("access-control-allow-origin") is None
 
 
 def test_explicit_allowlist_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,7 +92,7 @@ def test_explicit_allowlist_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Once an explicit list is set, loopback is no longer implicitly trusted.
     blocked = _preflight(client, "http://localhost:8787")
-    assert blocked.headers.get("access-control-allow-origin") != "http://localhost:8787"
+    assert blocked.headers.get("access-control-allow-origin") is None
 
 
 def test_wildcard_optback(monkeypatch: pytest.MonkeyPatch) -> None:
