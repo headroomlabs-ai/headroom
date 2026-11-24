@@ -9,6 +9,7 @@ way a user would from the shell.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -2342,16 +2343,64 @@ def test_pids_from_netstat_reads_probed_listeners_whatever_the_locale() -> None:
     assert wrap_mod._pids_from_netstat(output, 8787) == {4242, 4244}
 
 
-def test_pids_from_ss_reads_probed_listeners() -> None:
-    output = (
-        'LISTEN 0 2048 127.0.0.1:8787 0.0.0.0:* users:(("python3",pid=4242,fd=7))\n'
-        'LISTEN 0 2048 192.168.1.5:8787 0.0.0.0:* users:(("nginx",pid=555,fd=3))\n'
+def test_pids_from_proc_reads_probed_listeners_from_kernel_tables(tmp_path: Path) -> None:
+    """Linux fallback: socket inodes from /proc/net/tcp, owners from /proc/<pid>/fd."""
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        "   0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501 0 1111\n"
+        "   1: 0500A8C0:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000  501 0 2222\n"
+        "   2: 0100007F:2253 0100007F:C350 01 00000000:00000000 00:00000000 00000000  501 0 3333\n",
+        encoding="ascii",
     )
-    assert wrap_mod._pids_from_ss(output, 8787) == {4242}
+    for pid, inode in (("4242", "1111"), ("555", "2222"), ("777", "3333")):
+        (tmp_path / pid / "fd").mkdir(parents=True)
+        os.symlink(f"socket:[{inode}]", tmp_path / pid / "fd" / "3")
+    (tmp_path / "self").mkdir()  # non-numeric entries are skipped
+
+    assert wrap_mod._pids_from_proc(8787, tmp_path) == {4242}
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("12345", 12345),
+        (" 42 ", 42),
+        ("\u0661\u0662", None),
+        ("1" * 5000, None),
+        ("-1", None),
+        ("", None),
+    ],
+    ids=["plain", "padded", "non-ascii-digits", "huge", "negative", "empty"],
+)
+def test_parse_pid_fails_closed(text: str, expected: int | None) -> None:
+    assert wrap_mod._parse_pid(text) == expected
+    assert wrap_mod._health_pid(text) == expected
+
+
+def test_listening_pids_runs_netstat_from_the_windows_system_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A netstat.exe in the project directory must never be the one that runs."""
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> Any:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(wrap_mod, "run", run)
+    monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+
+    assert wrap_mod._listening_pids(8787) == set()
+    assert commands[0][0] == str(tmp_path / "Windows" / "System32" / "netstat.exe")
 
 
 def test_pids_from_lsof_reads_probed_ipv4_listeners() -> None:
-    output = "p4242\nf7\ntIPv4\nn127.0.0.1:8787\np555\nf3\ntIPv6\nn[::1]:8787\np999\nf4\ntIPv4\nn*:8787\n"
+    output = (
+        "p4242\nf7\ntIPv4\nn127.0.0.1:8787\np555\nf3\ntIPv6\nn[::1]:8787\n"
+        "p999\nf4\ntIPv4\nn*:8787\np" + "1" * 5000 + "\nf5\ntIPv4\nn*:8787\n"
+    )
     assert wrap_mod._pids_from_lsof(output, 8787) == {4242, 999}
 
 

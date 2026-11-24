@@ -4612,6 +4612,14 @@ def _reaches_probe(address: str, port: int) -> bool:
     return address in {f"{host}:{port}" for host in _PROBED_HOSTS}
 
 
+def _parse_pid(text: str) -> int | None:
+    """A PID written as plain ASCII digits; anything else (or too long) is None."""
+    text = text.strip()
+    if not (text.isascii() and text.isdigit() and len(text) <= 10):
+        return None
+    return int(text)
+
+
 def _pids_from_netstat(output: str, port: int) -> set[int]:
     """Listening PIDs for 127.0.0.1:``port`` in Windows ``netstat -ano -p TCP`` output.
 
@@ -4626,19 +4634,48 @@ def _pids_from_netstat(output: str, port: int) -> set[int]:
             and cols[0].upper() == "TCP"
             and _reaches_probe(cols[1], port)
             and cols[2].endswith(":0")
-            and cols[4].isdecimal()
+            and (pid := _parse_pid(cols[4])) is not None
         ):
-            pids.add(int(cols[4]))
+            pids.add(pid)
     return pids
 
 
-def _pids_from_ss(output: str, port: int) -> set[int]:
-    """Listening PIDs for 127.0.0.1:``port`` in ``ss -4ltnpH`` output."""
+# 127.0.0.1 and 0.0.0.0 as /proc/net/tcp writes them (host byte order).
+_PROC_PROBED_HOSTS = {"0100007F", "7F000001", "00000000"}
+_PROC_TCP_LISTEN = "0A"
+
+
+def _pids_from_proc(port: int, proc: Path = Path("/proc")) -> set[int] | None:
+    """Linux: PIDs owning a 127.0.0.1/0.0.0.0 listening socket on ``port``.
+
+    Reads the kernel's own tables (``/proc/net/tcp`` and ``/proc/<pid>/fd``),
+    so no process-controlled text (a command name) is parsed. Only this user's
+    processes' descriptors are readable, which is all that can be signalled.
+    """
+    try:
+        rows = (proc / "net" / "tcp").read_text(encoding="ascii").splitlines()[1:]
+    except (OSError, UnicodeDecodeError):
+        return None
+    sockets: set[str] = set()
+    for row in rows:
+        cols = row.split()
+        if len(cols) < 10 or cols[3] != _PROC_TCP_LISTEN:
+            continue
+        host, _, hex_port = cols[1].partition(":")
+        if host in _PROC_PROBED_HOSTS and hex_port == f"{port:04X}":
+            sockets.add(f"socket:[{cols[9]}]")
     pids: set[int] = set()
-    for line in output.splitlines():
-        cols = line.split()
-        if len(cols) >= 6 and _reaches_probe(cols[3], port):
-            pids.update(int(pid) for pid in re.findall(r"\bpid=(\d+)", line))
+    if not sockets:
+        return pids
+    for entry in proc.iterdir():
+        pid = _parse_pid(entry.name)
+        if pid is None:
+            continue
+        try:
+            if any(os.readlink(fd) in sockets for fd in (entry / "fd").iterdir()):
+                pids.add(pid)
+        except OSError:  # another user's process, or it exited meanwhile
+            continue
     return pids
 
 
@@ -4649,7 +4686,7 @@ def _pids_from_lsof(output: str, port: int) -> set[int]:
     for line in output.splitlines():
         tag, value = line[:1], line[1:]
         if tag == "p":
-            pid = int(value) if value.isdecimal() else None
+            pid = _parse_pid(value)
         elif tag == "f":
             kind = None
         elif tag == "t":
@@ -4677,21 +4714,21 @@ def _listening_pids(port: int) -> set[int] | None:
         except psutil.AccessDenied:
             pass  # macOS needs root for this; use the OS tools below
     if sys.platform == "win32":
-        tools = [(["netstat", "-ano", "-p", "TCP"], _pids_from_netstat)]
+        # By full path: a bare name can resolve to the current directory first.
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        netstat = str(Path(system_root) / "System32" / "netstat.exe")
+        command, parse = [netstat, "-ano", "-p", "TCP"], _pids_from_netstat
     else:
-        tools = [
-            (["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "ptn"], _pids_from_lsof),
-            (["ss", "-4ltnpH", f"sport = :{port}"], _pids_from_ss),
-        ]
-    for command, parse in tools:
-        try:
-            result = run(command, capture_output=True, text=True, timeout=10, check=False)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        # lsof exits 1 when nothing matches; that is an answer, not a failure.
-        if result.returncode in (0, 1):
-            return parse(result.stdout, port)
-    return None
+        command = ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "ptn"]
+        parse = _pids_from_lsof
+    try:
+        result = run(command, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    # lsof exits 1 when nothing matches; that is an answer, not a failure.
+    if result is not None and result.returncode in (0, 1):
+        return parse(result.stdout, port)
+    return _pids_from_proc(port) if sys.platform.startswith("linux") else None
 
 
 def _health_pid(raw: object) -> int | None:
@@ -4700,8 +4737,8 @@ def _health_pid(raw: object) -> int | None:
         return None
     if isinstance(raw, int):
         return raw
-    if isinstance(raw, str) and raw.strip().isdecimal():
-        return int(raw)
+    if isinstance(raw, str):
+        return _parse_pid(raw)
     return None
 
 
@@ -5580,6 +5617,9 @@ def _ensure_proxy_unlocked(
                             "session will use the existing proxy as-is."
                         )
                     else:
+                        # The stale-version branch above may already have
+                        # stopped this proxy; one replacement covers both.
+                        already_stopped = needs_restart
                         needs_restart = True
                         click.echo(f"  Proxy on port {port} is missing: {flags_str}")
                         click.echo("  Restarting proxy with upgraded configuration...")
@@ -5590,7 +5630,9 @@ def _ensure_proxy_unlocked(
                         code_graph = code_graph or bool(running_config.get("code_graph"))
 
                         proxy_pid = _health_pid(running_config.get("pid"))
-                        if proxy_pid is not None:
+                        if already_stopped:
+                            click.echo("  Stale proxy already stopped; starting one replacement.")
+                        elif proxy_pid is not None:
                             if not helpers._kill_proxy_by_pid(proxy_pid, port):
                                 raise click.ClickException(
                                     f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
