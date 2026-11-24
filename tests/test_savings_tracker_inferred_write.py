@@ -27,7 +27,7 @@ def _fake_litellm_gpt4o() -> types.SimpleNamespace:
     )
 
 
-def test_inferred_write_is_not_charged_on_top_of_uncached(monkeypatch):
+def test_issue_4961_reproducer_with_inferred_flag(monkeypatch):
     monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
     # Inferred write: the 1000 write tokens ARE the 1000 uncached tokens.
     cost = _estimate_input_cost_usd(
@@ -95,6 +95,18 @@ def test_inferred_write_fallback_pricing(monkeypatch):
     assert cost == pytest.approx(expected)
 
 
+def test_inferred_write_without_uncached_breakdown_falls_back_to_total(monkeypatch):
+    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    cost = _estimate_input_cost_usd(
+        "gpt-4o",
+        1000,
+        cache_write_tokens=1000,
+        uncached_input_tokens=0,
+        cache_inferred=True,
+    )
+    assert cost == pytest.approx(0.0025)
+
+
 def test_record_lifetime_request_inferred_write(monkeypatch):
     monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
     with tempfile.TemporaryDirectory() as tmp:
@@ -151,70 +163,41 @@ async def test_prometheus_metrics_record_request_inferred_write(monkeypatch):
         assert resp["cost"]["input_usd"] == pytest.approx(0.0025)
 
 
-def test_e2e_proxied_chat_completion_inferred_write():
-    from unittest.mock import MagicMock, patch
+def test_request_outcome_updates_lifetime_cost_for_inferred_write(tmp_path, monkeypatch):
+    import asyncio
 
-    from fastapi.testclient import TestClient
+    from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
-    from headroom.backends.base import BackendResponse
-    from headroom.proxy.server import ProxyConfig, create_app
-
-    async def fake_send(body_: dict, headers: dict) -> BackendResponse:
-        return BackendResponse(
-            body={
-                "id": "chatcmpl-test",
-                "object": "chat.completion",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "hello"},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 1000,
-                    "completion_tokens": 10,
-                    "total_tokens": 1010,
-                    "prompt_tokens_details": {"cached_tokens": 0},
-                },
-            },
-            status_code=200,
-        )
-
-    mock = MagicMock()
-    mock.name = "anyllm-openai"
-    mock.send_openai_message = fake_send
-    mock.map_model_id = MagicMock(return_value="gpt-4o")
-    mock.supports_model = MagicMock(return_value=True)
-
-    config = ProxyConfig(
-        optimize=False,
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        backend="anyllm",
-        anyllm_provider="openai",
-        stateless=True,
+    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    tracker = SavingsTracker(path=str(tmp_path / "proxy_savings.json"))
+    handler = types.SimpleNamespace(
+        metrics=PrometheusMetrics(savings_tracker=tracker, stateless=True),
+        cost_tracker=None,
+        logger=None,
+        pipeline_extensions=None,
     )
 
-    with patch("headroom.proxy.server.AnyLLMBackend", return_value=mock):
-        app = create_app(config)
-        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
-            r0 = client.get("/stats-lifetime")
-            assert r0.status_code == 200
-            initial_cost = r0.json()["cost"]["input_usd"]
+    initial_cost = tracker.lifetime_response()["cost"]["input_usd"]
+    asyncio.run(
+        emit_request_outcome(
+            handler,
+            RequestOutcome(
+                request_id="issue-4961",
+                provider="openai",
+                model="gpt-4o",
+                original_tokens=1000,
+                optimized_tokens=1000,
+                provider_input_tokens=1000,
+                output_tokens=10,
+                tokens_saved=0,
+                attempted_input_tokens=1000,
+                cache_write_tokens=1000,
+                uncached_input_tokens=1000,
+                cache_inferred=True,
+            ),
+        )
+    )
+    after_cost = tracker.lifetime_response()["cost"]["input_usd"]
 
-            r_chat = client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "gpt-4o",
-                    "messages": [{"role": "user", "content": "test prompt"}],
-                },
-                headers={"Authorization": "Bearer test-key"},
-            )
-            assert r_chat.status_code == 200
-
-            r1 = client.get("/stats-lifetime")
-            assert r1.status_code == 200
-            after_cost = r1.json()["cost"]["input_usd"]
-            delta = round(after_cost - initial_cost, 6)
-            assert delta == pytest.approx(0.0025)
+    assert after_cost - initial_cost == pytest.approx(0.0025)

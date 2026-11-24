@@ -673,7 +673,8 @@ def _estimate_input_cost_usd(
     """Estimate input spend in USD for a request.
 
     Uses provider cache pricing when a complete cache breakdown is available and
-    otherwise falls back to list-price input tokens.
+    otherwise falls back to list-price input tokens. Inferred cache writes are
+    the same tokens as uncached input, so they are not priced as a second bucket.
     """
     total_input_tokens = _coerce_int(input_tokens)
     cache_read = _coerce_int(cache_read_tokens)
@@ -1170,6 +1171,8 @@ class SavingsTracker:
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        # True when the write count duplicates uncached input rather than a
+        # separately billed provider bucket.
         cache_inferred: bool = False,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
