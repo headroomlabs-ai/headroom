@@ -1377,12 +1377,12 @@ class BatchHandlerMixin:
 
     async def handle_batch_list(self, request: Request) -> Response:
         """Handle GET /v1/batches - List batches (passthrough)."""
-        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+        return await self.handle_passthrough(request, self.OPENAI_API_URL, provider="openai")
 
     async def handle_batch_get(self, request: Request, batch_id: str) -> Response:
         """Handle GET /v1/batches/{batch_id} - Get batch (passthrough)."""
-        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+        return await self.handle_passthrough(request, self.OPENAI_API_URL, provider="openai")
 
     async def handle_batch_cancel(self, request: Request, batch_id: str) -> Response:
         """Handle POST /v1/batches/{batch_id}/cancel - Cancel batch (passthrough)."""
-        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+        return await self.handle_passthrough(request, self.OPENAI_API_URL, provider="openai")

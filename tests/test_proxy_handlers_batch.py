@@ -124,7 +124,7 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
             if k.lower().startswith("x-headroom-")
         }
 
-    async def handle_passthrough(self, request, base_url):  # noqa: ANN001, ANN201
+    async def handle_passthrough(self, request, base_url, provider=None):  # noqa: ANN001, ANN201
         return {"request": request, "base_url": base_url}
 
     async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
@@ -1591,7 +1591,7 @@ async def test_batch_helper_methods_and_openai_file_error_branches() -> None:
     handler = DummyBatchHandler()
     marker = object()
 
-    async def fake_passthrough(request, base_url):  # noqa: ANN001
+    async def fake_passthrough(request, base_url, provider=None):  # noqa: ANN001
         return marker
 
     handler.handle_passthrough = fake_passthrough

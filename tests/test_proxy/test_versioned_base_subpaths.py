@@ -190,6 +190,38 @@ def test_batch_passthrough_creates_under_the_base_version() -> None:
     assert seen == [f"POST {ARK_BASE}/batches"]
 
 
+@pytest.mark.parametrize(
+    "base", ["https://gateway.example/api/v3", "https://gateway.example/api/v3/v1"]
+)
+@pytest.mark.parametrize("user_agent", ["claude-code/2.1.0", "openai-python/1.0"])
+def test_all_batch_routes_share_one_base_for_any_client(base: str, user_agent: str) -> None:
+    # The batch routes are OpenAI's whoever calls them, so the user agent must not
+    # move list/lookup/cancel onto a different upstream than create.
+    headers = {"authorization": "Bearer synthetic", "user-agent": user_agent}
+    seen: list[str] = []
+    with _make_proxy_client(openai_api_url=base) as client:
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=_batch_upstream(seen))
+        client.post(
+            "/v1/batches",
+            headers=headers,
+            json={
+                "input_file_id": "file-abc",
+                "endpoint": "/v1/embeddings",
+                "completion_window": "24h",
+            },
+        )
+        client.get("/v1/batches", headers=headers)
+        client.get("/v1/batches/batch_1", headers=headers)
+        client.post("/v1/batches/batch_1/cancel", headers=headers)
+
+    assert seen == [
+        f"POST {base}/batches",
+        f"GET {base}/batches",
+        f"GET {base}/batches/batch_1",
+        f"POST {base}/batches/batch_1/cancel",
+    ]
+
+
 _MESSAGES_BODY = {
     "model": "claude-sonnet-4-5",
     "max_tokens": 16,
