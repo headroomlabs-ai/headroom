@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -50,317 +49,6 @@ if TYPE_CHECKING:
     from headroom.memory.models import Memory
 
 logger = logging.getLogger(__name__)
-
-# Same heading rule as the bridge parsers, so exported bullets re-import under their topic.
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
-_ATX_HEADING_START_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
-_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_THEMATIC_BREAK_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
-_BLOCK_QUOTE_RE = re.compile(r"^ {0,3}>")
-_LIST_ITEM_INTERRUPT_RE = re.compile(r"^ {0,3}(?:[-+*]|1[.)])[ \t]+\S")
-_CONTAINER_MARKER_RE = re.compile(r"^(?:(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)|>)")
-_LIST_ITEM_MARKER_RE = re.compile(
-    r"^(?P<indent> {0,3})(?P<marker>[-+*]|\d{1,9}[.)])(?:(?P<spacing> +)\S.*|[ \t]*)$"
-)
-_HTML_BLOCK_TAGS = (
-    "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
-    "dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|"
-    "frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|"
-    "menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|"
-    "summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul"
-)
-_HTML_BLOCKS = (
-    (
-        re.compile(r" {0,3}<(?:pre|script|style|textarea)(?=[\t\n\v\f\r >]|$)", re.I),
-        re.compile(r"</(?:pre|script|style|textarea)>", re.I),
-    ),
-    (re.compile(r" {0,3}<!--"), re.compile(r"-->")),
-    (re.compile(r" {0,3}<\?"), re.compile(r"\?>")),
-    (re.compile(r" {0,3}<![A-Za-z]"), re.compile(r">")),
-    (re.compile(r" {0,3}<!\[CDATA\["), re.compile(r"]]>")),
-    (
-        re.compile(rf" {{0,3}}</?(?:{_HTML_BLOCK_TAGS})(?=[\t\n\v\f\r ]|/?>|$)", re.I),
-        re.compile(r"^[ \t]*$"),
-    ),
-)
-_HTML_TAG_NAME = r"[A-Za-z][A-Za-z0-9-]*"
-_HTML_ATTRIBUTE = (
-    r"[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
-    r"(?:[ \t]*=[ \t]*(?:[^ \t\n\"'=<>`]+|'[^']*'|\"[^\"]*\"))?"
-)
-_HTML_TYPE_7_RE = re.compile(
-    rf" {{0,3}}(?:<(?:{_HTML_TAG_NAME})(?:{_HTML_ATTRIBUTE})*[ \t]*/?>"
-    rf"|</(?:{_HTML_TAG_NAME})[ \t]*>)[ \t]*$"
-)
-# Lines after which no paragraph is open, so a standalone tag line can start a block.
-_SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
-_NO_PARAGRAPH_RE = re.compile(
-    r"^(?: {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]*"  # empty list item
-    r"|(?: {4}| {0,3}\t).*"  # indented code
-    r")$"
-)
-_LINK_REFERENCE_DEFINITION_RE = re.compile(
-    r"""^[ ]{0,3}\[
-    (?=(?:\\[^\n]|[^\[\]\\])*(?:\\[^\n]|[^\s\[\]\\])
-       (?:\\[^\n]|[^\[\]\\])*\]:)
-    (?:\\[^\n]|[^\[\]\\])+\]:[ \t]*(?:\n[ \t]*)?
-    (?:
-        <(?:\\[^\n]|[^<>\\\n])*>
-      | (?P<bare>(?!<)(?:\\[()]|[^\s\x00-\x1f\x7f])+)
-    )
-    (?:
-        (?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)
-        (?:"(?:\\[^\n]|[^"\\])*"|'(?:\\[^\n]|[^'\\])*'|
-           \((?:\\[^\n]|[^()\\])*\))[ \t]*(?=\n|$)
-      | [ \t]*(?=\n|$)
-    )""",
-    re.VERBOSE,
-)
-
-
-def _balanced_link_destination(destination: str) -> bool:
-    """Return whether a bare link destination has balanced parentheses."""
-    depth = 0
-    index = 0
-    while index < len(destination):
-        character = destination[index]
-        if character == "\\":
-            index += 2
-            continue
-        if character == "(":
-            depth += 1
-            if depth > 32:
-                return False
-        elif character == ")":
-            depth -= 1
-            if depth < 0:
-                return False
-        index += 1
-    return depth == 0
-
-
-def _interrupts_reference_candidate(line: str) -> bool:
-    """Return whether line terminates a possible link reference definition."""
-    return (
-        not line.strip()
-        or _ATX_HEADING_START_RE.match(line) is not None
-        or _THEMATIC_BREAK_RE.match(line) is not None
-        or _FENCE_RE.match(line) is not None
-        or _BLOCK_QUOTE_RE.match(line) is not None
-        or _LIST_ITEM_INTERRUPT_RE.match(line) is not None
-        or any(start.match(line) for start, _ in _HTML_BLOCKS)
-    )
-
-
-def _leading_indent(line: str) -> int:
-    """Return leading indentation, treating a tab as reaching a 4-column stop."""
-    indent = 0
-    for character in line:
-        if character == " ":
-            indent += 1
-        elif character == "\t":
-            indent += 4 - indent % 4
-        else:
-            break
-    return indent
-
-
-def _list_item_fence_base(
-    lines: list[str], opener: int, indent: int, continuation_lines: set[int]
-) -> int:
-    """Return the content offset of the list item holding a fence, or zero at top level."""
-    limit = indent  # every line between the item's marker and the fence is indented this far
-    below_blank = False
-    for index in range(opener - 1, -1, -1):
-        line = lines[index].removesuffix("\r")
-        if not line.strip():
-            below_blank = True
-            continue
-        if index in continuation_lines:  # paragraph text, possibly a lazy continuation
-            below_blank = False
-            continue
-        line_indent = _leading_indent(line)
-        marker_match = _LIST_ITEM_MARKER_RE.match(line)
-        if marker_match is not None and line_indent < limit:
-            marker_end = len(marker_match.group("indent")) + len(marker_match.group("marker"))
-            spacing = len(marker_match.group("spacing") or "")
-            content_offset = marker_end + (spacing if 1 <= spacing <= 4 else 1)
-            if content_offset <= limit:
-                # An empty list item ends at a blank line right below its marker.
-                empty_item = marker_match.group("spacing") is None
-                return 0 if empty_item and below_blank else content_offset
-        limit = min(limit, line_indent)
-        below_blank = False
-    return 0
-
-
-def _markdown_structure(
-    lines: list[str],
-) -> tuple[list[tuple[int, str | None]], int | None, set[int], set[int]]:
-    """Return placement boundaries and opaque-block insertion metadata."""
-    headings: list[tuple[int, str | None]] = []
-    block: tuple[re.Pattern[str], int, bool, int | None] | None = None
-    blank_line_block_ends: set[int] = set()
-    setext_boundaries: set[int] = set()
-    continuation_lines: set[int] = set()
-    in_paragraph = False
-    paragraph_start = 0
-    reference_end = -1
-
-    for index, original_line in enumerate(lines):
-        if index <= reference_end:
-            continue
-        line = original_line.removesuffix("\r")
-        if block is not None:
-            end_pattern, _, ends_at_blank_line, fence_base = block
-            if end_pattern.search(line):
-                if ends_at_blank_line:
-                    blank_line_block_ends.add(index)
-                block = None
-                in_paragraph = False
-                continue
-            if fence_base is None or not line.strip() or _leading_indent(line) >= fence_base:
-                continue
-            block = None
-            in_paragraph = False
-
-        fence_match = _FENCE_RE.match(line)
-        if fence_match and not (
-            fence_match.group(1).startswith("`") and "`" in fence_match.group(2)
-        ):
-            marker = fence_match.group(1)
-            indent = fence_match.start(1)
-            fence_base = _list_item_fence_base(lines, index, indent, continuation_lines)
-            end_pattern = re.compile(
-                rf"^ {{{fence_base},{fence_base + 3}}}"
-                rf"{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$"
-            )
-            block = (end_pattern, index, False, fence_base)
-            in_paragraph = False
-            continue
-
-        for html_type, (start_pattern, end_pattern) in enumerate(_HTML_BLOCKS):
-            if start_pattern.match(line):
-                if not end_pattern.search(line):
-                    block = (end_pattern, index, html_type == len(_HTML_BLOCKS) - 1, None)
-                in_paragraph = False
-                break
-        else:
-            if not in_paragraph and re.match(r"^ {0,3}\[", line):
-                candidate_end = next(
-                    (
-                        i
-                        for i in range(index + 1, len(lines))
-                        if _interrupts_reference_candidate(lines[i].removesuffix("\r"))
-                    ),
-                    len(lines),
-                )
-                candidate = "\n".join(
-                    item.removesuffix("\r") for item in lines[index:candidate_end]
-                )
-                reference_match = _LINK_REFERENCE_DEFINITION_RE.match(candidate)
-                if reference_match and (
-                    reference_match.group("bare") is None
-                    or _balanced_link_destination(reference_match.group("bare"))
-                ):
-                    reference_end = index + reference_match.group().count("\n")
-                    in_paragraph = False
-                    continue
-            if not in_paragraph and _HTML_TYPE_7_RE.match(line):
-                block = (_HTML_BLOCKS[-1][1], index, True, None)
-                in_paragraph = False
-            elif heading_match := _HEADING_RE.match(line):
-                headings.append((index, heading_match.group(2).strip()))
-                in_paragraph = False
-            elif _ATX_HEADING_START_RE.match(line):
-                if not line.startswith(" "):
-                    headings.append((index, None))
-                in_paragraph = False
-            elif in_paragraph and _SETEXT_UNDERLINE_RE.match(line):
-                # A paragraph opened on a list item, block quote or indented line is not a
-                # top-level setext heading.
-                start_line = lines[paragraph_start].removesuffix("\r")
-                if not start_line[:1].isspace() and not _CONTAINER_MARKER_RE.match(start_line):
-                    headings.append((paragraph_start, None))
-                    setext_boundaries.add(paragraph_start)
-                in_paragraph = False
-            elif _THEMATIC_BREAK_RE.match(line):
-                in_paragraph = False
-            elif not line.strip():
-                in_paragraph = False
-            elif not in_paragraph:
-                in_paragraph = not _NO_PARAGRAPH_RE.match(line)
-                paragraph_start = index
-            elif not (_BLOCK_QUOTE_RE.match(line) or _LIST_ITEM_MARKER_RE.match(line)):
-                continuation_lines.add(index)
-
-    if block is not None and block[2]:
-        blank_line_block_ends.add(len(lines))
-    return (
-        headings,
-        # A list item's fence also ends where the item ends, so it is never left open.
-        block[1] if block is not None and not block[2] and not block[3] else None,
-        blank_line_block_ends,
-        setext_boundaries,
-    )
-
-
-def _merge_bullets_into_markdown(
-    existing_content: str, bullets_by_topic: dict[str, list[str]]
-) -> str:
-    """Insert each topic's bullets into its existing section, appending missing sections.
-
-    A topic matches the first heading, of any level, whose text equals the topic. Its
-    bullets go after the heading's own content, before the next heading, so they never
-    land under a later section or a sub-heading.
-    """
-    lines = existing_content.split("\n")
-    headings, unterminated_block, blank_line_block_ends, setext_boundaries = _markdown_structure(
-        lines
-    )
-    inserts: dict[int, list[str]] = defaultdict(list)
-    appended: list[str] = []
-
-    for topic, bullets in bullets_by_topic.items():
-        position = next(
-            (pos for pos, (_, text) in enumerate(headings) if text == topic.strip()), None
-        )
-        if position is None:
-            appended.append(f"\n## {topic}")
-            appended.extend(bullets)
-            continue
-
-        start = headings[position][0] + 1
-        section_end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
-        end = section_end
-        if unterminated_block is not None and start <= unterminated_block < end:
-            end = unterminated_block
-        while end > start and not lines[end - 1].strip():
-            end -= 1
-        line_suffix = "\r" if lines[end - 1].endswith("\r") else ""
-        if end in blank_line_block_ends:
-            if end < len(lines):
-                end += 1
-            else:
-                inserts[end].append(line_suffix)
-        inserts[end].extend(f"{bullet}{line_suffix}" for bullet in bullets)
-        if end == section_end and section_end in setext_boundaries:
-            inserts[end].append(line_suffix)
-
-    merged: list[str] = []
-    for index, line in enumerate(lines):
-        merged.extend(inserts.get(index, ()))
-        merged.append(line)
-    merged.extend(inserts.get(len(lines), ()))
-
-    append_text = "\n".join(appended) + "\n" if appended else ""
-    if any(line.endswith("\r") for line in merged):
-        while merged and not merged[-1].strip():
-            merged.pop()
-        merged_text = "\n".join(merged)
-    else:
-        merged_text = "\n".join(merged).rstrip()
-    return merged_text + "\n" + append_text
 
 
 # ---------------------------------------------------------------------------
@@ -918,8 +606,8 @@ class MemoryBridge:
     ) -> int:
         """Append new memories to an existing markdown file.
 
-        Reads the file, inserts memories into their existing sections (appending a
-        section for a topic without one), writes back. Returns count of memories appended.
+        Reads the file, appends memories under appropriate sections,
+        writes back. Returns count of memories appended.
         """
         if not memories:
             return 0
@@ -934,23 +622,29 @@ class MemoryBridge:
 
         # Group new memories by topic
         grouped = self._group_memories_by_topic(memories)
-        bullets_by_topic: dict[str, list[str]] = {}
+        lines_to_append: list[str] = []
 
         for topic, topic_memories in grouped.items():
-            bullets: list[str] = []
+            # Check if section already exists in the file
+            section_exists = f"## {topic}" in existing_content
+
+            if not section_exists:
+                lines_to_append.append(f"\n## {topic}")
+
             for memory in topic_memories:
                 content = memory.content.strip()
                 first_line = content.split("\n")[0].strip()
                 if first_line.startswith("- "):
-                    bullets.append(first_line)
+                    lines_to_append.append(first_line)
                 else:
-                    bullets.append(f"- {first_line}")
-            bullets_by_topic[topic] = bullets
+                    lines_to_append.append(f"- {first_line}")
 
-        if not bullets_by_topic:
+        if not lines_to_append:
             return 0
 
-        new_content = _merge_bullets_into_markdown(existing_content, bullets_by_topic)
+        # Append to file
+        append_text = "\n".join(lines_to_append) + "\n"
+        new_content = existing_content.rstrip() + "\n" + append_text
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

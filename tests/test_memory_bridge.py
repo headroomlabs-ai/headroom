@@ -318,429 +318,6 @@ class TestRelationshipExtraction:
         assert uses_rels[0]["destination"] == long_dst
 
 
-class TestMarkdownSectionMerge:
-    """Exported bullets join their exact heading's own content (pure function)."""
-
-    @pytest.mark.parametrize(
-        ("existing", "expected"),
-        [
-            pytest.param(
-                "## Facts\n- a\n\n## Updates\n- b\n",
-                "## Facts\n- a\n- new\n\n## Updates\n- b\n",
-                id="heading-above-last-section",
-            ),
-            pytest.param(
-                "## Facts and figures\n- a\n- see ## Facts\n",
-                "## Facts and figures\n- a\n- see ## Facts\n\n## Facts\n- new\n",
-                id="exact-heading-only",
-            ),
-            pytest.param(
-                "## Facts\n- a\n### Details\n- d\n## Updates\n- b\n",
-                "## Facts\n- a\n- new\n### Details\n- d\n## Updates\n- b\n",
-                id="before-sub-heading",
-            ),
-            pytest.param(
-                "## Facts\r\n- a\r\n\r\n## Updates\r\n- b\r\n",
-                "## Facts\r\n- a\r\n- new\r\n\r\n## Updates\r\n- b\r\n",
-                id="crlf",
-            ),
-            pytest.param(
-                "## Facts\n- a\n```sh\n# Description\necho hi\n```\n",
-                "## Facts\n- a\n```sh\n# Description\necho hi\n```\n- new\n",
-                id="fenced-shell-description",
-            ),
-            pytest.param(
-                "## Facts\n- left\u2028right\n",
-                "## Facts\n- left\u2028right\n- new\n",
-                id="unicode-line-separator",
-            ),
-            pytest.param(
-                "```md\n## Facts\n- fenced\n```\n## Updates\n- real\n",
-                "```md\n## Facts\n- fenced\n```\n## Updates\n- real\n\n## Facts\n- new\n",
-                id="topic-heading-inside-fence",
-            ),
-            pytest.param(
-                "## Facts\n- a\n~~~text\n## Updates\n- fenced\n~~~\n## Real Updates\n- real\n",
-                "## Facts\n- a\n~~~text\n## Updates\n- fenced\n~~~\n- new\n"
-                "## Real Updates\n- real\n",
-                id="tilde-fence-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n```sh\n# Description\necho hi\n",
-                "## Facts\n- a\n- new\n\n```sh\n# Description\necho hi\n",
-                id="unterminated-fence",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n",
-                "## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n- new\n",
-                id="html-comment-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n<!--\n## Hidden\n",
-                "## Facts\n- a\n- new\n\n<!--\n## Hidden\n",
-                id="unterminated-html-comment",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n",
-                "## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n- new\n",
-                id="html-pre-block",
-            ),
-            pytest.param(
-                "## Facts\n- a\n<script>\n# not a heading\n</script>\n## Updates\n- b\n",
-                "## Facts\n- a\n<script>\n# not a heading\n</script>\n- new\n## Updates\n- b\n",
-                id="html-script-block",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n<div>\n## Example\n</div>\n\n## Updates\n- b\n",
-                "## Facts\n- a\n\n<div>\n## Example\n</div>\n\n- new\n## Updates\n- b\n",
-                id="html-div-block",
-            ),
-            pytest.param(
-                "## Facts\n- a\n<div>\nx\n</div>",
-                "## Facts\n- a\n<div>\nx\n</div>\n\n- new\n",
-                id="html-div-block-at-eof",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n",
-                "## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n- new\n",
-                id="html-span-block",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n  <span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n",
-                "## Facts\n- a\n\n  <span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n- new\n",
-                id="html-indented-span-block",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n</pre>\nExample text\n## Example\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n</pre>\nExample text\n## Example\n\nNotes resume here.\n- new\n",
-                id="html-closing-tag-block",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\nBackground\n==========\n<span>\nExample text\n"
-                "## Example\n</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n- new\n\nBackground\n==========\n<span>\nExample text\n"
-                "## Example\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-setext-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n-\n<span>\n## Example\n</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n-\n<span>\n## Example\n</span>\n\nNotes resume here.\n- new\n",
-                id="html-span-after-empty-list-item",
-            ),
-            pytest.param(
-                "## Facts\nSome fact.\n\n    code\n<span>\n## Example\n</span>\n\nNotes resume here.\n",
-                "## Facts\nSome fact.\n\n    code\n<span>\n## Example\n</span>\n\n"
-                "Notes resume here.\n- new\n",
-                id="html-span-after-indented-code",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[ref]: /url\n<span>\n## Example\n</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[ref]: /url\n<span>\n## Example\n</span>\n\n"
-                "Notes resume here.\n- new\n",
-                id="html-span-after-link-reference",
-            ),
-            pytest.param(
-                '## Facts\nSome fact.\n\n[foo\\]]: </my url> "a \\" b"\n<span>\n'
-                "## Example\n</span>\n\nNotes resume here.\n",
-                '## Facts\nSome fact.\n\n[foo\\]]: </my url> "a \\" b"\n<span>\n'
-                "## Example\n</span>\n\nNotes resume here.\n- new\n",
-                id="html-span-after-escaped-link-reference",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n- new\n",
-                id="html-span-after-multiline-link-destination",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[ref]:\n  /u((a))\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[ref]:\n  /u((a))\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n- new\n",
-                id="html-span-after-nested-paren-link-destination",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[ref]:\n  /url(foo\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[ref]:\n  /url(foo\n<span>\nExample text\n- new\n"
-                "## Example\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-unbalanced-link-destination",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[ref]: /url\\ x\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[ref]: /url\\ x\n<span>\nExample text\n- new\n"
-                "## Example\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-escaped-space-link-destination",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[ref]: /url\n(a(b)\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[ref]: /url\n(a(b)\n<span>\nExample text\n- new\n"
-                "## Example\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-unbalanced-link-title",
-            ),
-            pytest.param(
-                '## Facts\n- a\n\n[ref]: /url\n  "Title"\n<span>\nExample text\n'
-                "## Example\n</span>\n\nNotes resume here.\n",
-                '## Facts\n- a\n\n[ref]: /url\n  "Title"\n<span>\nExample text\n'
-                "## Example\n</span>\n\nNotes resume here.\n- new\n",
-                id="html-span-after-next-line-link-title",
-            ),
-            pytest.param(
-                '## Facts\n- a\n\n[ref]: /url "Title\ncontinues"\n<span>\nExample text\n'
-                "## Example\n</span>\n\nNotes resume here.\n",
-                '## Facts\n- a\n\n[ref]: /url "Title\ncontinues"\n<span>\nExample text\n'
-                "## Example\n</span>\n\nNotes resume here.\n- new\n",
-                id="html-span-after-multiline-link-title",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[multi\nline]: /url\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[multi\nline]: /url\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n- new\n",
-                id="html-span-after-multiline-link-label",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[ref]:\ntwo words\n<span>\nExample text\n## Example\n"
-                "</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[ref]:\ntwo words\n<span>\nExample text\n- new\n"
-                "## Example\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-invalid-link-definition",
-            ),
-            pytest.param(
-                '## Facts\n- a\n\n[ref]: /url "Title\n## Example\ncontinued"\n<span>\n'
-                "Example text\n## Inner\n</span>\n\nNotes resume here.\n",
-                '## Facts\n- a\n\n[ref]: /url "Title\n- new\n## Example\ncontinued"\n'
-                "<span>\nExample text\n## Inner\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-link-title-cut-by-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[multi\n## Example\nlabel]: /url\n<span>\nExample text\n"
-                "## Inner\n</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[multi\n- new\n## Example\nlabel]: /url\n<span>\n"
-                "Example text\n## Inner\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-link-label-cut-by-heading",
-            ),
-            pytest.param(
-                '## Facts\n- a\n\n[ref]: /url "Title\n   ## Example\ncontinued"\n<span>\n'
-                "Example text\n## Inner\n</span>\n\nNotes resume here.\n",
-                '## Facts\n- a\n\n[ref]: /url "Title\n   ## Example\ncontinued"\n<span>\n'
-                "Example text\n- new\n## Inner\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-link-title-cut-by-indented-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n[multi\n##\nlabel]: /url\n<span>\nExample text\n"
-                "## Inner\n</span>\n\nNotes resume here.\n",
-                "## Facts\n- a\n\n[multi\n- new\n##\nlabel]: /url\n<span>\nExample text\n"
-                "## Inner\n</span>\n\nNotes resume here.\n",
-                id="html-span-after-link-label-cut-by-empty-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n##\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n",
-                "## Facts\n- a\n- new\n\n##\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n",
-                id="html-span-after-empty-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n  ##\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n",
-                "## Facts\n- a\n\n  ##\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n- new\n",
-                id="html-span-after-indented-empty-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n   ## Note\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n",
-                "## Facts\n- a\n\n   ## Note\n<span>\nExample text\n## Example\n</span>\n\n"
-                "Notes resume here.\n- new\n",
-                id="html-span-after-indented-heading",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\nUpdates\n-------\n- b\n",
-                "## Facts\n- a\n- new\n\nUpdates\n-------\n- b\n",
-                id="setext-heading-boundary",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\nUpdate line one\nupdate line two\n===\n- b\n",
-                "## Facts\n- a\n- new\n\nUpdate line one\nupdate line two\n===\n- b\n",
-                id="setext-heading-boundary-equals-multiline",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\nUpdates\n---\n- b\n",
-                "## Facts\n- a\n- new\n\nUpdates\n---\n- b\n",
-                id="setext-heading-boundary-dashes-like-thematic-break",
-            ),
-            pytest.param(
-                "## Facts\nUpdates\n-------\n- b\n",
-                "## Facts\n- new\n\nUpdates\n-------\n- b\n",
-                id="setext-heading-right-after-topic",
-            ),
-            pytest.param(
-                "## Facts\n- a\n---\n- b\n",
-                "## Facts\n- a\n---\n- b\n- new\n",
-                id="thematic-break-after-list-item-is-not-setext",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\n  Inner\n  -----\n",
-                "## Facts\n- a\n\n  Inner\n  -----\n- new\n",
-                id="indented-setext-in-list-item-is-not-boundary",
-            ),
-            pytest.param(
-                "## Facts\r\n- a\r\n\r\nUpdates\r\n-------\r\n- b\r\n",
-                "## Facts\r\n- a\r\n- new\r\n\r\nUpdates\r\n-------\r\n- b\r\n",
-                id="setext-heading-boundary-crlf",
-            ),
-            pytest.param(
-                "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n## Real Updates\n- real\n",
-                "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n- new\n"
-                "## Real Updates\n- real\n",
-                id="shorter-fence-does-not-close-longer-does",
-            ),
-            pytest.param(
-                "## Facts\n- To check the version:\n  ```sh\n  version\n    ```\n## Updates\n- b\n",
-                "## Facts\n- To check the version:\n  ```sh\n  version\n    ```\n"
-                "- new\n## Updates\n- b\n",
-                id="list-item-fence-relative-closer",
-            ),
-            pytest.param(
-                "## Facts\n- a\n  ```\n  x\n```\n## Updates\n- b\n",
-                "## Facts\n- a\n  ```\n  x\n- new\n```\n## Updates\n- b\n",
-                id="list-item-fence-ends-with-list-item",
-            ),
-            pytest.param(
-                "## Facts\n- a\n  ```\n  ## Example\n",
-                "## Facts\n- a\n  ```\n  ## Example\n- new\n",
-                id="list-item-fence-unterminated",
-            ),
-            pytest.param(
-                "## Facts\n-   x\n  ```\n## Example\n  ```\n## Updates\n- b\n",
-                "## Facts\n-   x\n  ```\n## Example\n  ```\n- new\n## Updates\n- b\n",
-                id="fence-left-of-list-item-content-is-top-level",
-            ),
-            pytest.param(
-                "## Facts\n-\n  ```sh\n  version\n    ```\n",
-                "## Facts\n-\n  ```sh\n  version\n    ```\n- new\n",
-                id="empty-list-item-fence-relative-closer",
-            ),
-            pytest.param(
-                "## Facts\n-\n  ```\n  x\n ```\n",
-                "## Facts\n-\n  ```\n  x\n- new\n ```\n",
-                id="empty-list-item-fence-ends-at-less-indented-line",
-            ),
-            pytest.param(
-                "## Facts\n- x\n  continuation\n   ```sh\n   code\n     ```\n## Updates\n- b\n",
-                "## Facts\n- x\n  continuation\n   ```sh\n   code\n     ```\n- new\n"
-                "## Updates\n- b\n",
-                id="list-item-fence-after-item-continuation",
-            ),
-            pytest.param(
-                "## Facts\n- a\ncontinuation\n   ```sh\n   code\n     ```\n## Updates\n- b\n",
-                "## Facts\n- a\ncontinuation\n   ```sh\n   code\n     ```\n- new\n"
-                "## Updates\n- b\n",
-                id="list-item-fence-after-lazy-continuation",
-            ),
-            pytest.param(
-                "## Facts\n1. a\n- b\n  ```\n  x\n    ```\n## Updates\n- c\n",
-                "## Facts\n1. a\n- b\n  ```\n  x\n    ```\n- new\n## Updates\n- c\n",
-                id="list-item-fence-after-sibling-list-item",
-            ),
-            pytest.param(
-                "## Facts\n- a\n> quote\n   ```sh\n   code\n     ```\n## Updates\n- b\n",
-                "## Facts\n- a\n> quote\n- new\n   ```sh\n   code\n     ```\n## Updates\n- b\n",
-                id="fence-after-block-quote-is-top-level",
-            ),
-            pytest.param(
-                "## Facts\nText\nmore\n   ```\n## Example\n   ```\n## Updates\n- b\n",
-                "## Facts\nText\nmore\n   ```\n## Example\n   ```\n- new\n## Updates\n- b\n",
-                id="fence-after-top-level-paragraph-is-top-level",
-            ),
-            pytest.param(
-                "## Facts\n- a\n  - b\n   ```\n   x\n     ```\n## Updates\n- c\n",
-                "## Facts\n- a\n  - b\n   ```\n   x\n     ```\n- new\n## Updates\n- c\n",
-                id="list-item-fence-after-nested-item",
-            ),
-            pytest.param(
-                "## Facts\n-\n\n  ```\n## Example\n  ```\n## Updates\n- b\n",
-                "## Facts\n-\n\n  ```\n## Example\n  ```\n- new\n## Updates\n- b\n",
-                id="fence-after-empty-list-item-and-blank-is-top-level",
-            ),
-            pytest.param(
-                "## Facts\nText.\n\n  ```\n    ```\n  x\n  ```\n## Updates\n- b\n",
-                "## Facts\nText.\n\n  ```\n    ```\n  x\n  ```\n- new\n## Updates\n- b\n",
-                id="top-level-indented-fence-keeps-margin-closer",
-            ),
-            pytest.param(
-                "## Facts\n- a\n\nOutside list.\n\n  ```\n  x\n    ```\n## Updates\n- b\n",
-                "## Facts\n- a\n\nOutside list.\n- new\n\n  ```\n  x\n    ```\n## Updates\n- b\n",
-                id="non-list-line-before-indented-fence-is-top-level",
-            ),
-            pytest.param(
-                "## Facts\n- a\n## Updates\n- b\n## Facts\n- e\n",
-                "## Facts\n- a\n- new\n## Updates\n- b\n## Facts\n- e\n",
-                id="first-duplicate-heading",
-            ),
-            pytest.param("## Facts\n- a", "## Facts\n- a\n- new\n", id="no-trailing-newline"),
-            pytest.param(
-                "## Facts\n- a\n\n\n", "## Facts\n- a\n- new\n", id="trailing-blank-lines"
-            ),
-            pytest.param("## Facts  \n- a\n", "## Facts  \n- a\n- new\n", id="heading-whitespace"),
-            pytest.param(
-                "## Facts\n## Updates\n- b\n",
-                "## Facts\n- new\n## Updates\n- b\n",
-                id="empty-section",
-            ),
-            pytest.param("", "\n\n## Facts\n- new\n", id="empty-file"),
-            pytest.param(
-                "## Updates\n- b\n", "## Updates\n- b\n\n## Facts\n- new\n", id="missing-section"
-            ),
-        ],
-    )
-    def test_merge_places_bullets_in_matching_section(self, existing, expected):
-        from headroom.memory.bridge import _merge_bullets_into_markdown
-
-        assert _merge_bullets_into_markdown(existing, {"Facts": ["- new"]}) == expected
-
-    def test_merge_keeps_list_item_fence_with_relative_closer(self):
-        from headroom.memory.bridge import _merge_bullets_into_markdown
-
-        existing = "# General\n- To check the version:\n  ```sh\n  version\n    ```\n"
-        expected = "# General\n- To check the version:\n  ```sh\n  version\n    ```\n- new\n"
-
-        merged = _merge_bullets_into_markdown(existing, {"General": ["- new"]})
-
-        assert merged == expected
-        parsed = parse_claude_code_memory(merged)
-        general = next(section for section in parsed.sections if section.heading == "General")
-        assert general.facts == ["To check the version:", "new"]
-
-    def test_merge_matches_sub_heading_topic_and_reimports_by_section(self):
-        from headroom.memory.bridge import _merge_bullets_into_markdown
-
-        merged = _merge_bullets_into_markdown(
-            "## Facts\n- a\n### Details\n- d\n\n## Updates\n- b\n",
-            {"Details": ["- detail"], "Facts": ["- fact"], "General": ["- general"]},
-        )
-
-        assert merged == (
-            "## Facts\n- a\n- fact\n### Details\n- d\n- detail\n\n## Updates\n- b\n"
-            "\n## General\n- general\n"
-        )
-        sections = {s.heading: s.facts for s in parse_claude_code_memory(merged).sections}
-        assert sections == {
-            "Facts": ["a", "fact"],
-            "Details": ["d", "detail"],
-            "Updates": ["b"],
-            "General": ["general"],
-        }
-
-
 # =============================================================================
 # Bridge Tests (require backend)
 # =============================================================================
@@ -974,6 +551,110 @@ class TestMemoryBridgeSync:
         assert "Rust" in updated_content
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("markdown", "topic", "expected"),
+        [
+            pytest.param(
+                "## Facts\n- a\n```sh\n# Description\necho hi\n```\n",
+                "Facts",
+                b"## Facts\n- a\n```sh\n# Description\necho hi\n```\n- new\n",
+                id="F1-fence-hash-line-6008077252",
+            ),
+            pytest.param(
+                "## Facts\n- one\u2028two\n",
+                "Facts",
+                "## Facts\n- one\u2028two\n- new\n".encode(),
+                id="F2-u2028-6008077252",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n",
+                "Facts",
+                b"## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n- new\n",
+                id="F3-html-comment-6027567395",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n",
+                "Facts",
+                b"## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n- new\n",
+                id="F4-pre-6028319242",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<div>\n## Example\n</div>\n\n## Updates\n- b\n",
+                "Facts",
+                b"## Facts\n- a\n\n<div>\n## Example\n</div>\n\n## Updates\n- b\n- new\n",
+                id="F5-div-blank-line-6028809147",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F6-span-6030452224",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n  <span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n  <span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F7-indented-span-6031791335",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\nBackground\n==========\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\nBackground\n==========\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F8-setext-span-6032654557",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F9-multiline-link-ref-6033361292",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n##\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n##\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F10-empty-heading-span-7148484411",
+            ),
+            pytest.param(
+                "# General\n- To check the version:\n  ```sh\n  version\n    ```\n",
+                "General",
+                b"# General\n- To check the version:\n  ```sh\n  version\n    ```\n\n## General\n- new\n",
+                id="F11-list-item-fence-6049668617",
+            ),
+            pytest.param(
+                "## General\n- original item\n  <pre>\n  sample text\n",
+                "General",
+                b"## General\n- original item\n  <pre>\n  sample text\n- new\n",
+                id="F12-list-item-pre-7150259492",
+            ),
+            pytest.param(
+                "## General\n- existing\n\n- - -\n\n  ```text\n## Example output\n  ```\n",
+                "General",
+                b"## General\n- existing\n\n- - -\n\n  ```text\n## Example output\n  ```\n- new\n",
+                id="F13-thematic-break-indented-fence-7150363442",
+            ),
+            pytest.param(
+                "## General\nRead this first:\n> Existing note\n---\n- existing\n",
+                "General",
+                b"## General\nRead this first:\n> Existing note\n---\n- existing\n- new\n",
+                id="F14-quote-then-setext-like-break-7150363442",
+            ),
+        ],
+    )
+    async def test_sync_appends_export_without_editing_existing_markdown(
+        self, bridge, tmp_dir, backend, markdown, topic, expected
+    ):
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text(markdown, encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+
+        await backend.save_memory(content="new", user_id="test_user", metadata={"topic": topic})
+        await bridge.sync(user_id="test_user")
+
+        assert md_path.read_bytes() == expected
+
+    @pytest.mark.asyncio
     async def test_source_tag_prevents_reexport(self, bridge, tmp_dir, backend):
         """Memories imported via bridge should not be re-exported."""
         md_path = tmp_dir / "MEMORY.md"
@@ -1019,6 +700,11 @@ class TestMemoryBridgeSync:
         content = md_path.read_text(encoding="utf-8")
         assert content.count("Release label is cobalt-47") == 1
         assert content.count("Project uses SQLite") == 1
+        expected = (
+            b"## Facts\n- User likes Python\n\n## Updates\n- Project uses SQLite\n\n"
+            b"## General\n- Release label is cobalt-47\n"
+        )
+        assert md_path.read_bytes() == expected
 
         # A restarted bridge reloads the saved cutoff and file hash, so nothing replays.
         from headroom.memory.bridge import MemoryBridge
@@ -1029,73 +715,7 @@ class TestMemoryBridgeSync:
         assert repeat.import_stats.files_skipped_unchanged == 1
         assert repeat.import_stats.sections_imported == 0
         assert repeat.memories_exported == 0
-        assert md_path.read_text(encoding="utf-8") == content
-
-    @pytest.mark.asyncio
-    async def test_sync_inserts_export_into_existing_section_above_last_heading(
-        self, bridge, tmp_dir, backend
-    ):
-        """An exported memory joins its own section, not the file's last heading."""
-        md_path = tmp_dir / "MEMORY.md"
-        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
-        bridge._config.md_paths = [md_path]
-        initial = await bridge.sync(user_id="test_user")
-        skip_if_offline_bridge_import_failed(initial.import_stats)
-
-        organic = await backend.save_memory(
-            content="Release label is cobalt-47",
-            user_id="test_user",
-            metadata={"topic": "Facts"},
-        )
-        created_at = organic.created_at.replace(tzinfo=timezone.utc)
-        bridge._sync_state["last_sync"] = (created_at - timedelta(minutes=1)).isoformat()
-        bridge._save_sync_state()
-        md_path.write_text(
-            "## Facts\n- User likes Python\n\n## Updates\n- Project uses SQLite\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-
-        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
-            clock.now.return_value = created_at + timedelta(minutes=1)
-            stats = await bridge.sync(user_id="test_user")
-
-        assert stats.memories_exported == 1
-        content = md_path.read_text(encoding="utf-8")
-        assert content == (
-            "## Facts\n- User likes Python\n- Release label is cobalt-47\n\n"
-            "## Updates\n- Project uses SQLite\n"
-        )
-        sections = {s.heading: s.facts for s in parse_markdown(content, str(md_path)).sections}
-        assert sections["Facts"] == ["User likes Python", "Release label is cobalt-47"]
-        assert sections["Updates"] == ["Project uses SQLite"]
-
-    @pytest.mark.asyncio
-    async def test_sync_preserves_fence_and_unicode_separator(self, bridge, tmp_dir, backend):
-        """Export after a fence without rewriting its contents or Unicode separators."""
-        md_path = tmp_dir / "MEMORY.md"
-        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
-        bridge._config.md_paths = [md_path]
-        initial = await bridge.sync(user_id="test_user")
-        skip_if_offline_bridge_import_failed(initial.import_stats)
-
-        organic = await backend.save_memory(
-            content="Release label is cobalt-47",
-            user_id="test_user",
-            metadata={"topic": "Facts"},
-        )
-        created_at = organic.created_at.replace(tzinfo=timezone.utc)
-        bridge._sync_state["last_sync"] = (created_at - timedelta(minutes=1)).isoformat()
-        bridge._save_sync_state()
-        fixture = "## Facts\n- left\u2028right\n```sh\n# Description\necho hi\n```\n"
-        md_path.write_text(fixture, encoding="utf-8", newline="\n")
-
-        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
-            clock.now.return_value = created_at + timedelta(minutes=1)
-            stats = await bridge.sync(user_id="test_user")
-
-        assert stats.memories_exported == 1
-        assert md_path.read_text(encoding="utf-8") == (fixture + "- Release label is cobalt-47\n")
+        assert md_path.read_bytes() == expected
 
     @pytest.mark.asyncio
     async def test_first_sync_exports_existing_organic_memory(self, bridge, tmp_dir, backend):
