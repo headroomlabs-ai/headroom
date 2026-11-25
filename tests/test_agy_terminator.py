@@ -1962,8 +1962,11 @@ async def test_upstream_proxy_connect_preserves_ipv6_brackets() -> None:
     from headroom.proxy.agy_terminator import _connect_via_upstream_proxy, _parse_connect
 
     assert _parse_connect("CONNECT [::1]:8443 HTTP/1.1") == ("::1", 8443)
+    assert _parse_connect("CONNECT [FE80::1%Eth0]:443 HTTP/1.1") == ("fe80::1%Eth0", 443)
     with pytest.raises(ValueError):
         _parse_connect("CONNECT [not-an-ipv6]:443 HTTP/1.1")
+    with pytest.raises(ValueError):
+        _parse_connect("CONNECT [::1%]:443 HTTP/1.1")
     with pytest.raises(ValueError):
         _parse_connect("CONNECT [::1] HTTP/1.1")
 

@@ -327,7 +327,9 @@ def _parse_connect(line: str) -> tuple[str, int]:
         port = int(port_str)
         if not (1 <= port <= 65535):
             raise ValueError(f"Invalid port in CONNECT target: {hostport!r}")
-        return raw_host.lower(), port
+        addr_part, sep, zone_id = raw_host.partition("%")
+        normalized_host = f"{addr_part.lower()}{sep}{zone_id}" if sep else raw_host.lower()
+        return normalized_host, port
     if ":" not in hostport:
         raise ValueError(f"Missing port in CONNECT target: {hostport!r}")
     host, port_str = hostport.rsplit(":", 1)

@@ -98,7 +98,7 @@ class AgyRegistrar(MCPRegistrar):
         do NOT shell out to ``shutil.which("agy")`` — the registrar is also used
         in test environments where the CLI may not be on PATH.
         """
-        return self._appdata_dir.exists() or self._config_file.exists()
+        return _safe_exists(self._appdata_dir) or _safe_exists(self._config_file)
 
     def get_server(self, server_name: str) -> ServerSpec | None:
         """Return the registered ServerSpec for ``server_name``, or ``None``."""
@@ -214,7 +214,10 @@ class AgyRegistrar(MCPRegistrar):
                 return RegisterResult(RegisterStatus.REGISTERED, f"wrote {self._config_file}")
         except OSError as exc:
             if not force:
-                existing = self.get_server(spec.name)
+                try:
+                    existing = self.get_server(spec.name)
+                except (OSError, UnicodeError):
+                    existing = None
                 if existing is not None and _specs_equivalent(existing, spec):
                     return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
             return RegisterResult(
@@ -227,9 +230,9 @@ class AgyRegistrar(MCPRegistrar):
         Returns ``True`` on success, ``False`` if the server was absent or the
         file could not be read/written.
         """
-        if not self._config_file.exists():
-            return False
         try:
+            if not self._config_file.exists():
+                return False
             with _config_file_lock(self._config_file):
                 if not self._config_file.exists():
                     return False
@@ -269,8 +272,13 @@ class AgyRegistrar(MCPRegistrar):
         was deleted, ``"not_matched"`` when absent/unreadable/non-matching, or
         ``"failed"`` if locking or writing failed.
         """
-        if not self._config_file.exists():
+        try:
+            self._config_file.stat()
+        except FileNotFoundError:
             return "not_matched"
+        except OSError as exc:
+            logger.debug("agy: could not inspect %s: %s", self._config_file, exc)
+            return "failed"
         # Fast read-only pre-check: avoid opening a writable lock sidecar when
         # no matching entry exists (e.g. a symlink into a read-only dotfiles dir
         # during `wrap agy --no-mcp`). Ownership is re-verified inside the lock
@@ -329,9 +337,9 @@ class AgyRegistrar(MCPRegistrar):
         if on_confirmed is None and on_verified is None:
             current = self.get_server(server_name)
             return current is not None and predicate(current)
-        if not self._config_file.exists():
-            return False
         try:
+            if not self._config_file.exists():
+                return False
             with _config_file_lock(self._config_file):
                 if not self._config_file.exists():
                     return False
@@ -361,7 +369,10 @@ class AgyRegistrar(MCPRegistrar):
             if on_confirmed is None and on_verified is not None:
                 # Read-only config with an unowned compatible server: verify
                 # read-only and prime cache without failing on the lock sidecar.
-                current = self.get_server(server_name)
+                try:
+                    current = self.get_server(server_name)
+                except (OSError, UnicodeError):
+                    current = None
                 if current is not None and predicate(current):
                     on_verified(current)
                     return True
@@ -379,6 +390,14 @@ class _MalformedConfigError(RuntimeError):
     """Raised when an existing config cannot be parsed before a full rewrite."""
 
 
+def _safe_exists(path: Path) -> bool:
+    """Return ``path.exists()`` without propagating ``OSError`` on unreadable parents."""
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     """Read JSON file, returning empty dict if absent or unparseable.
 
@@ -386,12 +405,10 @@ def _read_json(path: Path) -> dict[str, Any]:
     unparseable file returns ``{}`` here, and writing that back destroys the
     user's config. Use :func:`_read_json_for_write` on the write path instead.
     """
-    if not path.exists():
-        return {}
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     if not isinstance(data, dict):
         return {}

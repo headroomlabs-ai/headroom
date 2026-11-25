@@ -1102,3 +1102,112 @@ class TestRegistrarSafety:
         assert setup_results == [True]
         assert reg1.get_server("headroom") == replacement_spec
         assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True
+
+    def test_register_server_inaccessible_config_returns_failed_and_install_continues(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inaccessible config dir must report FAILED without aborting install_everywhere."""
+        import headroom.mcp_registry.agy as agy_mod
+        from headroom.mcp_registry.base import MCPRegistrar, RegisterResult
+        from headroom.mcp_registry.install import install_everywhere
+
+        appdata = tmp_path / ".gemini" / "antigravity-cli"
+        appdata.mkdir(parents=True)
+        reg = _make_reg(tmp_path)
+        spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+
+        assert reg.detect() is True
+
+        def _deny_lock(_path: Path):
+            raise PermissionError("permission denied")
+
+        def _deny_get_server(_name: str):
+            raise PermissionError("permission denied on config dir")
+
+        monkeypatch.setattr(agy_mod, "_config_file_lock", _deny_lock)
+        monkeypatch.setattr(reg, "get_server", _deny_get_server)
+
+        res = reg.register_server(spec)
+        assert res.status == RegisterStatus.FAILED
+
+        class _DummyRegistrar(MCPRegistrar):
+            name = "dummy"
+            display_name = "Dummy"
+            config_hint = "dummy.json"
+
+            def __init__(self) -> None:
+                self.registered: list[ServerSpec] = []
+
+            def detect(self) -> bool:
+                return True
+
+            def get_server(self, server_name: str) -> ServerSpec | None:
+                return None
+
+            def register_server(self, s: ServerSpec, *, force: bool = False) -> RegisterResult:
+                self.registered.append(s)
+                return RegisterResult(RegisterStatus.REGISTERED, "ok")
+
+            def unregister_server(self, server_name: str) -> bool:
+                return False
+
+        dummy = _DummyRegistrar()
+        results = install_everywhere(registrars=[reg, dummy])
+        assert results["agy"].status == RegisterStatus.FAILED
+        assert results["dummy"].status == RegisterStatus.REGISTERED
+        assert len(dummy.registered) == 1
+        assert dummy.registered[0].name == "headroom"
+
+    def test_register_server_readable_matching_config_with_unwritable_lock_returns_already(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Readable matching config returns ALREADY when lock cannot be opened (unless forced)."""
+        import headroom.mcp_registry.agy as agy_mod
+
+        spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        reg = _make_reg(tmp_path)
+        assert reg.register_server(spec).status == RegisterStatus.REGISTERED
+
+        def _deny_lock(_path: Path):
+            raise PermissionError("read-only config dir")
+
+        monkeypatch.setattr(agy_mod, "_config_file_lock", _deny_lock)
+
+        assert reg.register_server(spec).status == RegisterStatus.ALREADY
+        assert reg.register_server(spec, force=True).status == RegisterStatus.FAILED
+
+    def test_read_json_handles_permission_error_from_open(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_read_json must return {} instead of propagating PermissionError on unreadable config."""
+        import os
+
+        import headroom.mcp_registry.agy as agy_mod
+
+        config_dir = tmp_path / ".gemini" / "config"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "mcp_config.json"
+        config_file.write_text('{"mcpServers": {}}', encoding="utf-8")
+
+        def _deny_open(*_args, **_kwargs):
+            raise PermissionError("cannot traverse parent dir")
+
+        monkeypatch.setattr("builtins.open", _deny_open)
+        assert agy_mod._read_json(config_file) == {}
+        monkeypatch.undo()
+
+        # Also exercise real OS-level chmod 0o000 on POSIX when non-root.
+        if os.name == "posix" and os.geteuid() != 0:
+            appdata = tmp_path / ".gemini" / "antigravity-cli"
+            appdata.mkdir(parents=True, exist_ok=True)
+            reg = _make_reg(tmp_path)
+            spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+            config_dir.chmod(0o000)
+            try:
+                assert reg.detect() is True
+                assert reg.get_server("headroom") is None
+                assert reg.register_server(spec).status == RegisterStatus.FAILED
+                assert reg.unregister_server("headroom") is False
+                assert reg.unregister_server_if("headroom", lambda _s: True) == "failed"
+            finally:
+                config_dir.chmod(0o755)
