@@ -962,6 +962,39 @@ def test_stop_raises_when_identity_lost_but_pid_still_alive(monkeypatch, tmp_pat
         stop_runtime(manifest)
 
 
+def test_stop_tolerates_pid_reaped_on_the_final_poll(monkeypatch, tmp_path: Path) -> None:
+    # The case left in JerrettDavis's re-review of #4892: the process
+    # stays alive with its identity matching through the first 29
+    # post-SIGTERM polls, then is reaped during the final poll — the
+    # poll's first liveness check still sees it, the identity and
+    # exiting probes both read False, and the second liveness check
+    # reports the PID gone. That is a completed stop: clear the pid
+    # file and return instead of falling out of the loop into
+    # "runtime remained alive after SIGTERM" with runner.pid left behind.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 123)
+    # The pre-SIGTERM check and the first liveness check of all 30
+    # polls see the PID alive; the final poll's second liveness check
+    # reports it gone.
+    alive_states = iter([True] * 31 + [False])
+    # Identity matches pre-SIGTERM and through poll 29, then reads
+    # False on the final poll.
+    identity_states = iter([True] * 30 + [False])
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(alive_states, False))
+    monkeypatch.setattr(
+        "headroom.install.runtime._process_identity",
+        lambda pid, current: next(identity_states, False),
+    )
+    monkeypatch.setattr("headroom.install.runtime._process_is_exiting", lambda pid: False)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda *args: None)
+    monkeypatch.setattr("headroom.install.runtime.time.sleep", lambda seconds: None)
+
+    stop_runtime(manifest)
+
+    assert _read_pid("default") is None
+
+
 def test_process_is_exiting_detects_psutil_zombie(monkeypatch) -> None:
     class ZombieProcess:
         def __init__(self, pid: int) -> None:
