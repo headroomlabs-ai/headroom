@@ -26,34 +26,65 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Case-sensitivity of the volume holding a TOIN store's parent directory,
-# keyed by resolved parent. Probed once per directory per process.
+# keyed by resolved parent. Measured once per directory per process; only
+# measured results are cached, so an unclassifiable directory is retried.
 _case_insensitive_volumes: dict[str, bool] = {}
 
 
-def _volume_is_case_insensitive(parent: Path) -> bool:
-    """True when ``parent``'s volume treats case-variant spellings as one file.
+def _volume_is_case_insensitive(parent: Path) -> bool | None:
+    """Whether ``parent``'s volume treats case-variant spellings as one file.
 
-    Probed by writing a uniquely named file and checking a case-variant of
-    its name: no standard-library call reports this (``os.path.normcase`` is
-    the identity on macOS, whose default volume is case-insensitive). On a
-    volume that cannot be probed (read-only directory), fall back to the
-    ``normcase`` convention — folding on Windows, exact elsewhere.
+    Returns True/False when measured and None when the directory could not
+    be classified (the caller then keeps the exact spelling and the next
+    call retries). No standard-library call reports this directly
+    (``os.path.normcase`` is the identity on macOS, whose default volume is
+    case-insensitive), so it is measured in two steps:
+
+    1. Read-only: a directory entry whose case-variant spelling also exists
+       answers by whether the two spellings are the same file — no write,
+       so a readable-but-unwritable store directory is still classified.
+    2. Otherwise a probe file is created with ``tempfile.mkstemp``
+       (exclusively, unpredictable name) and a case-variant of its name is
+       checked. The unpredictable name matters: a predictable one could be
+       pre-planted as a symlink by a local writer of the directory and the
+       probe's write would follow it.
     """
     key = str(parent)
-    cached = _case_insensitive_volumes.get(key)
-    if cached is not None:
-        return cached
-    result = os.path.normcase("A") != os.path.normcase("a")
+    if key in _case_insensitive_volumes:
+        return _case_insensitive_volumes[key]
     try:
-        parent.mkdir(parents=True, exist_ok=True)
-        probe = parent / f".headroom_case_probe_{os.getpid()}"
-        probe.write_text("x", encoding="utf-8")
-        try:
-            result = probe.with_name(probe.name.upper()).exists()
-        finally:
-            probe.unlink(missing_ok=True)
+        for entry in parent.iterdir():
+            variant = entry.with_name(entry.name.upper())
+            if variant.name == entry.name:
+                continue  # spelling has no case to compare
+            if not os.path.lexists(variant):
+                # On an insensitive volume the variant spelling is the same
+                # entry and would exist.
+                result = False
+                _case_insensitive_volumes[key] = result
+                return result
+            try:
+                result = os.path.samefile(entry, variant)
+            except OSError:
+                continue  # undecidable entry (e.g. broken symlink); try others
+            _case_insensitive_volumes[key] = result
+            return result
     except OSError:
         pass
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        fd, probe_name = tempfile.mkstemp(dir=parent, prefix=".headroom_case_probe_")
+        os.close(fd)
+        try:
+            probe = parent / probe_name
+            variant = probe.with_name(probe.name.upper())
+            if variant.name == probe.name:
+                return None  # mkstemp name carries no case to compare
+            result = os.path.lexists(variant)
+        finally:
+            (parent / probe_name).unlink(missing_ok=True)
+    except OSError:
+        return None
     _case_insensitive_volumes[key] = result
     return result
 
@@ -253,9 +284,18 @@ class FileSystemTOINBackend:
         if self._owner is None:
             parent = self._configured_path.parent.resolve()
             identity = str(parent / self._configured_path.name)
-            if _volume_is_case_insensitive(parent):
+            folded = _volume_is_case_insensitive(parent)
+            if folded:
                 identity = identity.lower()
-            self._owner = Path(identity)
+                self._owner = Path(identity)
+            elif folded is False:
+                self._owner = Path(identity)
+            else:
+                # Directory could not be classified (e.g. blocked parent):
+                # hash the exact spelling for this call only and leave the
+                # identity unmemoized so a later call re-measures — a stamp
+                # written under "unknown" must not outlive the measurement.
+                return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
         return hashlib.sha256(str(self._owner).encode("utf-8", "surrogatepass")).hexdigest()
 
     def _refuse_foreign_store(self) -> None:

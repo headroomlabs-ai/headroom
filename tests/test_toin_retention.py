@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from headroom.proxy.tenant_key import _sanitize_tenant_key
-from headroom.telemetry.backends.filesystem import FileSystemTOINBackend
+from headroom.telemetry.backends.filesystem import (
+    FileSystemTOINBackend,
+    _volume_is_case_insensitive,
+)
 from headroom.telemetry.models import ToolSignature
 from headroom.telemetry.toin import TOINConfig, ToolIntelligenceNetwork
 
@@ -927,9 +931,48 @@ def test_case_sensitive_volume_keeps_distinct_owners_across_a_symlink(tmp_path, 
     _record(second, 1)
     with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
         second.save()
-    # And its save must not replace the linked store with second's history.
+    # Its save must not replace the link: assert at the alias, since an
+    # atomic save over the alias leaves the target's bytes unchanged.
+    assert link.is_symlink()
     assert store.read_bytes() == before
     assert any(getattr(record, "event", None) == "toin_save_failed" for record in caplog.records)
+
+
+def test_case_probe_cannot_be_redirected_onto_a_victim_file(tmp_path) -> None:
+    """The probe's write must not follow a symlink pre-planted at a predictable name.
+
+    A local writer of the store directory used to be able to plant
+    ``.headroom_case_probe_<pid>`` as a symlink and have the proxy truncate
+    the target with its own permissions. The probe now creates its file
+    exclusively under an unpredictable name, so a planted name is never
+    written through.
+    """
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not truncate", encoding="utf-8", newline="\n")
+    planted = tmp_path / f".headroom_case_probe_{os.getpid()}"
+    try:
+        planted.symlink_to(victim)
+    except OSError:
+        pytest.skip("symlink creation unavailable on this platform/user")
+
+    _volume_is_case_insensitive(tmp_path)
+
+    assert victim.read_text(encoding="utf-8") == "do not truncate"
+
+
+def test_case_classification_from_existing_entries_writes_nothing(tmp_path) -> None:
+    """An existing entry classifies the volume without any write.
+
+    A readable-but-unwritable store directory (a macOS reader without write
+    access) must still be classified, or the reader hashes a different
+    owner identity than the writer stamped and rejects its own saved store.
+    """
+    (tmp_path / "store.json").write_text("{}", encoding="utf-8", newline="\n")
+
+    result = _volume_is_case_insensitive(tmp_path)
+
+    assert result in (True, False)  # measured, not unknown
+    assert list(tmp_path.glob(".headroom_case_probe*")) == []
 
 
 def test_ownerless_legacy_sibling_is_not_adopted(tmp_path) -> None:
