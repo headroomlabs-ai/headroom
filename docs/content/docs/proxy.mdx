@@ -139,7 +139,7 @@ For Strands, use `HeadroomBundle(code_memory="enola")`; the existing
 `enable_serena_mcp` flag still applies when `code_memory` is omitted.
 
 For an in-container agent, build the image with
-`--build-arg HEADROOM_EXTRAS=proxy,code,bedrock,enola` to include the Enola
+`--build-arg HEADROOM_EXTRAS=proxy,code,bedrock,redis,enola` to include the Enola
 executable in the runtime image. Run the agent and its MCP server in that
 container with the repository mounted there; executable paths registered inside
 the container refer to that container's filesystem.

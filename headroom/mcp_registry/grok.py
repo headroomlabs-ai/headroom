@@ -31,3 +31,7 @@ class GrokRegistrar(_TomlMarkerRegistrar):
         else:
             config_dir = Path.home() / ".grok"
         super().__init__(config_dir)
+
+    def initialize(self) -> None:
+        """Prepare config storage after the wrapper has validated a live launch."""
+        self._config_dir.mkdir(parents=True, exist_ok=True)

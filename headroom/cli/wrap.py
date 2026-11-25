@@ -2650,6 +2650,27 @@ def _inject_enola_instructions(file_path: Path) -> None:
     click.echo(f"  Enola instructions injected into {file_path}")
 
 
+def _remove_unused_code_memory_instructions(registrar: Any, name: str, block: str) -> None:
+    """Keep shared guidance while any agent using this file still has the backend."""
+    from headroom.mcp_registry import get_all_registrars
+
+    file_path = _serena_instruction_file(registrar)
+    if not file_path.exists() or block not in _read_text(file_path):
+        return
+    for candidate in [registrar, *get_all_registrars()]:
+        if candidate is not registrar and candidate.name == registrar.name:
+            continue
+        if _serena_instruction_file(candidate) != file_path:
+            continue
+        try:
+            if candidate.get_server(name) is not None:
+                return
+        except OSError:
+            # An unreadable config cannot prove that shared guidance is unused.
+            return
+    _remove_code_memory_instructions(file_path, block)
+
+
 def _serena_instruction_file(registrar: Any) -> Path:
     """Resolve the project instruction file the agent reads for guidance.
 
@@ -3298,8 +3319,11 @@ def _setup_enola_mcp(registrar: Any, *, verbose: bool = False) -> bool:
         raise click.ClickException(str(exc)) from exc
     ownership_key = getattr(registrar, "ownership_key", lambda name: name)("enola")
     result = registrar.register_server(spec)
+    registration_scope = {"scope": registrar.scope} if hasattr(registrar, "ownership_key") else {}
     owned_update = result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
-        registrar.name, registrar.get_server("enola"), ownership_key=ownership_key
+        registrar.name,
+        registrar.get_server("enola", **registration_scope),
+        ownership_key=ownership_key,
     )
     if owned_update:
         result = registrar.register_server(spec, force=True)
@@ -3338,9 +3362,7 @@ def _disable_enola_mcp(registrar: Any, *, explicit: bool = True, verbose: bool =
     elif registrar.get_server("enola") is not None and (explicit or verbose):
         click.echo("  Enola MCP is user-managed — leaving it in place.")
     if status != "failed" and registrar.get_server("enola") is None:
-        _remove_code_memory_instructions(
-            _serena_instruction_file(registrar), ENOLA_INSTRUCTIONS_BLOCK
-        )
+        _remove_unused_code_memory_instructions(registrar, "enola", ENOLA_INSTRUCTIONS_BLOCK)
     return status
 
 
@@ -3368,16 +3390,14 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
     if selection == _CODE_MEMORY_NONE:
         _disable_serena_mcp(registrar, verbose=verbose, explicit=_code_memory_opted_out(kwargs))
         _disable_enola_mcp(registrar, explicit=_code_memory_opted_out(kwargs), verbose=verbose)
-        instruction_file = _serena_instruction_file(registrar)
-        _remove_code_memory_instructions(instruction_file, SERENA_INSTRUCTIONS_BLOCK)
-        _remove_code_memory_instructions(instruction_file, ENOLA_INSTRUCTIONS_BLOCK)
+        _remove_unused_code_memory_instructions(registrar, "serena", SERENA_INSTRUCTIONS_BLOCK)
         return
 
     if selection == _CODE_MEMORY_ENOLA:
         if _setup_enola_mcp(registrar, verbose=verbose):
             _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory enola")
             instruction_file = _serena_instruction_file(registrar)
-            _remove_code_memory_instructions(instruction_file, SERENA_INSTRUCTIONS_BLOCK)
+            _remove_unused_code_memory_instructions(registrar, "serena", SERENA_INSTRUCTIONS_BLOCK)
             _inject_enola_instructions(instruction_file)
         return
 
@@ -8485,17 +8505,23 @@ def grok(
         headroom wrap grok --code-memory serena    # Also register the Serena code-memory MCP
         headroom wrap grok --port 9999             # Custom proxy port
     """
-    if not no_mcp:
-        from headroom.mcp_registry import GrokRegistrar
+    from headroom.mcp_registry import GrokRegistrar
 
-        _setup_headroom_mcp(GrokRegistrar(), port, verbose=verbose, force=True)
+    grok_bin = None
+    if not prepare_only:
+        grok_bin = _require_binary(
+            "grok", install_hint="Install Grok CLI: https://docs.x.ai/docs/grok-cli"
+        )
+    registrar = GrokRegistrar()
+    registrar.initialize()
+
+    if not no_mcp:
+        _setup_headroom_mcp(registrar, port, verbose=verbose, force=True)
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-    from headroom.mcp_registry import GrokRegistrar
-
     _setup_coding_compressor(
-        GrokRegistrar(),
+        registrar,
         serena_context="grok",
         serena=serena,
         no_serena=no_serena,
@@ -8507,9 +8533,7 @@ def grok(
     if prepare_only:
         return
 
-    grok_bin = _require_binary(
-        "grok", install_hint="Install Grok CLI: https://docs.x.ai/docs/grok-cli"
-    )
+    assert grok_bin is not None
 
     env, env_vars_display = _build_grok_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -9570,6 +9594,40 @@ def opencode(
 # =============================================================================
 
 
+def _restore_opencode_backup(config_file: Path, backup_file: Path) -> None:
+    """Restore routing settings while retaining a customized Enola MCP entry."""
+    from headroom.mcp_registry import OpencodeRegistrar
+    from headroom.mcp_registry.ledger import headroom_installed_matching
+    from headroom.mcp_registry.opencode import _MalformedConfigError, _read_json_for_write
+
+    current = _parse_json_loose(_read_text(config_file)) if config_file.exists() else {}
+    servers = current.get("mcp")
+    entry = servers.get("enola") if isinstance(servers, dict) else None
+    observed = OpencodeRegistrar(config_path=config_file).get_server("enola")
+    if not isinstance(entry, dict) or headroom_installed_matching("opencode", observed):
+        shutil.copy2(backup_file, config_file)
+        return
+
+    # A non-matching entry belongs to the user, including fields outside the
+    # canonical ServerSpec such as timeout or enabled. Keep the complete object.
+    try:
+        restored = _read_json_for_write(backup_file)
+    except _MalformedConfigError as exc:
+        raise click.ClickException(
+            f"Cannot preserve Enola: invalid OpenCode backup: {exc}"
+        ) from exc
+    restored_servers = restored.setdefault("mcp", {})
+    if not isinstance(restored_servers, dict):
+        raise click.ClickException(
+            "Cannot preserve Enola: the OpenCode backup has an invalid mcp map"
+        )
+    if restored_servers.get("enola") == entry:
+        shutil.copy2(backup_file, config_file)
+    else:
+        restored_servers["enola"] = entry
+        _write_text(config_file, json.dumps(restored, indent=2) + "\n")
+
+
 @unwrap.command("opencode")
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
@@ -9581,7 +9639,8 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     Behaviour:
 
     * If a pre-wrap backup (``opencode.json.headroom-backup``) exists, the
-      original file is restored byte-for-byte and the backup is removed.
+      original file is restored and the backup is removed. A customized Enola
+      entry is retained; otherwise restoration is byte-for-byte.
     * Otherwise, if Headroom recorded what it owns in the config (the
       ``opencode.json.headroom-managed.json`` sidecar), the injected model
       ids and baseURL are removed and the rest of the file is preserved.
@@ -9605,7 +9664,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
 
     if backup_file.exists():
         try:
-            shutil.copy2(backup_file, config_file)
+            _restore_opencode_backup(config_file, backup_file)
             backup_file.unlink()
             click.echo(f"  Restored prior {config_file} from pre-wrap backup.")
             status = "restored"

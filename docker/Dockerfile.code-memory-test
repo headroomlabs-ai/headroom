@@ -1,24 +1,41 @@
 # Dependency-only image for MCP/wrap tests, including the real pinned Enola.
 # Mount the checkout at /workspace when running; no host Python is needed.
 # This image does not build the Rust compression extension or run the proxy.
-FROM python:3.14-slim
+FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
 
 ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
-COPY pyproject.toml /tmp/headroom-pyproject.toml
+RUN python -m pip install --no-cache-dir uv==0.11.18
+WORKDIR /tmp/locked
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
+# Export the reviewed lock as constraints, including the locked test tools.
+# Only the lightweight MCP/test subset below is installed; ML extras are not.
+RUN uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes --no-annotate --output-file /tmp/constraints.txt
 RUN python - <<'PY'
+import importlib.metadata
+import re
 import subprocess
-import sys
 import tomllib
 from pathlib import Path
 
-with open('/tmp/headroom-pyproject.toml', 'rb') as stream:
+with open('pyproject.toml', 'rb') as stream:
     project = tomllib.load(stream)['project']
+with open('uv.lock', 'rb') as stream:
+    locked = tomllib.load(stream)['package']
 requirements = project['dependencies'] + project['optional-dependencies']['enola']
 requirements += project['optional-dependencies']['strands']
 requirements += project['optional-dependencies']['mcp']
-requirements += ['pytest>=7', 'pytest-asyncio>=0.21']
-requirements += [dep for dep in project['optional-dependencies']['dev'] if dep.startswith('ruff==')]
-subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', *requirements])
+for name in ['pytest', 'pytest-asyncio', 'ruff']:
+    versions = {p['version'] for p in locked if p['name'] == name}
+    assert len(versions) == 1, f'{name} needs an explicit platform selection'
+    requirements.append(f'{name}=={versions.pop()}')
+subprocess.check_call(['uv', 'pip', 'install', '--system', '--constraint', '/tmp/constraints.txt', *requirements])
+# Fail closed if dependency metadata introduces anything outside the lock.
+normalize = lambda name: re.sub(r'[-_.]+', '-', name).lower()
+reviewed = {(normalize(p['name']), p['version']) for p in locked}
+for dist in importlib.metadata.distributions():
+    name = normalize(dist.metadata['Name'])
+    if name not in {'pip', 'uv'}:
+        assert (name, dist.version) in reviewed, f'Unreviewed dependency: {name}=={dist.version}'
 entry = Path('/usr/local/bin/headroom')
 entry.write_text('#!/usr/local/bin/python\nfrom headroom.cli import main\nmain()\n')
 entry.chmod(0o755)

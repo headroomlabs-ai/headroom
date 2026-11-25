@@ -53,6 +53,8 @@ class ServerSpec:
     command: str
     args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
+    # Registrars with an enable/disable switch preserve it in comparisons and ownership.
+    enabled: bool = True
 
 
 @dataclass
@@ -148,12 +150,15 @@ def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
         and a.command == b.command
         and tuple(a.args) == tuple(b.args)
         and dict(a.env) == dict(b.env)
+        and a.enabled == b.enabled
     )
 
 
 def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
     """Render the difference between two specs for human consumption."""
     parts: list[str] = []
+    if existing.enabled != requested.enabled:
+        parts.append(f"enabled {existing.enabled} -> {requested.enabled}")
     if existing.command != requested.command:
         parts.append(f"command {existing.command!r} -> {requested.command!r}")
     if tuple(existing.args) != tuple(requested.args):

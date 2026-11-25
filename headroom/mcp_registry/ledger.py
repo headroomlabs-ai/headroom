@@ -32,12 +32,15 @@ def ledger_path() -> Path:
 
 def spec_fingerprint(spec: ServerSpec) -> str:
     """Stable fingerprint for a registered MCP server spec."""
-    payload = {
+    payload: dict[str, Any] = {
         "name": spec.name,
         "command": spec.command,
         "args": list(spec.args),
         "env": dict(sorted(spec.env.items())),
     }
+    # Preserve fingerprints recorded before enable/disable state was tracked.
+    if not spec.enabled:
+        payload["enabled"] = False
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
