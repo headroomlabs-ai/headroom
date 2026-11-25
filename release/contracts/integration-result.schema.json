@@ -65,9 +65,35 @@
   },
   "allOf": [
     {
-      "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
-      "then": { "properties": { "reasons": { "maxItems": 0 } } },
-      "else": { "properties": { "reasons": { "minItems": 1 } } }
+      "if": {
+        "properties": {
+          "status": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reasons": {
+            "maxItems": 0
+          },
+          "checks": {
+            "additionalProperties": {
+              "const": "pass"
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "reasons": {
+            "minItems": 1
+          }
+        }
+      }
     }
   ]
 }
