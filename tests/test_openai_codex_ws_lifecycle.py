@@ -15,7 +15,7 @@ import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -3298,27 +3298,30 @@ async def test_ws_failed_turn_labels_do_not_reach_the_next_turn(monkeypatch, ter
     assert all("output_shaper:verbosity:L2" not in o.transforms_applied for o in outcomes)
 
 
-@pytest.mark.asyncio
-async def test_ws_memory_continuation_outcome_keeps_the_turn_labels(monkeypatch):
+async def _run_memory_continuation_session(monkeypatch, labels, usages):
+    """Drive one client turn that Headroom answers with memory continuations.
+
+    Every usage but the last belongs to a completion that calls a memory tool,
+    so Headroom runs the tool and sends the next continuation itself; the last
+    is the answer the client sees. ``labels`` are the turn's shaping labels.
+    """
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "0")
     monkeypatch.setattr(openai_module, "COMPRESSION_TIMEOUT_SECONDS", 30.0)
-    function_call = {
-        "type": "function_call",
-        "id": "fc-1",
-        "call_id": "call-1",
-        "name": "memory_search",
-        "arguments": "{}",
-    }
-    upstream = _FakeUpstream(
-        [
-            json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
-            json.dumps({"type": "response.output_item.added", "item": function_call}),
-            json.dumps({"type": "response.output_item.done", "item": function_call}),
-            _completed("r-1", _USAGE),
-            json.dumps({"type": "response.created", "response": {"id": "r-2"}}),
-            _completed("r-2", {"input_tokens": 150, "output_tokens": 20}),
-        ]
-    )
+    events = []
+    for i, usage in enumerate(usages, start=1):
+        events.append(json.dumps({"type": "response.created", "response": {"id": f"r-{i}"}}))
+        if i < len(usages):
+            function_call = {
+                "type": "function_call",
+                "id": f"fc-{i}",
+                "call_id": f"call-{i}",
+                "name": "memory_search",
+                "arguments": "{}",
+            }
+            events.append(json.dumps({"type": "response.output_item.added", "item": function_call}))
+            events.append(json.dumps({"type": "response.output_item.done", "item": function_call}))
+        events.append(_completed(f"r-{i}", usage))
+    upstream = _FakeUpstream(events)
     client_ws = _FakeWebSocket(frames=[_first_frame()], hold_after_initial=True)
     client_ws.headers["x-headroom-user-id"] = "user-1"
     handler = _DummyOpenAIHandler()
@@ -3327,7 +3330,7 @@ async def test_ws_memory_continuation_outcome_keeps_the_turn_labels(monkeypatch)
 
     def _compress(payload, *, model, request_id, **_kwargs):
         shaped = {**payload, "instructions": "shaped"}
-        return shaped, True, 5, ["output_shaper:verbosity:L2"], "compressed", 10, 5, 10
+        return shaped, True, 5, list(labels), "compressed", 10, 5, 10
 
     handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
     outcomes = []
@@ -3338,8 +3341,73 @@ async def test_ws_memory_continuation_outcome_keeps_the_turn_labels(monkeypatch)
     handler._record_request_outcome = _record_request_outcome
     with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
         await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=5.0)
+    assert len(upstream.sent) == len(usages), "expected Headroom to send each continuation"
+    return outcomes
 
-    assert len(upstream.sent) == 2, "expected Headroom to send the memory continuation"
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_outcome_keeps_the_turn_labels(monkeypatch):
+    outcomes = await _run_memory_continuation_session(
+        monkeypatch,
+        ["text", "output_shaper:verbosity:L2"],
+        [_USAGE, {"input_tokens": 150, "output_tokens": 20}],
+    )
+
     turn_outcomes = [o for o in outcomes if o.provider_input_tokens > 0]
     assert [o.provider_input_tokens for o in turn_outcomes] == [100, 150]
-    assert all("output_shaper:verbosity:L2" in o.transforms_applied for o in turn_outcomes)
+    assert all("text" in o.transforms_applied for o in turn_outcomes)
+    # One logical turn is one output-savings observation: the hidden memory
+    # completion is billed and keeps its other labels, but only the final
+    # completion carries the shaping label (and the turn's whole output).
+    hidden, final = turn_outcomes
+    assert "output_shaper:verbosity:L2" not in hidden.transforms_applied
+    assert "output_shaper:verbosity:L2" in final.transforms_applied
+    assert [o.output_tokens for o in turn_outcomes] == [10, 20]
+    assert final.shaped_output_tokens == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hidden_outputs, final_output",
+    [([30], 120), ([10, 20], 120)],
+    ids=["one-continuation", "chained-continuations"],
+)
+async def test_ws_memory_continuation_is_one_ledger_observation(
+    monkeypatch, tmp_path, hidden_outputs, final_output
+):
+    """A memory continuation is one logical turn billed as several requests:
+    the recorder sees one sample of the summed output, not one per request,
+    each of which would be credited against the full baseline."""
+    from headroom.proxy import output_savings
+    from headroom.proxy.outcome import emit_request_outcome
+    from headroom.proxy.output_savings import SavingsRecorder, stratum_key, stratum_label
+
+    key = stratum_key(turn_kind="code", input_tokens=8000, model="gpt-5.4", has_tools=True)
+    recorder = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    for _ in range(5):
+        recorder._ledger.baseline.observe(key, 200)
+    monkeypatch.setattr(output_savings, "_RECORDER", recorder)
+    monkeypatch.setattr(output_savings, "MODELLED_REDUCTION", {})
+
+    usages = [
+        {"input_tokens": 100, "output_tokens": out} for out in [*hidden_outputs, final_output]
+    ]
+    outcomes = await _run_memory_continuation_session(
+        monkeypatch,
+        [stratum_label("treatment", key), "output_shaper:verbosity:L2"],
+        usages,
+    )
+    funnel = SimpleNamespace(metrics=MagicMock(), cost_tracker=None, logger=None)
+    funnel.metrics.record_request = AsyncMock()
+    for outcome in outcomes:
+        await emit_request_outcome(funnel, outcome)
+
+    sample = recorder._ledger.treatment[key]
+    assert (sample.n, sample.sum) == (1, 150)
+    credited = sum(
+        call.kwargs["output_tokens_saved"] for call in funnel.metrics.record_request.call_args_list
+    )
+    assert credited == 50
+    # Billing still sees every upstream request's own output and input.
+    billed = [c.kwargs for c in funnel.metrics.record_request.call_args_list]
+    assert sum(b["output_tokens"] for b in billed) == 150
