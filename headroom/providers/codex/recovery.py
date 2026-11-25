@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -908,8 +908,11 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
                 raise RuntimeError("source Codex home was replaced while it was being pinned")
         except BaseException:
             # Best effort: a leftover staging dir is never offered for recovery,
-            # and the original error is the one to report.
+            # and the original error is the one to report. The backup dir holds
+            # nothing else yet, so it goes too rather than look like a backup.
             shutil.rmtree(staging, ignore_errors=True)
+            with suppress(OSError):
+                backup_dir.rmdir()
             raise
         staging.rename(pinned)
     target_backup = backup_dir / "target-before"

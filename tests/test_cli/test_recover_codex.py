@@ -287,7 +287,7 @@ def test_recovery_refuses_a_source_with_an_unreadable_directory(
         recover_codex_home(source=source, target=target)
     assert sorted(p.name for p in target.iterdir()) == ["config.toml"]
     assert codex_recovery.discover_retained_sources(target) == []
-    assert not list(tmp_path.rglob("source-pinned*"))
+    assert list((tmp_path / codex_recovery._RECOVERY_DIR).iterdir()) == []
 
 
 @_unreadable_dirs
