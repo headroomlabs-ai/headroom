@@ -169,30 +169,42 @@ def test_go_log_keeps_its_timestamps(command, tokenizer):
     assert "2026/09/02 14" not in out.split("\n")
 
 
-JUL_LOG = "".join(
-    f"Sep 02, 2026 2:{i % 60:02d}:10 PM com.example.OrderService process\n" for i in range(40)
-)
-BLAME = "".join(
-    f"c75ebdee6 (Dev One  2026-07-02 19:04:14 -0700 {n:>2}) def helper_{n}(value): return value\n"
-    for n in range(1, 61)
-)
+_PREFIXED_CLOCKS = {
+    "git-blame": "c75ebdee6 (Dev One  2026-07-02 {} -0700) value = ",
+    "java-util-logging": "Nov 24, 2026 {} AM com.example.Order.",
+    "bracket": "worker[{}] heartbeat ",
+    "logfmt-clock": "ts={} level=info msg=handled ",
+    "logfmt-iso": 'time="2026-09-02T{}Z" level=info msg=handled ',
+}
 
 
-@pytest.mark.parametrize(
-    ("command", "output", "fake_header"),
-    [
-        ("grep OrderService app.log", JUL_LOG, "Sep 02, 2026 2"),
-        ("git blame -L 1,60 helpers.py", BLAME, "c75ebdee6 (Dev One  2026-07-02 19"),
-    ],
-    ids=["java-util-logging", "git-blame"],
-)
-def test_clock_behind_a_prefix_keeps_its_timestamp(command, output, fake_header, tokenizer):
-    # java.util.logging and `git blame` put the clock mid-line. Split as
-    # path:line:content it would fold into a fake header over `30:10 PM ...` rows.
-    out, transforms = _anthropic(command, output, tokenizer)
-    assert "router:bash:lossless_search" not in transforms
-    assert "router:tool_result:lossless_search" not in transforms
-    assert fake_header not in out.split("\n")
+@pytest.mark.parametrize("ccr", [True, False], ids=["ccr", "no-ccr"])
+@pytest.mark.parametrize("command", ["grep record app.log", "cat app.log"])
+@pytest.mark.parametrize("row", _PREFIXED_CLOCKS.values(), ids=_PREFIXED_CLOCKS)
+def test_prefixed_clock_records_survive_the_lossy_router(row, command, ccr, tokenizer):
+    # No relevance context and a lossy router: only the fold keeps these rows out of
+    # the search and log compressors, so a fold that refused them would drop records.
+    clocks = [f"{10 + i // 60}:{i % 60:02d}:10" for i in range(240)]
+    text = "".join(f"{row.format(clock)}record_{i:03}\n" for i, clock in enumerate(clocks))
+    config = ContentRouterConfig()
+    config.ccr_enabled = config.ccr_inject_marker = ccr
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": command}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": text}],
+        },
+    ]
+    result = ContentRouter(config).apply(messages, tokenizer, compress_user_messages=True)
+    out = result.messages[1]["content"][0]["content"]
+    assert any(t.endswith(":lossless_search") for t in result.transforms_applied)
+    assert search_unheading(out) == text
+    assert [c for c in clocks if c not in out] == []
 
 
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----

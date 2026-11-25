@@ -92,34 +92,36 @@ _TIMESTAMP_ROW_RE = re.compile(
     r")"
 )
 
-# A clock can also sit MID-line, behind a prefix no start-anchored pattern can
-# know: ``git blame`` (``c75ebdee6 (Dev One  2026-07-02 19:04:14 -0700  3) ...``),
-# ``git log --date=iso`` and Java's default log (``Nov 24, 2026 10:46:15 AM
-# org.Foo main``). The grep-row split then cuts the ``HH:MM:SS`` at its two
-# colons: the "path" ends in the hour, ``line`` is the minute and the content
-# starts with the second. The hour has to open a token (after a space, ``[`` or
-# ``=``, or the ``T`` of an ISO date), so a path such as ``logs/2026/11/24`` is
-# not read as a clock.
-_CLOCK_HOUR_RE = re.compile(r"(?:^|(?<=[\s\[=])|(?<=\dT))\d{1,2}$")
-_CLOCK_SECOND_RE = re.compile(r"[0-5]\d(?!\d)")
+# A clock behind a prefix has the grep-row shape as well: ``git blame``
+# (``c75ebdee6 (Dev One  2026-07-02 19:04:14 -0700  3) ...``), Java's default log
+# (``Nov 24, 2026 10:46:15 AM ...``), ``worker[14:10:10] ...``. Cut at its first
+# colon, the heading would end in the hour and the rows start at the minute. These
+# lines still fold, but cut before the hour, which follows a character that opens
+# a token (``\x22`` is the quote) or the ``T`` of an ISO date.
+_CLOCK_HEADING_RE = re.compile(r"(?:[\s\[(\x22'=,|]|\dT)$")
+_CLOCK_ROW_RE = re.compile(r"\d{1,2}:[0-5]\d:[0-5]\d(?!\d)")
+_CLOCK_LINE_RE = re.compile(
+    r"^(?P<heading>[^\n:]*(?:[\s\[(\x22'=,|]|\dT))(?P<row>\d{1,2}:[0-5]\d:[0-5]\d(?!\d).*)$"
+)
 
 
-def _grep_row(line: str) -> re.Match[str] | None:
-    """``_GREP_ROW_RE`` match for ``line``; ``None`` for a log record that only looks like one."""
+def _heading_split(line: str) -> tuple[str, str] | None:
+    """``(heading, row)`` for a line :func:`search_heading` can fold, else ``None``."""
     if _TIMESTAMP_ROW_RE.match(line):
         return None
     m = _GREP_ROW_RE.match(line)
-    # Almost every path ends in a letter, so that is the cheap first test.
-    if m and line[m.end(1) - 1].isdigit():
-        path, minute, content = m.groups()
-        if (
-            len(minute) == 2
-            and minute < "60"
-            and _CLOCK_HOUR_RE.search(path)
-            and _CLOCK_SECOND_RE.match(content)
-        ):
-            return None
-    return m
+    if m is None:
+        return None
+    end = m.end("path")
+    if line[end - 1].isdigit():  # most paths end in a letter
+        clock = _CLOCK_LINE_RE.match(line)
+        if clock:
+            return clock["heading"], clock["row"]
+    elif _CLOCK_HEADING_RE.search(line, max(end - 2, 0), end) and _CLOCK_ROW_RE.match(
+        line, end + 1
+    ):
+        return None  # ``x[:14:10:10``: would be joined back without its ':'
+    return m["path"], line[end + 1 :]
 
 
 # unified-diff ``index <sha>..<sha> <mode>`` line. The diff still applies
@@ -337,24 +339,34 @@ def search_heading(text: str) -> str:
     blank separators are inserted (they would be ambiguous with passthrough
     content), keeping the transform exactly reversible via
     :func:`search_unheading`.
+
+    A clock behind a prefix is cut before its hour (see ``_CLOCK_LINE_RE``), so
+    the clock stays whole on its row. A heading is only written for such a line
+    when the next one shares it.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
+    splits = [_heading_split(line) for line in lines]
     out: list[str] = []
-    current_path: str | None = None
-    for line in lines:
-        m = _grep_row(line)
-        if m:
-            path = m.group("path")
-            if path != current_path:
-                out.append(path)
-                current_path = path
-            out.append(f"{m.group('line')}:{m.group('content')}")
-        else:
+    current: str | None = None
+    for i, line in enumerate(lines):
+        split = splits[i]
+        if split is None:
             # Any non-grep-row line ends the current file grouping.
             out.append(line)
-            current_path = None
+            current = None
+            continue
+        heading, row = split
+        if heading != current:
+            after = splits[i + 1] if i + 1 < len(lines) else None
+            if len(heading) + len(row) == len(line) and (after is None or after[0] != heading):
+                out.append(line)
+                current = None
+                continue
+            out.append(heading)
+            current = heading
+        out.append(row)
     return _join(out, had_trailing)
 
 
@@ -364,20 +376,23 @@ def search_unheading(text: str) -> str:
     A *header* line is any line that is not itself a ``line:content`` data row
     and is immediately followed by at least one ``line:content`` data row; it
     is consumed (not re-emitted) and its text becomes the ``path`` prefix for
-    the data rows that follow, until a non-data line appears.
+    the data rows that follow, until a non-data line appears. A clock heading
+    (``_CLOCK_HEADING_RE``) joins its clock rows directly, any other with a ``:``.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
     out: list[str] = []
     current_path: str | None = None
+    clock = False
     n = len(lines)
     i = 0
     while i < n:
         line = lines[i]
         data = _HEADING_ROW_RE.match(line)
         if current_path is not None and data:
-            out.append(f"{current_path}:{data.group('line')}:{data.group('content')}")
+            joint = "" if clock and _CLOCK_ROW_RE.match(line) else ":"
+            out.append(f"{current_path}{joint}{line}")
             i += 1
             continue
         # Not a data row under an active header. Decide if THIS line is a new
@@ -385,6 +400,7 @@ def search_unheading(text: str) -> str:
         # data row. If so, consume it as the path prefix (do not emit).
         if not data and i + 1 < n and _HEADING_ROW_RE.match(lines[i + 1]):
             current_path = line
+            clock = _CLOCK_HEADING_RE.search(line) is not None
             i += 1
             continue
         # Plain passthrough line (or a stray data row with no header): emit it
@@ -422,7 +438,7 @@ def search_dir_heading(text: str, *, backslash: bool = False) -> str:
     out: list[str] = []
     current_dir: str | None = None
     for line in lines:
-        m = _grep_row(line)
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
         path = m.group("path") if m else ""
         cut = max(path.rfind(sep) for sep in separators) + 1
         if m and cut:

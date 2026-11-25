@@ -8,10 +8,15 @@ byte-reversible, so compact_lossless's inverse-check cannot catch it.
 """
 
 import os
+import re
 
 import pytest
 
-from headroom.transforms.lossless_compaction import compact_lossless
+from headroom.transforms.lossless_compaction import (
+    compact_lossless,
+    search_heading,
+    search_unheading,
+)
 
 
 def _multi_hour_log() -> str:
@@ -31,33 +36,6 @@ def _ruby_logger_log() -> str:
         for sev in ("DEBUG", "INFO", "WARN", "ERROR", "FATAL", "ANY")
         for m in range(10)
     )
-
-
-def _git_blame_log() -> str:
-    """``git blame`` rows: the author and commit time come before the code, so no
-    start-anchored pattern sees the clock. Consecutive lines of one commit share
-    everything up to the hour."""
-    return "\n".join(
-        f"c75ebdee6 (Dev One  2026-07-02 19:04:14 -0700 {n:>2}) def helper_{n}(value): return value"
-        for n in range(1, 61)
-    )
-
-
-def _java_util_logging_log() -> str:
-    """java.util.logging's default SimpleFormatter prints a timestamp line, then
-    ``LEVEL: message``; ``grep`` for the logger keeps only the timestamp lines."""
-    return "\n".join(
-        f"Sep 02, 2026 2:{m:02d}:10 PM com.example.OrderService process" for m in range(60)
-    )
-
-
-def _prefixed_iso_log() -> str:
-    """CI job logs and logfmt put a name or a key in front of an ISO timestamp; a prefix
-    with a "/" also reaches the directory fold."""
-    job = [f"build-7 2026-09-02T14:{m:02d}:10Z step {m} done" for m in range(60)]
-    logfmt = [f'time="2026-09-02T15:{m:02d}:10Z" level=info msg="ok {m}"' for m in range(60)]
-    slashed = [f"releases/v1 2026-09-02T16:{m:02d}:10Z published {m}" for m in range(60)]
-    return "\n".join(job + logfmt + slashed)
 
 
 _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maximum
@@ -91,10 +69,6 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
             for m in range(60)
         ),
         _ruby_logger_log(),
-        _git_blame_log(),
-        _java_util_logging_log(),
-        _prefixed_iso_log(),
-        "\n".join(f"svc=api [14:{m:02d}:10.123] handled request {m}" for m in range(60)),
     ],
     ids=[
         "iso-datetime",
@@ -107,10 +81,6 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
         "access-log",
         "access-log-longest-host",
         "ruby-logger",
-        "git-blame",
-        "java-util-logging",
-        "prefixed-iso-t",
-        "bracketed-mid-line",
     ],
 )
 def test_timestamped_logs_are_never_folded(sample: str) -> None:
@@ -125,9 +95,8 @@ def test_timestamped_logs_are_never_folded(sample: str) -> None:
         ("logs/controller.log", "E0902 14:30:{s:02d}.000000       1 reflector.go:100] list failed"),
         ("/var/log/nginx/access.log", '10.0.0.7 - - [02/Sep/2026:14:30:{s:02d} +0000] "GET /" 500'),
         ("log/production.log", "I, [2026-09-02T14:30:{s:02d}.000000 #1]  INFO -- : 200 OK"),
-        ("logs/app.log", "Sep 02, 2026 2:30:{s:02d} PM com.example.OrderService process"),
     ],
-    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger", "java-util-logging"],
+    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger"],
 )
 def test_grep_rows_over_those_logs_still_fold(path: str, row: str) -> None:
     """``grep -n`` output starts with the file path, so it is not a log row."""
@@ -178,44 +147,108 @@ def test_kill_switch_is_read_live_not_cached_at_import() -> None:
             os.environ["HEADROOM_LOSSLESS_COMPACTION"] = prior
 
 
+# --- a clock behind a prefix: folded, but cut before the hour ---
+_CLOCK_PREFIXES = {
+    "git-blame": "c75ebdee6 (Dev One  2026-07-02 ",
+    "java-util-logging": "Nov 24, 2026 ",
+    "iso-t": "build-7 2026-09-02T",
+    "logfmt-iso": 'time="2026-09-02T',
+    "logfmt-clock": "ts=",
+    "quoted-clock": 'time="',
+    "single-quoted-clock": "t='",
+    "bracket": "worker[",
+    "paren": "svc (",
+    "comma": "a,b,",
+    "pipe": "web|",
+    "tab": "pod\t",
+}
+
+
+def _prefixed_log(prefix: str, hours: int = 3) -> list[str]:
+    return [
+        f"{prefix}{h}:{m:02d}:10 record {h}-{m}" for h in range(9, 9 + hours) for m in range(60)
+    ]
+
+
+@pytest.mark.parametrize("prefix", _CLOCK_PREFIXES.values(), ids=_CLOCK_PREFIXES)
+def test_clock_behind_a_prefix_is_not_split(prefix: str) -> None:
+    lines = _prefixed_log(prefix)
+    text = "\n".join(lines)
+    out = compact_lossless(text, "search").split("\n")
+    # One heading for all three hours, and every row starts with its whole clock.
+    assert out == [prefix] + [line[len(prefix) :] for line in lines]
+    assert search_unheading("\n".join(out)) == text
+
+
+def test_a_line_that_shares_its_prefix_with_neither_neighbour_stays_whole() -> None:
+    a, b = _prefixed_log("worker[", 1), _prefixed_log("db[", 1)
+    text = "\n".join(line for pair in zip(a, b) for line in pair)
+    assert search_heading(text) == text
+    text = "\n".join([b[0], *a[:3], b[1], *a[3:6]])
+    out = search_heading(text)
+    group = [["worker[", *(line[7:] for line in lines)] for lines in (a[:3], a[3:6])]
+    assert out.split("\n") == [b[0], *group[0], b[1], *group[1]]
+    assert search_unheading(out) == text
+
+
+def test_clock_headings_and_grep_headings_mix() -> None:
+    grep = [f"src/app.py:{n}:30:10 is the row's own text" for n in (14, 15, 16)]
+    text = "\n".join(
+        [*_prefixed_log("ts=", 1)[:3], *grep, *_prefixed_log("worker[", 1)[:3], "plain"]
+    )
+    out = search_heading(text)
+    assert out.split("\n")[4:8] == ["src/app.py", *(line.split(":", 1)[1] for line in grep)]
+    assert search_unheading(out) == text
+
+
+@pytest.mark.parametrize("path", ["notes[", "a b T1T", "x="])
+def test_grep_row_that_would_decode_as_a_clock_stays_whole(path: str) -> None:
+    # Joined back without its ":", this row would read `notes[14:30:10`.
+    text = "\n".join([f"{path}:14:30:10 text"] * 3 + _prefixed_log("worker[", 1))
+    out = compact_lossless(text, "search")
+    assert len(out) < len(text)
+    assert search_unheading(out) == text
+
+
+@pytest.mark.parametrize("path", ["notes[", "a b T1T", "x="])
+def test_grep_rows_under_a_path_that_ends_like_a_clock_heading_still_fold(path: str) -> None:
+    grep = "\n".join(f"{path}:{n}:plain text" for n in range(1, 41))
+    out = compact_lossless(grep, "search")
+    assert out.split("\n")[0] == path
+    assert search_unheading(out) == grep
+
+
 @pytest.mark.parametrize(
     ("path", "content", "lines"),
     [
-        ("logs/2026/11/24", "30 items processed", range(15, 55)),  # "24" follows a "/"
-        ("chunk12", "30 files copied", range(15, 55)),  # "12" is part of a name
-        ("data/part-7", "45 rows kept", range(15, 55)),  # "-7" is a suffix
-        ("notes/v2.10", "15 entries", range(15, 55)),  # "10" follows a "."
+        ("logs/2026/11/24", "30 items", range(15, 55)),  # "24" follows a "/"
+        ("chunk12", "30 files", range(15, 55)),  # "12" is part of a name
+        ("part-7", "45 rows", range(15, 55)),
+        ("v2.10", "15 entries", range(15, 55)),
         ("deploy 14", "75 items", range(15, 55)),  # 75 is not a second
-        ("deploy 14", "105 items", range(15, 55)),  # three digits are not a second
+        ("deploy 14", "105 items", range(15, 55)),
         ("deploy 14", "10 items", range(1, 10)),  # a one-digit minute is not a clock
         ("tasks 3", "30 items", range(60, 100)),  # 60 and up is not a minute
-    ],
-    ids=[
-        "after-slash",
-        "in-name",
-        "suffix",
-        "after-dot",
-        "bad-second",
-        "long-second",
-        "one-digit-minute",
-        "minute-60-up",
+        ("deploy 141", "30 items", range(15, 55)),  # three digits are not an hour
     ],
 )
-def test_grep_rows_that_only_resemble_a_clock_still_fold(
-    path: str, content: str, lines: range
-) -> None:
-    """A clock is a token-opening hour, a minute 00-59 and a second 00-59, in that order."""
+def test_grep_rows_that_only_resemble_a_clock_fold_by_path(path, content, lines) -> None:
     grep = "\n".join(f"{path}:{lines[i % len(lines)]}:{content}" for i in range(40))
-    out = compact_lossless(grep, "search")
-    assert len(out) < len(grep)
+    out = search_heading(grep)
     assert out.split("\n")[0] == path
+    assert search_unheading(out) == grep
 
 
-@pytest.mark.parametrize(
-    "prefix",
-    ["deploy ", "svc [", "ts=", "run-3 2026-09-02T", "c75ebdee6 (Dev One  2026-07-02 "],
-)
-def test_an_hour_that_opens_a_token_is_a_clock(prefix: str) -> None:
-    """After a space, ``[``, ``=`` or an ISO ``T`` the same shape is a clock, not a path."""
-    rows = "\n".join(f"{prefix}14:{m:02d}:10 x" for m in range(10, 50))
-    assert compact_lossless(rows, "search") == rows
+def test_prefixed_logs_never_lose_the_fold_to_a_split_clock() -> None:
+    """Two prefixes, changing every few lines: still smaller, still exact, clocks whole."""
+    lines = [
+        f"{'worker[' if (i // 3) % 2 else 'db-1 ['}{10 + i // 60}:{i % 60:02d}:10] r{i}"
+        for i in range(180)
+    ]
+    text = "\n".join(lines)
+    out = compact_lossless(text, "search")
+    assert len(out) < len(text)
+    assert search_unheading(out) == text
+    rows = [row for row in out.split("\n") if re.match(r"\d", row)]
+    assert len(rows) == len(lines)
+    assert all(re.match(r"\d{1,2}:\d{2}:\d{2}] r\d+$", row) for row in rows)
