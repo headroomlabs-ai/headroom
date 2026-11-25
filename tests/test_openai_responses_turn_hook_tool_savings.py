@@ -27,6 +27,16 @@ def _clean_registry():
     clear_turn_hooks()
 
 
+@pytest.fixture(autouse=True)
+def _forget_response_arms(monkeypatch):
+    """Each test starts with no remembered response chains."""
+    from collections import OrderedDict
+
+    from headroom.proxy import output_arm_key
+
+    monkeypatch.setattr(output_arm_key, "_keys_by_response", OrderedDict())
+
+
 class _CondenseDescriptions:
     """Shortens every tool description in place, as tool search's condense pass does."""
 
@@ -48,11 +58,40 @@ def _tool(name: str) -> dict:
 
 
 def _post(body: dict) -> list:
+    return _post_turns([body])
+
+
+def _sse(response_id: str) -> bytes:
+    response = {
+        "id": response_id,
+        "object": "response",
+        "model": "gpt-5.5",
+        "output": [],
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+    }
+    return "".join(
+        f"event: {kind}\ndata: {json.dumps({'type': kind, 'response': {**response, 'status': status}})}\n\n"
+        for kind, status in (
+            ("response.created", "in_progress"),
+            ("response.completed", "completed"),
+        )
+    ).encode()
+
+
+def _post_turns(
+    bodies: list[dict],
+    *,
+    response_ids: list[str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> list:
+    """POST each body to one app in order; the provider answers turn ``i`` with
+    ``response_ids[i]`` (buffered or streamed, as the body asks)."""
     from fastapi.testclient import TestClient
 
     from headroom.proxy.loopback_guard import require_loopback
     from headroom.proxy.server import ProxyConfig, create_app
 
+    ids = iter(response_ids or ["resp_1"] * len(bodies))
     app = create_app(ProxyConfig(optimize=True, cache_enabled=False, rate_limit_enabled=False))
     app.dependency_overrides[require_loopback] = lambda: None
     outcomes: list = []
@@ -63,7 +102,7 @@ def _post(body: dict) -> list:
             return httpx.Response(
                 200,
                 json={
-                    "id": "resp_1",
+                    "id": next(ids),
                     "object": "response",
                     "status": "completed",
                     "model": "gpt-5.5",
@@ -73,6 +112,11 @@ def _post(body: dict) -> list:
                 request=httpx.Request("POST", url),
             )
 
+        def stream_upstream(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=_sse(next(ids)), headers={"content-type": "text/event-stream"}
+            )
+
         record = server._record_request_outcome
 
         async def capture(outcome):
@@ -80,14 +124,28 @@ def _post(body: dict) -> list:
             await record(outcome)
 
         server._retry_request = fake_retry
+        server.http_client = httpx.AsyncClient(transport=httpx.MockTransport(stream_upstream))
+        server.http_client_h1 = server.http_client
         server._record_request_outcome = capture
-        resp = client.post(
-            "/v1/responses",
-            content=json.dumps(body).encode(),
-            headers={"Authorization": "Bearer sk-test", "Content-Type": "application/json"},
-        )
-        assert resp.status_code == 200, resp.text
+        for body in bodies:
+            resp = client.post(
+                "/v1/responses",
+                content=json.dumps(body).encode(),
+                headers={
+                    "Authorization": "Bearer sk-test",
+                    "Content-Type": "application/json",
+                    **(headers or {}),
+                },
+            )
+            assert resp.status_code == 200, resp.text
     return outcomes
+
+
+def _arms(outcome: Any) -> set[str]:
+    from headroom.proxy.output_savings import parse_stratum_label
+
+    parsed = map(parse_stratum_label, outcome.transforms_applied)
+    return {p[0] for p in parsed if p is not None}
 
 
 def test_hook_shrunk_tool_descriptions_are_booked_as_tool_savings() -> None:
@@ -152,15 +210,18 @@ def test_http_turn_steered_in_its_input_is_booked_as_shaped(monkeypatch) -> None
 
 
 def _text_in_arm(model: str, arm: str) -> str:
-    """A steered first user turn whose conversation lands in ``arm`` at a 30% holdout."""
+    """A steered first user turn whose conversation lands in ``arm`` at a 30% holdout.
+
+    Picked on the opener as the client sent it, before any steering: that is
+    the body a create hook decides its steering on.
+    """
     from headroom.proxy.output_savings import assign_arm, conversation_key_from_body
     from headroom.proxy.output_verbosity_policy import steering_text
 
     for i in range(200):
-        text = f"task {i}\n\n{steering_text(3)}"
-        body = {"model": model, "input": [{"role": "user", "content": text}]}
+        body = {"model": model, "input": [{"role": "user", "content": f"task {i}"}]}
         if assign_arm(conversation_key_from_body(body), 0.3) == arm:
-            return text
+            return f"task {i}\n\n{steering_text(3)}"
     raise AssertionError(f"no conversation landed in {arm}")
 
 
@@ -193,6 +254,138 @@ def test_both_shaping_passes_put_a_request_in_one_holdout_arm(monkeypatch, arm: 
     assert ("output_shaper:verbosity:L3" in labels) is (arm == "treatment"), labels
 
 
+def _user(text: str) -> list[dict]:
+    return [{"role": "user", "content": text}]
+
+
+def _body_arm(body: dict) -> str:
+    from headroom.proxy.output_savings import assign_arm, conversation_key_from_body
+
+    return assign_arm(conversation_key_from_body(body), 0.3)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_response_chain_keeps_its_openers_holdout_arm(monkeypatch, stream: bool) -> None:
+    """A turn sent with ``previous_response_id`` carries only its own prompt, so
+    keying it on its body moved the conversation to another arm mid-life."""
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
+    opener = {"model": "gpt-5.5", "input": _user("fix the failing test"), "stream": stream}
+    first, second = f"resp_chain_{stream}_1", f"resp_chain_{stream}_2"
+    follow_up = {
+        "model": "gpt-5.5",
+        "previous_response_id": first,
+        "input": _user("and the lint"),
+        "stream": stream,
+    }
+    # On their own bodies the two turns land in different arms.
+    assert _body_arm(opener) != _body_arm(follow_up)
+
+    outcomes = _post_turns([opener, follow_up], response_ids=[first, second])
+
+    assert len(outcomes) == 2
+    assert [_arms(o) for o in outcomes] == [{_body_arm(opener)}] * 2
+
+
+def test_a_session_header_keeps_one_holdout_arm_when_the_chain_is_unknown(monkeypatch) -> None:
+    """Codex names its session in a ``session_id`` header. After a restart the
+    previous response is unknown; the header still holds the conversation's arm."""
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
+    opener = {"model": "gpt-5.5", "input": _user("fix the failing test"), "stream": False}
+    follow_up = {
+        "model": "gpt-5.5",
+        "previous_response_id": "resp_from_before_a_restart",
+        "input": _user("and the lint"),
+        "stream": False,
+    }
+    assert _body_arm(opener) != _body_arm(follow_up)
+
+    outcomes = _post_turns(
+        [opener, follow_up],
+        response_ids=["resp_session_1", "resp_session_2"],
+        headers={"session_id": "codex-session-1"},
+    )
+
+    assert len(outcomes) == 2
+    assert len(_arms(outcomes[0]) | _arms(outcomes[1])) == 1, [
+        o.transforms_applied for o in outcomes
+    ]
+
+
+class _KiroLikeSteering:
+    """An ``on_responses_create`` hook that steers as headroom-kiro does: it
+    decides the arm on the body it is handed (``x-headroom-session-id``, else
+    ``conversation_key_from_body``), drops ``instructions``, and in treatment
+    appends the steering block to every user prompt."""
+
+    name = "kiro-like"
+
+    def __init__(self) -> None:
+        self.steered: list[bool] = []
+
+    def on_responses_create(self, request: Any) -> dict:
+        from headroom.proxy.output_savings import assign_arm, conversation_key_from_body
+        from headroom.proxy.output_shaper import output_holdout_fraction
+        from headroom.proxy.output_verbosity_policy import (
+            replace_or_append_steering_block,
+            steering_text,
+        )
+
+        session = request.headers.get("x-headroom-session-id")
+        key = (
+            f"header:x-headroom-session-id:{session}"
+            if session
+            else conversation_key_from_body(dict(request.body))
+        )
+        treatment = assign_arm(key, output_holdout_fraction()) == "treatment"
+        self.steered.append(treatment)
+        body = {k: v for k, v in request.body.items() if k != "instructions"}
+        if treatment:
+            block = steering_text(3)
+            assert block is not None
+            body["input"] = [
+                {**item, "content": replace_or_append_steering_block(item["content"], block)[0]}
+                if item.get("role") == "user"
+                else item
+                for item in body["input"]
+            ]
+        return body
+
+
+@pytest.mark.parametrize("arm", ["control", "treatment"])
+@pytest.mark.parametrize("instructions", [False, True])
+def test_create_hook_steering_and_core_agree_on_the_arm(
+    monkeypatch, arm: str, instructions: bool
+) -> None:
+    """The hook steers before core assigns its arm. Core keyed the steered body
+    (and, with ``instructions`` dropped, a different field), so a conversation
+    the hook steered could be booked as control and the reverse."""
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
+    hook = _KiroLikeSteering()
+    register_turn_hook(hook)
+    bodies = []
+    # Thirty conversations, enough that some (``task 17``) changed arm when
+    # their steered body was keyed; the arm is picked on the unsteered body.
+    for i in range(30):
+        body: dict = {"model": "gpt-5.5", "input": _user(f"task {i}"), "stream": False}
+        if instructions:
+            body["instructions"] = f"You are agent {i}."
+        if _body_arm(body) == arm:
+            bodies.append(body)
+
+    outcomes = _post_turns(bodies)
+
+    assert hook.steered == [arm == "treatment"] * len(bodies)
+    assert [_arms(o) for o in outcomes] == [{arm}] * len(bodies)
+    for outcome in outcomes:
+        labels = list(outcome.transforms_applied)
+        assert ("output_shaper:verbosity:L3" in labels) is (arm == "treatment"), labels
+
+
 def test_responses_conversations_without_an_id_get_their_own_holdout_keys() -> None:
     """Without a response id the key used a constant, so every Responses
     conversation of a model shared one holdout arm."""
@@ -205,6 +398,20 @@ def test_responses_conversations_without_an_id_get_their_own_holdout_keys() -> N
 
     assert key("list the files") != key("fix the failing test")
     assert key("list the files") == key("list the files")
+
+
+def test_a_steering_block_in_the_opener_does_not_move_its_holdout_key() -> None:
+    """headroom-kiro appends the block to the user turn; the key, and so the
+    arm, must read the same before and after."""
+    from headroom.proxy.output_savings import conversation_key_from_body
+    from headroom.proxy.output_verbosity_policy import steering_text
+
+    def key(text: str) -> str:
+        return conversation_key_from_body(
+            {"model": "gpt-5.5", "input": [{"role": "user", "content": text}]}
+        )
+
+    assert key(f"task 17\n\n{steering_text(3)}") == key("task 17")
 
 
 def test_bypassed_request_with_null_messages_reaches_the_provider() -> None:

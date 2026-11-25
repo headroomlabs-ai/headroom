@@ -377,6 +377,10 @@ def test_native_responses_route_carries_the_client_decision(
     Deleting the kwargs splat at the native call site leaves every other test in
     this file green; this one fails.
     """
+    from headroom.proxy.output_savings import conversation_key_from_body
+
+    # No session header and no previous response: the holdout key is the body's.
+    expected = {**expected, "output_arm_key": conversation_key_from_body(_responses_body())}
     for client, seen, transport in _native_responses_client():
         response = client.post(
             "/v1/responses",
@@ -391,11 +395,7 @@ def test_native_responses_route_carries_the_client_decision(
         assert transport.call_count == 1, response.text
         assert response.status_code == 200, response.text
         assert seen, "the Responses compressor was never reached"
-        assert {
-            k: v
-            for k, v in seen[0].items()
-            if k not in {"timing", "savings_tags", "output_arm_key"}
-        } == expected
+        assert {k: v for k, v in seen[0].items() if k not in {"timing", "savings_tags"}} == expected
 
 
 # --- production route: the Codex WebSocket handler ---------------------------

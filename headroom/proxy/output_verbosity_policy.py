@@ -127,6 +127,20 @@ def steering_text(level: int) -> str | None:
     return f"{STEERING_SENTINEL}\n{text}\n{STEERING_SUFFIX}"
 
 
+def without_trailing_steering_block(text: str) -> str:
+    """``text`` with a steering block at its end removed, right-stripped.
+
+    The inverse of the append in :func:`replace_or_append_steering_block`, so a
+    prompt reads the same before and after an extension steers it.
+    """
+    stripped = text.rstrip()
+    if stripped.endswith(STEERING_SUFFIX):
+        start = stripped.rfind(STEERING_SENTINEL)
+        if start >= 0:
+            return stripped[:start].rstrip()
+    return stripped
+
+
 def replace_or_append_steering_block(existing: str, block: str) -> tuple[str, bool]:
     """Replace an existing steering block in text, or append one at the tail."""
     start = existing.find(STEERING_SENTINEL)

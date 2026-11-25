@@ -6,6 +6,8 @@ import hashlib
 from collections.abc import Iterable
 from typing import Any, cast
 
+from .output_verbosity_policy import without_trailing_steering_block
+
 # Coarse input-token buckets. Coarse on purpose: too many strata make
 # per-stratum baselines sparse and noisy. Boundaries in tokens.
 _INPUT_BUCKETS = (2_000, 8_000, 32_000, 128_000)
@@ -195,8 +197,14 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
 
 
 def _absorb_first_responses_user_turn(digest: Any, input_data: Any) -> None:
+    """Fold the first user turn of ``input`` into ``digest``, minus any steering.
+
+    An extension that cannot use ``instructions`` (headroom-kiro) appends the
+    steering block to the user turn itself. Dropping it keeps the key, and so
+    the holdout arm, the same before and after that insertion.
+    """
     if isinstance(input_data, str):
-        _absorb(digest, input_data)
+        _absorb(digest, without_trailing_steering_block(input_data))
         return
     if not isinstance(input_data, list):
         return
@@ -205,12 +213,12 @@ def _absorb_first_responses_user_turn(digest: Any, input_data: Any) -> None:
             continue
         content = item.get("content")
         if isinstance(content, str):
-            _absorb(digest, content)
+            _absorb(digest, without_trailing_steering_block(content))
         elif isinstance(content, list):
             _absorb_text_blocks(
                 digest,
                 (
-                    part["text"]
+                    without_trailing_steering_block(part["text"])
                     for part in content
                     if isinstance(part, dict) and isinstance(part.get("text"), str)
                 ),

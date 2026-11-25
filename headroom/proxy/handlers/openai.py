@@ -6440,6 +6440,17 @@ class OpenAIHandlerMixin:
             body=body,
             metadata={"path": request.url.path, "stream": body.get("stream", False)},
         )
+        # One holdout arm per request. Output shaping runs in the compression
+        # pass and again before the send; deriving the key twice (from
+        # different body views) could put one request in both arms, and the
+        # ledger reads the first. Derived from the body as the client sent it,
+        # before the create hooks below, which is the body headroom-kiro
+        # decides its steering on; a hook that drops ``instructions`` or
+        # steers the user turn then cannot move the arm. Bypassed requests
+        # are never shaped, so they derive no key.
+        from headroom.proxy.output_arm_key import output_arm_key, remember_response_arm_key
+
+        _output_arm_key = None if _bypass else output_arm_key(body, request.headers)
         # Before every stage that reads the body, so a hook's replacement is
         # what compression, deferral, token counting, pricing and the
         # stream/buffered dispatch all see.
@@ -7048,21 +7059,6 @@ class OpenAIHandlerMixin:
         # CompressionUnits and routing them through ContentRouter. Policy
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
-        # One holdout arm per request. Output shaping runs in the compression
-        # pass and again before the send; deriving the key twice (from
-        # different body views) could put one request in both arms, and the
-        # ledger reads the first. Same key headroom-kiro steers by.
-        from headroom.proxy.output_savings import conversation_key_from_body
-
-        # Bypassed requests are never shaped, so they derive no key.
-        _session_header = request.headers.get("x-headroom-session-id")
-        _output_arm_key: str | None = None
-        if not _bypass:
-            _output_arm_key = (
-                f"header:x-headroom-session-id:{_session_header}"
-                if _session_header
-                else conversation_key_from_body(body)
-            )
         if self.config.optimize and not _bypass:
             # Pre-compression tools reference: the compression pass is
             # copy-on-write on the payload, so this still points at the
@@ -7326,6 +7322,7 @@ class OpenAIHandlerMixin:
                     conversation_key=responses_conversation_key,
                     conversation_tokens_saved=tokens_saved,
                     savings_measure=savings_measure,
+                    output_arm_key=_output_arm_key,
                 )
             else:
 
@@ -7767,6 +7764,9 @@ class OpenAIHandlerMixin:
                     # it correctly.
                     from headroom.proxy.helpers import compute_turn_id
 
+                    # A next turn naming this response keeps this arm.
+                    if isinstance(resp_json, dict):
+                        remember_response_arm_key(resp_json.get("id"), _output_arm_key)
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,
