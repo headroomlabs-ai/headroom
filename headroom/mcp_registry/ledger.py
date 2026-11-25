@@ -41,6 +41,8 @@ def spec_fingerprint(spec: ServerSpec) -> str:
     # Preserve fingerprints recorded before enable/disable state was tracked.
     if not spec.enabled:
         payload["enabled"] = False
+    if spec.extra:
+        payload["extra"] = spec.extra
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 

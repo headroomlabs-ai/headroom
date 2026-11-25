@@ -36,6 +36,7 @@ def _parse_json_loose(raw: str) -> dict[str, Any] | None:
     of ``//`` and ``/* */`` comments and trailing commas, so this accepts the
     same files ``headroom wrap``/``install`` already edit.
     """
+    raw = raw.lstrip("\ufeff")
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -127,13 +128,24 @@ def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     env: dict[str, str] = {}
     if isinstance(env_value, dict):
         env = {str(k): str(v) for k, v in env_value.items()}
+    extra = {
+        key: value
+        for key, value in entry.items()
+        if key not in {"type", "command", "environment", "env", "enabled"}
+    }
     return ServerSpec(
-        name=name, command=command, args=args, env=env, enabled=entry.get("enabled") is not False
+        name=name,
+        command=command,
+        args=args,
+        env=env,
+        enabled=entry.get("enabled") is not False,
+        extra=extra,
     )
 
 
 def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     entry: dict[str, Any] = {
+        **spec.extra,
         "type": "local",
         "command": [spec.command, *spec.args],
         "enabled": spec.enabled,

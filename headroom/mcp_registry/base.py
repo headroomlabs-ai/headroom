@@ -55,6 +55,8 @@ class ServerSpec:
     env: dict[str, str] = field(default_factory=dict)
     # Registrars with an enable/disable switch preserve it in comparisons and ownership.
     enabled: bool = True
+    # Agent-specific options must participate in ownership checks too.
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -151,6 +153,7 @@ def _specs_equivalent(a: ServerSpec, b: ServerSpec) -> bool:
         and tuple(a.args) == tuple(b.args)
         and dict(a.env) == dict(b.env)
         and a.enabled == b.enabled
+        and a.extra == b.extra
     )
 
 
@@ -159,6 +162,8 @@ def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
     parts: list[str] = []
     if existing.enabled != requested.enabled:
         parts.append(f"enabled {existing.enabled} -> {requested.enabled}")
+    if existing.extra != requested.extra:
+        parts.append(f"extra {existing.extra} -> {requested.extra}")
     if existing.command != requested.command:
         parts.append(f"command {existing.command!r} -> {requested.command!r}")
     if tuple(existing.args) != tuple(requested.args):

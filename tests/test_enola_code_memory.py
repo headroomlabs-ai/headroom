@@ -224,6 +224,62 @@ def install_owned(registrar, spec, *, scope=None):
     )
 
 
+@pytest.mark.parametrize("with_backup", [True, False])
+def test_opencode_timeout_only_customization_survives_unwrap(project, tmp_path, with_backup):
+    from headroom.mcp_registry import OpencodeRegistrar
+
+    config = tmp_path / ".config/opencode/opencode.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"model":"openai/gpt-4o","theme":"dark"}\n', encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "wrap",
+            "opencode",
+            "--prepare-only",
+            "--code-memory",
+            "enola",
+            "--code-memory-instructions",
+            "--no-mcp",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(config.read_text())
+    data["mcp"]["enola"]["timeout"] = 123456
+    saved = data["mcp"]["enola"]
+    config.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    if not with_backup:
+        config.with_name(config.name + ".headroom-backup").unlink()
+    result = runner.invoke(main, ["unwrap", "opencode", "--no-stop-proxy"])
+    assert result.exit_code == 0, result.output
+    restored = json.loads(config.read_text())
+    assert restored["model"] == "openai/gpt-4o"
+    assert restored["theme"] == "dark"
+    assert restored["mcp"]["enola"] == saved
+    registrar = OpencodeRegistrar(config_path=config)
+    assert not headroom_installed_matching("opencode", registrar.get_server("enola"))
+    assert wrap.ENOLA_INSTRUCTIONS_BLOCK in Path("AGENTS.md").read_text()
+    # A later cleanup must continue to respect the customization.
+    wrap._disable_enola_mcp(registrar)
+    assert json.loads(config.read_text())["mcp"]["enola"] == saved
+
+
+def test_opencode_bom_backup_round_trip_preserves_user_enola(project, tmp_path):
+    config = tmp_path / ".config/opencode/opencode.json"
+    config.parent.mkdir(parents=True)
+    original = '\ufeff{"model":"openai/gpt-4o","mcp":{"enola":{"type":"local","command":["/custom/enola"],"timeout":123456}}}\n'.encode()
+    config.write_bytes(original)
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["wrap", "opencode", "--prepare-only", "--code-memory", "enola", "--no-mcp"]
+    )
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(main, ["unwrap", "opencode", "--no-stop-proxy"])
+    assert result.exit_code == 0, result.output
+    assert config.read_bytes() == original
+
+
 def test_opencode_restore_with_invalid_backup_preserves_customized_entry(project, tmp_path):
     config = tmp_path / "opencode.json"
     original = '{"mcp":{"enola":{"command":["/custom/enola"],"enabled":false}}}\n'
