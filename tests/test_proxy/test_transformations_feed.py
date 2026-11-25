@@ -16,6 +16,42 @@ def app():
     return create_app()
 
 
+def _log_entry(request_id: str, **overrides) -> RequestLog:
+    base: dict = {
+        "request_id": request_id,
+        "timestamp": "2026-04-24T10:00:00Z",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "input_tokens_original": 100,
+        "input_tokens_optimized": 40,
+        "output_tokens": 10,
+        "tokens_saved": 60,
+        "savings_percent": 60.0,
+        "optimization_latency_ms": 1.0,
+        "total_latency_ms": 20.0,
+        "tags": {},
+        "cache_hit": False,
+        "transforms_applied": [],
+    }
+    base.update(overrides)
+    return RequestLog(**base)
+
+
+def _seed(app, count: int, **overrides) -> None:
+    for i in range(count):
+        app.state.proxy.logger.log(_log_entry(f"r{i}", **overrides))
+
+
+async def _feed(app, query: str = "") -> list[dict]:
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 12345)),
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.get(f"/transformations/feed?{query}")
+    assert response.status_code == 200
+    return response.json()["transformations"]
+
+
 @pytest.mark.asyncio
 async def test_transformations_feed_endpoint_returns_list(app):
     """The endpoint should return a list of recent transformations."""
@@ -40,34 +76,42 @@ async def test_transformations_feed_returns_messages(app):
     The pre/post pair is what makes compression legible: consumers can diff
     the two to see what the pipeline stripped, replaced, or kept.
     """
-    async with AsyncClient(
-        transport=ASGITransport(app=app, client=("127.0.0.1", 12345)),
-        base_url="http://127.0.0.1",
-    ) as client:
-        response = await client.get("/transformations/feed")
-
-    data = response.json()
-    transformations = data["transformations"]
+    _seed(
+        app,
+        3,
+        request_messages=[{"role": "user", "content": "pre"}],
+        compressed_messages=[{"role": "user", "content": "post"}],
+        response_content="ok",
+    )
+    transformations = await _feed(app)
+    assert len(transformations) == 3
     for t in transformations:
         assert "request_messages" in t
-        assert t["request_messages"] is None or isinstance(t["request_messages"], list)
+        assert t["request_messages"] == [{"role": "user", "content": "pre"}]
         assert "compressed_messages" in t
-        assert t["compressed_messages"] is None or isinstance(t["compressed_messages"], list)
+        assert t["compressed_messages"] == [{"role": "user", "content": "post"}]
         assert "response_content" in t
-        assert t["response_content"] is None or isinstance(t["response_content"], str)
+        assert t["response_content"] == "ok"
 
 
 @pytest.mark.asyncio
 async def test_transformations_feed_respects_limit(app):
     """The endpoint should respect a ?limit= query parameter."""
-    async with AsyncClient(
-        transport=ASGITransport(app=app, client=("127.0.0.1", 12345)),
-        base_url="http://127.0.0.1",
-    ) as client:
-        response = await client.get("/transformations/feed?limit=5")
+    _seed(app, 150)
+    assert len(await _feed(app, "limit=5")) == 5
+    assert len(await _feed(app)) == 20  # default
+    assert len(await _feed(app, "limit=1000")) == 100  # upper clamp
 
-    data = response.json()
-    assert len(data["transformations"]) <= 5
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query", ["limit=0", "limit=-1", "limit=-100", "limit=0&include_messages=0"]
+)
+async def test_transformations_feed_clamps_non_positive_limit(app, query):
+    """``limit<=0`` used to slice ``[-0:]`` / ``[-n:]`` and return (nearly) the
+    whole log, bypassing the 100-entry cap that guards the event loop."""
+    _seed(app, 150)
+    assert len(await _feed(app, query)) == 1
 
 
 @pytest.mark.asyncio

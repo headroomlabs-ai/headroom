@@ -218,6 +218,11 @@ def install_all(
     Raises:
         RuntimeError: when a ``fail_closed`` extension's ``install()`` raised.
     """
+    from headroom.proxy.output_shaper import (
+        restore_steering_registry,
+        steering_registry_snapshot,
+    )
+
     enabled_set = _resolve_enabled(enabled)
     discovered = list(discover())
     discovered_names = [n for n, _ in discovered]
@@ -246,9 +251,13 @@ def install_all(
         if not wildcard and name not in enabled_set:
             continue
         before = len(middleware_list) if isinstance(middleware_list, list) else 0
+        registry_before = steering_registry_snapshot()
         try:
             install(app, config)
         except Exception as exc:  # noqa: BLE001 — one bad extension must not brick the proxy
+            # A skipped extension must not keep steering text, a default
+            # level or savings factors it registered before raising.
+            restore_steering_registry(registry_before)
             if _is_fail_closed(install):
                 # The extension is the proxy's upstream auth (or equivalent):
                 # running without it would serve requests it was meant to

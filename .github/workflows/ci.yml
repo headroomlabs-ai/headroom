@@ -234,7 +234,7 @@ jobs:
         # case-insensitivity regressions, not newlines: NTFS is the only CI
         # volume where case-variant spellings are one directory entry, so
         # the Unicode-basename and case-alias tests only execute here.
-        run: pytest tests/test_learn tests/test_memory tests/test_memory_sync.py tests/test_toin_retention.py -m windows_newline --tb=short -q
+        run: pytest tests/test_learn tests/test_memory tests/test_memory_sync.py tests/test_toin_retention.py tests/test_proxy/test_cc_switch_reconciler.py -m windows_newline --tb=short -q
 
   python-314-wheels:
     # Partners on centrally managed machines cannot choose their Python, and

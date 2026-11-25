@@ -57,6 +57,12 @@ interface LaunchSpec {
 const HEADROOM_MODULE_DISCOVERY_SNIPPET =
   "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('headroom') else 1)";
 
+// `python -m` / `python -c` put the current directory first on sys.path, so a
+// `headroom/` folder in whatever directory OpenClaw runs from would be used
+// instead of the installed package. -P (Python 3.11+, which headroom-ai
+// requires) leaves it off; older interpreters reject -P and are skipped.
+const PYTHON_SAFE_PATH_FLAG = "-P";
+
 export class ProxyManager {
   private config: ProxyManagerConfig;
   private logger: ProxyManagerLogger;
@@ -230,9 +236,9 @@ export class ProxyManager {
       specs.push({
         label: `Configured Python: ${configuredPython} -m headroom.cli`,
         command: configuredPython,
-        args: ["-m", "headroom.cli", ...commonArgs],
+        args: [PYTHON_SAFE_PATH_FLAG, "-m", "headroom.cli", ...commonArgs],
         checkCommand: configuredPython,
-        checkArgs: ["-c", HEADROOM_MODULE_DISCOVERY_SNIPPET],
+        checkArgs: [PYTHON_SAFE_PATH_FLAG, "-c", HEADROOM_MODULE_DISCOVERY_SNIPPET],
       });
     }
 
@@ -325,9 +331,9 @@ export class ProxyManager {
       specs.push({
         label: `Python: ${pyCmd} -m headroom.cli`,
         command: pyCmd,
-        args: ["-m", "headroom.cli", ...commonArgs],
+        args: [PYTHON_SAFE_PATH_FLAG, "-m", "headroom.cli", ...commonArgs],
         checkCommand: pyCmd,
-        checkArgs: ["-c", HEADROOM_MODULE_DISCOVERY_SNIPPET],
+        checkArgs: [PYTHON_SAFE_PATH_FLAG, "-c", HEADROOM_MODULE_DISCOVERY_SNIPPET],
       });
     }
 
