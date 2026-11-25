@@ -138,7 +138,13 @@ _CODE_PATTERNS = {
 # line share plus structure signals, with prose and front-matter guards.
 _CONFIG_SECTION_RE = re.compile(r"^\s*\[\[?[\w.\-\"' ]+\]\]?\s*$")
 _TOML_ASSIGN_RE = re.compile(r"""^\s*(?:[\w.\-]+|"[^"]+"|'[^']+')\s*=\s*\S""")
-_INI_ASSIGN_RE = re.compile(r"^\s*[\w.\-@ ]+?\s*[=:]\s*")
+# Linear form of `^\s*[\w.\-@ ]+?\s*[=:]` (same language; the old form was cubic
+# on a run of spaces because space is in both `\s` and the key class). Branch 1:
+# the key has a non-space char; its inner run may hold spaces, but it starts and
+# ends on a non-space char, so no two adjacent quantifiers share a space. Branch 2:
+# a key made only of spaces (other whitespace around), each loop turn starts with
+# a space.
+_INI_ASSIGN_RE = re.compile(r"^(?:\s*[\w.\-@](?:[\w.\-@ ]*[\w.\-@])?\s*|[^\S ]*(?: [^\S ]*)+)[=:]")
 _YAML_KEY_RE = re.compile(r"""^\s*(?:-\s+)?(?:[\w.\-/]+|"[^"]+"|'[^']+')\s*:(?:\s|$)""")
 _YAML_LIST_RE = re.compile(r"^\s*-\s+\S")
 _YAML_DOC_RE = re.compile(r"^---\s*$|^\.\.\.\s*$")

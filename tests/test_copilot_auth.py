@@ -1175,7 +1175,7 @@ def test_is_copilot_api_url_trusts_configured_enterprise_api_url(
     assert not copilot_auth.is_copilot_api_url("https://copilot-api.other.example.com/v1/responses")
 
 
-def test_build_copilot_upstream_url_strips_v1_only_for_copilot_hosts() -> None:
+def test_build_copilot_upstream_url_strips_v1_for_bare_copilot_hosts() -> None:
     assert (
         copilot_auth.build_copilot_upstream_url(
             "https://api.githubcopilot.com",
@@ -1190,6 +1190,70 @@ def test_build_copilot_upstream_url_strips_v1_only_for_copilot_hosts() -> None:
         )
         == "https://api.openai.com/v1/chat/completions"
     )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "path", "expected"),
+    [
+        (
+            "https://open.bigmodel.cn/api/paas/v4",
+            "/v1/chat/completions",
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        ),
+        (
+            "https://open.bigmodel.cn/api/paas/v4/",
+            "v1/chat/completions",
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        ),
+        ("https://example.com/v1", "/v1/responses", "https://example.com/v1/responses"),
+        ("https://example.com/api/v12", "/v1/models", "https://example.com/api/v12/models"),
+        ("https://example.com/v4", "/models", "https://example.com/v4/models"),
+        ("https://example.com/v4", "/v10/models", "https://example.com/v4/v10/models"),
+        ("https://example.com/v4", "/v1", "https://example.com/v4/v1"),
+    ],
+)
+def test_build_copilot_upstream_url_with_versioned_base(
+    base_url: str, path: str, expected: str
+) -> None:
+    assert copilot_auth.build_copilot_upstream_url(base_url, path) == expected
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.deepseek.com",
+        "https://example.com/api",
+        "https://example.com/api/preview4",
+        "https://example.com/api/v4beta",
+        "https://example.com/api/v4/tenant",
+        "https://v4",
+    ],
+)
+def test_build_copilot_upstream_url_preserves_v1_for_unversioned_base(base_url: str) -> None:
+    assert (
+        copilot_auth.build_copilot_upstream_url(base_url, "/v1/chat/completions")
+        == f"{base_url}/v1/chat/completions"
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_var", "base_url", "path"),
+    [
+        ("GITHUB_COPILOT_API_URL", "https://chat.example.test/api/v4", "/v1/messages"),
+        (
+            "GITHUB_COPILOT_PROXY_URL",
+            "https://inline.example.test/api/v12",
+            "/v1/engines/model/completions",
+        ),
+    ],
+)
+def test_build_copilot_upstream_url_keeps_native_paths_on_versioned_copilot_override(
+    monkeypatch: pytest.MonkeyPatch, env_var: str, base_url: str, path: str
+) -> None:
+    # A Copilot override that ends in /vN is still Copilot: its native paths
+    # must not lose /v1 to the generic versioned-base rule.
+    monkeypatch.setenv(env_var, base_url)
+    assert copilot_auth.build_copilot_upstream_url(base_url, path) == f"{base_url}{path}"
 
 
 def test_build_copilot_upstream_url_preserves_v1_messages_for_copilot() -> None:
