@@ -583,7 +583,10 @@ class ToolIntelligenceNetwork:
         self._lock = threading.RLock()  # RLock for reentrant locking (save calls export_patterns)
 
         # Storage backend
-        if backend is not None:
+        if isinstance(backend, FileSystemTOINBackend):
+            backend.configure_version(_TOIN_STORE_VERSION)
+            self._backend = backend
+        elif backend is not None:
             self._backend = backend
         elif toin_backend_disabled():
             # HEADROOM_TOIN_BACKEND=none means in-memory-only, so it has to win

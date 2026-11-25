@@ -666,12 +666,12 @@ def test_configured_path_cannot_clobber_another_instance_stores(tmp_path, caplog
     toin_b.save()
     b_before = v3.read_text(encoding="utf-8")
 
-    # Proxy A loads its own legacy file, which falls back to it because the
-    # v3 sibling is not A's store yet (it spells no owner A recognises).
+    # A must not import B's versioned store, even when legacy data exists.
     legacy.write_text(json.dumps(_saved_store(legacy, 2)), encoding="utf-8", newline="\n")
 
     with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
         toin_a = ToolIntelligenceNetwork(TOINConfig(storage_path=str(legacy), auto_save_interval=0))
+    assert not toin_a._patterns  # Foreign history must never be imported.
     toin_a.save()
 
     assert v3.read_text(encoding="utf-8") == b_before
@@ -704,6 +704,47 @@ def test_version_paths_never_double_the_version_marker(
     assert backend._pre_upgrade_path == (
         tmp_path / expected_pre_upgrade if expected_pre_upgrade else None
     )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("name", ["toin.v3", "toin.v3.json"])
+def test_version_like_legacy_path_preserves_rollback(tmp_path, explicit, name) -> None:
+    path = tmp_path / name
+    data = _saved_store(path, 2)
+    data["version"] = "2.0"
+    path.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    before = path.read_bytes()
+    backend = FileSystemTOINBackend(str(path)) if explicit else None
+    toin = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(path), auto_save_interval=0), backend=backend
+    )
+    assert len(toin._patterns) == 2
+    toin.save()
+    assert path.read_bytes() == before
+    assert toin._backend.path != path
+    assert (
+        len(
+            ToolIntelligenceNetwork(
+                TOINConfig(storage_path=str(path), auto_save_interval=0),
+                backend=FileSystemTOINBackend(str(path)) if explicit else None,
+            )._patterns
+        )
+        == 2
+    )
+
+
+def test_owner_accepts_equivalent_paths(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    first = ToolIntelligenceNetwork(TOINConfig(storage_path="toin.json", auto_save_interval=0))
+    _record(first, 1)
+    first.save()
+    second = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(tmp_path / "toin.json"), auto_save_interval=0)
+    )
+    assert len(second._patterns) == 1
+    _record(second, 2)
+    second.save()
+    assert len(json.loads(second._backend.path.read_text(encoding="utf-8"))["patterns"]) == 2
 
 
 def test_filesystem_backend_writes_compact_json(tmp_path) -> None:

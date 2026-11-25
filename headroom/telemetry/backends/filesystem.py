@@ -84,14 +84,43 @@ class FileSystemTOINBackend:
         # ``toin.v3.json``) can derive to the same versioned write target;
         # stamping the owner lets save() refuse to clobber another proxy's
         # store instead of silently overwriting it.
-        self._owner = self._path
+        self._configured_path = self._path
+        self._owner = self._path.resolve()
+        self._store_version = None
         if store_version:
-            self._path, self._pre_upgrade_path = _version_paths(self._path, store_version)
+            self.configure_version(store_version)
+
+    def configure_version(self, store_version: str) -> None:
+        """Apply TOIN's storage version to this backend without replacing it."""
+        if self._store_version == store_version:
+            return
+        if self._store_version is not None:
+            raise ValueError("TOIN backend already configured for a different version")
+        self._store_version = store_version
+        self._path, self._pre_upgrade_path = _version_paths(self._configured_path, store_version)
+        # A version-like filename may predate the layout version. Never
+        # overwrite an existing legacy store merely because of its name.
+        if self._pre_upgrade_path is None and self._path.exists():
+            try:
+                with open(self._path, encoding="utf-8") as f:
+                    version = json.load(f).get("version", "1.0")
+            except (OSError, ValueError, AttributeError):
+                version = None
+            if version in ("1.0", "2.0"):
+                self._pre_upgrade_path = self._path
+                self._path = self._path.with_name(
+                    self._path.name + f".v{store_version.split('.', 1)[0]}"
+                )
 
     def _read_path(self) -> Path:
         """Path to load: this version's store, else the pre-upgrade one."""
         if not self._path.exists() and self._pre_upgrade_path is not None:
             return self._pre_upgrade_path
+        return self._path
+
+    @property
+    def path(self) -> Path:
+        """Active write path."""
         return self._path
 
     @property
@@ -127,7 +156,7 @@ class FileSystemTOINBackend:
         try:
             with open(self._path) as f:
                 existing = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return
         if not isinstance(existing, dict):
             return
@@ -162,8 +191,14 @@ class FileSystemTOINBackend:
                 return {}
             with open(read_path) as f:
                 data: dict[str, Any] = json.load(f)
+                if read_path == self._path and isinstance(data, dict):
+                    owner = data.get("owner")
+                    if isinstance(owner, str) and owner and owner != self._owner_token():
+                        raise ValueError(
+                            f"TOIN store {read_path} belongs to another configured path"
+                        )
                 return data
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
             logger.warning("Failed to load TOIN data from %s: %s", read_path, e)
             return {}
 
