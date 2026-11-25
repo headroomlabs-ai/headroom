@@ -1,8 +1,9 @@
-"""Worker functions for bounded tiktoken loading.
+"""Worker entry point for bounded tiktoken loading.
 
-These run in a separate process via multiprocessing spawn context so they
-can be terminated on timeout. The module is imported in the child process
-so must be import-safe (no module-level side effects).
+Runs as ``python -m headroom.tokenizers._tiktoken_worker <mode> <encoding> <out>``
+so the load happens in a process the caller can kill on timeout. A subprocess
+rather than ``multiprocessing`` spawn: spawn re-imports the caller's script into
+the child, re-running unguarded module-level code (server start, sockets, ...).
 """
 
 from __future__ import annotations
@@ -12,12 +13,14 @@ import hashlib
 import json
 import logging
 import os
+import pickle
+import sys
 import tempfile
 from typing import Any
 
 import tiktoken
 
-from headroom.offline import OfflineEgressBlocked
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -319,32 +322,47 @@ def _build_encoding_from_cache(encoding_name: str) -> Any:
     )
 
 
-def _load_encoding_worker(encoding_name: str, queue: Any) -> None:
-    """Worker function to load encoding in a separate process.
+def _encoding_payload(enc: Any) -> dict[str, Any]:
+    """The parts of an ``Encoding`` that can cross a process boundary as plain data.
 
-    Uses multiprocessing so we can actually terminate on timeout.
-    Does cache check, hash verification, AND encoding construction inside the timeout boundary.
-    Returns the encoding object via queue on success, or status string on failure.
+    Never send the ``Encoding`` itself: tiktoken pickles a registered encoding as
+    its *name*, and unpickling calls ``tiktoken.registry.get_encoding`` in the
+    parent -- a fresh, unbounded vocabulary download outside any deadline.
     """
+    return {
+        "name": enc.name,
+        "pat_str": enc._pat_str,
+        "mergeable_ranks": enc._mergeable_ranks,
+        "special_tokens": enc._special_tokens,
+    }
+
+
+def _load(mode: str, encoding_name: str) -> dict[str, Any]:
+    """Load ``encoding_name`` locally (``cache``) or from the network (``download``)."""
+    if mode == "download":
+        guard_egress("tiktoken encoding download")
+        return {"status": "ok", **_encoding_payload(tiktoken.get_encoding(encoding_name))}
+
+    is_cached, has_invalid = _encoding_cached_locally(encoding_name)
+    if has_invalid:
+        # Partial or corrupted cache - don't attempt to build
+        return {"status": "invalid_cache"}
+    if not is_cached:
+        return {"status": "not_cached"}
+    return {"status": "ok", **_encoding_payload(_build_encoding_from_cache(encoding_name))}
+
+
+def main(argv: list[str]) -> int:
+    """Entry point: write the load result to ``argv[2]`` as a pickled dict."""
+    mode, encoding_name, out_path = argv
     try:
-        # Check local cache FIRST (inside the timeout boundary)
-        # This includes filesystem I/O: file open, read, hash verification
-        is_cached, has_invalid = _encoding_cached_locally(encoding_name)
-        if has_invalid:
-            # Partial or corrupted cache - don't attempt to build
-            queue.put(("invalid_cache", encoding_name))
-            return
+        result = _load(mode, encoding_name)
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent verbatim
+        result = {"status": "error", "error": str(exc)}
+    with open(out_path, "wb") as f:
+        pickle.dump(result, f)
+    return 0 if result["status"] == "ok" else 1
 
-        if is_cached:
-            # Cache exists and is valid - build encoding in worker (bounded by timeout)
-            enc = _build_encoding_from_cache(encoding_name)
-            queue.put(("ok", enc))
-            return
 
-        # Not cached, would need download - but we don't do that here
-        queue.put(("not_cached", encoding_name))
-
-    except OfflineEgressBlocked:
-        raise
-    except BaseException as exc:  # noqa: BLE001
-        queue.put(("error", str(exc)))
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

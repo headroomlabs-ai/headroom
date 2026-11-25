@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Models already reported as falling back to estimation. A provisional fallback
+# is re-resolved on every get(), so warning each time would flood the log.
+_provisional_warned: set[str] = set()
+
 
 # Model pattern matching for tokenizer selection
 # Order matters - more specific patterns first
@@ -218,7 +222,10 @@ class TokenizerRegistry:
                 tokenizer = registry._model_factories[model_lower](model)
             else:
                 tokenizer = registry._create_tokenizer(model, backend)
-            remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
+            # A provisional tokenizer is a stand-in for a vocab that may still load
+            # (tiktoken cooldown); caching it would pin the model to estimation.
+            if not getattr(tokenizer, "_provisional", False):
+                remember_bounded(registry._cache, cache_key, tokenizer, cls._CACHE_MAXSIZE)
             return tokenizer
         except Exception as e:
             if fallback:
@@ -375,8 +382,13 @@ class TokenizerRegistry:
             try:
                 load_encoding(get_encoding_for_model(model))
             except (TiktokenLoadError, OfflineEgressBlocked) as exc:
-                logger.warning("tiktoken unavailable (%s); using estimation.", exc)
-                return EstimatingTokenCounter()
+                if model not in _provisional_warned:
+                    _provisional_warned.add(model)
+                    logger.warning("tiktoken unavailable (%s); using estimation.", exc)
+                estimator = EstimatingTokenCounter()
+                # Not cached by get(): the vocab may load once its cooldown expires.
+                estimator._provisional = True
+                return estimator
             return TiktokenCounter(model)
         except ImportError:
             logger.warning("tiktoken not installed. Install with: pip install tiktoken")

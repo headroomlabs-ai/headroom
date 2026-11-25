@@ -491,6 +491,11 @@ class BaseTokenizer(ABC):
     MESSAGE_OVERHEAD = 4
     REPLY_OVERHEAD = 3  # Assistant reply start tokens
 
+    # True when this tokenizer stands in for a vocab that may still become
+    # loadable (e.g. tiktoken cooldown); TokenizerRegistry won't cache it, so
+    # the model can recover instead of being pinned to estimation for the process.
+    _provisional = False
+
     # Oversized-blob token estimation (see _count_serialized). Serializing a blob
     # is cheap; running count_text over the whole multi-megabyte string is what
     # blocks the proxy event loop, so a large blob is counted from an even-spread
