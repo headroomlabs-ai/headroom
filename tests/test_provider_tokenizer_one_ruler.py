@@ -333,6 +333,7 @@ def test_a_bad_encoding_entry_only_affects_its_own_alias(
                         ALIAS: "cl100k_base",
                         "alias-with-a-number": 5,
                         "alias-with-an-unknown-encoding": "no_such_encoding",
+                        "alias-with-an-empty-encoding": "",
                     }
                 }
             }
@@ -342,6 +343,7 @@ def test_a_bad_encoding_entry_only_affects_its_own_alias(
     assert get_tokenizer(ALIAS).encoding_name == "cl100k_base"
     assert isinstance(get_tokenizer("alias-with-a-number"), EstimatingTokenCounter)
     assert isinstance(get_tokenizer("alias-with-an-unknown-encoding"), EstimatingTokenCounter)
+    assert isinstance(get_tokenizer("alias-with-an-empty-encoding"), EstimatingTokenCounter)
     _assert_ordinary_counters()
 
 

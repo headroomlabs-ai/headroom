@@ -133,8 +133,8 @@ def load_openai_encodings() -> dict[str, str]:
     must not change how Claude or Gemini are counted, and ``OpenAIProvider``
     uses it too, so the provider and the registry always agree on a model's
     encoding. Anything unusable (unreadable source, invalid JSON, non-object
-    sections, non-string encodings) is skipped with a warning; this never
-    raises.
+    sections, non-string or empty encodings) is skipped with a warning; this
+    never raises.
     """
     encodings: dict[str, str] = {}
 
@@ -198,11 +198,15 @@ def _encodings_from(source: str, read: Callable[[], Any], *, env_source: bool) -
         )
         return {}
 
-    encodings = {model: encoding for model, encoding in raw.items() if isinstance(encoding, str)}
+    encodings = {
+        model: encoding
+        for model, encoding in raw.items()
+        if isinstance(encoding, str) and encoding.strip()
+    }
     skipped = sorted(model for model in raw if model not in encodings)
     if skipped:
         logger.warning(
-            "Ignoring model encodings from %s for %s: the encoding must be a string",
+            "Ignoring model encodings from %s for %s: the encoding must be a non-empty string",
             source,
             ", ".join(skipped),
         )
