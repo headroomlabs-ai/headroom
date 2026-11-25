@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use headroom_proxy::inbound_auth::{ProxyToken, RELAY_PROOF_HEADER};
+use headroom_proxy::inbound_auth::{ProxyToken, FRONT_REMOTE_HEADER, RELAY_PROOF_HEADER};
 use headroom_proxy::{build_app, AppState, Config};
 use tower::util::ServiceExt;
 use wiremock::matchers::any;
@@ -570,4 +570,73 @@ async fn python_upstream_gets_the_relay_host_under_no_rewrite_host() {
         no_rewrite_remote_request(true, Some(TOKEN)).await,
         ("headroom-remote.invalid".to_owned(), true)
     );
+}
+
+/// The remote marker one upstream request carried, for a caller at `peer`
+/// that sends `headers`, with `--python-upstream` on or off.
+async fn upstream_remote_marker(
+    python: bool,
+    rewrite_host: bool,
+    peer: &str,
+    headers: &[(&str, &str)],
+) -> Option<String> {
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.python_upstream = python;
+    config.rewrite_host = rewrite_host;
+    let app = build_app(AppState::new(config).unwrap());
+    let mut builder = Request::builder().method("GET").uri("/v1/models");
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        builder = builder.header("host", "127.0.0.1:8787");
+    }
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    let addr: SocketAddr = peer.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    seen[0]
+        .headers
+        .get(FRONT_REMOTE_HEADER)
+        .map(|v| v.to_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn every_relayed_remote_caller_carries_the_remote_marker() {
+    // Whatever Host reaches the upstream (a preserved container alias, a
+    // public name, the relay name), the Python proxy is told the caller is
+    // not local; a client-sent value is replaced.
+    for python in [false, true] {
+        for rewrite_host in [true, false] {
+            for host in ["host.docker.internal:8787", "proxy.example:8787"] {
+                assert_eq!(
+                    upstream_remote_marker(
+                        python,
+                        rewrite_host,
+                        REMOTE,
+                        &[("host", host), (FRONT_REMOTE_HEADER, "0")],
+                    )
+                    .await
+                    .as_deref(),
+                    Some("1"),
+                    "python={python} rewrite_host={rewrite_host} host={host}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_caller_never_carries_the_remote_marker() {
+    // Nobody but this process sets it: a value a local client sends is
+    // dropped, so the upstream sees no marker at all.
+    for python in [false, true] {
+        assert_eq!(
+            upstream_remote_marker(python, true, LOCAL, &[(FRONT_REMOTE_HEADER, "1")]).await,
+            None,
+            "python={python}"
+        );
+    }
 }

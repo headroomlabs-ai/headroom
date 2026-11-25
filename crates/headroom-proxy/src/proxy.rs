@@ -673,6 +673,10 @@ pub(crate) async fn forward_http(
         .get::<crate::inbound_auth::NonLocalCaller>()
         .is_some()
     {
+        outgoing_headers.insert(
+            crate::inbound_auth::FRONT_REMOTE_HEADER,
+            http::HeaderValue::from_static("1"),
+        );
         if let Some(host) = crate::inbound_auth::host_override_for_non_local(
             outgoing_headers.get(http::header::HOST),
             &state.config.upstream,

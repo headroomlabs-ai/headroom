@@ -30,6 +30,14 @@ const PROXY_TOKEN_HEADER: &str = "x-headroom-proxy-token";
 /// `front_relay_proof`: the Python proxy behind the front accepts it in
 /// place of the token this front strips. Removed from every inbound request.
 pub const RELAY_PROOF_HEADER: &str = "x-headroom-front-proof";
+
+/// Set to `1` on every request relayed for a [`NonLocalCaller`], whatever
+/// `Host` is sent and in every mode, and removed from what clients send.
+/// Not a secret: it only takes trust away. The Python proxy never treats a
+/// request carrying it as local (loopback or container-alias `Host`), so a
+/// remote caller cannot borrow a local name it would trust from this
+/// process's loopback connection.
+pub const FRONT_REMOTE_HEADER: &str = "x-headroom-front-remote";
 const RELAY_PROOF_CONTEXT: &[u8] = b"headroom-front-relay-v1\0";
 
 /// A configured proxy token. `Debug` never prints the value, because
@@ -183,13 +191,16 @@ pub struct RelayProof(pub HeaderValue);
 /// loopback forms this one does not.
 pub const NON_LOCAL_HOST: &str = "headroom-remote.invalid";
 
-/// Whether the upstream is the Python proxy on this machine, the only
-/// receiver the relay proof is for: a loopback IP literal or `localhost`.
+/// Whether a `--python-upstream` upstream may receive the relay proof: the
+/// Python proxy on this machine, addressed as a loopback IP literal,
+/// `localhost`, or (from a container) a container host alias.
 pub(crate) fn upstream_takes_relay_proof(upstream: &url::Url) -> bool {
     match upstream.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Domain(name)) => {
+            name.eq_ignore_ascii_case("localhost") || names_container_host_alias(name)
+        }
         None => false,
     }
 }
@@ -291,8 +302,9 @@ pub async fn inbound_gate(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Only this process may vouch for a caller upstream.
+    // Only this process may vouch for a caller upstream, or mark it remote.
     req.headers_mut().remove(RELAY_PROOF_HEADER);
+    req.headers_mut().remove(FRONT_REMOTE_HEADER);
     // No ConnectInfo is no evidence of a local caller: fail closed, as
     // Python's is_loopback_host(None) does.
     let peer = req
@@ -409,6 +421,8 @@ mod tests {
             "http://127.0.0.1:8788",
             "http://[::1]:8788",
             "http://LOCALHOST:1",
+            "http://host.docker.internal:8788",
+            "http://HOST.CONTAINERS.INTERNAL:8788",
         ] {
             assert!(upstream_takes_relay_proof(&ok.parse().unwrap()), "{ok}");
         }
@@ -416,6 +430,7 @@ mod tests {
             "https://api.anthropic.com",
             "http://10.0.0.5:8788",
             "http://localhost.example.com",
+            "http://host.docker.internal.example.com",
         ] {
             assert!(!upstream_takes_relay_proof(&no.parse().unwrap()), "{no}");
         }
