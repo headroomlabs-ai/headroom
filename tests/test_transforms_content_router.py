@@ -1441,7 +1441,7 @@ diff --git a/src/Resources/public/js/signup.js b/src/Resources/public/js/signup.
 index 3333333..4444444 100644
 --- a/src/Resources/public/js/signup.js
 +++ b/src/Resources/public/js/signup.js
-@@ -54,6 +54,10 @@
+@@ -54,4 +54,8 @@
        var rawStep = $trigger.data('targetStep');
        var validatedStep = Math.max(1, Math.min(Number(rawStep), this.$steps.length));
 +      // Moving forward is blocked until the phone fields of the current step are valid.
@@ -1454,7 +1454,7 @@ diff --git a/src/Resources/translations/messages.en.xlf b/src/Resources/translat
 index 5555555..6666666 100644
 --- a/src/Resources/translations/messages.en.xlf
 +++ b/src/Resources/translations/messages.en.xlf
-@@ -7298,6 +7298,10 @@
+@@ -7298,4 +7298,10 @@
          <target>Make a new payment</target>
        </trans-unit>
 +      <trans-unit id="LPW92ab" resname="signup.phone.paste_error">
@@ -1479,12 +1479,7 @@ The translation keys still need a matching entry in the French file.
 """
 
 
-@pytest.mark.parametrize(
-    "content",
-    [MIXED_GIT_DIFF, f"<returncode>0</returncode>\n<output>\n{MIXED_GIT_DIFF}</output>"],
-    ids=["bare", "tool_envelope"],
-)
-def test_mixed_git_diff_routes_to_diff(content: str) -> None:
+def test_mixed_git_diff_routes_to_diff() -> None:
     """A unified diff the detector calls GIT_DIFF must reach DiffCompressor (#5050).
 
     Both signals come from the real heuristic and the pure-Python detector, so
@@ -1494,22 +1489,26 @@ def test_mixed_git_diff_routes_to_diff(content: str) -> None:
 
     router = ContentRouter(ContentRouterConfig())
 
-    assert is_mixed_content(content) is True
-    detection = detect_content_type(content)
+    assert is_mixed_content(MIXED_GIT_DIFF) is True
+    detection = detect_content_type(MIXED_GIT_DIFF)
     assert detection.content_type is ContentType.GIT_DIFF
 
-    strategy = router._determine_strategy(content, mixed=True, detection=detection)
+    strategy = router._determine_strategy(MIXED_GIT_DIFF, mixed=True, detection=detection)
     assert strategy is CompressionStrategy.DIFF
 
 
-def test_mixed_git_diff_keeps_hunk_lines_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The MIXED path rejoined hunk sections with blank lines and could send
-    changed lines to lossy ML; on DIFF every ``+``/``-`` line survives as-is."""
+def _force_git_diff_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         content_router_module,
         "_detect_content",
         lambda content: DetectionResult(ContentType.GIT_DIFF, 1.0, {}),
     )
+
+
+def test_mixed_git_diff_keeps_hunk_lines_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The MIXED path rejoined hunk sections with blank lines and could send
+    changed lines to lossy ML; on DIFF every ``+``/``-`` line survives as-is."""
+    _force_git_diff_detection(monkeypatch)
 
     result = ContentRouter(ContentRouterConfig()).compress(MIXED_GIT_DIFF)
 
@@ -1519,6 +1518,78 @@ def test_mixed_git_diff_keeps_hunk_lines_verbatim(monkeypatch: pytest.MonkeyPatc
         if line.startswith(("+", "-")):
             assert line in out_lines
     assert "class SignupType extends AbstractType\n {\n" in result.compressed
+
+
+def test_mixed_git_diff_through_diff_compressor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With lossless folding off the diff reaches DiffCompressor itself: the
+    status/stat preamble and every changed line survive, and no blank line is
+    inserted inside a hunk."""
+    monkeypatch.setenv("HEADROOM_LOSSLESS_COMPACTION", "0")
+    _force_git_diff_detection(monkeypatch)
+
+    result = ContentRouter(ContentRouterConfig()).compress(MIXED_GIT_DIFF)
+
+    assert result.strategy_used is CompressionStrategy.DIFF
+    assert result.compressed.startswith(MIXED_GIT_DIFF.split("diff --git", 1)[0])
+    out_lines = result.compressed.split("\n")
+    for line in MIXED_GIT_DIFF.split("\n"):
+        if line.startswith(("+", "-")):
+            assert line in out_lines
+    assert "" not in out_lines
+
+
+_MIXED_GIT_DIFF_NO_INDEX = "\n".join(
+    line for line in MIXED_GIT_DIFF.split("\n") if not line.startswith("index ")
+)
+
+
+@pytest.mark.parametrize(
+    ("content", "must_keep"),
+    [
+        (
+            f"<returncode>0</returncode>\n<output>\n{_MIXED_GIT_DIFF_NO_INDEX}</output>",
+            ["</output>"],
+        ),
+        (
+            _MIXED_GIT_DIFF_NO_INDEX + "\n    Run the integration tests before merging.\n"
+            "    This is important for all reviewers.\n",
+            ["Run the integration tests before merging.", "This is important for all reviewers."],
+        ),
+        (
+            # ``git diff && git diff --stat``: the stat summary follows the patch.
+            _MIXED_GIT_DIFF_NO_INDEX.split("\n", 7)[7] + "\n".join(MIXED_GIT_DIFF.split("\n")[3:7]),
+            MIXED_GIT_DIFF.split("\n")[3:7],
+        ),
+        (
+            _MIXED_GIT_DIFF_NO_INDEX.replace(
+                "b/src/Resources/public/js/signup.js\n",
+                "b/src/Resources/public/js/signup.js\nold mode 100644\nnew mode 100755\n",
+            ),
+            ["old mode 100644", "new mode 100755"],
+        ),
+    ],
+    ids=["tool_envelope", "trailing_prose", "trailing_stat", "mode_change"],
+)
+def test_mixed_git_diff_outside_hunks_stays_mixed(
+    monkeypatch: pytest.MonkeyPatch, content: str, must_keep: list[str]
+) -> None:
+    """DiffCompressor reads every line after a hunk as hunk context and trims
+    it, and has no record for ``old mode``/``new mode``. Content outside the
+    hunks the headers declare keeps the MIXED route and survives compression
+    when lossless folding does not run."""
+    monkeypatch.setenv("HEADROOM_LOSSLESS_COMPACTION", "0")
+    _force_git_diff_detection(monkeypatch)
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(content) is True
+    detection = DetectionResult(ContentType.GIT_DIFF, 1.0, {})
+    assert router._determine_strategy(content, mixed=True, detection=detection) is (
+        CompressionStrategy.MIXED
+    )
+
+    result = router.compress(content)
+    for text in must_keep:
+        assert text in result.compressed
 
 
 def _git_log_patch_entry(sha_digit: str, subject: str) -> str:
