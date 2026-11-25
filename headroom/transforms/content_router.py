@@ -8190,6 +8190,7 @@ class ContentRouter(Transform):
         # Set on the first tool text block from the whole result.
         search_guard: bool | None = None
         search_verbatim = False
+        search_block_rows: dict[int, str] = {}
 
         # Top-level text blocks are fragments of one tool result. Measure the
         # whole result so splitting a large log cannot activate the small-result
@@ -8549,20 +8550,31 @@ class ContentRouter(Transform):
                         continue
                     if search_guard is None:
                         search_guard = self._bash_search_guard_applies(_shell_name, _msg_tool_id)
+                        texts = [
+                            b
+                            for b in content_blocks
+                            if isinstance(b, dict)
+                            and b.get("type") == "text"
+                            and isinstance(b.get("text"), str)
+                        ]
                         # Judge the whole result first: a fragment may start mid-row.
                         search_verbatim = search_guard and self._bash_search_rows_verbatim(
-                            "".join(
-                                b["text"]
-                                for b in content_blocks
-                                if isinstance(b, dict)
-                                and b.get("type") == "text"
-                                and isinstance(b.get("text"), str)
-                            )
+                            "".join(b["text"] for b in texts)
                         )
-                    # Other blocks may break the whole-result check, so a block
-                    # of timestamped rows still qualifies on its own.
+                        if search_guard and not search_verbatim:
+                            # Other blocks broke the whole-result check, so judge
+                            # each block alone, without the tail of a row that an
+                            # earlier block started.
+                            prev = "\n"
+                            for b in texts:
+                                rows = b["text"]
+                                if not prev.endswith("\n"):
+                                    rows = rows.partition("\n")[2]
+                                search_block_rows[id(b)] = rows
+                                prev = b["text"] or prev
                     if search_verbatim or (
-                        search_guard and self._bash_search_rows_verbatim(block.get("text"))
+                        search_guard
+                        and self._bash_search_rows_verbatim(search_block_rows.get(id(block)))
                     ):
                         new_blocks.append(block)
                         transforms_applied.append("router:bash:search_verbatim")
