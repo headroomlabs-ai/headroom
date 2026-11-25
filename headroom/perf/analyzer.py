@@ -37,8 +37,12 @@ DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
 _PERF_LOG_FILE_RE = re.compile(r"proxy(?:-\d+){0,2}\.log(?:\.\d+)?$")
 
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
+# Anchored on the record header so "PERF" must open the message: a record whose
+# message merely quotes "[id] PERF ..." (a client value, an upstream error) is
+# not a PERF record and must not book savings.
 _PERF_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) .* \[(?P<rid>[^\]]+)\] PERF (?P<kv>.+)$"
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) - [\w.]+ - [A-Z]+ - "
+    r"\[(?P<rid>[^\]]+)\] PERF (?P<kv>.+)$"
 )
 
 # Matches: content_router: 51 msgs — ...
@@ -101,9 +105,12 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     Everything after ``transforms=`` is captured as a single value.
     """
     result: dict[str, str] = {}
-    # Handle transforms= specially since its value contains spaces
-    if "transforms=" in kv_str:
-        before, transforms_val = kv_str.split("transforms=", 1)
+    # Handle transforms= specially since its value contains spaces. Match it
+    # only as a field of its own (after a space), never inside another value:
+    # "model=transforms=x" must not shift every later field.
+    padded = f" {kv_str}"
+    if " transforms=" in padded:
+        before, transforms_val = padded.split(" transforms=", 1)
         transform_parts: list[str] = []
         for part in transforms_val.split():
             if "=" in part:

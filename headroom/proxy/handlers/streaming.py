@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.log_safety import safe_id
 from headroom.proxy import public_errors
 from headroom.proxy.memory_tool_stream import (
     MemoryToolStreamFilter,
@@ -2680,7 +2681,7 @@ class StreamingMixin:
 
                 if tokens_saved > 0:
                     logger.info(
-                        f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                        f"[{request_id}] {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                         f"(saved {tokens_saved:,} tokens) via {backend.name} [stream]"
                     )
 
