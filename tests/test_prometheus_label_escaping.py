@@ -120,7 +120,7 @@ async def test_quote_in_provider_is_escaped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_backslash_and_newline_in_model_are_escaped() -> None:
+async def test_backslash_in_model_is_escaped_and_newline_model_is_bucketed() -> None:
     metrics = PrometheusMetrics()
 
     await _record(metrics, model="back\\slash")
@@ -130,8 +130,9 @@ async def test_backslash_and_newline_in_model_are_escaped() -> None:
 
     # Backslash first, so the escapes this inserts are not re-escaped.
     assert 'headroom_requests_by_model{model="back\\\\slash"} 1' in text
-    assert 'headroom_requests_by_model{model="line\\nfeed"} 1' in text
-    # The line feed must not survive as a real newline splitting the sample.
+    # A model containing a control character never becomes its own series:
+    # it counts under "other" instead (issue #4942).
+    assert 'headroom_requests_by_model{model="other"} 1' in text
     assert "line\nfeed" not in text
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -14,7 +13,6 @@ from headroom.providers.registry import (
     create_proxy_backend,
     format_backend_status,
 )
-from headroom.proxy import upstream_guard
 
 
 class DummyStorage:
@@ -87,20 +85,13 @@ def test_proxy_provider_runtime_selects_targets_and_providers() -> None:
     assert runtime.select_passthrough_base_url({"x-goog-api-key": "test"}) == (
         "https://gemini.example"
     )
-    # The Azure branch honours the override only after the SSRF guard clears
-    # the destination (CVE-2026-77775), and `azure.example` does not resolve.
-    # Pin a public answer so this stays a test of target *precedence*.
-    with patch.object(
-        upstream_guard.socket,
-        "getaddrinfo",
-        return_value=[(None, None, None, None, ("20.10.10.10", 443))],
-    ):
-        assert (
-            runtime.select_passthrough_base_url(
-                {"api-key": "azure-key", "x-headroom-base-url": "https://azure.example/openai/"}
-            )
-            == "https://azure.example/openai"
+    # A caller-named upstream is the route's business, never this helper's.
+    assert (
+        runtime.select_passthrough_base_url(
+            {"api-key": "azure-key", "x-headroom-base-url": "https://azure.example/openai/"}
         )
+        == "https://openai.example"
+    )
     assert runtime.select_passthrough_base_url({}) == "https://openai.example"
 
 

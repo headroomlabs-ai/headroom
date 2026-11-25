@@ -769,6 +769,7 @@ class TestProxyClientRefCounting:
         monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: next(checks))
+        monkeypatch.setattr(wrap_mod, "_is_headroom_proxy_pid", lambda _pid, _port: True)
         monkeypatch.setattr(
             wrap_mod.subprocess,
             "run",
