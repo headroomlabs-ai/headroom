@@ -467,3 +467,23 @@ def test_the_env_mapping_wins_over_models_json_in_any_case(
 
     assert get_tokenizer("my-alias").encoding_name == "cl100k_base"
     assert OpenAIProvider().get_token_counter("MY-ALIAS")._encoding.name == "cl100k_base"
+
+
+def test_an_unknown_configured_encoding_only_affects_its_own_alias_in_the_provider(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry estimated such an alias; the provider raised ValueError."""
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"openai": {"encodings": {ALIAS: "cl100k_base", "typo-alias": "cl100k_bsae"}}}),
+    )
+    provider = OpenAIProvider()
+
+    provider_counter = provider.get_token_counter("typo-alias")
+    registry_counter = get_tokenizer("typo-alias")
+    assert isinstance(provider_counter, EstimatingTokenCounter), repr(provider_counter)
+    assert isinstance(registry_counter, EstimatingTokenCounter), repr(registry_counter)
+    assert provider_counter.count_messages(MESSAGES) == registry_counter.count_messages(MESSAGES)
+
+    assert provider.get_token_counter(ALIAS)._encoding.name == "cl100k_base"
+    assert provider.get_token_counter("gpt-4o")._encoding.name == "o200k_base"

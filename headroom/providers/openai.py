@@ -489,7 +489,10 @@ class OpenAIProvider(Provider):
                     self._token_counters[model] = OpenAITokenCounter(
                         model=model, custom_encodings=self._encodings
                     )
-                except TiktokenLoadError as exc:
+                except (TiktokenLoadError, ValueError) as exc:
+                    # ValueError: tiktoken does not know the encoding name, e.g.
+                    # a typo in a configured mapping. Estimate for this model
+                    # only, as the tokenizer registry does.
                     logger.warning(
                         "tiktoken unavailable for %s (%s); using estimation.", model, exc
                     )
