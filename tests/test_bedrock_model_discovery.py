@@ -24,6 +24,7 @@ _PROFILES = {
     "claude-haiku-4-5-20251001": "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
     "claude-haiku-4-5-20250601": "bedrock/us.anthropic.claude-haiku-4-5-20250601-v1:0",
     "claude-sonnet-4-6": "bedrock/global.anthropic.claude-sonnet-4-6",
+    "claude-opus-4-1-20250805": "bedrock/us.anthropic.claude-opus-4-1-20250805-v1:0",
 }
 
 _ANTHROPIC_HEADERS = {"x-api-key": "placeholder", "anthropic-version": "2023-06-01"}
@@ -44,6 +45,11 @@ def test_undated_name_maps_to_the_newest_dated_bedrock_profile() -> None:
         == "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
     )
     assert backend.map_model_id("claude-sonnet-4-6") == "bedrock/global.anthropic.claude-sonnet-4-6"
+
+
+def test_a_version_number_is_not_mistaken_for_a_snapshot_date() -> None:
+    # "claude-sonnet-4" must not silently become "claude-sonnet-4-6".
+    assert "sonnet-4-6" not in _bedrock_backend().map_model_id("claude-sonnet-4")
 
 
 def _client(backend: LiteLLMBackend | None):
@@ -68,6 +74,14 @@ def test_model_list_is_answered_from_bedrock_without_an_upstream_call() -> None:
         ):
             listed = client.get("/v1/models", headers=_ANTHROPIC_HEADERS)
             one = client.get("/v1/models/claude-sonnet-4-6", headers=_ANTHROPIC_HEADERS)
+            alias = client.get("/v1/models/claude-haiku-4-5", headers=_ANTHROPIC_HEADERS)
+            long_context = client.get(
+                "/v1/models/claude-sonnet-4-6[1m]", headers=_ANTHROPIC_HEADERS
+            )
+            first = client.get("/v1/models?limit=2", headers=_ANTHROPIC_HEADERS).json()
+            rest = client.get(
+                f"/v1/models?limit=2&after_id={first['last_id']}", headers=_ANTHROPIC_HEADERS
+            ).json()
             missing = client.get("/v1/models/claude-opus-9", headers=_ANTHROPIC_HEADERS)
     finally:
         client.__exit__(None, None, None)
@@ -76,6 +90,9 @@ def test_model_list_is_answered_from_bedrock_without_an_upstream_call() -> None:
     assert [m["id"] for m in listed.json()["data"]] == sorted(_PROFILES)
     assert one.status_code == 200 and one.json()["id"] == "claude-sonnet-4-6"
     assert missing.status_code == 404
+    assert alias.status_code == 200 and long_context.status_code == 200
+    assert [m["id"] for m in first["data"]] == sorted(_PROFILES)[:2] and first["has_more"]
+    assert [m["id"] for m in rest["data"]] == sorted(_PROFILES)[2:] and not rest["has_more"]
 
 
 def test_model_list_without_bedrock_still_passes_through() -> None:

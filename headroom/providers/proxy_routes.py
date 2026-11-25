@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
+from headroom.backends.base import newest_snapshot
 from headroom.log_safety import redact_url
+from headroom.providers.anthropic import sanitize_anthropic_model_id
 from headroom.providers.cloudcode import (
     cloudcode_passthrough_target,
     normalize_cloudcode_passthrough_path,
@@ -677,19 +680,34 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             "created_at": "1970-01-01T00:00:00Z",
         }
 
+    def _anthropic_model_page(ids: list[str], params: Mapping[str, str]) -> dict[str, Any]:
+        # Anthropic's list paging: ``limit`` (default 20, 1-1000), and cursors
+        # ``after_id`` / ``before_id`` naming a model id.
+        try:
+            limit = min(max(int(params.get("limit", "20")), 1), 1000)
+        except ValueError:
+            limit = 20
+        start, end = 0, len(ids)
+        if params.get("after_id") in ids:
+            start = ids.index(params["after_id"]) + 1
+        if params.get("before_id") in ids:
+            end = ids.index(params["before_id"])
+            start = max(start, end - limit)
+        page = ids[start:end][:limit]
+        return {
+            "data": [_anthropic_model_entry(m) for m in page],
+            # More pages in the direction being paged.
+            "has_more": start > 0 if "before_id" in params else start + len(page) < end,
+            "first_id": page[0] if page else None,
+            "last_id": page[-1] if page else None,
+        }
+
     @app.get("/v1/models")
     async def list_models(request: Request):
         provider_name, base_url = await _model_metadata_route(request)
         bedrock_ids = _bedrock_model_ids(request, provider_name)
         if bedrock_ids is not None:
-            return JSONResponse(
-                {
-                    "data": [_anthropic_model_entry(m) for m in bedrock_ids],
-                    "has_more": False,
-                    "first_id": bedrock_ids[0] if bedrock_ids else None,
-                    "last_id": bedrock_ids[-1] if bedrock_ids else None,
-                }
-            )
+            return JSONResponse(_anthropic_model_page(bedrock_ids, request.query_params))
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -703,7 +721,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         provider_name, base_url = await _model_metadata_route(request)
         bedrock_ids = _bedrock_model_ids(request, provider_name)
         if bedrock_ids is not None:
-            if model_id in bedrock_ids:
+            # Same names inference accepts: a "[1m]" context suffix and an
+            # undated alias of a listed snapshot.
+            clean_id = sanitize_anthropic_model_id(model_id)
+            if clean_id in bedrock_ids or newest_snapshot(clean_id, bedrock_ids):
                 return JSONResponse(_anthropic_model_entry(model_id))
             return JSONResponse(
                 {

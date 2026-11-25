@@ -25,7 +25,7 @@ from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
-from .base import Backend, BackendResponse, StreamEvent
+from .base import Backend, BackendResponse, StreamEvent, newest_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -973,14 +973,9 @@ class LiteLLMBackend(Backend):
             # Undated alias ("claude-haiku-4-5") for a model Bedrock only lists
             # dated ("claude-haiku-4-5-20251001"): use the newest snapshot.
             # Without this the fallback below builds an ID Bedrock rejects.
-            if normalized:
-                dated = [
-                    key
-                    for key in self._model_map
-                    if key.startswith(f"{normalized}-") and key[len(normalized) + 1 :].isdigit()
-                ]
-                if dated:
-                    return self._model_map[max(dated)]
+            snapshot = newest_snapshot(normalized, self._model_map) if normalized else None
+            if snapshot:
+                return self._model_map[snapshot]
 
             # Bedrock fallback: construct a valid region-prefixed model ID.
             # Without this, bare model names like "claude-sonnet-4-20250514"
