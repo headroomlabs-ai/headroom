@@ -451,6 +451,97 @@ class TestMarkdownSectionMerge:
                 id="html-span-after-escaped-link-reference",
             ),
             pytest.param(
+                "## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-multiline-link-destination",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]:\n  /u((a))\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[ref]:\n  /u((a))\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-nested-paren-link-destination",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]:\n  /url(foo\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[ref]:\n  /url(foo\n<span>\nExample text\n- new\n"
+                "## Example\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-unbalanced-link-destination",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]: /url\\ x\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[ref]: /url\\ x\n<span>\nExample text\n- new\n"
+                "## Example\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-escaped-space-link-destination",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]: /url\n(a(b)\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[ref]: /url\n(a(b)\n<span>\nExample text\n- new\n"
+                "## Example\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-unbalanced-link-title",
+            ),
+            pytest.param(
+                '## Facts\n- a\n\n[ref]: /url\n  "Title"\n<span>\nExample text\n'
+                "## Example\n</span>\n\nNotes resume here.\n",
+                '## Facts\n- a\n\n[ref]: /url\n  "Title"\n<span>\nExample text\n'
+                "## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-next-line-link-title",
+            ),
+            pytest.param(
+                '## Facts\n- a\n\n[ref]: /url "Title\ncontinues"\n<span>\nExample text\n'
+                "## Example\n</span>\n\nNotes resume here.\n",
+                '## Facts\n- a\n\n[ref]: /url "Title\ncontinues"\n<span>\nExample text\n'
+                "## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-multiline-link-title",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[multi\nline]: /url\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[multi\nline]: /url\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n- new\n",
+                id="html-span-after-multiline-link-label",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]:\ntwo words\n<span>\nExample text\n## Example\n"
+                "</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[ref]:\ntwo words\n<span>\nExample text\n- new\n"
+                "## Example\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-invalid-link-definition",
+            ),
+            pytest.param(
+                '## Facts\n- a\n\n[ref]: /url "Title\n## Example\ncontinued"\n<span>\n'
+                "Example text\n## Inner\n</span>\n\nNotes resume here.\n",
+                '## Facts\n- a\n\n[ref]: /url "Title\n- new\n## Example\ncontinued"\n'
+                "<span>\nExample text\n## Inner\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-link-title-cut-by-heading",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[multi\n## Example\nlabel]: /url\n<span>\nExample text\n"
+                "## Inner\n</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[multi\n- new\n## Example\nlabel]: /url\n<span>\n"
+                "Example text\n## Inner\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-link-label-cut-by-heading",
+            ),
+            pytest.param(
+                '## Facts\n- a\n\n[ref]: /url "Title\n   ## Example\ncontinued"\n<span>\n'
+                "Example text\n## Inner\n</span>\n\nNotes resume here.\n",
+                '## Facts\n- a\n\n[ref]: /url "Title\n   ## Example\ncontinued"\n<span>\n'
+                "Example text\n- new\n## Inner\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-link-title-cut-by-indented-heading",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[multi\n##\nlabel]: /url\n<span>\nExample text\n"
+                "## Inner\n</span>\n\nNotes resume here.\n",
+                "## Facts\n- a\n\n[multi\n##\nlabel]: /url\n<span>\nExample text\n"
+                "- new\n## Inner\n</span>\n\nNotes resume here.\n",
+                id="html-span-after-link-label-cut-by-empty-heading",
+            ),
+            pytest.param(
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n## Real Updates\n- real\n",
                 "## Facts\n- a\n````sh\n```\n## Updates\n- fenced\n`````\n- new\n"
                 "## Real Updates\n- real\n",

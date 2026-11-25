@@ -53,8 +53,11 @@ logger = logging.getLogger(__name__)
 
 # Same heading rule as the bridge parsers, so exported bullets re-import under their topic.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_ATX_HEADING_START_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _THEMATIC_BREAK_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+_BLOCK_QUOTE_RE = re.compile(r"^ {0,3}>")
+_LIST_ITEM_INTERRUPT_RE = re.compile(r"^ {0,3}(?:[-+*]|1[.)])[ \t]+\S")
 _HTML_BLOCK_TAGS = (
     "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
     "dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|"
@@ -90,14 +93,59 @@ _SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 _NO_PARAGRAPH_RE = re.compile(
     r"^(?: {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]*"  # empty list item
     r"|(?: {4}| {0,3}\t).*"  # indented code
-    r"| {0,3}\[(?:\\.|[^\]\\])+\]:[ \t]*"  # link reference label
-    r"(?:<(?:\\.|[^>\\\n])*>|\S+)"  # destination
-    r"(?:[ \t]+(?:"  # optional title
-    r'"(?:\\.|[^"\\])*"'
-    r"|'(?:\\.|[^'\\])*'"
-    r"|\((?:\\.|[^)\\])*\)))?"
-    r"[ \t]*)$"
+    r")$"
 )
+_LINK_REFERENCE_DEFINITION_RE = re.compile(
+    r"""^[ ]{0,3}\[
+    (?=(?:\\[^\n]|[^\[\]\\])*(?:\\[^\n]|[^\s\[\]\\])
+       (?:\\[^\n]|[^\[\]\\])*\]:)
+    (?:\\[^\n]|[^\[\]\\])+\]:[ \t]*(?:\n[ \t]*)?
+    (?:
+        <(?:\\[^\n]|[^<>\\\n])*>
+      | (?P<bare>(?!<)(?:\\[()]|[^\s\x00-\x1f\x7f])+)
+    )
+    (?:
+        (?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)
+        (?:"(?:\\[^\n]|[^"\\])*"|'(?:\\[^\n]|[^'\\])*'|
+           \((?:\\[^\n]|[^()\\])*\))[ \t]*(?=\n|$)
+      | [ \t]*(?=\n|$)
+    )""",
+    re.VERBOSE,
+)
+
+
+def _balanced_link_destination(destination: str) -> bool:
+    """Return whether a bare link destination has balanced parentheses."""
+    depth = 0
+    index = 0
+    while index < len(destination):
+        character = destination[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "(":
+            depth += 1
+            if depth > 32:
+                return False
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+        index += 1
+    return depth == 0
+
+
+def _interrupts_reference_candidate(line: str) -> bool:
+    """Return whether line terminates a possible link reference definition."""
+    return (
+        not line.strip()
+        or _ATX_HEADING_START_RE.match(line) is not None
+        or _THEMATIC_BREAK_RE.match(line) is not None
+        or _FENCE_RE.match(line) is not None
+        or _BLOCK_QUOTE_RE.match(line) is not None
+        or _LIST_ITEM_INTERRUPT_RE.match(line) is not None
+        or any(start.match(line) for start, _ in _HTML_BLOCKS)
+    )
 
 
 def _markdown_structure(
@@ -108,8 +156,11 @@ def _markdown_structure(
     block: tuple[re.Pattern[str], int, bool] | None = None
     blank_line_block_ends: set[int] = set()
     in_paragraph = False
+    reference_end = -1
 
     for index, original_line in enumerate(lines):
+        if index <= reference_end:
+            continue
         line = original_line.removesuffix("\r")
         if block is not None:
             end_pattern, _, ends_at_blank_line = block
@@ -137,6 +188,26 @@ def _markdown_structure(
                 in_paragraph = False
                 break
         else:
+            if not in_paragraph and re.match(r"^ {0,3}\[", line):
+                candidate_end = next(
+                    (
+                        i
+                        for i in range(index + 1, len(lines))
+                        if _interrupts_reference_candidate(lines[i].removesuffix("\r"))
+                    ),
+                    len(lines),
+                )
+                candidate = "\n".join(
+                    item.removesuffix("\r") for item in lines[index:candidate_end]
+                )
+                reference_match = _LINK_REFERENCE_DEFINITION_RE.match(candidate)
+                if reference_match and (
+                    reference_match.group("bare") is None
+                    or _balanced_link_destination(reference_match.group("bare"))
+                ):
+                    reference_end = index + reference_match.group().count("\n")
+                    in_paragraph = False
+                    continue
             if not in_paragraph and _HTML_TYPE_7_RE.match(line):
                 block = (_HTML_BLOCKS[-1][1], index, True)
                 in_paragraph = False
