@@ -747,6 +747,82 @@ def test_owner_accepts_equivalent_paths(tmp_path, monkeypatch) -> None:
     assert len(json.loads(second._backend.path.read_text(encoding="utf-8"))["patterns"]) == 2
 
 
+def test_archiving_the_rollback_copy_keeps_the_migrated_store(tmp_path) -> None:
+    """The write-target decision must survive the rollback copy being archived.
+
+    A configured name that already looks versioned (``toin.v3.json``) holding
+    legacy data migrates to a ``.v3`` sibling. If the decision depended on the
+    configured file still existing, archiving that rollback copy would make
+    the next start open a fresh store at the configured name and orphan the
+    learned history in the sibling.
+    """
+    path = tmp_path / "toin.v3.json"
+    data = _saved_store(path, 2)
+    data["version"] = "2.0"
+    path.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+
+    first = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+    assert len(first._patterns) == 2
+    first.save()
+    migrated = first._backend.path
+    assert migrated != path
+
+    # Operator archives the rollback copy.
+    archived = tmp_path / "archive" / path.name
+    archived.parent.mkdir()
+    path.rename(archived)
+
+    second = ToolIntelligenceNetwork(TOINConfig(storage_path=str(path), auto_save_interval=0))
+    assert second._backend.path == migrated
+    assert len(second._patterns) == 2
+    _record(second, 99)
+    second.save()
+    assert len(json.loads(migrated.read_text(encoding="utf-8"))["patterns"]) == 3
+    # The configured name stays the rollback view: not rewritten, not recreated.
+    assert not path.exists()
+
+
+def test_version_probe_respects_the_size_limit(tmp_path) -> None:
+    """Startup must not parse an oversized version-named store to probe it."""
+    path = tmp_path / "toin.v3.json"
+    path.write_text(json.dumps({"version": "2.0", "patterns": {}}), encoding="utf-8")
+    path.write_bytes(path.read_bytes() + b" " * 10_000)
+
+    backend = FileSystemTOINBackend(str(path), max_load_bytes=100, store_version="3.0")
+
+    # Oversized candidate: left in place for the regular load guard to skip,
+    # not parsed in the constructor and not migrated to a sibling.
+    assert backend.path == path
+    assert backend._pre_upgrade_path is None
+    assert backend.load() == {}
+    assert path.exists()
+
+
+def test_save_replaces_a_symlink_without_orphaning_the_store(tmp_path) -> None:
+    """An atomic save replaces the link, so the owner token must name the link.
+
+    ``_owner`` used to resolve through the symlink to its target; the save
+    replaced the link with a regular file stamped with the target's token and
+    the next start rejected its own store.
+    """
+    target = tmp_path / "store.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "toin.json"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation unavailable on this platform/user")
+
+    first = ToolIntelligenceNetwork(TOINConfig(storage_path=str(link), auto_save_interval=0))
+    _record(first, 0)
+    first.save()
+
+    # The link was replaced by a regular file at the configured name.
+    assert link.is_symlink() is False
+    restarted = ToolIntelligenceNetwork(TOINConfig(storage_path=str(link), auto_save_interval=0))
+    assert restarted._patterns  # own store accepted, not rejected as foreign
+
+
 def test_filesystem_backend_writes_compact_json(tmp_path) -> None:
     path = tmp_path / "toin.json"
     FileSystemTOINBackend(str(path)).save({"patterns": {"a": {"value": 1}}})

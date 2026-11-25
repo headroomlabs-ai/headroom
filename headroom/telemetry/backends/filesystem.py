@@ -83,9 +83,13 @@ class FileSystemTOINBackend:
         # Two backends configured at different paths (``toin.json`` and
         # ``toin.v3.json``) can derive to the same versioned write target;
         # stamping the owner lets save() refuse to clobber another proxy's
-        # store instead of silently overwriting it.
+        # store instead of silently overwriting it. The parent directory is
+        # canonicalized but the final filename is kept verbatim: an atomic
+        # save replaces the file *at the configured name* (a symlink is
+        # replaced, not followed), so the token must identify that name,
+        # not the link target a previous store may have lived at.
         self._configured_path = self._path
-        self._owner = self._path.resolve()
+        self._owner = self._configured_path.parent.resolve() / self._configured_path.name
         self._store_version: str | None = None
         if store_version:
             self.configure_version(store_version)
@@ -98,19 +102,56 @@ class FileSystemTOINBackend:
             raise ValueError("TOIN backend already configured for a different version")
         self._store_version = store_version
         self._path, self._pre_upgrade_path = _version_paths(self._configured_path, store_version)
-        # A version-like filename may predate the layout version. Never
-        # overwrite an existing legacy store merely because of its name.
-        if self._pre_upgrade_path is None and self._path.exists():
-            try:
-                with open(self._path, encoding="utf-8") as f:
-                    version = json.load(f).get("version", "1.0")
-            except (OSError, ValueError, AttributeError):
-                version = None
-            if version in ("1.0", "2.0"):
-                self._pre_upgrade_path = self._path
-                self._path = self._path.with_name(
-                    self._path.name + f".v{store_version.split('.', 1)[0]}"
-                )
+        if self._pre_upgrade_path is not None:
+            return
+        # The configured name already carries the version (``toin.v3.json``).
+        # It may still hold a pre-upgrade layout — an operator who pointed
+        # HEADROOM_TOIN_PATH at a legacy file named like the new one — so the
+        # write target is decided from what is on disk. The decision must not
+        # depend on the configured file's presence: an operator who archives
+        # the rollback copy after the first migration must land on the same
+        # migrated store on restart, not open a fresh store at the configured
+        # name.
+        sibling = self._path.with_name(self._path.name + f".v{store_version.split('.', 1)[0]}")
+        if self._migrated_store_exists(sibling):
+            self._pre_upgrade_path = self._path
+            self._path = sibling
+            return
+        # Never overwrite an existing legacy store merely because of its name.
+        # The probe respects the load limit: an oversized store must be
+        # skipped by the regular load guard, not parsed here at startup.
+        if self._probe_version(self._path) in ("1.0", "2.0"):
+            self._pre_upgrade_path = self._path
+            self._path = sibling
+
+    def _probe_version(self, path: Path) -> str | None:
+        """Read a store's layout version, or None when unreadable or oversized."""
+        try:
+            if self._max_load_bytes is not None and path.stat().st_size > self._max_load_bytes:
+                return None
+            with open(path, encoding="utf-8") as f:
+                version: Any = json.load(f).get("version", "1.0")
+                return version if isinstance(version, str) else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def _migrated_store_exists(self, path: Path) -> bool:
+        """True when ``path`` holds a readable store this configured path owns.
+
+        A store with no ``owner`` key predates the ownership stamp and is
+        accepted, matching ``_refuse_foreign_store``.
+        """
+        try:
+            if self._max_load_bytes is not None and path.stat().st_size > self._max_load_bytes:
+                return False
+            with open(path, encoding="utf-8") as f:
+                existing = json.load(f)
+        except (OSError, ValueError, AttributeError):
+            return False
+        if not isinstance(existing, dict):
+            return False
+        owner = existing.get("owner")
+        return not isinstance(owner, str) or not owner or owner == self._owner_token()
 
     def _read_path(self) -> Path:
         """Path to load: this version's store, else the pre-upgrade one."""
