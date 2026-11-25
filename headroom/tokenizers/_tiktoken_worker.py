@@ -20,7 +20,7 @@ from typing import Any
 
 import tiktoken
 
-from headroom.offline import guard_egress
+from headroom.offline import OfflineEgressBlocked, guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -352,15 +352,24 @@ def _load(mode: str, encoding_name: str) -> dict[str, Any]:
     return {"status": "ok", **_encoding_payload(_build_encoding_from_cache(encoding_name))}
 
 
+def _write_result(out_path: str, result: dict[str, Any]) -> None:
+    with open(out_path, "wb") as f:
+        pickle.dump(result, f)
+
+
 def main(argv: list[str]) -> int:
     """Entry point: write the load result to ``argv[2]`` as a pickled dict."""
     mode, encoding_name, out_path = argv
     try:
         result = _load(mode, encoding_name)
+    except OfflineEgressBlocked:
+        # An air-gap refusal is a policy decision, not "loading failed": report it
+        # and let it reach the caller instead of degrading it to an error.
+        _write_result(out_path, {"status": "offline_blocked"})
+        raise
     except BaseException as exc:  # noqa: BLE001 - reported to the parent verbatim
         result = {"status": "error", "error": str(exc)}
-    with open(out_path, "wb") as f:
-        pickle.dump(result, f)
+    _write_result(out_path, result)
     return 0 if result["status"] == "ok" else 1
 
 

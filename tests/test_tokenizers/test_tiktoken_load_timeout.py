@@ -29,22 +29,25 @@ from headroom.tokenizers._tiktoken_worker import _encoding_payload
 from headroom.tokenizers.estimator import EstimatingTokenCounter
 from headroom.tokenizers.registry import TokenizerRegistry
 
+# Held directly: a test that swaps tc._get_encoding must not break teardown.
+_CACHED_GET_ENCODING = tc._get_encoding
+
 
 @pytest.fixture(autouse=True)
 def _reset_encoding_state():
     import tiktoken
 
-    tc._get_encoding.cache_clear()
-    tc._download_failed.clear()
-    tc._disk_load_permanently_failed.clear()
-    tc._cooldown_until.clear()
-    tiktoken.registry.ENCODINGS.clear()
+    def reset() -> None:
+        _CACHED_GET_ENCODING.cache_clear()
+        tc._download_failed.clear()
+        tc._cooldown_until.clear()
+        tiktoken.registry.ENCODINGS.clear()
+        # A counter cached by an earlier test would answer instead of load_encoding.
+        TokenizerRegistry.clear_cache()
+
+    reset()
     yield
-    tc._get_encoding.cache_clear()
-    tc._download_failed.clear()
-    tc._disk_load_permanently_failed.clear()
-    tc._cooldown_until.clear()
-    tiktoken.registry.ENCODINGS.clear()
+    reset()
 
 
 def _synthetic_payload(encoding_name: str) -> dict:
@@ -145,6 +148,7 @@ def test_failed_encoding_allows_retry_after_cooldown(
 
     time.sleep(0.1)  # let the cooldown expire
     _stub_worker(monkeypatch, _synthetic_payload("retry-enc"))
+    monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "5")
 
     enc = tc.load_encoding("retry-enc")
     assert isinstance(enc, tiktoken.Encoding)
@@ -259,6 +263,156 @@ def test_estimator_is_not_cached_so_model_can_recover(monkeypatch: pytest.Monkey
     assert isinstance(first, EstimatingTokenCounter)
     assert isinstance(second, EstimatingTokenCounter)
     assert len(calls) == 2, "estimator was cached; the model can never recover"
+
+
+def test_offline_miss_cools_down_instead_of_spawning_each_call(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A miss costs one subprocess, not one per request."""
+    marker = tmp_path / "spawns.txt"
+    blob = pickle.dumps({"status": "not_cached"}).hex()
+    script = (
+        "import pickle,sys;"
+        f"open({str(marker)!r}, 'a').write('x');"
+        "pickle.dump(pickle.loads(bytes.fromhex(sys.argv[1])), open(sys.argv[2], 'wb'))"
+    )
+    monkeypatch.setattr(
+        tc,
+        "_worker_cmd",
+        lambda mode, name, out: [sys.executable, "-c", script, blob, out],
+    )
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path / "cache"))
+
+    for _ in range(3):
+        with pytest.raises(tc.TiktokenLoadError):
+            tc.load_encoding("cl100k_base")
+
+    assert marker.read_text() == "x", "a request loop spawned a child per call"
+
+
+def test_deadline_covers_parent_reconstruction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The budget covers the rebuild in the parent, not just the child."""
+    import tiktoken
+
+    payload = _synthetic_payload("slow-enc")
+    _stub_worker(monkeypatch, payload)  # child answers instantly
+    monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "1.0")
+
+    real_encoding = tiktoken.Encoding
+
+    def _slow_constructor(*args, **kwargs):
+        time.sleep(1.5)
+        return real_encoding(*args, **kwargs)
+
+    monkeypatch.setattr(tiktoken, "Encoding", _slow_constructor)
+
+    start = time.perf_counter()
+    with pytest.raises(tc.TiktokenLoadError, match="did not load within"):
+        tc.load_encoding("slow-enc")
+    assert time.perf_counter() - start < 2.5
+
+
+def test_online_download_times_out_with_empty_cache_dir(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No disk cache at all: the download phase is the try that has to be bounded."""
+    modes = tmp_path / "modes.txt"
+    script = (
+        "import pickle,sys,time;"
+        f"open({str(modes)!r}, 'a').write(sys.argv[1] + chr(10));"
+        "time.sleep(30) if sys.argv[1] == 'download' else None;"
+        "pickle.dump({'status': 'not_cached'}, open(sys.argv[3], 'wb'))"
+    )
+    monkeypatch.setattr(
+        tc,
+        "_worker_cmd",
+        lambda mode, name, out: [sys.executable, "-c", script, mode, name, out],
+    )
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", "")
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "1.0")
+
+    start = time.perf_counter()
+    with pytest.raises(tc.TiktokenLoadError, match="download timed out"):
+        tc.load_encoding("cl100k_base")
+    assert time.perf_counter() - start < 2.5
+    assert modes.read_text().split() == ["cache", "download"], "did not take the download path"
+    assert tc._download_failed == set(), "a timeout is not a download failure"
+    assert tc._cooldown_until["cl100k_base"] > time.monotonic()
+
+    with pytest.raises(tc.TiktokenLoadError, match="retrying after cooldown"):
+        tc.load_encoding("cl100k_base")
+    assert modes.read_text().split() == ["cache", "download"], "cooldown did not stop a third child"
+
+
+def test_worker_boundary_reports_offline_refusal(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The child must not degrade an air-gap refusal into a generic load error."""
+    import subprocess
+
+    out = tmp_path / "out.pickle"
+    env = tc._worker_env()
+    env["HEADROOM_OFFLINE"] = "1"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "headroom.tokenizers._tiktoken_worker",
+            "download",
+            "cl100k_base",
+            str(out),
+        ],
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert pickle.loads(out.read_bytes())["status"] == "offline_blocked"
+
+
+def test_claude_fallback_is_provisional_and_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Claude's estimator must not outlive the vocabulary's availability."""
+    import tiktoken
+
+    from headroom.tokenizers.tiktoken_counter import TiktokenCounter
+
+    payload = _synthetic_payload("o200k_base")
+    real_encoding = tiktoken.Encoding(
+        name=payload["name"],
+        pat_str=payload["pat_str"],
+        mergeable_ranks=payload["mergeable_ranks"],
+        special_tokens=payload["special_tokens"],
+    )
+    state = {"loaded": False}
+
+    def fake_load(name: str):
+        if not state["loaded"]:
+            raise tc.TiktokenLoadError("vocab stalled")
+        return real_encoding
+
+    monkeypatch.setattr(tc, "load_encoding", fake_load)
+    monkeypatch.setattr(tc, "_get_encoding", fake_load)  # TiktokenCounter loads through this
+
+    assert isinstance(TokenizerRegistry.get("claude-3-5-sonnet"), EstimatingTokenCounter)
+
+    state["loaded"] = True
+    assert isinstance(TokenizerRegistry.get("gpt-4o"), TiktokenCounter)  # vocab recovered
+
+    recovered = TokenizerRegistry.get("claude-3-5-sonnet")
+    assert isinstance(recovered, TiktokenCounter), "Claude kept the estimator after recovery"
+
+
+def test_parent_propagates_the_worker_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refusal reaches the caller as a refusal, not as a load failure."""
+    from headroom.offline import OfflineEgressBlocked
+
+    _stub_worker(monkeypatch, {"status": "offline_blocked"})
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", "")
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+
+    with pytest.raises(OfflineEgressBlocked):
+        tc.load_encoding("cl100k_base")
 
 
 def test_offline_warm_cache_works_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -425,14 +579,15 @@ def test_disk_load_miss_retryable_offline(monkeypatch: pytest.MonkeyPatch) -> No
         with pytest.raises(tc.TiktokenLoadError) as exc_info:
             tc.load_encoding("cl100k_base")
         assert "not in local cache and HEADROOM_OFFLINE=1" in str(exc_info.value)
-        assert "cl100k_base" not in tc._disk_load_permanently_failed
         assert "cl100k_base" not in tc._download_failed
+        assert tc._cooldown_until["cl100k_base"] > time.monotonic()
 
         monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
         tiktoken.get_encoding("cl100k_base")
         monkeypatch.setenv("HEADROOM_OFFLINE", "1")
         tiktoken.registry.ENCODINGS.clear()
         tc._get_encoding.cache_clear()
+        del tc._cooldown_until["cl100k_base"]  # the miss cooldown expires in real use
 
         enc2 = tc.load_encoding("cl100k_base")
         assert enc2.name == "cl100k_base"

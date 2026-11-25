@@ -434,7 +434,11 @@ class TokenizerRegistry:
                 load_encoding("o200k_base")
             except TiktokenLoadError:
                 logger.info("tiktoken o200k_base unavailable for %s; using char estimator", model)
-                return EstimatingTokenCounter(chars_per_token=3.5)
+                estimator = EstimatingTokenCounter(chars_per_token=3.5)
+                # Provisional: not cached by get(), so a vocabulary that loads
+                # later (after its cooldown) is picked up without a restart.
+                estimator._provisional = True
+                return estimator
             return TiktokenCounter(model, encoding="o200k_base")
         except Exception:  # pragma: no cover - defensive; keep counting alive
             return EstimatingTokenCounter(chars_per_token=3.5)
