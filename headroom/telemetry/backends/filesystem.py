@@ -38,7 +38,15 @@ def _version_paths(path: Path, store_version: str) -> tuple[Path, Path | None]:
     major = store_version.split(".", 1)[0]
     versioned_marker = f".v{major}"
     versioned_suffix = f"{versioned_marker}{path.suffix}"
-    if path.name.endswith(versioned_marker) or path.name.endswith(versioned_suffix):
+    # Case-insensitive platforms spell one directory entry many ways, and the
+    # owner identity is case-normalized there — so the version check must be
+    # too, or ``TOIN.V3.JSON`` would derive a different write target while
+    # sharing ``toin.v3.json``'s owner. ``normcase`` is the identity on
+    # case-sensitive filesystems, keeping those comparisons exact.
+    name = os.path.normcase(path.name)
+    if name.endswith(os.path.normcase(versioned_marker)) or name.endswith(
+        os.path.normcase(versioned_suffix)
+    ):
         # The caller already named the versioned file (e.g. ``toin.v3.json``).
         # Write it in place and do not treat the unversioned sibling as a
         # pre-upgrade source: ``toin.json`` and ``toin.v3.json`` must stay
@@ -130,6 +138,15 @@ class FileSystemTOINBackend:
         # the sibling: the configured file is preserved untouched as the
         # rollback view (or an oversized archive), and fresh learning lands in
         # an ownership-checked sibling the next start rediscovers.
+        #
+        # An oversized store may in fact already be at this layout version —
+        # its version cannot be checked without the parse the size limit
+        # forbids. Redirecting then forks the history: the oversized original
+        # keeps the older records and the sibling receives the new ones. That
+        # is still strictly better than the alternative (every write refused,
+        # all new learning lost on restart), and it is recoverable: once the
+        # load limit is raised, moving the sibling aside lets the next start
+        # read the original store again.
         if self._oversized(self._path) or self._probe_version(self._path) in ("1.0", "2.0"):
             self._pre_upgrade_path = self._path
             self._path = sibling

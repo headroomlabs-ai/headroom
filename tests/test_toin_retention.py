@@ -847,6 +847,30 @@ def test_oversized_legacy_store_preserves_old_data_and_persists_new_learning(
     }
 
 
+def test_case_alias_spelling_shares_one_store(tmp_path) -> None:
+    """On a case-insensitive volume, a case-alias spelling must not fork the store.
+
+    The owner identity is case-normalized there, so the version check has to
+    be as well: ``TOIN.V3.JSON`` must be recognized as already versioned and
+    resolve to the same owner as ``toin.v3.json``. On a case-sensitive
+    filesystem the spellings are genuinely different files and stay distinct.
+    """
+    lower = tmp_path / "toin.v3.json"
+    lower.write_text(json.dumps({"version": "3.0", "patterns": {}}), encoding="utf-8", newline="\n")
+    (tmp_path / "case_probe").write_text("x", encoding="utf-8")
+    if not (tmp_path / "CASE_PROBE").exists():
+        pytest.skip("case-sensitive filesystem: the alias is a different file by design")
+
+    backend = FileSystemTOINBackend(str(tmp_path / "TOIN.V3.JSON"), store_version="3.0")
+
+    # Recognized as already versioned: written in place, no sibling derived.
+    assert backend.path == tmp_path / "TOIN.V3.JSON"
+    assert backend._pre_upgrade_path is None
+    twin = FileSystemTOINBackend(str(lower), store_version="3.0")
+    assert backend._owner_token() == twin._owner_token()
+    assert twin.load() == {"version": "3.0", "patterns": {}}
+
+
 def test_ownerless_legacy_sibling_is_not_adopted(tmp_path) -> None:
     """A legacy store at the derived sibling belongs to another proxy.
 
