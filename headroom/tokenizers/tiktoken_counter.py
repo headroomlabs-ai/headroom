@@ -139,23 +139,21 @@ def _get_encoding(encoding_name: str):
     except Exception:
         pass
 
-    # Short-circuit: if this encoding previously failed permanently to load from disk (corruption), fail fast
-    if encoding_name in _disk_load_permanently_failed:
-        raise TiktokenLoadError(
-            f"tiktoken encoding {encoding_name!r} previously failed to load from disk cache (corruption)"
-        )
-
-    # Check if this encoding previously failed to DOWNLOAD
+    # Check if this encoding previously failed to DOWNLOAD (permanent failure - network issues)
     if encoding_name in _download_failed:
         raise TiktokenLoadError(
             f"tiktoken encoding {encoding_name!r} previously failed to download"
         )
 
+    # NOTE: _disk_load_failed tracks transient disk load failures (timeout/crash).
+    # These are NOT short-circuited - they remain retryable once vocabulary is available.
+    # _disk_load_permanently_failed tracks corruption/invalid cache - only blocks in offline mode.
+
     # Try to load from disk cache with timeout using multiprocessing (can actually terminate)
     # This moves the cache check AND the load inside the timeout boundary
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
-    proc = ctx.Process(target=_load_encoding_worker, args=(encoding_name, queue), daemon=True)
+    proc = ctx.Process(target=_load_encoding_worker, args=(encoding_name, queue), daemon=False)
     proc.start()
     proc.join(_load_timeout_seconds())
 
@@ -170,8 +168,9 @@ def _get_encoding(encoding_name: str):
             _load_timeout_seconds(),
         )
         # Do NOT add to _download_failed - disk load timeout is retryable
-        # Add to _disk_load_permanently_failed for stalls (unlikely to resolve on retry)
-        _disk_load_permanently_failed.add(encoding_name)
+        # Do NOT add to _disk_load_permanently_failed - timeout is not corruption
+        # Only track in _disk_load_failed for observability
+        _disk_load_failed.add(encoding_name)
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load timed out")
 
     if proc.exitcode != 0:
@@ -203,17 +202,22 @@ def _get_encoding(encoding_name: str):
         tiktoken.registry.ENCODINGS[encoding_name] = enc
         return enc
     elif status == "invalid_cache":
-        # Corrupted cache - permanent failure
-        _disk_load_permanently_failed.add(encoding_name)
-        # If online, try to download fresh; if offline, fail fast (cache-only)
+        # Corrupted cache - permanent failure for offline, but online can repair by downloading
         if is_offline():
+            _disk_load_permanently_failed.add(encoding_name)
             raise TiktokenLoadError(
                 f"tiktoken encoding {encoding_name!r} has invalid cache entry and HEADROOM_OFFLINE=1"
             )
-        # Online: fall through to download attempt
+        # Online: fall through to download attempt (do NOT mark as permanently failed)
+        logger.info(
+            "tiktoken encoding %r has invalid cache entry; attempting online repair",
+            encoding_name,
+        )
         pass
     elif status == "not_cached":
         # Not cached locally - will try download if online
+        # Cache miss is NOT a failure - it's expected on first use or cold cache
+        # Do NOT add to any failure set; retry will work once cache is populated
         pass
     elif status == "error":
         _disk_load_permanently_failed.add(encoding_name)
@@ -240,7 +244,7 @@ def _get_encoding(encoding_name: str):
 def _get_encoding_with_timeout(encoding_name: str, ctx) -> Any:
     """Bounded tiktoken.get_encoding call for online mode with cold cache."""
     queue = ctx.Queue()
-    proc = ctx.Process(target=_download_encoding_worker, args=(encoding_name, queue), daemon=True)
+    proc = ctx.Process(target=_download_encoding_worker, args=(encoding_name, queue), daemon=False)
     proc.start()
     proc.join(_load_timeout_seconds())
 

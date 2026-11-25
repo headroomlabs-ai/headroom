@@ -1305,6 +1305,8 @@ class TokenCountAccuracyResult:
     avg_error_percent: float
     max_error_percent: float
     results: list[dict[str, Any]] = field(default_factory=list)
+    reference_available: bool = True
+    ground_truth_counts: list[int] | None = None
 
     def summary(self) -> str:
         """Generate summary."""
@@ -1345,6 +1347,8 @@ def evaluate_token_counting_accuracy(
     token_counter = TokenCounter(model)
     results = []
     errors = []
+    ground_truth_counts: list[int] = []
+    reference_available = True
 
     for text in test_texts:
         estimated = token_counter.count_text(text)
@@ -1357,9 +1361,12 @@ def evaluate_token_counting_accuracy(
 
             enc = load_encoding("cl100k_base")
             actual = len(enc.encode(text))
+            ground_truth_counts.append(actual)
         except Exception:
             # Fallback: assume estimate is close
             actual = len(text) // 4
+            ground_truth_counts.append(None)
+            reference_available = False
 
         error_percent = abs(estimated - actual) / max(actual, 1) * 100
         errors.append(error_percent)
@@ -1382,6 +1389,8 @@ def evaluate_token_counting_accuracy(
         avg_error_percent=sum(errors) / len(errors) if errors else 0,
         max_error_percent=max(errors) if errors else 0,
         results=results,
+        reference_available=reference_available,
+        ground_truth_counts=ground_truth_counts if reference_available else None,
     )
 
 
