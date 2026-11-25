@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -87,9 +88,16 @@ class FileSystemTOINBackend:
         # canonicalized but the final filename is kept verbatim: an atomic
         # save replaces the file *at the configured name* (a symlink is
         # replaced, not followed), so the token must identify that name,
-        # not the link target a previous store may have lived at.
+        # not the link target a previous store may have lived at. The name
+        # is case-normalized on case-insensitive platforms so a case-only
+        # respelling of HEADROOM_TOIN_PATH stays the same owner there while
+        # remaining distinct on case-sensitive filesystems.
         self._configured_path = self._path
-        self._owner = self._configured_path.parent.resolve() / self._configured_path.name
+        self._owner = Path(
+            os.path.normcase(
+                str(self._configured_path.parent.resolve() / self._configured_path.name)
+            )
+        )
         self._store_version: str | None = None
         if store_version:
             self.configure_version(store_version)
@@ -117,17 +125,26 @@ class FileSystemTOINBackend:
             self._pre_upgrade_path = self._path
             self._path = sibling
             return
-        # Never overwrite an existing legacy store merely because of its name.
-        # The probe respects the load limit: an oversized store must be
-        # skipped by the regular load guard, not parsed here at startup.
-        if self._probe_version(self._path) in ("1.0", "2.0"):
+        # Never overwrite an existing legacy store merely because of its name,
+        # and never parse an oversized one at startup. Both redirect writes to
+        # the sibling: the configured file is preserved untouched as the
+        # rollback view (or an oversized archive), and fresh learning lands in
+        # an ownership-checked sibling the next start rediscovers.
+        if self._oversized(self._path) or self._probe_version(self._path) in ("1.0", "2.0"):
             self._pre_upgrade_path = self._path
             self._path = sibling
+
+    def _oversized(self, path: Path) -> bool:
+        """True when ``path`` exists but exceeds the configured load limit."""
+        try:
+            return self._max_load_bytes is not None and path.stat().st_size > self._max_load_bytes
+        except OSError:
+            return False
 
     def _probe_version(self, path: Path) -> str | None:
         """Read a store's layout version, or None when unreadable or oversized."""
         try:
-            if self._max_load_bytes is not None and path.stat().st_size > self._max_load_bytes:
+            if self._oversized(path):
                 return None
             with open(path, encoding="utf-8") as f:
                 version: Any = json.load(f).get("version", "1.0")
@@ -136,22 +153,25 @@ class FileSystemTOINBackend:
             return None
 
     def _migrated_store_exists(self, path: Path) -> bool:
-        """True when ``path`` holds a readable store this configured path owns.
+        """True when ``path`` holds a store this configured path migrated.
 
-        A store with no ``owner`` key predates the ownership stamp and is
-        accepted, matching ``_refuse_foreign_store``.
+        Positive evidence only: the expected layout version and this path's
+        owner stamp, both written by every save the network performs. An
+        ownerless sibling is a legacy store from a differently configured
+        proxy and must be left alone, not adopted and rewritten.
         """
         try:
-            if self._max_load_bytes is not None and path.stat().st_size > self._max_load_bytes:
+            if self._oversized(path):
                 return False
             with open(path, encoding="utf-8") as f:
                 existing = json.load(f)
         except (OSError, ValueError, AttributeError):
             return False
-        if not isinstance(existing, dict):
-            return False
-        owner = existing.get("owner")
-        return not isinstance(owner, str) or not owner or owner == self._owner_token()
+        return (
+            isinstance(existing, dict)
+            and existing.get("version") == self._store_version
+            and existing.get("owner") == self._owner_token()
+        )
 
     def _read_path(self) -> Path:
         """Path to load: this version's store, else the pre-upgrade one."""

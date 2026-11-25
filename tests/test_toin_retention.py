@@ -782,20 +782,101 @@ def test_archiving_the_rollback_copy_keeps_the_migrated_store(tmp_path) -> None:
     assert not path.exists()
 
 
-def test_version_probe_respects_the_size_limit(tmp_path) -> None:
+def test_version_probe_respects_the_size_limit(tmp_path, monkeypatch) -> None:
     """Startup must not parse an oversized version-named store to probe it."""
-    path = tmp_path / "toin.v3.json"
-    path.write_text(json.dumps({"version": "2.0", "patterns": {}}), encoding="utf-8")
-    path.write_bytes(path.read_bytes() + b" " * 10_000)
+    import headroom.telemetry.backends.filesystem as filesystem
 
+    path = tmp_path / "toin.v3.json"
+    path.write_text(json.dumps({"version": "2.0", "patterns": {}}), encoding="utf-8", newline="\n")
+    path.write_bytes(path.read_bytes() + b" " * 10_000)
+    original = path.read_bytes()
+
+    parsed: list[str] = []
+    real_load = filesystem.json.load
+
+    def counting_load(fp, *args, **kwargs):
+        parsed.append(str(getattr(fp, "name", fp)))
+        return real_load(fp, *args, **kwargs)
+
+    monkeypatch.setattr(filesystem.json, "load", counting_load)
     backend = FileSystemTOINBackend(str(path), max_load_bytes=100, store_version="3.0")
 
-    # Oversized candidate: left in place for the regular load guard to skip,
-    # not parsed in the constructor and not migrated to a sibling.
-    assert backend.path == path
-    assert backend._pre_upgrade_path is None
+    # The oversized candidate was never parsed; writes are redirected to the
+    # ownership-checked sibling and the oversized file is preserved untouched
+    # as the rollback view.
+    assert backend.path != path
+    assert backend._pre_upgrade_path == path
     assert backend.load() == {}
-    assert path.exists()
+    assert path.read_bytes() == original
+    assert not any(name.endswith("toin.v3.json") for name in parsed)
+
+
+def test_oversized_legacy_store_preserves_old_data_and_persists_new_learning(
+    tmp_path,
+) -> None:
+    """An oversized legacy store must not block persistence of fresh records.
+
+    The oversized file is preserved byte-for-byte, new learning is saved to
+    the ownership-checked sibling, and a restart with the same configuration
+    rediscovers that sibling instead of losing the records.
+    """
+    path = tmp_path / "toin.v3.json"
+    data = _saved_store(path, 2)
+    data["version"] = "2.0"
+    path.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    path.write_bytes(path.read_bytes() + b" " * 20_000)
+    original = path.read_bytes()
+
+    # The limit fits a fresh record store but not the padded legacy file.
+    toin = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(path), max_storage_bytes=4000, auto_save_interval=0)
+    )
+    assert toin._patterns == {}  # oversized store not imported
+    _record(toin, 50)
+    toin.save()
+
+    sibling = toin._backend.path
+    assert sibling != path
+    assert path.read_bytes() == original
+    restarted = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(path), max_storage_bytes=4000, auto_save_interval=0)
+    )
+    assert restarted._backend.path == sibling
+    assert _signature(50).structure_hash in {
+        pattern.tool_signature_hash for pattern in restarted._patterns.values()
+    }
+
+
+def test_ownerless_legacy_sibling_is_not_adopted(tmp_path) -> None:
+    """A legacy store at the derived sibling belongs to another proxy.
+
+    Reusing an existing alternate store requires positive evidence of the
+    migration: the expected layout version and this configured path's owner
+    stamp. An ownerless sibling is left untouched and the fresh store is
+    written at the configured name.
+    """
+    configured = tmp_path / "toin.v3.json"
+    sibling = tmp_path / "toin.v3.json.v3"
+    legacy = _saved_store(sibling, 2)
+    legacy["version"] = "2.0"
+    sibling.write_text(json.dumps(legacy), encoding="utf-8", newline="\n")
+    before = sibling.read_bytes()
+
+    toin = ToolIntelligenceNetwork(TOINConfig(storage_path=str(configured), auto_save_interval=0))
+    assert toin._patterns == {}  # the legacy sibling was not imported
+    _record(toin, 7)
+    toin.save()
+
+    assert toin._backend.path == configured
+    assert sibling.read_bytes() == before
+    saved = json.loads(configured.read_text(encoding="utf-8"))
+    assert saved["version"] == "3.0"
+    restarted = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(configured), auto_save_interval=0)
+    )
+    assert _signature(7).structure_hash in {
+        pattern.tool_signature_hash for pattern in restarted._patterns.values()
+    }
 
 
 def test_save_replaces_a_symlink_without_orphaning_the_store(tmp_path) -> None:
@@ -806,7 +887,12 @@ def test_save_replaces_a_symlink_without_orphaning_the_store(tmp_path) -> None:
     the next start rejected its own store.
     """
     target = tmp_path / "store.json"
-    target.write_text("{}", encoding="utf-8")
+    # A v3-shaped store behind the link: the version probe must see the
+    # current layout, not a legacy one, or the backend migrates to a sibling
+    # and never touches the link.
+    target.write_text(
+        json.dumps({"version": "3.0", "patterns": {}}), encoding="utf-8", newline="\n"
+    )
     # A version-like configured name is written in place, so the active
     # write path is the symlink itself (an unversioned name would save to
     # the .v3 sibling and never touch the link).
