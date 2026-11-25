@@ -148,3 +148,45 @@ def test_shared_proxy_antigravity_stream_preserves_sandbox_default(monkeypatch):
         "provider": "gemini",
         "model": "gemini-3-flash",
     }
+
+
+@pytest.mark.parametrize(
+    "connect_host",
+    ["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"],
+)
+def test_verified_dispatch_cloudcode_host_takes_precedence_over_antigravity_ua(
+    monkeypatch, connect_host
+):
+    """Guarded AGY dispatch keeps the connected Cloud Code host even with antigravity/ UA."""
+
+    async def passthrough(self, request, base_url, **kw):
+        return JSONResponse({"base": base_url, "auth": request.headers.get("authorization")})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", passthrough)
+    app = create_app(
+        ProxyConfig(
+            openai_api_url="https://operator-openai.test",
+            cloudcode_api_url="https://operator-cloudcode.test",
+        )
+    )
+    headers = {
+        "host": connect_host,
+        "user-agent": "antigravity/1.0",
+        "authorization": "Bearer cloudcode-caller",
+    }
+
+    guarded = make_host_guard(app, DEFAULT_ALLOWLIST)
+    guarded_resp = TestClient(guarded).post("/v1internal:loadCodeAssist", headers=headers)
+    assert guarded_resp.status_code == 200
+    assert guarded_resp.json() == {
+        "base": f"https://{connect_host}",
+        "auth": "Bearer cloudcode-caller",
+    }
+
+    # Without validated AGY dispatch state, an antigravity/ UA still uses the daily sandbox route.
+    shared_resp = TestClient(app).post("/v1internal:loadCodeAssist", headers=headers)
+    assert shared_resp.status_code == 200
+    assert shared_resp.json() == {
+        "base": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+        "auth": "Bearer cloudcode-caller",
+    }
