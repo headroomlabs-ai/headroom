@@ -38,6 +38,7 @@ from headroom.proxy.output_steering import (
     apply_openai_chat_verbosity_steering,
     apply_openai_responses_verbosity_steering,
     apply_verbosity_steering,
+    input_already_steered,
     replace_or_append_steering_block,
     steering_text,
 )
@@ -389,6 +390,24 @@ class ShapeResult:
             self.labels = []
 
 
+def _latest_user_message_steered(items: Any) -> bool:
+    """True when the newest user message in a Responses ``input`` ends with a steering block.
+
+    Only the newest: an older prompt keeps its block for the rest of the
+    conversation, so it says nothing about whether this turn was steered.
+    """
+    if isinstance(items, list):
+        users = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and item.get("role") == "user"
+            and item.get("type") in (None, "message")
+        ]
+        items = users[-1:]
+    return input_already_steered(items)
+
+
 def shape_openai_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -406,6 +425,12 @@ def shape_openai_responses_request(
     level = settings.verbosity_level if level_override is None else level_override
     if level > 0 and apply_openai_responses_verbosity_steering(body, level):
         result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
+    elif level > 0 and _latest_user_message_steered(body.get("input")):
+        # An extension already steered the user turns (Kiro rejects
+        # ``instructions``, so headroom-kiro places the block there at this
+        # same resolved level). The request is shaped; without the label the
+        # output-savings ledger books it as unshaped and saves nothing.
         result.labels.append(f"output_shaper:verbosity:L{level}")
 
     return result
@@ -581,17 +606,4 @@ def shape_responses_request(
     The Responses counterpart of :func:`shape_request`: same settings, same
     labels, same level-resolution contract.
     """
-    if settings is None:
-        settings = OutputShaperSettings.from_env()
-    result = ShapeResult()
-    if not settings.enabled:
-        return result
-
-    assert result.labels is not None  # __post_init__ guarantees this
-
-    level = settings.verbosity_level if level_override is None else level_override
-    if level > 0 and apply_responses_verbosity_steering(body, level):
-        result.changed = True
-        result.labels.append(f"output_shaper:verbosity:L{level}")
-
-    return result
+    return shape_openai_responses_request(body, settings, level_override)

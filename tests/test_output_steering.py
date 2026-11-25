@@ -182,3 +182,57 @@ def test_openai_chat_steering_level_zero_is_noop() -> None:
     body = {"messages": [{"role": "system", "content": "S."}]}
     assert apply_openai_chat_verbosity_steering(body, 0) is False
     assert body["messages"][0]["content"] == "S."
+
+
+def _shape_live(payload: dict, monkeypatch, holdout: str = "0") -> tuple[list[str], bool]:
+    """Shape through the Responses path live HTTP and WebSocket traffic takes."""
+    from headroom.proxy.handlers.openai import _shape_openai_responses_payload
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", holdout)
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    return _shape_openai_responses_payload(
+        payload, model="auto", request_id="t", output_shaper_enabled=True
+    )
+
+
+def test_responses_turn_steered_by_an_extension_is_labelled_shaped(monkeypatch) -> None:
+    """Kiro rejects ``instructions``, so headroom-kiro steers the user turn itself.
+
+    Core must not add a second copy, but the request was shaped: without the
+    verbosity label the output-savings ledger books every Kiro turn as unshaped.
+    """
+    steered = f"fix it\n\n{steering_text(3)}"
+    payload = {"model": "auto", "input": [{"role": "user", "content": steered}]}
+
+    labels, mutated = _shape_live(payload, monkeypatch)
+
+    assert "output_shaper:verbosity:L3" in labels
+    assert mutated is False
+    assert payload == {"model": "auto", "input": [{"role": "user", "content": steered}]}
+
+
+def test_control_arm_turn_is_not_labelled_shaped(monkeypatch) -> None:
+    steered = f"fix it\n\n{steering_text(3)}"
+    payload = {"model": "auto", "input": [{"role": "user", "content": steered}]}
+
+    labels, _ = _shape_live(payload, monkeypatch, holdout="1")
+
+    assert not any(label.startswith("output_shaper:verbosity:") for label in labels)
+
+
+def test_older_steered_prompt_does_not_label_an_unsteered_turn(monkeypatch) -> None:
+    """An earlier prompt keeps its block; this turn's prompt carries none, and
+    core will not add a second copy, so nothing shaped this turn."""
+    payload = {
+        "model": "auto",
+        "input": [
+            {"role": "user", "content": f"fix it\n\n{steering_text(3)}"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "now run the tests"},
+        ],
+    }
+
+    labels, mutated = _shape_live(payload, monkeypatch)
+
+    assert mutated is False
+    assert not any(label.startswith("output_shaper:verbosity:") for label in labels)

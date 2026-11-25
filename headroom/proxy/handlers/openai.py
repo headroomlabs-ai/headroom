@@ -997,8 +997,10 @@ def _shape_openai_responses_payload(
 
         level, src = resolve_verbosity_level(settings)
         shape_result = shape_responses_request(payload, settings, level_override=level)
+        # Kept even when the bytes did not change: a turn an extension already
+        # steered (Kiro) is shaped, and the ledger reads the label to know it.
+        labels.extend(shape_result.labels or [])
         if shape_result.changed:
-            labels.extend(shape_result.labels or [])
             logger.info(
                 "[%s] OutputShaper(responses, L%s/%s): %s",
                 request_id,
@@ -3349,6 +3351,7 @@ class OpenAIHandlerMixin:
                 ),
                 conversation=conversation,
             )
+
             # Streaming turns get fold-only hooks, same rule as the
             # chat-completions path. A hook that defers work to `on_response`
             # cannot run here: the response side is wired on the buffered branch
@@ -3361,9 +3364,39 @@ class OpenAIHandlerMixin:
             # the client's request rather than the effective one — conservative
             # in the safe direction: at worst a buffered-by-CCR turn misses a
             # saving, never a stranded tool call.
+            def _tool_tokens(tools: Any) -> int | None:
+                # Deferral flags stripped: deferral is booked on its own tag.
+                # Accounting must never break a request, so a failed count
+                # books nothing.
+                if _req_ctx.count_tools is None:
+                    return None
+                try:
+                    return int(_req_ctx.count_tools(without_deferral_flags(tools)))
+                except Exception as e:
+                    logger.debug(
+                        "[%s] turn-hook tool token count failed; savings not counted: %s",
+                        request_id,
+                        describe_exception(e),
+                    )
+                    return None
+
+            # Counted before the hooks run: a hook may edit the tools in place.
+            _tool_tokens_before = _tool_tokens(working.get("tools"))
             run_request_hooks(_req_ctx, stream_safe_only=bool(payload.get("stream")))
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
+            # Tool definitions a hook shrank (description condensing) go on the
+            # tag every surface sums into the tool-savings headline, as on the
+            # chat-completions path.
+            _tool_tokens_after = _tool_tokens(_req_ctx.tools)
+            _hook_tool_saved = 0
+            if _tool_tokens_before is not None and _tool_tokens_after is not None:
+                _hook_tool_saved = max(0, _tool_tokens_before - _tool_tokens_after)
+            if _hook_tool_saved > 0 and savings_tags is not None:
+                savings_tags["turn_hook_tools_saved_tokens"] = (
+                    int(savings_tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _hook_tool_saved
+                )
+                transforms.append(f"turn_hook:tools:{_hook_tool_saved}tok")
             # A hook may also fold the messages (replace or in-place). Write back a
             # replaced list — previously dropped on this path — then re-count so the
             # message-fold saving is both applied AND recorded in tokens_saved.
@@ -3374,8 +3407,11 @@ class OpenAIHandlerMixin:
                     _mt_after = self.openai_provider.get_token_counter(model).count_text(
                         _json_debug_dumps(working.get(_msg_key) or [])
                     )
-                    if _mt_after < _mt_before:
-                        tokens_saved += _mt_before - _mt_after
+                    # Signed, then clamped once: message text a hook added
+                    # offsets the tool definitions it removed.
+                    tokens_saved += net_hook_tool_saving(
+                        _mt_before - _mt_after, savings_tags, _hook_tool_saved
+                    )
                 except Exception as e:
                     logger.debug(
                         "[%s] turn-hook message fold token count failed; savings not counted: %s",
