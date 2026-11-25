@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import ipaddress
+import os
 import re
 import socket
 import ssl
@@ -22,6 +23,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import WebSocketRoute
+from starlette.websockets import WebSocketDisconnect
 
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.proxy.upstream_guard import is_safe_upstream_url
@@ -320,12 +322,28 @@ def _is_loopback(host: object) -> bool:
     return ip is not None and ip.is_loopback
 
 
-@pytest.fixture
-def no_outbound_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+
+
+def _expected_ws_close(exc: WebSocketDisconnect) -> bool:
+    """A policy refusal, or a failed dial to the blocked default upstream.
+
+    An origin refusal is not expected: the probes send no Origin, and a probe
+    stopped there would never reach the upstream choice it is meant to test.
+    """
+    if exc.code == 1008:
+        return exc.reason != "origin not allowed"
+    return (exc.code, exc.reason) == (1011, "upstream connection failed")
+
+
+def _block_outbound_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Refuse every non-loopback name lookup and connect, and record the attempts.
 
     A probe that falls through to a provider's default upstream then fails at
     once instead of waiting on a live host, and nothing leaves the machine.
+    Inherited proxy settings are cleared too: with ``HTTPS_PROXY`` set, a
+    client would dial the (refused) proxy instead of a loopback target, so a
+    route that forwards to the stand-in would go unseen.
     """
     refused: list[str] = []
     real_getaddrinfo = socket.getaddrinfo
@@ -342,7 +360,7 @@ def no_outbound_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     def _check(address: object) -> None:
         # Non-tuple addresses are AF_UNIX paths: local by definition.
         host = address[0] if isinstance(address, tuple) else None
-        if isinstance(address, tuple) and not _is_loopback(host):
+        if not _is_loopback(host):
             refused.append(f"connect:{host}")
             raise OSError(errno.ENETUNREACH, "outbound network blocked in test")
 
@@ -357,12 +375,32 @@ def no_outbound_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(socket.socket, "connect", connect)
     monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     # LiteLLM would otherwise fetch its price map at app startup.
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+    # Prove the blocker is installed before any probe runs: a TEST-NET-1
+    # connect and a name lookup must both be refused and recorded.
+    with pytest.raises(OSError, match="blocked in test"):
+        socket.create_connection(("192.0.2.1", 9), timeout=1)
+    with pytest.raises(socket.gaierror, match="blocked in test"):
+        socket.getaddrinfo("blocked.example", 443)
+    assert refused == ["connect:192.0.2.1", "dns:blocked.example"]
+    refused.clear()
     return refused
 
 
-def test_no_route_forwards_to_a_loopback_upstream(no_outbound_network: list[str]) -> None:
+@pytest.fixture
+def no_outbound_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    return _block_outbound_network(monkeypatch)
+
+
+@pytest.mark.usefixtures("no_outbound_network")
+def test_no_route_forwards_to_a_loopback_upstream() -> None:
     """Sweep the whole route table -- the guard must hold everywhere.
 
     This is the generalisation of the fix: a future route that resolves a
@@ -383,34 +421,50 @@ def test_no_route_forwards_to_a_loopback_upstream(no_outbound_network: list[str]
 
     # Route errors are not the subject: a 500 is a response like any other,
     # and only a hit on the internal service fails the sweep.
-    with (
-        _InternalService() as internal,
-        TestClient(app, raise_server_exceptions=False) as client,
-    ):
-        for method, path in sorted(http_probes):
-            bodies = _PROBE_BODIES if method in _BODY_METHODS else (None,)
-            for unlock in _UNLOCK_HEADERS:
-                headers = {**unlock, "x-headroom-base-url": internal.url}
-                for body in bodies:
-                    client.request(method, path, headers=headers, json=body)
+    unexpected_closes: list[str] = []
+    with _InternalService() as internal:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            for method, path in sorted(http_probes):
+                bodies = _PROBE_BODIES if method in _BODY_METHODS else (None,)
+                for unlock in _UNLOCK_HEADERS:
+                    headers = {**unlock, "x-headroom-base-url": internal.url}
+                    for body in bodies:
+                        client.request(method, path, headers=headers, json=body)
 
-        # The WebSocket handlers pick and dial their upstream at the handshake,
-        # before the first client frame, so opening the socket is the probe.
-        for path in sorted(ws_probes):
-            for unlock in _UNLOCK_HEADERS:
-                headers = {**unlock, "x-headroom-base-url": internal.url}
-                # A refused handshake or a handler that fails on its (blocked)
-                # default upstream is not a forward; only a hit counts.
-                with (
-                    contextlib.suppress(Exception),
-                    client.websocket_connect(path, headers=headers),
-                ):
-                    pass
+            # The WebSocket handlers pick and dial their upstream at the handshake,
+            # before the first client frame, so opening the socket is the probe.
+            for path in sorted(ws_probes):
+                for unlock in _UNLOCK_HEADERS:
+                    headers = {**unlock, "x-headroom-base-url": internal.url}
+                    # A policy refusal or a failed dial to the blocked default
+                    # upstream is expected. Any other close, or a handler crash
+                    # (re-raised by the test client), fails the sweep.
+                    try:
+                        with client.websocket_connect(path, headers=headers):
+                            pass
+                    except WebSocketDisconnect as exc:
+                        if not _expected_ws_close(exc):
+                            unexpected_closes.append(f"{path}: {exc.code} {exc.reason!r}")
+        # Read after the client exits: leaving it joins the app's portal, so a
+        # handler still forwarding after a probe returned has finished by now.
         reached = list(internal.hits)
 
     assert reached == [], f"routes forwarded to a loopback upstream: {reached}"
-    # The blocker was live: default upstreams were tried and refused locally.
-    assert no_outbound_network, "no outbound attempt was seen; is the blocker installed?"
+    assert unexpected_closes == [], f"WebSocket probes closed unexpectedly: {unexpected_closes}"
+
+
+def test_sweep_blocker_ignores_an_inherited_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An inherited HTTPS_PROXY must not route loopback probes to a refused proxy."""
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.setenv(name, "http://10.0.0.1:3128")
+    _block_outbound_network(monkeypatch)
+    inherited = [n for v in _PROXY_ENV_VARS for n in (v, v.lower()) if n in os.environ]
+    assert inherited == [], f"proxy settings left in place: {inherited}"
+
+    with _InternalService() as internal, httpx.Client() as client:
+        assert client.get(internal.url + "/via-env").status_code == 200
+
+    assert internal.hits == ["/via-env"]
 
 
 _GATEWAY = "my-resource.openai.azure.com"
