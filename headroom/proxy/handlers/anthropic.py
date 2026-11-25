@@ -2084,14 +2084,17 @@ class AnthropicHandlerMixin:
                         )
                     logger.warning(f"[{request_id}] Security scan error: {e}")
 
-            # Hook: pre_compress — let hooks modify messages before compression
-
+            # Hook: pre_compress — let hooks modify messages before compression.
+            # Cache mode skips the hooks that rewrite or steer messages (they
+            # would bust the provider's prefix cache), but post_compress only
+            # observes, so the user query it reports is captured in both modes.
+            _hook_user_query = extract_user_query(messages) if self.config.hooks else ""
             if self.config.hooks and not is_cache_mode(self.config.mode):
                 from headroom.hooks import CompressContext
 
                 _hook_ctx = CompressContext(
                     model=model,
-                    user_query=extract_user_query(messages),
+                    user_query=_hook_user_query,
                     provider=provider_name,
                 )
                 try:
@@ -3088,7 +3091,11 @@ class AnthropicHandlerMixin:
                             else 0,
                             transforms_applied=transforms_applied,
                             model=model,
-                            user_query=_hook_ctx.user_query if self.config.hooks else "",
+                            # The context carries a pre_compress rewrite of the
+                            # query; cache mode has no context, only the capture.
+                            user_query=_hook_ctx.user_query
+                            if _hook_ctx is not None
+                            else _hook_user_query,
                             provider=provider_name,
                         )
                     )
