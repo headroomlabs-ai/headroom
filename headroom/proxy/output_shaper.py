@@ -390,22 +390,40 @@ class ShapeResult:
             self.labels = []
 
 
-def _latest_user_message_steered(items: Any) -> bool:
-    """True when the newest user message in a Responses ``input`` ends with a steering block.
+def _latest_user_message_steering_level(items: Any) -> int | None:
+    """The verbosity level whose block ends the newest user message in a Responses ``input``.
 
     Only the newest: an older prompt keeps its block for the rest of the
     conversation, so it says nothing about whether this turn was steered.
+    The level is read from the block itself, so the savings booked for it are
+    that level's, whatever this proxy is configured to send. None when the
+    message carries no block, or one whose text matches no known level.
     """
-    if isinstance(items, list):
-        users = [
-            item
-            for item in items
-            if isinstance(item, dict)
-            and item.get("role") == "user"
-            and item.get("type") in (None, "message")
-        ]
-        items = users[-1:]
-    return input_already_steered(items)
+    if isinstance(items, str):  # Responses accepts a bare string as one user message
+        items = [{"role": "user", "content": items}]
+    if not isinstance(items, list):
+        return None
+    users = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and item.get("type") in (None, "message")
+    ]
+    if not users or not input_already_steered(users[-1:]):
+        return None
+    content = users[-1].get("content")
+    parts = content if isinstance(content, list) else [{"text": content}]
+    for part in parts:
+        text = part.get("text") if isinstance(part, dict) else None
+        if not isinstance(text, str):
+            continue
+        tail = text.rstrip()
+        for level in sorted(output_verbosity_policy.VERBOSITY_LEVELS):
+            block = steering_text(level)
+            if block is not None and tail.endswith(block.rstrip()):
+                return level
+    return None
 
 
 def shape_openai_responses_request(
@@ -426,12 +444,14 @@ def shape_openai_responses_request(
     if level > 0 and apply_openai_responses_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
-    elif level > 0 and _latest_user_message_steered(body.get("input")):
-        # An extension already steered the user turns (Kiro rejects
-        # ``instructions``, so headroom-kiro places the block there at this
-        # same resolved level). The request is shaped; without the label the
-        # output-savings ledger books it as unshaped and saves nothing.
-        result.labels.append(f"output_shaper:verbosity:L{level}")
+    elif level > 0:
+        # An extension may already have steered the user turn (Kiro rejects
+        # ``instructions``, so headroom-kiro places the block there). The
+        # request is shaped; without the label the output-savings ledger books
+        # it as unshaped and saves nothing.
+        steered_level = _latest_user_message_steering_level(body.get("input"))
+        if steered_level is not None:
+            result.labels.append(f"output_shaper:verbosity:L{steered_level}")
 
     return result
 

@@ -236,3 +236,17 @@ def test_older_steered_prompt_does_not_label_an_unsteered_turn(monkeypatch) -> N
 
     assert mutated is False
     assert not any(label.startswith("output_shaper:verbosity:") for label in labels)
+
+
+def test_extension_steered_turn_is_labelled_with_the_level_in_its_block(monkeypatch) -> None:
+    """Savings are modelled per level, so the label names the block actually sent."""
+    payload = {
+        "model": "auto",
+        "input": [{"role": "user", "content": f"fix it\n\n{steering_text(2)}"}],
+    }
+
+    labels, mutated = _shape_live(payload, monkeypatch)  # proxy configured for L3
+
+    assert mutated is False
+    assert "output_shaper:verbosity:L2" in labels
+    assert "output_shaper:verbosity:L3" not in labels
