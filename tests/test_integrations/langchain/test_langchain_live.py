@@ -73,6 +73,7 @@ def anthropic_llm():
 # --- HeadroomChatModel: invoke (sync) ---
 
 
+@pytest.mark.live
 class TestHeadroomChatModelLiveOpenAI:
     """Live tests: HeadroomChatModel wrapping ChatOpenAI."""
 
@@ -125,6 +126,7 @@ class TestHeadroomChatModelLiveOpenAI:
         assert "average_savings_percent" in summary
 
 
+@pytest.mark.live
 class TestHeadroomChatModelLiveAnthropic:
     """Live tests: HeadroomChatModel wrapping ChatAnthropic.
 
@@ -162,6 +164,7 @@ class TestHeadroomChatModelLiveAnthropic:
 # --- Streaming ---
 
 
+@pytest.mark.live
 class TestHeadroomChatModelStreamingLive:
     """Live streaming tests."""
 
@@ -191,6 +194,7 @@ class TestHeadroomChatModelStreamingLive:
 # --- Tool calling (real round-trip) ---
 
 
+@pytest.mark.live
 class TestHeadroomChatModelToolCallsLive:
     """Live tool-calling tests: bind_tools + invoke with tool use."""
 
@@ -269,6 +273,7 @@ class TestHeadroomChatModelToolCallsLive:
 # --- LCEL chain ---
 
 
+@pytest.mark.live
 class TestHeadroomLCELive:
     """Live LCEL chain tests."""
 

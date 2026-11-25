@@ -135,7 +135,10 @@ def test_compress_allows_non_loopback_with_flag(monkeypatch):
 
 
 def test_compress_allows_container_gateway_with_loopback_host(monkeypatch):
+    """Host -> 127.0.0.1 publication (acknowledged) -> container sees the gateway."""
     monkeypatch.delenv("HEADROOM_COMPRESS_ALLOW_REMOTE", raising=False)
+    monkeypatch.delenv("HEADROOM_PROXY_TOKEN", raising=False)
+    monkeypatch.setenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", "1")
     monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
     client = TestClient(
         _fast_app(),
@@ -144,6 +147,56 @@ def test_compress_allows_container_gateway_with_loopback_host(monkeypatch):
     )
     resp = client.post("/v1/compress", json=_BODY)
     assert resp.status_code == 200, resp.text
+
+
+def test_compress_allows_token_authenticated_container_gateway(monkeypatch):
+    """With a token the gate has authenticated the gateway peer (docker-compose.yml)."""
+    monkeypatch.delenv("HEADROOM_COMPRESS_ALLOW_REMOTE", raising=False)
+    monkeypatch.delenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", raising=False)
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cret-token")
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    client = TestClient(
+        _fast_app(),
+        base_url="http://127.0.0.1:8787",
+        client=("172.17.0.1", 12345),
+    )
+    resp = client.post("/v1/compress", json=_BODY, headers={"Authorization": "Bearer s3cret-token"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_compress_allows_container_gateway_with_config_only_token(monkeypatch):
+    """A token passed through ProxyConfig (no env var) vouches for the gateway too."""
+    monkeypatch.delenv("HEADROOM_COMPRESS_ALLOW_REMOTE", raising=False)
+    monkeypatch.delenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", raising=False)
+    monkeypatch.delenv("HEADROOM_PROXY_TOKEN", raising=False)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            proxy_token="cfg-token",
+        )
+    )
+    client = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.1", 12345))
+    resp = client.post("/v1/compress", json=_BODY, headers={"Authorization": "Bearer cfg-token"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_compress_blocks_unvouched_container_gateway(monkeypatch):
+    """Issue #4794: a peer container reaching a non-loopback publication arrives
+    from the gateway too, so the gateway alone must not be trusted."""
+    monkeypatch.delenv("HEADROOM_COMPRESS_ALLOW_REMOTE", raising=False)
+    monkeypatch.delenv("HEADROOM_PROXY_TOKEN", raising=False)
+    monkeypatch.delenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", raising=False)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    client = TestClient(
+        _fast_app(),
+        base_url="http://127.0.0.1:8787",
+        client=("172.17.0.1", 12345),
+    )
+    assert client.post("/v1/compress", json=_BODY).status_code == 404
 
 
 def test_compress_blocks_peer_container_on_bridge_network(monkeypatch):

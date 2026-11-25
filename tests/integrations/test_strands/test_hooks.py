@@ -188,6 +188,7 @@ def simple_calculator(a: int, b: int, operation: str) -> str:
 # ============================================================================
 
 
+@pytest.mark.live
 @pytest.mark.skipif(SKIP_BEDROCK, reason="AWS credentials not available")
 @pytest.mark.skipif(not STRANDS_AVAILABLE, reason="strands-agents not installed")
 class TestHeadroomHookProviderReal:
