@@ -316,6 +316,21 @@ def test_register_server_force_overwrites_mismatch(tmp_path: Path) -> None:
     assert updated.command == "headroom"
 
 
+def test_timeout_compatibility_preserves_identity_and_explicit_requests(tmp_path: Path) -> None:
+    registrar = _registrar(tmp_path)
+    existing = ServerSpec("enola", "/bin/enola", extra={"timeout": 120000})
+    requested = ServerSpec("enola", "/bin/enola")
+    assert registrar.register_server(existing).ok
+    path = tmp_path / "opencode.json"
+    original = path.read_bytes()
+    assert registrar.register_server(requested, force=True).status == RegisterStatus.ALREADY
+    assert path.read_bytes() == original
+    assert not _specs_equivalent(registrar.get_server("enola"), requested)
+    explicit = ServerSpec("enola", "/bin/enola", extra={"timeout": 1000})
+    assert registrar.register_server(explicit).status == RegisterStatus.MISMATCH
+    assert path.read_bytes() == original
+
+
 def test_unregister_removes_mcp_key_when_empty(tmp_path: Path) -> None:
     """unregister_server removes the top-level 'mcp' key when it becomes empty."""
     registrar = _registrar(tmp_path)

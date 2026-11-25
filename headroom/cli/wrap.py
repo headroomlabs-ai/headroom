@@ -2379,12 +2379,7 @@ def _setup_headroom_mcp(
     proxy_url = f"http://127.0.0.1:{port}"
     spec = build_headroom_spec(proxy_url)
     if force:
-        existing = registrar.get_server(spec.name)
-        if existing is not None:
-            # Automatic retrieval refreshes own the command and proxy URL,
-            # while agent-specific options (such as OpenCode timeout) stay
-            # under user control, including when the port changes.
-            spec.extra.update(existing.extra)
+        spec = registrar.prepare_refresh(spec)
     result = registrar.register_server(spec, force=force)
 
     line = format_result(

@@ -32,7 +32,8 @@ for name in ['pytest', 'pytest-asyncio', 'ruff']:
 Path('/tmp/requirements.in').write_text('\n'.join(requirements) + '\n')
 # Resolve only the lightweight subset, constrained to reviewed versions. Every
 # selected artifact must then pass hash verification against the lock itself.
-subprocess.check_call(['uv', '--no-config', 'pip', 'compile', '--no-header', '--no-annotate', '--constraint', '/tmp/constraints.txt', '/tmp/requirements.in', '--output-file', '/tmp/selected.txt'])
+# Wheel-only resolution prevents source build hooks before hash verification.
+subprocess.check_call(['uv', '--no-config', 'pip', 'compile', '--only-binary', ':all:', '--no-header', '--no-annotate', '--constraint', '/tmp/constraints.txt', '/tmp/requirements.in', '--output-file', '/tmp/selected.txt'])
 normalize = lambda name: re.sub(r'[-_.]+', '-', name).lower()
 artifacts = {}
 for package in locked:

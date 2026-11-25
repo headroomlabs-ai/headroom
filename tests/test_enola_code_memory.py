@@ -254,6 +254,74 @@ def test_opencode_rewrap_preserves_retrieval_options(project, tmp_path, port):
     assert observed.env == expected.env
 
 
+def test_opencode_wrap_replaces_remote_retrieval_with_valid_local_entry(project, tmp_path):
+    config = tmp_path / ".config/opencode/opencode.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "headroom": {
+                        "type": "remote",
+                        "url": "http://127.0.0.1:8788/mcp",
+                        "headers": {"Authorization": "Bearer fixture"},
+                        "oauth": False,
+                        "timeout": 10000,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        main, ["wrap", "opencode", "--prepare-only", "--code-memory", "none"]
+    )
+    assert result.exit_code == 0, result.output
+    entry = json.loads(config.read_text())["mcp"]["headroom"]
+    assert entry["type"] == "local"
+    assert entry["command"][-2:] == ["mcp", "serve"]
+    assert entry["timeout"] == 10000
+    assert set(entry) <= {"type", "command", "environment", "enabled", "timeout"}
+
+
+@pytest.mark.parametrize("was_owned", [False, True])
+def test_opencode_timeout_only_enola_installs_guidance_without_adoption(
+    project, tmp_path, was_owned
+):
+    from headroom.mcp_registry import OpencodeRegistrar
+
+    config = tmp_path / ".config/opencode/opencode.json"
+    registrar = OpencodeRegistrar(config_path=config)
+    spec = enola.build_enola_spec()
+    assert registrar.register_server(spec).ok
+    if was_owned:
+        record_install("opencode", spec)
+    serena = build_serena_spec("agent")
+    assert registrar.register_server(serena).ok
+    record_install("opencode", serena)
+    data = json.loads(config.read_text())
+    data["mcp"]["enola"]["timeout"] = 120000
+    saved = data["mcp"]["enola"]
+    config.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    result = CliRunner().invoke(
+        main,
+        [
+            "wrap",
+            "opencode",
+            "--prepare-only",
+            "--no-mcp",
+            "--code-memory",
+            "enola",
+            "--code-memory-instructions",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert wrap.ENOLA_INSTRUCTIONS_BLOCK in Path("AGENTS.md").read_text()
+    assert json.loads(config.read_text())["mcp"]["enola"] == saved
+    assert not headroom_installed_matching("opencode", registrar.get_server("enola"))
+    assert registrar.get_server("serena") is None
+
+
 def install_owned(registrar, spec, *, scope=None):
     assert registrar.register_server(spec).ok
     record_install(

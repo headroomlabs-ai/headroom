@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -182,7 +183,15 @@ class OpencodeRegistrar(MCPRegistrar):
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
         existing = self.get_server(spec.name)
 
-        if existing is not None and _specs_equivalent(existing, spec):
+        # An unspecified timeout does not change how the requested server is
+        # launched. Accept it without writing or adopting the user's options;
+        # the complete spec still participates in ownership fingerprints.
+        comparable = existing
+        if existing is not None and "timeout" not in spec.extra:
+            comparable = replace(
+                existing, extra={k: v for k, v in existing.extra.items() if k != "timeout"}
+            )
+        if comparable is not None and _specs_equivalent(comparable, spec):
             return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
 
         if existing is not None and not force:
@@ -196,6 +205,20 @@ class OpencodeRegistrar(MCPRegistrar):
             self.unregister_server(spec.name)
 
         return self._write_entry(spec)
+
+    def prepare_refresh(self, spec: ServerSpec) -> ServerSpec:
+        """Keep local options when refreshing a local stdio server.
+
+        Remote URL, headers and OAuth settings are invalid on local entries.
+        Preserve only options supported by the destination transport.
+        """
+        existing = self.get_server(spec.name)
+        extra = dict(spec.extra)
+        if existing is not None:
+            for key in ("timeout", "cwd"):
+                if key in existing.extra:
+                    extra.setdefault(key, existing.extra[key])
+        return replace(spec, extra=extra)
 
     def unregister_server(self, server_name: str) -> bool:
         data = _read_json(self._config_path)

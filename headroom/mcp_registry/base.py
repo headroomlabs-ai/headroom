@@ -102,6 +102,10 @@ class MCPRegistrar(ABC):
     def get_server(self, server_name: str) -> ServerSpec | None:
         """Return the registered :class:`ServerSpec`, or ``None`` if absent."""
 
+    def prepare_refresh(self, spec: ServerSpec) -> ServerSpec:
+        """Carry forward agent options valid for an automatic server refresh."""
+        return spec
+
     @abstractmethod
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
         """Idempotently register an MCP server."""
