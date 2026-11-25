@@ -26,6 +26,7 @@ import atexit
 import errno
 import importlib.util
 import io
+import ipaddress
 import json
 import os
 import re
@@ -5208,12 +5209,190 @@ def _detect_running_proxy_backend(port: int) -> str | None:
     return _copilot_detect_running_proxy_backend(port)
 
 
+# ``_check_proxy`` and ``/health`` reach the proxy on 127.0.0.1, so only a
+# listener that this address reaches counts: bound to 127.0.0.1 or to every
+# IPv4 interface. A listener on another address (``[::1]``, a LAN IP) with the
+# same port is a different server that the probe never spoke to.
+_PROBED_HOSTS = ("127.0.0.1", "0.0.0.0", "*")
+
+
+def _reaches_probe(address: str, port: int) -> bool:
+    return address in {f"{host}:{port}" for host in _PROBED_HOSTS}
+
+
+def _parse_pid(text: str) -> int | None:
+    """A PID written as plain ASCII digits; anything else (or too long) is None."""
+    text = text.strip()
+    if not (text.isascii() and text.isdigit() and len(text) <= 10):
+        return None
+    return int(text)
+
+
+def _pids_from_netstat(output: str, port: int) -> set[int]:
+    """Listening PIDs for 127.0.0.1:``port`` in Windows ``netstat -ano -p TCP`` output.
+
+    A listening row has a foreign address ending in ``:0``; the State column
+    is localised, so it is not read.
+    """
+    pids: set[int] = set()
+    for line in output.splitlines():
+        cols = line.split()
+        if (
+            len(cols) == 5
+            and cols[0].upper() == "TCP"
+            and _reaches_probe(cols[1], port)
+            and cols[2].endswith(":0")
+            and (pid := _parse_pid(cols[4])) is not None
+        ):
+            pids.add(pid)
+    return pids
+
+
+_PROC_TCP_LISTEN = "0A"
+
+
+def _proc_ipv4(hex_host: str) -> str | None:
+    """Dotted IPv4 for a /proc/net/tcp address: hex of the raw bytes in host order."""
+    try:
+        raw = bytes.fromhex(hex_host)
+    except ValueError:
+        return None
+    if len(raw) != 4:
+        return None
+    return str(ipaddress.IPv4Address(raw[::-1] if sys.byteorder == "little" else raw))
+
+
+def _pids_from_proc(port: int, proc: Path = Path("/proc")) -> set[int] | None:
+    """Linux: PIDs owning a 127.0.0.1/0.0.0.0 listening socket on ``port``.
+
+    Reads the kernel's own tables (``/proc/net/tcp`` and ``/proc/<pid>/fd``),
+    so no process-controlled text (a command name) is parsed. Only this user's
+    processes' descriptors are readable, which is all that can be signalled.
+    """
+    try:
+        rows = (proc / "net" / "tcp").read_text(encoding="ascii").splitlines()[1:]
+    except (OSError, UnicodeDecodeError):
+        return None
+    sockets: set[str] = set()
+    for row in rows:
+        cols = row.split()
+        if len(cols) < 10 or cols[3] != _PROC_TCP_LISTEN:
+            continue
+        host, _, hex_port = cols[1].partition(":")
+        if hex_port == f"{port:04X}" and _reaches_probe(f"{_proc_ipv4(host)}:{port}", port):
+            sockets.add(f"socket:[{cols[9]}]")
+    pids: set[int] = set()
+    if not sockets:
+        return pids
+    for entry in proc.iterdir():
+        pid = _parse_pid(entry.name)
+        if pid is None:
+            continue
+        try:
+            descriptors = list((entry / "fd").iterdir())
+        except OSError:  # another user's process, or it exited meanwhile
+            continue
+        for fd in descriptors:
+            try:
+                target = os.readlink(fd)
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue  # this descriptor closed meanwhile; the others still count
+            if target in sockets:
+                pids.add(pid)
+                break
+    return pids
+
+
+def _pids_from_lsof(output: str, port: int) -> set[int]:
+    """Listening PIDs for 127.0.0.1:``port`` in ``lsof -F ptn`` output."""
+    pids: set[int] = set()
+    pid = kind = None
+    for line in output.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p":
+            pid = _parse_pid(value)
+        elif tag == "f":
+            kind = None
+        elif tag == "t":
+            kind = value
+        elif tag == "n" and pid is not None and kind == "IPv4" and _reaches_probe(value, port):
+            pids.add(pid)
+    return pids
+
+
+def _listening_pids(port: int) -> set[int] | None:
+    """PIDs listening where the probe connects (127.0.0.1:``port``); None if unknown."""
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dependency
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            return {
+                conn.pid
+                for conn in psutil.net_connections(kind="tcp4")
+                if conn.status == psutil.CONN_LISTEN
+                and conn.pid
+                and _reaches_probe(f"{conn.laddr.ip}:{conn.laddr.port}", port)
+            }
+        except psutil.AccessDenied:
+            pass  # macOS needs root for this; use the OS tools below
+    if sys.platform == "win32":
+        # By full path: a bare name can resolve to the current directory first.
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        netstat = str(Path(system_root) / "System32" / "netstat.exe")
+        command, parse = [netstat, "-ano", "-p", "TCP"], _pids_from_netstat
+    else:
+        command = ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "ptn"]
+        parse = _pids_from_lsof
+    try:
+        result = run(command, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    # lsof exits 1 when nothing matches; that is an answer, not a failure.
+    if result is not None and result.returncode in (0, 1):
+        return parse(result.stdout, port)
+    return _pids_from_proc(port) if sys.platform.startswith("linux") else None
+
+
+def _health_pid(raw: object) -> int | None:
+    """The PID in a ``/health`` body (an int or a decimal string), else None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        return _parse_pid(raw)
+    return None
+
+
+def _is_headroom_proxy_pid(pid: int, port: int) -> bool:
+    """True if ``pid`` holds the listening socket on ``port``.
+
+    The PID comes from the ``/health`` body of whatever listens on the port,
+    so it is untrusted: it must be a plain PID other than ours that the OS
+    reports as a listener on that port. Fails closed when no tool can tell.
+    """
+    if pid <= 1 or pid == os.getpid():
+        return False
+    listeners = _listening_pids(port)
+    return listeners is not None and pid in listeners
+
+
 def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     """Terminate a proxy process by PID and wait for the port to free up.
 
     Sends SIGTERM first, falls back to SIGKILL after 5 seconds.
-    Returns True if the port is free afterwards, False otherwise.
+    Returns True if the port is free afterwards, False otherwise, including
+    when ``pid`` cannot be confirmed as the Headroom proxy on ``port`` (then
+    nothing is signalled).
     """
+    if not _is_headroom_proxy_pid(pid, port):
+        click.echo(
+            f"  Warning: PID {pid} reported on port {port} is not listening on that port; "
+            "not stopping it."
+        )
+        return False
     if sys.platform == "win32":
         # ``os.kill(..., SIGTERM)`` only targets one Windows process.  The
         # native proxy launcher can own a serving child, so terminating the
@@ -5249,7 +5428,10 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
         if not _check_proxy(port):
             return True
 
-    # SIGTERM didn't work — escalate to SIGKILL (Unix) or terminate (Windows)
+    # SIGTERM didn't work — escalate to SIGKILL (Unix) or terminate (Windows).
+    # Check again first: the PID may have exited and been reused meanwhile.
+    if not _is_headroom_proxy_pid(pid, port):
+        return False
     try:
         _kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
         os.kill(pid, _kill_signal)
@@ -5283,16 +5465,11 @@ def _stop_local_proxy_for_unwrap(port: int) -> str:
     if running_config is None:
         return "unidentified"
 
-    proxy_pid = running_config.get("pid")
+    proxy_pid = _health_pid(running_config.get("pid"))
     if proxy_pid is None:
         return "no_pid"
 
-    try:
-        pid = int(proxy_pid)
-    except (TypeError, ValueError):
-        return "no_pid"
-
-    return "stopped" if _kill_proxy_by_pid(pid, port) else "failed"
+    return "stopped" if _kill_proxy_by_pid(proxy_pid, port) else "failed"
 
 
 def _manifest_targets_claude(manifest: Any) -> bool:
@@ -6014,13 +6191,17 @@ def _ensure_proxy_unlocked(
                         f"  Proxy on port {port} is running Headroom {running_version}; "
                         f"restarting with {_HEADROOM_VERSION}..."
                     )
-                    proxy_pid = running_config.get("pid") if running_config is not None else None
+                    proxy_pid = (
+                        _health_pid(running_config.get("pid"))
+                        if running_config is not None
+                        else None
+                    )
                     if proxy_pid is None:
                         raise click.ClickException(
                             f"Proxy on port {port} is stale but did not expose a PID. "
                             "Stop it manually and retry."
                         )
-                    if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                    if not helpers._kill_proxy_by_pid(proxy_pid, port):
                         raise click.ClickException(
                             f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
                             "Stop it manually and retry."
@@ -6060,6 +6241,9 @@ def _ensure_proxy_unlocked(
                             "session will use the existing proxy as-is."
                         )
                     else:
+                        # The stale-version branch above may already have
+                        # stopped this proxy; one replacement covers both.
+                        already_stopped = needs_restart
                         needs_restart = True
                         click.echo(f"  Proxy on port {port} is missing: {flags_str}")
                         click.echo("  Restarting proxy with upgraded configuration...")
@@ -6069,9 +6253,11 @@ def _ensure_proxy_unlocked(
                         learn = learn or bool(running_config.get("learn"))
                         code_graph = code_graph or bool(running_config.get("code_graph"))
 
-                        proxy_pid = running_config.get("pid")
-                        if proxy_pid is not None:
-                            if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                        proxy_pid = _health_pid(running_config.get("pid"))
+                        if already_stopped:
+                            click.echo("  Stale proxy already stopped; starting one replacement.")
+                        elif proxy_pid is not None:
+                            if not helpers._kill_proxy_by_pid(proxy_pid, port):
                                 raise click.ClickException(
                                     f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
                                     "Stop it manually and retry."
@@ -6114,14 +6300,14 @@ def _ensure_proxy_unlocked(
                             f"  Proxy on port {port} has incompatible routing config "
                             f"({keys_str}); restarting with the requested config..."
                         )
-                        proxy_pid = running_config.get("pid")
+                        proxy_pid = _health_pid(running_config.get("pid"))
                         if proxy_pid is None:
                             raise click.ClickException(
                                 f"Proxy on port {port} has incompatible routing config "
                                 f"({keys_str}) but did not expose a PID. "
                                 "Stop it manually and retry."
                             )
-                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                        if not helpers._kill_proxy_by_pid(proxy_pid, port):
                             raise click.ClickException(
                                 f"Failed to stop incompatible proxy (PID {proxy_pid}) "
                                 f"on port {port}. Stop it manually and retry."

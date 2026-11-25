@@ -624,7 +624,7 @@ If `HEADROOM_KOMPRESS_ENDPOINT` is set, Kompress inference is offloaded over HTT
 <Callout type="warning" title="Loopback-only by default">
 This route is restricted to loopback callers and answers everyone else with **`404`**, not `403` — deliberately, so it stays invisible to external scanners. A gateway calling it from another host or pod therefore sees what looks like a missing route.
 
-Both the client IP and the inbound `Host:` header must name loopback. In container environments (Docker/Podman), requests forwarded from the container host gateway are also admitted under loopback `Host:` headers. To allow arbitrary remote callers, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. `HEADROOM_PROXY_TOKEN` still applies if set. The same policy applies to [`POST /v1/usage`](#relaying-provider-usage-post-v1usage).
+Both the client IP and the inbound `Host:` header must name loopback. In container environments (Docker/Podman), requests from the container host gateway are also admitted under loopback `Host:` headers, but only when `HEADROOM_PROXY_TOKEN` is set or `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` declares a `127.0.0.1` publication (the shipped launchers set it). The gateway address alone can't tell the host from another container on the same bridge. To allow arbitrary remote callers, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. `HEADROOM_PROXY_TOKEN` still applies if set. The same policy applies to [`POST /v1/usage`](#relaying-provider-usage-post-v1usage).
 </Callout>
 
 #### Message format

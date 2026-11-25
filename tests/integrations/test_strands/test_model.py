@@ -222,6 +222,7 @@ def math_operation(x: float, y: float, op: str) -> str:
 # ============================================================================
 
 
+@pytest.mark.live
 @pytest.mark.skipif(SKIP_BEDROCK, reason="AWS credentials not available")
 @pytest.mark.skipif(not STRANDS_AVAILABLE, reason="strands-agents not installed")
 class TestHeadroomStrandsModelReal:

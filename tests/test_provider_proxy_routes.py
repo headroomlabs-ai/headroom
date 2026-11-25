@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.providers.codex.runtime import CodexRoutingDecision
-from headroom.proxy import upstream_guard
 from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
@@ -470,21 +469,13 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     assert proxy_routes._select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
         "https://legacy.gemini.test"
     )
-    # The azure branch honours the override, but only after the SSRF guard
-    # clears the destination (CVE-2026-77775). `azure.example` does not
-    # resolve, and the guard fails closed on resolution failure, so pin a
-    # public answer to keep this assertion about target *precedence*.
-    with patch.object(
-        upstream_guard.socket,
-        "getaddrinfo",
-        return_value=[(None, None, None, None, ("20.10.10.10", 443))],
-    ):
-        assert (
-            proxy_routes._select_passthrough_base_url(
-                proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
-            )
-            == "https://azure.example/base"
+    # A caller-named upstream is the route's business, never this helper's.
+    assert (
+        proxy_routes._select_passthrough_base_url(
+            proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
         )
+        == "https://legacy.anthropic.test"
+    )
     assert proxy_routes._select_passthrough_base_url(proxy, {"api-key": "azure"}) == (
         "https://legacy.anthropic.test"
     )

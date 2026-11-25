@@ -91,7 +91,7 @@ from headroom.config import (
 )
 from headroom.dashboard import get_dashboard_html
 from headroom.exceptions import ConfigurationError
-from headroom.log_safety import describe_exception, safe_id
+from headroom.log_safety import LOG_FORMAT, SingleLineFormatter, describe_exception, safe_id
 from headroom.observability import (
     LangfuseTracingConfig,
     OTelMetricsConfig,
@@ -505,9 +505,12 @@ def _build_agent_usage_summary(
 # PyTorch is optional in headroom; the warning is not actionable for operators.
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# One record per line on stderr too (container logs): a line break in a
+# request-derived value must not start a forged record. basicConfig is a no-op
+# when the host process configured the root logger already.
+_stderr_handler = logging.StreamHandler()
+_stderr_handler.setFormatter(SingleLineFormatter(LOG_FORMAT))
+logging.basicConfig(level=logging.INFO, handlers=[_stderr_handler])
 logger = logging.getLogger("headroom.proxy")
 
 # Liveness/readiness probe routes: auth-exempt, and logged at DEBUG.
@@ -4617,6 +4620,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.bind_policy import enforce_bind_policy
 
     _bind_decision = enforce_bind_policy(getattr(config, "host", None), _proxy_token)
+    # Whether a caller from the container bridge gateway may be taken for the
+    # host on the loopback-or-gateway routes (/debug/memory, /v1/compress,
+    # /v1/usage). The gateway address alone cannot tell the host from a peer
+    # container (#4794): trust it only when the gate makes every non-loopback
+    # caller present the token, or the operator acknowledged the open bind,
+    # which is documented to mean a publication on host loopback only.
+    app.state.container_gateway_vouched = bool(_proxy_token) or _bind_decision.acknowledged
 
     def _apply_security_headers(response) -> None:
         # setdefault: never clobber a header an upstream/handler already set.
@@ -7348,10 +7358,15 @@ def _run_uvicorn(
     uvicorn_kwargs: dict[str, Any],
 ) -> None:
     """Hand off to uvicorn. Split out so the bind target stays testable."""
+    from headroom.proxy.uvicorn_logging import uvicorn_log_config
+
     uvicorn.run(
         app_target,
         **bind_kwargs,
         log_level=log_level,
+        # uvicorn's own loggers do not propagate to the proxy's handlers, so
+        # they get the same one-record-per-line formatting here.
+        log_config=uvicorn_log_config(),
         workers=workers if workers > 1 else None,  # None = single process (default)
         limit_concurrency=limit_concurrency,
         # Defense-in-depth: the loopback guard for /debug/* endpoints trusts

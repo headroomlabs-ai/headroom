@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from headroom.log_safety import describe_exception
+from headroom.log_safety import describe_exception, log_token
 from headroom.proxy.conversation_savings import get_conversation_savings
 from headroom.proxy.savings import ItemMeasure, get_item_ledger
 from headroom.proxy.tool_schema_savings_policy import (
@@ -831,7 +831,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    a harness was identified — keeps the unidentified-traffic
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
-    client_part = f" client={outcome.client}" if outcome.client else ""
+    client_part = f" client={log_token(outcome.client)}" if outcome.client else ""
     # Only when it differs: on every path that reports novel-only savings the
     # two are equal and a second identical number is noise.
     novel_part = (
@@ -856,7 +856,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     encoded_savings = encode(savings_breakdown)
     logger.info(
         f"[{outcome.perf_request_id or outcome.request_id}] PERF "
-        f"model={outcome.model} msgs={outcome.num_messages} "
+        f"model={log_token(outcome.model)} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
         f"{novel_part}"

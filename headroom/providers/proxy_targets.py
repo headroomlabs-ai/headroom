@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -18,7 +17,6 @@ from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.grok.runtime import is_grok_cli_request
 from headroom.providers.vertex import vertex_target_for_location as _vertex_target_for_location
 from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST, normalize_host
-from headroom.proxy.upstream_guard import is_safe_upstream_url
 
 LEGACY_API_TARGET_ATTRS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_URL",
@@ -54,9 +52,6 @@ def cloudcode_host_base(host: str) -> str | None:
     """
     normalized = normalize_host(host)
     return f"https://{normalized}" if normalized in DEFAULT_ALLOWLIST else None
-
-
-logger = logging.getLogger("headroom.proxy")
 
 
 def route_grok_to_xai(headers: Mapping[str, str], openai_target: str) -> bool:
@@ -118,7 +113,12 @@ def select_passthrough_base_url(
     *,
     allow_cloudcode_host: bool = False,
 ) -> str:
-    """Resolve the upstream base URL for catch-all proxy passthrough requests."""
+    """Resolve the upstream base URL for catch-all proxy passthrough requests.
+
+    Only configured targets come out of here. A caller-named upstream
+    (``x-headroom-base-url``) is checked and used by the route itself, so it is
+    resolved once and the checked value is the one dialled.
+    """
     if allow_cloudcode_host and (base := cloudcode_host_base(headers.get("host", ""))):
         return base
     routing = resolve_codex_routing(headers)
@@ -126,17 +126,6 @@ def select_passthrough_base_url(
         return CHATGPT_BACKEND_API_URL
     if headers.get("x-goog-api-key"):
         return api_target(proxy, "gemini")
-    if headers.get("api-key"):
-        azure_base = headers.get("x-headroom-base-url", "")
-        if azure_base:
-            # Validate here, not only at the routes. `api-key` is attacker-
-            # supplied too, so this branch is reachable by anyone who can send
-            # a header, and it returns the destination the caller named. Routes
-            # that forgot to guard turned the proxy into an SSRF relay into
-            # loopback/RFC1918/cloud-metadata space (CVE-2026-77775).
-            if is_safe_upstream_url(azure_base):
-                return azure_base.rstrip("/")
-            logger.warning("ignoring unsafe x-headroom-base-url override: %r", azure_base)
     if is_anthropic_hello_path(path):
         return api_target(proxy, "anthropic")
     provider_name = proxy.provider_runtime.model_metadata_provider(headers)

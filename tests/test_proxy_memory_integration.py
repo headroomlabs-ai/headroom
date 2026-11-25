@@ -84,6 +84,7 @@ def anthropic_api_key():
     return os.environ.get("ANTHROPIC_API_KEY")
 
 
+@pytest.mark.live
 class TestMemoryHeaderValidation:
     """Test user ID header validation."""
 
@@ -150,6 +151,7 @@ class TestMemoryHeaderValidation:
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+@pytest.mark.live
 class TestMemoryToolInjection:
     """Test memory tool injection."""
 
@@ -189,6 +191,7 @@ class TestMemoryToolInjection:
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+@pytest.mark.live
 class TestMemorySaveAndSearch:
     """Test memory save and search flow."""
 
@@ -293,6 +296,7 @@ class TestMemorySaveAndSearch:
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+@pytest.mark.live
 class TestMemoryUserIsolation:
     """Test that memories are isolated per user."""
 
@@ -479,6 +483,7 @@ def _install_tool_call_recorder(handler):
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+@pytest.mark.live
 class TestMemoryIdAutoTailAndUpdate:
     """End-to-end live: model uses [memory_id] from auto-tail to call memory_update.
 
