@@ -90,6 +90,7 @@ class TestBackendCrossProcess:
         assert _ccr_backend_is_cross_process() is False
 
     def test_primed_and_live_retrieve_tool_schema_match(self) -> None:
+        pytest.importorskip("mcp")
         import asyncio
 
         from headroom.ccr.mcp_server import (

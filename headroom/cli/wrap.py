@@ -1808,7 +1808,7 @@ def _agy_exposes_retrieve_tool(registrar: Any, expected_spec: Any = None) -> boo
     # dir — agy writes <appdata>/mcp/<server>/<tool>.json regardless of which
     # config file declared the server.
     tool_cache = registrar.cache_dir / "headroom" / f"{CCR_TOOL_NAME}.json"
-    return tool_cache.is_file()
+    return bool(tool_cache.is_file())
 
 
 def _maybe_warn_agy_ccr_downgrade(retrieve_wired: bool) -> None:
@@ -10662,6 +10662,9 @@ def agy(
     # model ids). Set the global flags once, before the dispatch handles any
     # request. Assign through an Any alias (the flags aren't in litellm's stubs).
     try:
+        from headroom.offline import pin_litellm_cost_map_local
+
+        pin_litellm_cost_map_local()
         import litellm
 
         _litellm: Any = litellm
