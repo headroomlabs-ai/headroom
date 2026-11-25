@@ -55,7 +55,7 @@ pub async fn ws_handler(
     // PR-A5: same strip policy as the HTTP path — operators flip both
     // simultaneously via the single `Config::strip_internal_headers` knob.
     let strip_internal_ws = state.config.strip_internal_headers.is_enabled();
-    let forward_headers = build_forward_request_headers(
+    let mut forward_headers = build_forward_request_headers(
         req.headers(),
         client_addr.ip(),
         "http",
@@ -63,6 +63,26 @@ pub async fn ws_handler(
         &request_id,
         strip_internal_ws,
     );
+    // Same relay identity as the HTTP path (`forward_http`): tungstenite
+    // sets the upstream's own Host, so the marker is what tells the Python
+    // proxy this caller is not local, and the proof stands in for the token.
+    if req
+        .extensions()
+        .get::<crate::inbound_auth::NonLocalCaller>()
+        .is_some()
+    {
+        forward_headers.insert(
+            crate::inbound_auth::FRONT_REMOTE_HEADER,
+            HeaderValue::from_static("1"),
+        );
+        if let Some(proof) = req.extensions().get::<crate::inbound_auth::RelayProof>() {
+            if state.config.python_upstream
+                && crate::inbound_auth::upstream_takes_relay_proof(&state.config.upstream)
+            {
+                forward_headers.insert(crate::inbound_auth::RELAY_PROOF_HEADER, proof.0.clone());
+            }
+        }
+    }
     // Sec-WebSocket-Protocol must be propagated for subprotocol negotiation.
     let subprotocols: Option<String> = req
         .headers()
