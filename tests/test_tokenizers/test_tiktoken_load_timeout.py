@@ -404,10 +404,22 @@ def test_claude_fallback_is_provisional_and_recovers(monkeypatch: pytest.MonkeyP
 
 
 def test_parent_propagates_the_worker_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The refusal reaches the caller as a refusal, not as a load failure."""
+    """A download that hits the air-gap reaches the caller as a refusal.
+
+    The offline policy lives in the worker's *download* branch (a cache probe
+    never attempts egress), so stub the cache as a miss and the download as
+    refused to exercise the parent's download handler.
+    """
     from headroom.offline import OfflineEgressBlocked
 
-    _stub_worker(monkeypatch, {"status": "offline_blocked"})
+    script = (
+        "import pickle,sys;"
+        "kind='not_cached' if sys.argv[1]=='cache' else 'offline_blocked';"
+        "pickle.dump({'status': kind}, open(sys.argv[3],'wb'))"
+    )
+    monkeypatch.setattr(
+        tc, "_worker_cmd", lambda mode, name, out: [sys.executable, "-c", script, mode, name, out]
+    )
     monkeypatch.setenv("TIKTOKEN_CACHE_DIR", "")
     monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
 
@@ -498,6 +510,45 @@ def test_offline_warm_cache_payload_tokens_works(monkeypatch: pytest.MonkeyPatch
     with patch("requests.get") as mock_get:
         assert payload_tokens("hello world") == 2
         assert not mock_get.called
+
+
+def test_payload_tokens_recovers_after_a_load_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient load failure must not pin the compressor to characters forever.
+
+    Kompress used to cache ``_payload_encoder = False`` after the first failure,
+    so a miss whose vocabulary later lands on disk permanently compared characters
+    instead of tokens. The loader has its own per-encoding cooldown, so the cache
+    failure is now retried on the next call.
+    """
+    import tiktoken
+
+    from headroom.transforms import kompress_compressor as kc
+
+    real_encoding = tiktoken.Encoding(
+        name="cl100k_base",
+        pat_str=r"'\s|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+        mergeable_ranks={bytes([b]): b for b in range(256)},
+        special_tokens={"<|endoftext|>": 256},
+    )
+    state = {"calls": 0}
+
+    def fake_load(name: str):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise tc.TiktokenLoadError("vocab missing")
+        return real_encoding
+
+    monkeypatch.setattr(kc, "_payload_encoder", None)
+    monkeypatch.setattr(tc, "load_encoding", fake_load)
+
+    # First call: vocabulary unavailable -> becomes a miss, falls back to chars.
+    assert kc.payload_tokens("hello world") == len("hello world")
+    # Vocabulary is now on disk; a later call must resolve via the encoder instead
+    # of char-matching.
+    expected = len(real_encoding.encode("hello world", disallowed_special=()))
+    assert kc.payload_tokens("hello world") == expected
+    assert kc._payload_encoder is not None
+
 
 
 def test_offline_warm_cache_evaluate_token_counting_accuracy_works(

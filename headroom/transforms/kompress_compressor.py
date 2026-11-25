@@ -1680,12 +1680,16 @@ def payload_tokens(text: str) -> int:
     """
     global _payload_encoder
     if _payload_encoder is None:
+        # Do not persist a load failure: the loader's own per-encoding cooldown
+        # throttles retries, so a vocabulary that lands on disk later is picked up
+        # on a later call instead of pinning the compressor to character counts
+        # forever.
         try:
             from headroom.tokenizers.tiktoken_counter import load_encoding
 
             _payload_encoder = load_encoding("cl100k_base")
         except Exception:
-            _payload_encoder = False
+            pass  # leave None; retry next call
     if _payload_encoder:
         try:
             return len(_payload_encoder.encode(text, disallowed_special=()))

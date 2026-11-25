@@ -247,6 +247,10 @@ def _get_encoding(encoding_name: str):
     status = result["status"]
 
     if status == "ok":
+        # An already-late result fails fast without paying for the native
+        # reconstruction; a reconstruction that itself overruns is still
+        # rejected by the check after _register.
+        _check_deadline(encoding_name, deadline)
         enc = _register(encoding_name, result)
         _check_deadline(encoding_name, deadline)
         return enc
@@ -284,6 +288,7 @@ def _get_encoding(encoding_name: str):
 
     result = _run_worker("download", encoding_name, deadline)
     if result["status"] == "ok":
+        _check_deadline(encoding_name, deadline)
         enc = _register(encoding_name, result)
         _check_deadline(encoding_name, deadline)
         return enc
