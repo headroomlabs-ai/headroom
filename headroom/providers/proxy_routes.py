@@ -686,6 +686,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             limit = min(max(int(params.get("limit", "20")), 1), 1000)
         except ValueError:
             limit = 20
+        cursors = [params[c] for c in ("after_id", "before_id") if c in params]
+        if any(cursor not in ids for cursor in cursors):
+            # A cursor naming a model no longer listed: an empty page, never a
+            # silent restart from the top.
+            return {"data": [], "has_more": False, "first_id": None, "last_id": None}
         start, end = 0, len(ids)
         if params.get("after_id") in ids:
             start = ids.index(params["after_id"]) + 1

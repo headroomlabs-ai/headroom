@@ -47,6 +47,21 @@ def test_undated_name_maps_to_the_newest_dated_bedrock_profile() -> None:
     assert backend.map_model_id("claude-sonnet-4-6") == "bedrock/global.anthropic.claude-sonnet-4-6"
 
 
+def test_alias_of_an_override_only_snapshot_uses_the_override(monkeypatch) -> None:
+    """Discovery lists override keys, so an alias that resolves in the model
+    lookup must reach the override at inference, not a made-up profile ID."""
+    monkeypatch.setenv(
+        "HEADROOM_BEDROCK_MODEL_MAP", "claude-opus-4-9-20260101=us.anthropic.app-profile-x"
+    )
+    backend = _bedrock_backend()
+
+    assert "claude-opus-4-9-20260101" in (backend.bedrock_model_ids() or [])
+    assert backend.map_model_id("claude-opus-4-9") == backend.map_model_id(
+        "claude-opus-4-9-20260101"
+    )
+    assert "app-profile-x" in backend.map_model_id("claude-opus-4-9")
+
+
 def test_a_version_number_is_not_mistaken_for_a_snapshot_date() -> None:
     # "claude-sonnet-4" must not silently become "claude-sonnet-4-6".
     assert "sonnet-4-6" not in _bedrock_backend().map_model_id("claude-sonnet-4")
@@ -82,6 +97,9 @@ def test_model_list_is_answered_from_bedrock_without_an_upstream_call() -> None:
             rest = client.get(
                 f"/v1/models?limit=2&after_id={first['last_id']}", headers=_ANTHROPIC_HEADERS
             ).json()
+            stale = client.get(
+                "/v1/models?after_id=claude-gone-1", headers=_ANTHROPIC_HEADERS
+            ).json()
             missing = client.get("/v1/models/claude-opus-9", headers=_ANTHROPIC_HEADERS)
     finally:
         client.__exit__(None, None, None)
@@ -93,6 +111,7 @@ def test_model_list_is_answered_from_bedrock_without_an_upstream_call() -> None:
     assert alias.status_code == 200 and long_context.status_code == 200
     assert [m["id"] for m in first["data"]] == sorted(_PROFILES)[:2] and first["has_more"]
     assert [m["id"] for m in rest["data"]] == sorted(_PROFILES)[2:] and not rest["has_more"]
+    assert stale["data"] == [] and not stale["has_more"]
 
 
 def test_model_list_without_bedrock_still_passes_through() -> None:
