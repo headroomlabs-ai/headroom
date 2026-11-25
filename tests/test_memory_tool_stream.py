@@ -758,6 +758,85 @@ class TestNativeFailureSourceToReceipt:
             assert "internal-backend-marker" not in text
 
     @pytest.mark.asyncio
+    async def test_root_overview_fallback_is_not_a_success_receipt(self, tmp_path: Any) -> None:
+        """`view /memories` whose overview lookup raised is an error, not ok.
+
+        ``_get_memory_overview`` answers the root path with help text on
+        failure. That text is prose like a real overview, so the formatter
+        used to call it ``ok``: the client could not tell the failed lookup
+        from a store with no memories (GH #4888).
+        """
+        from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        class _DownBackend:
+            async def search_memories(self, **kwargs: Any) -> Any:
+                raise RuntimeError("internal-backend-marker")
+
+        handler = MemoryHandler(
+            MemoryConfig(
+                enabled=False,
+                use_native_tool=True,
+                native_memory_dir=str(tmp_path / "native"),
+            ),
+            agent_type="codex",
+        )
+
+        # The real dispatch entry point for view /memories — not a stubbed
+        # helper — so a change to the failure path here fails the test.
+        handler._backend = _DownBackend()
+        content = await handler._execute_native_memory_tool(
+            {"command": "view", "path": "/memories"}, "u1"
+        )
+        assert content.startswith("Error")
+        assert "internal-backend-marker" not in content
+
+        call = {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "memory",
+            "input": {"command": "view", "path": "/memories"},
+        }
+        result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
+        text = format_receipt([call], [result])
+        assert text == "[headroom memory] memory view error"
+        assert "ok" not in text
+        assert "internal-backend-marker" not in text
+
+    @pytest.mark.asyncio
+    async def test_successful_empty_overview_still_reads_ok(self, tmp_path: Any) -> None:
+        """The control: a store with no memories is a success, not an error."""
+        from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        class _EmptyBackend:
+            async def search_memories(self, **kwargs: Any) -> Any:
+                return []
+
+        handler = MemoryHandler(
+            MemoryConfig(
+                enabled=False,
+                use_native_tool=True,
+                native_memory_dir=str(tmp_path / "native"),
+            ),
+            agent_type="codex",
+        )
+        handler._backend = _EmptyBackend()
+        content = await handler._execute_native_memory_tool(
+            {"command": "view", "path": "/memories"}, "u1"
+        )
+        assert "0 memories stored" in content
+
+        call = {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "memory",
+            "input": {"command": "view", "path": "/memories"},
+        }
+        result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
+        assert format_receipt([call], [result]) == "[headroom memory] memory view ok"
+
+    @pytest.mark.asyncio
     async def test_backend_text_reaches_neither_the_stream_nor_the_history(
         self, tmp_path: Any
     ) -> None:

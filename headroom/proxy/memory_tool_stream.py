@@ -137,9 +137,6 @@ def _native_outcome(content: str) -> str:
     if content.startswith("No replacement was performed"):
         return "not applied"
     return "ok"
-    if content.startswith("No replacement was performed"):
-        return "not applied"
-    return "ok"
 
 
 def _receipt_status(payload: Any) -> str:

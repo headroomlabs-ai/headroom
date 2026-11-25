@@ -1884,8 +1884,14 @@ To SAVE a new memory:
 
         except Exception as e:
             logger.error(f"Memory: Overview failed: {e}")
-            # Return basic help even on error
-            return """📁 Memory System
+            # Return basic help even on error, but lead with the same fixed
+            # ``Error:`` phrase every other native helper uses: the help text
+            # alone is indistinguishable from a stored-memories overview, so
+            # the receipt would call a failed lookup ``ok`` (GH #4888). The
+            # exception stays in the log, never in the returned text.
+            return """Error: Memory overview unavailable
+
+📁 Memory System
 
 To SEARCH memories: view /memories/search/<query>
 To see RECENT: view /memories/recent
