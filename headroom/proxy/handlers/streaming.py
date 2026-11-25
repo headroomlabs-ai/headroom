@@ -47,6 +47,7 @@ from headroom.proxy import public_errors
 from headroom.proxy.memory_tool_stream import (
     MemoryToolStreamFilter,
     MemoryToolStreamOverflowError,
+    format_receipt,
 )
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.utils import format_exception_message
@@ -585,6 +586,35 @@ class StreamingMixin:
 
         # Usage of rounds whose message_delta the client never receives.
         prior_usage: dict[str, int] = {}
+        # Hidden calls the proxy ran this turn and their results, across every
+        # round, for the client-visible receipt (GH #4888).
+        ran_calls: list[dict[str, Any]] = []
+        ran_results: list[dict[str, Any]] = []
+
+        def _receipt_text() -> str | None:
+            """One line naming this turn's hidden calls, or None when off/empty."""
+            if getattr(self.config, "memory_tool_receipts", "text") != "text":
+                return None
+            return format_receipt(ran_calls, ran_results)
+
+        def _receipt_and_close() -> list[bytes]:
+            """Client-bound receipt block (when any) followed by the held tail."""
+            frames: list[bytes] = []
+            text = _receipt_text()
+            if text:
+                frames.extend(memory_filter.receipt_frames(text))
+                # Keep the proxy's own view of the client message in step:
+                # the prefix tracker compares it against what the client
+                # sends back on the next turn.
+                client_message = stream_state.get("memory_client_message")
+                if isinstance(client_message, dict):
+                    client_message["content"] = [
+                        *(client_message.get("content") or []),
+                        {"type": "text", "text": text},
+                    ]
+            frames.extend(memory_filter.closing_frames(prior_usage=prior_usage))
+            return frames
+
         while True:
             content: list[Any] = []
             if response is not None:
@@ -593,7 +623,7 @@ class StreamingMixin:
 
             if not memory_filter.hid_tool_calls:
                 record_visible(response, content, dropped_client_calls=False)
-                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
+                for frame in _receipt_and_close():
                     yield frame
                 return
 
@@ -628,6 +658,8 @@ class StreamingMixin:
                     f"{len(retrieval_calls)} headroom_retrieve call(s) withheld from "
                     "the SSE stream"
                 )
+            ran_calls.extend(memory_calls)
+            ran_results.extend(tool_results)
 
             replayable = response is not None and len(tool_results) == sum(
                 1 for block in content if is_proxy_call(block)
@@ -661,7 +693,7 @@ class StreamingMixin:
                         "continuation; ending the turn after running its proxy calls"
                     )
                 record_visible(response, content, dropped_client_calls=False)
-                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
+                for frame in _receipt_and_close():
                     yield frame
                 return
 

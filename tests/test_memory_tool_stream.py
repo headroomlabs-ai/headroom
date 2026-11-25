@@ -251,7 +251,187 @@ async def _client_view(proxy: HeadroomProxy, **kwargs: Any) -> list[dict[str, An
     return _events(raw)
 
 
-SAVE_RESULT = [{"type": "tool_result", "tool_use_id": "toolu_mem", "content": '{"status":"saved"}'}]
+SAVE_RESULT = [
+    {
+        "type": "tool_result",
+        "tool_use_id": "toolu_mem",
+        "content": '{"status":"saved","memory_id":"7f58fdac1234"}',
+    }
+]
+
+
+class TestMemoryReceipts:
+    """The client's history records that a hidden call ran (GH #4888)."""
+
+    def test_format_receipt_names_each_call_and_result(self) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        text = format_receipt(
+            [SAVE],
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_mem",
+                    "content": SAVE_RESULT[0]["content"],
+                }
+            ],
+        )
+        assert text == "[headroom memory] memory_save ok id=7f58fdac"
+
+    def test_format_receipt_reports_a_call_with_no_result_as_skipped(self) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        assert format_receipt([SAVE], []) == "[headroom memory] memory_save skipped"
+
+    @pytest.mark.asyncio
+    async def test_one_receipt_names_calls_across_continuation_rounds(self) -> None:
+        # Round 1 calls memory_save, round 2 calls memory_search, then the
+        # model answers. The client sees one receipt naming both.
+        search = {
+            "type": "tool_use",
+            "id": "toolu_search",
+            "name": "memory_search",
+            "input": {"query": "deploy region"},
+        }
+        search_result = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_search",
+            "content": '{"status":"found","count":2}',
+        }
+        proxy = _proxy(
+            [
+                _sse([SAVE], "tool_use"),
+                _sse([search], "tool_use"),
+                _sse([{"type": "text", "text": "Done."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy.memory_handler.handle_memory_tool_calls = AsyncMock(
+            side_effect=[SAVE_RESULT, [search_result]]
+        )
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and "text" in e["delta"]
+        ]
+        assert texts == [
+            "Done.",
+            "[headroom memory] memory_save ok id=7f58fdac; memory_search found 2",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_receipt_keeps_block_indices_contiguous(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        starts = [e["index"] for e in events if e["type"] == "content_block_start"]
+        assert starts == [0, 1, 2]
+
+    def test_format_receipt_is_none_without_calls(self) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        assert format_receipt([], []) is None
+
+    def test_receipt_block_is_a_contiguous_text_block(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_sse([TEXT, SAVE], "tool_use"))
+        frames = flt.receipt_frames("[headroom memory] memory_save ok")
+        events = _events(b"".join(frames))
+        assert [e["type"] for e in events] == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+        ]
+        # The hidden block was index 1 upstream; the receipt takes the client
+        # index the hidden block would have, so indices stay contiguous.
+        assert {e["index"] for e in events} == {1}
+        assert events[1]["delta"]["text"] == "[headroom memory] memory_save ok"
+        assert flt.next_index == 2
+
+    def test_receipt_frames_are_empty_without_text(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        assert flt.receipt_frames(None) == []
+
+    @pytest.mark.asyncio
+    async def test_client_sees_a_receipt_for_the_hidden_save(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [e["delta"]["text"] for e in events if e["type"] == "content_block_delta"]
+        assert texts == ["Saving that.", "Saved.", "[headroom memory] memory_save ok id=7f58fdac"]
+        # Receipt is the last block, before the held tail.
+        assert [e["type"] for e in events][-5:] == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_receipts_off_leaves_the_stream_clean(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "off"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [e["delta"]["text"] for e in events if e["type"] == "content_block_delta"]
+        assert texts == ["Saving that.", "Saved."]
+
+    @pytest.mark.asyncio
+    async def test_receipt_is_emitted_when_the_round_also_called_a_client_tool(self) -> None:
+        proxy = _proxy([_sse([SAVE, BASH], "tool_use")], SAVE_RESULT)
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and "text" in e["delta"]
+        ]
+        assert texts == ["[headroom memory] memory_save ok id=7f58fdac"]
+        assert [e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"] == [
+            "tool_use"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_finalizer_sees_the_receipt_block(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "text"
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+        await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        finalized = proxy._finalize_stream_response.await_args.kwargs["parsed_response"]
+        texts = [b.get("text") for b in finalized["content"]]
+        assert texts[-1] == "[headroom memory] memory_save ok id=7f58fdac"
 
 
 class TestStreamingMemoryContinuation:

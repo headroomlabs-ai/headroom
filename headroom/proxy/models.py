@@ -468,6 +468,11 @@ class ProxyConfig:
     memory_storage_mode: Literal["project", "user", "global"] = "project"
     memory_project_root_override: str = ""
     memory_inject_tools: bool = True
+    # GH #4888: proxy-run memory calls are withheld from the client, so the
+    # client's history shows the model's own text with no tool call behind it
+    # and the model saves again. ``text`` (default) appends a short receipt
+    # text block naming the calls that ran; ``off`` leaves the stream clean.
+    memory_tool_receipts: Literal["off", "text"] = "text"
     traffic_learning_enabled: bool = False
     traffic_learning_agent_type: str = "unknown"  # Which agent is being wrapped
     # Minimum evidence count before a learned pattern is persisted to memory.
