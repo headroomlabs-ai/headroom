@@ -10267,6 +10267,12 @@ class OpenAIHandlerMixin:
                                     ws_uncached_input_tokens_total += usage_uncached_tokens
 
                                 if event_type in {"response.failed", "response.incomplete"}:
+                                    # No outcome is recorded for this turn, so
+                                    # its labels would ride on the next turn's
+                                    # outcome. Rows and tool-schema tags stay
+                                    # pending: that request was sent, billed
+                                    # usage lands with the next outcome.
+                                    transforms_applied.clear()
                                     for buffered_event in event_buffer:
                                         await websocket.send_text(buffered_event)
                                     _reset()
@@ -10350,6 +10356,10 @@ class OpenAIHandlerMixin:
                                     continue
 
                                 response_completed_seen = True
+                                # Recording clears the turn's labels, but the
+                                # continuation below re-sends the same shaped
+                                # template, so its outcome carries them too.
+                                turn_labels = list(transforms_applied)
                                 await _record_ws_response_metrics()
 
                                 logger.info(
@@ -10423,6 +10433,7 @@ class OpenAIHandlerMixin:
                                 await _send_upstream(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
+                                _append_unique_transforms(transforms_applied, turn_labels)
                                 logger.info(
                                     f"[{request_id}] WS Memory: Sent continuation "
                                     f"with {len(tool_outputs)} result(s)"
