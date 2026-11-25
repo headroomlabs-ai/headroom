@@ -366,3 +366,50 @@ def test_savings_history_spend_matches_the_tracker_when_cache_reads_are_unpriced
         cost_tracker.totals()[1]
     )
     assert cost_tracker.totals()[1] == pytest.approx(0.26)
+
+
+def test_rollup_prices_long_context_reads_at_the_checkpoint_tier(catalog_pricing, tmp_path) -> None:
+    """The rollup's read cost must use the tier the checkpoint actually billed.
+
+    $0.10/M base cache reads, $0.20/M above 200k. A checkpoint carrying 250,000
+    cache reads billed $0.05; a fixed one-token probe reported the base rate and
+    showed $0.025 — half of what the request cost, with no way to reconcile it
+    against ``total_input_cost_usd``. The tier is re-derived from the
+    checkpoint's own chargeable tokens, so no schema change is needed and
+    existing history prices correctly too.
+    """
+    catalog_pricing(
+        {
+            "reader-model": {
+                # The tier itself is declared by the input field; the read rate
+                # carries its own above-threshold variant.
+                "input_cost_per_token": 1e-6,
+                "input_cost_per_token_above_200k_tokens": 2e-6,
+                "cache_read_input_token_cost": 1e-7,
+                "cache_read_input_token_cost_above_200k_tokens": 2e-7,
+            }
+        }
+    )
+    tracker = SavingsTracker(path=tmp_path / "savings.json", save_flush_every=1)
+    history = [
+        {
+            "timestamp": "2026-03-27T09:00:00Z",
+            "provider": "anthropic",
+            "model": "reader-model",
+            "total_tokens_saved": 0,
+            "cache_read_tokens": 0,
+            "total_input_tokens": 0,
+        },
+        {
+            "timestamp": "2026-03-27T09:30:00Z",
+            "provider": "anthropic",
+            "model": "reader-model",
+            "total_tokens_saved": 0,
+            "cache_read_tokens": 250_000,
+            "total_input_tokens": 250_000,
+        },
+    ]
+
+    bucket = tracker._build_rollup(history, "hour")[0]
+
+    assert bucket["cache_read_cost_usd_delta"] == pytest.approx(0.05)

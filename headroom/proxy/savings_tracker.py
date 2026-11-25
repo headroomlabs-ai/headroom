@@ -2405,16 +2405,15 @@ class SavingsTracker:
         prev_output_cost_usd = 0.0
         prev_cache_read_tokens = 0
         prev_cache_savings_usd = 0.0
-        # What the bucket's cache reads actually COST, priced per checkpoint
-        # with the same function that put them into ``total_input_cost_usd``.
-        # Consumers need it to take reads out of the input bill, and cannot
-        # derive it from ``cache_savings_usd``: the read discount is not a
-        # fixed multiple of the read cost (reads bill at 0.1x on most models,
-        # 0.05x or 0.025x on others), so "discount / 9" misprices exactly the
-        # models with the steepest cache discount.
-        read_cost_per_token: dict[str, float] = {}
+        # Per (model, tier): the per-token read cost at that tier, priced the
+        # way the request was. The tier comes from the CHECKPOINT's own
+        # chargeable tokens, not from the probe size: a fixed one-token probe
+        # always selected the base rate, so a long-context read that billed
+        # $0.05 was reported as $0.025 and the rollup disagreed with both the
+        # request's own pricing and the cost tracker.
+        read_cost_per_token: dict[tuple[str, bool], float] = {}
 
-        def _read_cost(model: str, reads: int) -> float | None:
+        def _read_cost(model: str, reads: int, chargeable: int) -> float | None:
             if reads <= 0:
                 return 0.0
             # Checkpoints written before per-model attribution carry no model,
@@ -2422,13 +2421,20 @@ class SavingsTracker:
             # the bucket's read cost as unknown rather than guess.
             if model == MODEL_UNKNOWN:
                 return None
-            if model not in read_cost_per_token:
-                # A ONE-token probe: `chargeable_tokens` is what picks the tier,
-                # so a 1M-token probe crossed every model's long-context
-                # threshold and reported the upper tier's read rate for buckets
-                # that never went near it.
-                read_cost_per_token[model] = _estimate_input_cost_usd(model, 1, cache_read_tokens=1)
-            return reads * read_cost_per_token[model]
+            from headroom.pricing.counterfactual import long_context_threshold
+
+            long_context = chargeable > long_context_threshold(model)
+            key = (model, long_context)
+            if key not in read_cost_per_token:
+                # Probe with enough READ tokens to land on the tier itself:
+                # ``_estimate_input_cost_usd`` picks the tier from the breakdown
+                # sum, so a one-read probe is base tier by construction and a
+                # threshold+1 read probe is the long tier.
+                probe = long_context_threshold(model) + 1 if long_context else 1
+                read_cost_per_token[key] = (
+                    _estimate_input_cost_usd(model, 0, cache_read_tokens=probe) / probe
+                )
+            return reads * read_cost_per_token[key]
 
         def _add_cache(
             target: dict[str, Any], reads: int, discount: float, cost: float | None
@@ -2482,7 +2488,9 @@ class SavingsTracker:
             prev_cache_read_tokens = total_cache_read_tokens
             prev_cache_savings_usd = total_cache_savings_usd
             model = _normalize_model(point.get("model"))
-            delta_cache_read_cost_usd = _read_cost(model, delta_cache_read_tokens)
+            delta_cache_read_cost_usd = _read_cost(
+                model, delta_cache_read_tokens, delta_input_tokens
+            )
 
             prev_total_tokens = total_tokens_saved
             prev_total_usd = total_usd
