@@ -166,7 +166,7 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
     body = _unwrap_response_create_body(body)
     digest = hashlib.sha256()
     digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
-    for msg in body.get("messages", []):
+    for msg in body.get("messages") or []:
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content")
             if isinstance(content, str):
@@ -186,8 +186,36 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
         if stable_response_key:
             _absorb(digest, stable_response_key)
         elif not body.get("messages"):
+            # No conversation id: seed on the first user turn of ``input``, as
+            # for chat. A constant here put every such conversation of a model
+            # in one holdout arm.
             _absorb(digest, "responses")
+            _absorb_first_responses_user_turn(digest, body.get("input"))
     return digest.hexdigest()
+
+
+def _absorb_first_responses_user_turn(digest: Any, input_data: Any) -> None:
+    if isinstance(input_data, str):
+        _absorb(digest, input_data)
+        return
+    if not isinstance(input_data, list):
+        return
+    for item in input_data:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            _absorb(digest, content)
+        elif isinstance(content, list):
+            _absorb_text_blocks(
+                digest,
+                (
+                    part["text"]
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ),
+            )
+        return
 
 
 def conversation_key_from_responses_body(body: dict[str, Any]) -> str:
@@ -201,26 +229,7 @@ def conversation_key_from_responses_body(body: dict[str, Any]) -> str:
     body = _unwrap_response_create_body(body)
     digest = hashlib.sha256()
     digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
-    input_data = body.get("input")
-    if isinstance(input_data, str):
-        _absorb(digest, input_data)
-    elif isinstance(input_data, list):
-        for item in input_data:
-            if not isinstance(item, dict) or item.get("role") != "user":
-                continue
-            content = item.get("content")
-            if isinstance(content, str):
-                _absorb(digest, content)
-            elif isinstance(content, list):
-                _absorb_text_blocks(
-                    digest,
-                    (
-                        part["text"]
-                        for part in content
-                        if isinstance(part, dict) and isinstance(part.get("text"), str)
-                    ),
-                )
-            break
+    _absorb_first_responses_user_turn(digest, body.get("input"))
     return digest.hexdigest()
 
 

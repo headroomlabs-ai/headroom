@@ -7054,12 +7054,15 @@ class OpenAIHandlerMixin:
         # ledger reads the first. Same key headroom-kiro steers by.
         from headroom.proxy.output_savings import conversation_key_from_body
 
+        # Bypassed requests are never shaped, so they derive no key.
         _session_header = request.headers.get("x-headroom-session-id")
-        _output_arm_key = (
-            f"header:x-headroom-session-id:{_session_header}"
-            if _session_header
-            else conversation_key_from_body(body)
-        )
+        _output_arm_key: str | None = None
+        if not _bypass:
+            _output_arm_key = (
+                f"header:x-headroom-session-id:{_session_header}"
+                if _session_header
+                else conversation_key_from_body(body)
+            )
         if self.config.optimize and not _bypass:
             # Pre-compression tools reference: the compression pass is
             # copy-on-write on the payload, so this still points at the

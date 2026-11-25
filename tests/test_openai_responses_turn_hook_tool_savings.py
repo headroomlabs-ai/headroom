@@ -151,32 +151,36 @@ def test_http_turn_steered_in_its_input_is_booked_as_shaped(monkeypatch) -> None
     assert "output_shaper:verbosity:L3" in outcomes[-1].transforms_applied
 
 
-@pytest.mark.parametrize(
-    ("model", "text", "arm"),
-    [
-        # Each pair is assigned opposite arms by the two passes' old keys.
-        ("gpt-5.5", "list the files", "control"),
-        ("gpt-5.4-mini", "read the readme", "treatment"),
-    ],
-)
-def test_both_shaping_passes_put_a_request_in_one_holdout_arm(
-    monkeypatch, model: str, text: str, arm: str
-) -> None:
+def _text_in_arm(model: str, arm: str) -> str:
+    """A steered first user turn whose conversation lands in ``arm`` at a 30% holdout."""
+    from headroom.proxy.output_savings import assign_arm, conversation_key_from_body
+    from headroom.proxy.output_verbosity_policy import steering_text
+
+    for i in range(200):
+        text = f"task {i}\n\n{steering_text(3)}"
+        body = {"model": model, "input": [{"role": "user", "content": text}]}
+        if assign_arm(conversation_key_from_body(body), 0.3) == arm:
+            return text
+    raise AssertionError(f"no conversation landed in {arm}")
+
+
+@pytest.mark.parametrize("arm", ["control", "treatment"])
+def test_both_shaping_passes_put_a_request_in_one_holdout_arm(monkeypatch, arm: str) -> None:
     """Optimized HTTP Responses shapes twice (in compression, then before the
     send). With a fractional holdout, two arm keys could label one request both
     treatment and control; the ledger reads the first stratum and drops a
     steered treatment turn that lacks a verbosity label."""
     from headroom.proxy.output_savings import parse_stratum_label
-    from headroom.proxy.output_verbosity_policy import steering_text
 
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
     monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
+    text = _text_in_arm("gpt-5.5", arm)
 
     outcomes = _post(
         {
-            "model": model,
-            "input": [{"role": "user", "content": f"{text}\n\n{steering_text(3)}"}],
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": text}],
             "stream": False,
         }
     )
@@ -187,3 +191,49 @@ def test_both_shaping_passes_put_a_request_in_one_holdout_arm(
     assert arms == {arm}, labels
     # The ledger drops a treatment sample that lacks a verbosity label.
     assert ("output_shaper:verbosity:L3" in labels) is (arm == "treatment"), labels
+
+
+def test_responses_conversations_without_an_id_get_their_own_holdout_keys() -> None:
+    """Without a response id the key used a constant, so every Responses
+    conversation of a model shared one holdout arm."""
+    from headroom.proxy.output_savings import conversation_key_from_body
+
+    def key(text: str) -> str:
+        return conversation_key_from_body(
+            {"model": "gpt-5.5", "input": [{"role": "user", "content": text}]}
+        )
+
+    assert key("list the files") != key("fix the failing test")
+    assert key("list the files") == key("list the files")
+
+
+def test_bypassed_request_with_null_messages_reaches_the_provider() -> None:
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.loopback_guard import require_loopback
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    app = create_app(ProxyConfig(optimize=True, cache_enabled=False, rate_limit_enabled=False))
+    app.dependency_overrides[require_loopback] = lambda: None
+    with TestClient(app) as client:
+
+        async def fake_retry(method, url, headers, body, stream=False, **kwargs):
+            return httpx.Response(
+                200,
+                json={"id": "r", "object": "response", "status": "completed", "output": []},
+                request=httpx.Request("POST", url),
+            )
+
+        app.state.proxy._retry_request = fake_retry
+        resp = client.post(
+            "/v1/responses",
+            content=json.dumps(
+                {"model": "gpt-5.5", "input": "hi", "messages": None, "stream": False}
+            ).encode(),
+            headers={
+                "Authorization": "Bearer sk-test",
+                "Content-Type": "application/json",
+                "x-headroom-bypass": "true",
+            },
+        )
+    assert resp.status_code == 200, resp.text
