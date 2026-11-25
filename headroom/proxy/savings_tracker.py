@@ -685,6 +685,13 @@ def _estimate_input_cost_usd(
     ``max()``, so a base-rate estimate lost to a tier-aware total and the premium
     was booked against the NEXT request's model and timestamp.
 
+    ``for_billing=True`` for the same reason this reads the tier here: this
+    function prices SPEND, not savings, so a row that publishes no cache-read
+    rate resolves it through the model's billing calculator exactly as
+    ``CostTracker`` does. The counterfactual fallback priced that read at the
+    tier's input rate and reported double what the tracker — and the provider —
+    charged.
+
     Uses provider cache pricing when a complete cache breakdown is available and
     otherwise falls back to list-price input tokens. Inferred cache writes are
     the same tokens as uncached input, so they are not priced as a second bucket.
@@ -721,7 +728,7 @@ def _estimate_input_cost_usd(
         rates = resolve_rates(
             model,
             long_context=chargeable_tokens > long_context_threshold(model),
-            for_billing=False,
+            for_billing=True,
         )
     except Exception as exc:
         logger.debug(

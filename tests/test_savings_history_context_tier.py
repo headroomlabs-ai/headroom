@@ -42,12 +42,28 @@ _CATALOG = {
 }
 
 
+def _billing_calculator(catalog: dict):
+    """Stand-in for LiteLLM's calculator: an unpriced slice bills at list input.
+
+    ``_estimate_input_cost_usd`` prices SPEND, so a catalog row that publishes no
+    cache-read rate resolves it the way ``CostTracker`` does — through the model's
+    billing calculator. Returning a flat 0 here would have made cache reads free
+    and hidden exactly the divergence these tests exist to catch.
+    """
+
+    def _price(*, model, prompt_tokens, completion_tokens=0, **_kw):
+        rate = (catalog.get(model) or {}).get("input_cost_per_token", 0.0)
+        return (float(prompt_tokens) * float(rate or 0.0), 0.0)
+
+    return _price
+
+
 @pytest.fixture
 def tiered_pricing(monkeypatch: pytest.MonkeyPatch) -> dict:
     """The same catalog on the savings side and the cost-tracker side."""
     from types import SimpleNamespace
 
-    fake = SimpleNamespace(model_cost=_CATALOG, cost_per_token=lambda **_kw: (0.0, 0.0))
+    fake = SimpleNamespace(model_cost=_CATALOG, cost_per_token=_billing_calculator(_CATALOG))
     monkeypatch.setattr(st, "_get_litellm_module", lambda: fake)
     monkeypatch.setattr(st, "_resolve_litellm_model", lambda model: model)
     resolve_rates.cache_clear()
@@ -70,7 +86,9 @@ def catalog_pricing(monkeypatch: pytest.MonkeyPatch):
     """
 
     def _apply(catalog: dict) -> dict:
-        fake = types.SimpleNamespace(model_cost=catalog, cost_per_token=lambda **_kw: (0.0, 0.0))
+        fake = types.SimpleNamespace(
+            model_cost=catalog, cost_per_token=_billing_calculator(catalog)
+        )
         resolve_rates.cache_clear()
         monkeypatch.setattr("headroom.pricing.counterfactual._litellm", lambda: fake)
         monkeypatch.setattr(
@@ -288,3 +306,63 @@ def test_one_hour_cache_writes_are_priced_at_their_own_ttl(tiered_pricing: dict,
         pytest.approx(1.00),
         pytest.approx(1.01),
     ]
+
+
+def test_savings_history_spend_matches_the_tracker_when_cache_reads_are_unpriced(
+    catalog_pricing, tmp_path
+) -> None:
+    """Reported spend must use the BILLED cache-rate fallback, like the tracker.
+
+    $1/M input, $2/M above 200k, no published cache-read price, and a calculator
+    that bills reads at $1/M. Reading 250k tokens therefore costs $0.25, not the
+    $0.50 the counterfactual fallback implied by pricing reads at the tier's
+    input rate — and since ``record_request`` keeps the larger of its estimate
+    and the tracker total, the excess $0.25 was booked against the next request
+    and never released.
+    """
+    catalog = {
+        "reader-model": {
+            "input_cost_per_token": 1e-6,
+            "input_cost_per_token_above_200k_tokens": 2e-6,
+        },
+        "expensive-model": {"input_cost_per_token": 1e-5},
+    }
+    catalog_pricing(catalog)
+
+    cost_tracker = CostTracker()
+    tracker = SavingsTracker(path=tmp_path / "savings.json", save_flush_every=1)
+
+    def record(model: str, *, reads: int = 0, uncached: int = 0) -> None:
+        total_tokens, total_cost = cost_tracker.totals()
+        tracker.record_request(
+            model=model,
+            input_tokens=reads + uncached,
+            tokens_saved=0,
+            cache_read_tokens=reads,
+            uncached_input_tokens=uncached,
+            output_tokens=1_000,
+            total_input_tokens=total_tokens,
+            total_input_cost_usd=total_cost,
+        )
+        cost_tracker.record_tokens(
+            model,
+            tokens_saved=0,
+            tokens_sent=reads + uncached,
+            cache_read_tokens=reads,
+            uncached_tokens=uncached,
+            output_tokens=1_000,
+        )
+
+    record("reader-model", reads=250_000)  # $0.25 of reads at the billed rate
+    record("expensive-model", uncached=1_000)  # $0.01
+
+    history = [entry for entry in tracker._state["history"] if entry["total_input_cost_usd"]]
+    assert [entry["total_input_cost_usd"] for entry in history] == [
+        pytest.approx(0.25),
+        pytest.approx(0.26),
+    ]
+    # Parity with the tracker, which is what the budget path reports.
+    assert tracker._state["lifetime"]["total_input_cost_usd"] == pytest.approx(
+        cost_tracker.totals()[1]
+    )
+    assert cost_tracker.totals()[1] == pytest.approx(0.26)

@@ -26,7 +26,12 @@ def _route_shared_resolver_at(fake_litellm, monkeypatch) -> None:
     """Install the fake catalog on the resolver the estimator now prices through."""
     from headroom.pricing.counterfactual import resolve_rates
 
+    def _billing_calculator(*, model, prompt_tokens, completion_tokens=0, **_kw):
+        rate = fake_litellm.model_cost.get(model, {}).get("input_cost_per_token", 0.0)
+        return (float(prompt_tokens) * float(rate or 0.0), 0.0)
+
     monkeypatch.setattr("headroom.pricing.counterfactual._litellm", lambda: fake_litellm)
+    monkeypatch.setattr(fake_litellm, "cost_per_token", _billing_calculator)
     monkeypatch.setattr(
         "headroom.pricing.litellm_pricing.resolve_litellm_model", lambda model: model
     )

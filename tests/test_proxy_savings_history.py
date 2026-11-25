@@ -434,13 +434,13 @@ def test_savings_tracker_save_survives_directory_fsync_failure(tmp_path, monkeyp
 
 
 def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
-    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
+    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens, **_kw):
+        # A numeric (input, output) pair, like LiteLLM's, and tolerant of the
+        # slice kwarg it is called with: the billed-cache-rate fallback reads the
+        # result as cost/token, so a dict or a strict signature would resolve
+        # every unpublished cache rate to 0 — the bug this PR fixes.
         if model in {"gpt-4o", "anthropic/claude-sonnet-4-6"}:
-            return {
-                "model": model,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-            }
+            return (prompt_tokens * 0.002, completion_tokens * 0.0)
         raise RuntimeError("unknown model")
 
     fake_litellm = SimpleNamespace(
