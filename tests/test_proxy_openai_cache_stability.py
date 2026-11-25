@@ -1327,3 +1327,48 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
         }
     finally:
         reset_otel_metrics()
+
+
+@pytest.mark.parametrize("drop_frozen", [True, False], ids=["drop-frozen", "rewrite-frozen"])
+def test_cache_mode_does_not_duplicate_surviving_frozen_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, drop_frozen: bool
+) -> None:
+    monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "frozen request"},
+        {"role": "assistant", "content": "frozen response"},
+        {"role": "user", "content": "live request"},
+    ]
+    captured = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content)["messages"])
+        return _provider_reply(request)
+
+    def shorten_messages(**kwargs):  # noqa: ANN001, ANN003, ANN202
+        result = _compress_unfrozen_tool_results(**kwargs)
+        if drop_frozen:
+            result.messages = result.messages[1:]
+        else:
+            result.messages = result.messages[:-1]
+            result.messages[1] = {**result.messages[1], "content": "rewritten frozen request"}
+        return result
+
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        _install_tracker(proxy, _FakePrefixTracker(frozen_count=3))
+        proxy.openai_pipeline.apply = shorten_messages
+        proxy.http_client = httpx.AsyncClient(transport=httpx.MockTransport(provider))
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={"model": "gpt-4o-mini", "messages": history},
+        )
+        assert response.status_code == 200
+
+    assert captured == [history]
