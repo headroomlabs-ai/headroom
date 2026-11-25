@@ -313,11 +313,7 @@ class TestStreamUsageGuard:
         out = guard.feed(start + delta + stop)
 
         assert out.count(b"\r\r") == 3
-        decoded = [
-            json.loads(line[len(b"data:") :].strip())
-            for line in out.split(b"\r\r")
-            if line
-        ]
+        decoded = [json.loads(line[len(b"data:") :].strip()) for line in out.split(b"\r\r") if line]
         assert [payload["type"] for payload in decoded] == [
             "message_start",
             "message_delta",
