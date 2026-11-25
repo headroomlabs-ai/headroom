@@ -275,6 +275,20 @@ def test_text_block_starting_mid_row_after_throwable_header_stays_whole(ccr_enab
     assert [block["text"] for block in out] == [first, rest[20:]]
 
 
+@pytest.mark.parametrize("ccr_enabled", [True, False], ids=["no-ccr", "ccr-disabled"])
+def test_text_block_starting_on_a_row_after_unterminated_block_stays_whole(ccr_enabled, tokenizer):
+    # The first block ends without a newline, but the second starts on a whole
+    # row, so its first row must not be skipped as the tail of another row.
+    rows = TOMCAT_LOG.split("\n")
+    first = rows[0] + "\njava.lang.IllegalStateException: unexpected state"
+    second = "\n".join([rows[1], JAVA_FRAME, *rows[2:]])
+    blocks = [{"type": "text", "text": first}, {"type": "text", "text": second}]
+    config = ContentRouterConfig(ccr_enabled=ccr_enabled, ccr_inject_marker=False)
+    out, transforms = _openai("grep INFO logs/catalina.out", blocks, tokenizer, config)
+    assert "router:bash:search_verbatim" in transforms
+    assert [block["text"] for block in out] == [first, second]
+
+
 def test_lossless_mode_still_folds_repeated_timestamped_matches(tokenizer):
     # Lossless mode has no markers either, but it never compresses lossily,
     # so its reversible run fold must still get the chance to shrink repeats.

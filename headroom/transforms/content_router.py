@@ -8190,7 +8190,7 @@ class ContentRouter(Transform):
         # Set on the first tool text block from the whole result.
         search_guard: bool | None = None
         search_verbatim = False
-        search_block_rows: dict[int, str] = {}
+        search_block_verbatim: dict[int, bool] = {}
 
         # Top-level text blocks are fragments of one tool result. Measure the
         # whole result so splitting a large log cannot activate the small-result
@@ -8563,19 +8563,20 @@ class ContentRouter(Transform):
                         )
                         if search_guard and not search_verbatim:
                             # Other blocks broke the whole-result check, so judge
-                            # each block alone, without the tail of a row that an
-                            # earlier block started.
+                            # each block alone. A block after an unterminated one
+                            # may start with the tail of that row, so it also
+                            # qualifies without its first line.
                             prev = "\n"
                             for b in texts:
-                                rows = b["text"]
-                                if not prev.endswith("\n"):
-                                    rows = rows.partition("\n")[2]
-                                search_block_rows[id(b)] = rows
-                                prev = b["text"] or prev
-                    if search_verbatim or (
-                        search_guard
-                        and self._bash_search_rows_verbatim(search_block_rows.get(id(block)))
-                    ):
+                                text = b["text"]
+                                search_block_verbatim[id(b)] = self._bash_search_rows_verbatim(
+                                    text
+                                ) or (
+                                    not prev.endswith("\n")
+                                    and self._bash_search_rows_verbatim(text.partition("\n")[2])
+                                )
+                                prev = text or prev
+                    if search_verbatim or search_block_verbatim.get(id(block), False):
                         new_blocks.append(block)
                         transforms_applied.append("router:bash:search_verbatim")
                         if route_counts is not None:
