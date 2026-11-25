@@ -149,3 +149,41 @@ def test_http_turn_steered_in_its_input_is_booked_as_shaped(monkeypatch) -> None
 
     assert outcomes
     assert "output_shaper:verbosity:L3" in outcomes[-1].transforms_applied
+
+
+@pytest.mark.parametrize(
+    ("model", "text", "arm"),
+    [
+        # Each pair is assigned opposite arms by the two passes' old keys.
+        ("gpt-5.5", "list the files", "control"),
+        ("gpt-5.4-mini", "read the readme", "treatment"),
+    ],
+)
+def test_both_shaping_passes_put_a_request_in_one_holdout_arm(
+    monkeypatch, model: str, text: str, arm: str
+) -> None:
+    """Optimized HTTP Responses shapes twice (in compression, then before the
+    send). With a fractional holdout, two arm keys could label one request both
+    treatment and control; the ledger reads the first stratum and drops a
+    steered treatment turn that lacks a verbosity label."""
+    from headroom.proxy.output_savings import parse_stratum_label
+    from headroom.proxy.output_verbosity_policy import steering_text
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
+
+    outcomes = _post(
+        {
+            "model": model,
+            "input": [{"role": "user", "content": f"{text}\n\n{steering_text(3)}"}],
+            "stream": False,
+        }
+    )
+
+    assert outcomes
+    labels = list(outcomes[-1].transforms_applied)
+    arms = {parsed[0] for parsed in map(parse_stratum_label, labels) if parsed is not None}
+    assert arms == {arm}, labels
+    # The ledger drops a treatment sample that lacks a verbosity label.
+    assert ("output_shaper:verbosity:L3" in labels) is (arm == "treatment"), labels

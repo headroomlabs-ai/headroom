@@ -941,6 +941,7 @@ def _shape_openai_responses_payload(
     model: str,
     request_id: str,
     output_shaper_enabled: bool | None = None,
+    conversation_key: str | None = None,
 ) -> tuple[list[str], bool]:
     """Output shaping for a Responses payload (opt-in, HEADROOM_OUTPUT_SHAPER).
 
@@ -977,7 +978,9 @@ def _shape_openai_responses_payload(
             return [], False
 
         holdout = output_holdout_fraction()
-        conversation = conversation_key_from_responses_body(payload)
+        # A caller that shapes the same request twice passes one key, so both
+        # passes land in the same arm.
+        conversation = conversation_key or conversation_key_from_responses_body(payload)
         arm = assign_arm(conversation, holdout)
 
         turn_kind = classify_responses_turn(payload.get("input")).value
@@ -3509,10 +3512,12 @@ class OpenAIHandlerMixin:
         savings_tags: dict[str, Any] | None = None,
         conversation: str | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        output_arm_key: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         """``conversation`` is the caller's ``turn_conversation_key``,
         derived before compression rewrites the body; turn hooks see it as
-        ``TurnContext.conversation``."""
+        ``TurnContext.conversation``. ``output_arm_key`` is the holdout key
+        for output shaping, when the caller shapes this request again later."""
         timing: dict[str, float] = {}
 
         # Codex >= 0.149.0 nests tool definitions in `input` items of type
@@ -3551,6 +3556,7 @@ class OpenAIHandlerMixin:
                 model=model,
                 request_id=request_id,
                 output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
+                conversation_key=output_arm_key,
             )
             compression_kwargs: dict[str, Any] = {
                 "model": model,
@@ -7042,6 +7048,18 @@ class OpenAIHandlerMixin:
         # CompressionUnits and routing them through ContentRouter. Policy
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
+        # One holdout arm per request. Output shaping runs in the compression
+        # pass and again before the send; deriving the key twice (from
+        # different body views) could put one request in both arms, and the
+        # ledger reads the first. Same key headroom-kiro steers by.
+        from headroom.proxy.output_savings import conversation_key_from_body
+
+        _session_header = request.headers.get("x-headroom-session-id")
+        _output_arm_key = (
+            f"header:x-headroom-session-id:{_session_header}"
+            if _session_header
+            else conversation_key_from_body(body)
+        )
         if self.config.optimize and not _bypass:
             # Pre-compression tools reference: the compression pass is
             # copy-on-write on the payload, so this still points at the
@@ -7065,6 +7083,7 @@ class OpenAIHandlerMixin:
                     client=client,
                     savings_tags=tags,
                     conversation=_turn_conversation,
+                    output_arm_key=_output_arm_key,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -7157,16 +7176,11 @@ class OpenAIHandlerMixin:
                     ) from _e
 
         if not _bypass:
-            _http_conversation_key = request.headers.get("x-headroom-session-id")
             _shape_result = _shape_openai_responses_for_output(
                 body,
                 input_tokens=message_input_tokens,
                 model=str(model or ""),
-                conversation_key=(
-                    f"header:x-headroom-session-id:{_http_conversation_key}"
-                    if _http_conversation_key
-                    else None
-                ),
+                conversation_key=_output_arm_key,
                 output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
                 # One request, one outcome: safe to credit a turn an extension
                 # steered (Kiro puts the block in the user turn).

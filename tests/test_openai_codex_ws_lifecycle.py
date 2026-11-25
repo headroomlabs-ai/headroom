@@ -3122,7 +3122,8 @@ async def test_ws_pending_savings_beyond_32_rows_are_all_booked(
 
 
 @pytest.mark.asyncio
-async def test_ws_extension_steered_turn_label_does_not_reach_any_turn(monkeypatch):
+@pytest.mark.parametrize("optimize", [False, True])
+async def test_ws_extension_steered_turn_label_does_not_reach_any_turn(monkeypatch, optimize):
     """Two turns on one session: the first carries a level-1 steering block an
     extension placed in its input, the second carries none. WebSocket outcomes
     reuse one session label list, so a level credited from turn one's input
@@ -3151,7 +3152,7 @@ async def test_ws_extension_steered_turn_label_does_not_reach_any_turn(monkeypat
         ]
     )
     handler = _DummyOpenAIHandler()
-    handler.config.optimize = False
+    handler.config.optimize = optimize
     outcomes = []
 
     async def _record_request_outcome(outcome):
@@ -3162,6 +3163,7 @@ async def test_ws_extension_steered_turn_label_does_not_reach_any_turn(monkeypat
     with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
         await handler.handle_openai_responses_ws(_FakeWebSocket(frames=[steered, plain]))
 
-    assert outcomes
+    # One outcome per turn: both turns are checked, not just the first.
+    assert len([o for o in outcomes if o.provider_input_tokens > 0]) == 2
     for outcome in outcomes:
         assert "output_shaper:verbosity:L1" not in outcome.transforms_applied
