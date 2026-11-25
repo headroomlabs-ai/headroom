@@ -11,9 +11,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
-from headroom.backends.base import newest_snapshot
 from headroom.log_safety import redact_url
-from headroom.providers.anthropic import sanitize_anthropic_model_id
+from headroom.providers.bedrock_models import newest_snapshot
 from headroom.providers.cloudcode import (
     cloudcode_passthrough_target,
     normalize_cloudcode_passthrough_path,
@@ -723,6 +722,9 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if bedrock_ids is not None:
             # Same names inference accepts: a "[1m]" context suffix and an
             # undated alias of a listed snapshot.
+            # Local import: the module pulls in litellm, which proxy startup avoids.
+            from headroom.providers.anthropic import sanitize_anthropic_model_id
+
             clean_id = sanitize_anthropic_model_id(model_id)
             if clean_id in bedrock_ids or newest_snapshot(clean_id, bedrock_ids):
                 return JSONResponse(_anthropic_model_entry(model_id))

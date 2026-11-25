@@ -22,10 +22,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.providers.bedrock_models import newest_snapshot
 from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
-from .base import Backend, BackendResponse, StreamEvent, newest_snapshot
+from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
 
