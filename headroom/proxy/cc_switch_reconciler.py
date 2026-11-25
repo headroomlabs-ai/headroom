@@ -52,6 +52,8 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from headroom import fsutil
+
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_S = 0.3
@@ -211,11 +213,9 @@ class CCSwitchReconciler:
         return True
 
     def _atomic_write(self, data: dict) -> None:
-        # Per-process temp name: multiple Headroom processes reconciling the
-        # same settings.json must not clobber each other's temp file.
-        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.hrtmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, self.path)
+        # fsutil.write_text: unique temp file, follows a symlinked settings.json
+        # and keeps the existing file's mode (the file holds the provider token).
+        fsutil.write_text(self.path, json.dumps(data, indent=2) + "\n")
         # Skip the mtime bump caused by our own write so we don't re-process it.
         try:
             self._last_mtime_ns = self.path.stat().st_mtime_ns

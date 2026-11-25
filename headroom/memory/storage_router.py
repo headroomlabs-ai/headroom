@@ -177,9 +177,11 @@ class ProjectResolver:
             if ident is not None:
                 return ident
 
-        # Tier 3: CLI-level override of the project root.
+        # Tier 3: CLI-level override of the project root. A native filesystem
+        # path: leading and trailing spaces are part of the directory name,
+        # so this tier does not strip them (#4173).
         if ctx.project_root_override:
-            ident = self._identity_from_cwd(ctx.project_root_override)
+            ident = self._identity_from_cwd(ctx.project_root_override, preserve_whitespace=True)
             if ident is not None:
                 return ident
 
@@ -233,7 +235,11 @@ class ProjectResolver:
 
     @classmethod
     def _identity_from_cwd(
-        cls, raw_cwd: str, *, percent_encoded: bool = False
+        cls,
+        raw_cwd: str,
+        *,
+        percent_encoded: bool = False,
+        preserve_whitespace: bool = False,
     ) -> tuple[str, str] | None:
         # ``percent_encoded`` is set only for the ``x-headroom-cwd`` header,
         # which the wrapper percent-encodes so non-ASCII paths stay valid HTTP
@@ -243,7 +249,20 @@ class ProjectResolver:
         # decoding it would fold genuinely distinct directories together: a
         # real ``/work/acme%2Fapi`` would collapse onto ``/work/acme/api`` and
         # share its store. Decode at the boundary that encodes, nowhere else.
-        cwd = unquote(raw_cwd.strip()) if percent_encoded else raw_cwd.strip()
+        # Strip-before-``unquote`` stays for that header so ``%20`` and a
+        # literal space stay distinct (#3597).
+        #
+        # ``preserve_whitespace`` is set only for the operator
+        # ``project_root_override``. That value is a native filesystem path:
+        # leading and trailing spaces are part of the directory name, not
+        # whitespace-delimited client metadata. Header values and system-prompt
+        # cwd lines still strip on purpose.
+        if percent_encoded:
+            cwd = unquote(raw_cwd.strip())
+        elif preserve_whitespace:
+            cwd = raw_cwd
+        else:
+            cwd = raw_cwd.strip()
         if not cwd:
             return None
         # Normalise so symlinked / trailing-slash variants collapse to

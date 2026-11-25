@@ -21,6 +21,7 @@ a silent fallback.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -263,19 +264,19 @@ class _FakePrefixTracker:
 
 
 def _make_anthropic_app(**config_overrides) -> tuple[TestClient, _CapturingTransport]:
-    config = ProxyConfig(
-        optimize=False,
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        cost_tracking_enabled=False,
-        log_requests=False,
-        ccr_inject_tool=False,
-        ccr_handle_responses=False,
-        ccr_context_tracking=False,
-        image_optimize=False,
+    settings = {
+        "optimize": False,
+        "cache_enabled": False,
+        "rate_limit_enabled": False,
+        "cost_tracking_enabled": False,
+        "log_requests": False,
+        "ccr_inject_tool": False,
+        "ccr_handle_responses": False,
+        "ccr_context_tracking": False,
+        "image_optimize": False,
         **config_overrides,
-    )
-    app = create_app(config)
+    }
+    app = create_app(ProxyConfig(**settings))
     proxy = app.state.proxy
     transport = _CapturingTransport()
     proxy.http_client = httpx.AsyncClient(transport=transport)
@@ -459,60 +460,66 @@ def test_legitimate_headers_passthrough_e2e() -> None:
     assert upstream.get("authorization") == "Bearer sk-ant-test"
 
 
-def test_inbound_read_path_still_reads_x_headroom_bypass() -> None:
-    """Bypass header still gates compression even though it's stripped from upstream.
-
-    The handler reads `request.headers.get('x-headroom-bypass')` directly.
-    Stripping the local outbound-bound `headers` dict does NOT affect that
-    inbound read path.
-    """
-    config = ProxyConfig(
-        # Compression is the only thing bypass affects observably; turn it on.
-        optimize=True,
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        cost_tracking_enabled=False,
-        log_requests=False,
-        ccr_inject_tool=False,
-        ccr_handle_responses=False,
-        ccr_context_tracking=False,
-        image_optimize=False,
-    )
-    app = create_app(config)
-    proxy = app.state.proxy
-    transport = _CapturingTransport()
-    proxy.http_client = httpx.AsyncClient(transport=transport)
-
-    fake_tracker = _FakePrefixTracker(frozen_count=0)
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s_bypass"
-    proxy.session_tracker_store.get_or_create = (
-        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
-    )
-
-    client = TestClient(app)
-
-    # Force a bypass via header. The handler logs "Bypass: skipping compression"
-    # if the inbound read worked; we can't easily intercept the log, so we
-    # primarily assert that:
-    #   1. The request still succeeds.
-    #   2. The upstream did NOT receive the `x-headroom-bypass` header.
+def _forwarded_tool_result(tool_output: str, extra_headers: dict[str, str]) -> str:
+    """POST ``tool_output`` as a tool result with optimize on; return what went upstream."""
+    client, transport = _make_anthropic_app(optimize=True)
     resp = client.post(
         "/v1/messages",
         headers={
             "x-api-key": "test-key",
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-            "x-headroom-bypass": "true",
+            **extra_headers,
         },
         json={
             "model": "claude-sonnet-4-6",
             "max_tokens": 16,
-            "messages": [{"role": "user", "content": "hi"}],
+            "messages": [
+                {"role": "user", "content": "list the services"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tu_1", "name": "list_services", "input": {}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu_1", "content": tool_output}
+                    ],
+                },
+            ],
         },
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     upstream = {k.lower(): v for k, v in (transport.captured_headers or {}).items()}
     assert "x-headroom-bypass" not in upstream
+    assert transport.captured_body is not None
+    forwarded = json.loads(transport.captured_body)["messages"][2]["content"][0]["content"]
+    assert isinstance(forwarded, str)
+    return forwarded
+
+
+def test_inbound_read_path_still_reads_x_headroom_bypass() -> None:
+    """Bypass header still gates compression even though it's stripped from upstream.
+
+    The compression gate (`CompressionDecision.decide`) reads the inbound
+    `request.headers`. Stripping the local outbound-bound `headers` dict must
+    not hide the header from that read.
+    """
+    rows = [
+        {"id": i, "status": "ok", "service": "api", "latency_ms": 12, "region": "us-east-1"}
+        for i in range(300)
+    ]
+    tool_output = json.dumps(rows)
+
+    # Control: without the header this tool result is compressed, so the
+    # bypass assertion below can tell "bypassed" from "nothing to compress".
+    compressed = _forwarded_tool_result(tool_output, {})
+    assert len(compressed) < len(tool_output), "control request was not compressed"
+
+    bypassed = _forwarded_tool_result(tool_output, {"x-headroom-bypass": "true"})
+    assert bypassed == tool_output
 
 
 def test_disabled_mode_passes_through_e2e(

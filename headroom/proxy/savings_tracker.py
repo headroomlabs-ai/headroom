@@ -673,15 +673,17 @@ def _estimate_input_cost_usd(
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     uncached_input_tokens: int = 0,
+    cache_inferred: bool = False,
 ) -> float:
     """Estimate input spend in USD for a request.
 
     Uses provider cache pricing when a complete cache breakdown is available and
-    otherwise falls back to list-price input tokens.
+    otherwise falls back to list-price input tokens. Inferred cache writes are
+    the same tokens as uncached input, so they are not priced as a second bucket.
     """
     total_input_tokens = _coerce_int(input_tokens)
     cache_read = _coerce_int(cache_read_tokens)
-    cache_write = _coerce_int(cache_write_tokens)
+    cache_write = 0 if cache_inferred else _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
 
     # Prefer the breakdown when callers supply segmented token counts.
@@ -1252,6 +1254,9 @@ class SavingsTracker:
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        # True when the write count duplicates uncached input rather than a
+        # separately billed provider bucket.
+        cache_inferred: bool = False,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
         # Mixed value types: per-layer dollars plus the string `basis` label
@@ -1380,6 +1385,7 @@ class SavingsTracker:
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             uncached_input_tokens=uncached_input_tokens,
+            cache_inferred=cache_inferred,
         )
 
         with self._lock:
@@ -1605,6 +1611,7 @@ class SavingsTracker:
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,
+                cache_inferred=cache_inferred,
             ),
         )
         # Cache-aware, like every other savings figure as of v6. ``tokens_saved``

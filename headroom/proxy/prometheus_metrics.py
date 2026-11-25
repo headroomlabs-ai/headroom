@@ -13,7 +13,7 @@ import asyncio
 import logging
 import threading
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +31,7 @@ logger = logging.getLogger("headroom.proxy")
 # Sentinel label value that models past MAX_DISTINCT_MODELS collapse into, so
 # client-supplied model cardinality stays bounded (see record_request).
 _OTHER_MODEL = "other"
+_MAX_MODEL_LENGTH = 128
 
 # Same idea for inbound request paths (see record_inbound_request). ``path`` is
 # client-controlled and effectively unbounded — ID-bearing passthrough routes
@@ -65,6 +66,12 @@ RATE_LIMIT_SOURCES = (RATE_LIMIT_SOURCE_HEADROOM, RATE_LIMIT_SOURCE_UPSTREAM)
 # Bucket for a failure with no attributed provider. Also seeded at zero so
 # headroom_requests_failed_total always exports at least one sample.
 _PROVIDER_UNKNOWN = "unknown"
+
+
+def _valid_model_key(model: str) -> bool:
+    return len(model) <= _MAX_MODEL_LENGTH and not any(
+        ord(char) < 32 or 127 <= ord(char) < 160 for char in model
+    )
 
 
 def _rate_limit_source(source: str | None) -> str:
@@ -361,8 +368,10 @@ class PrometheusMetrics:
                 "bust_write_tokens": 0,
             }
         )
-        # Track per-model cache request count to distinguish cold starts from busts
-        self._cache_requests_by_model: dict[str, int] = defaultdict(int)
+        # Track per-model cache request count to distinguish cold starts from busts.
+        # Keys are the caller's model values, not the display-coerced strings,
+        # so int 123 and str "123" keep separate histories.
+        self._cache_requests_by_model: dict[Any, int] = defaultdict(int)
 
         # New-input basis. The cohort is every request that newly BILLED input
         # (uncached or cache-write tokens), which is not the same set as the
@@ -971,8 +980,15 @@ class PrometheusMetrics:
             # (the sentinel docs/observability.md documents for `tier`), mirroring
             # the requests_by_stack cap. Membership test, never a defaultdict index:
             # indexing would materialize the key and defeat the cap.
-            if model in self.requests_by_model or len(self.requests_by_model) < MAX_DISTINCT_MODELS:
-                bounded_model = model
+            model_key = str(model)
+            model_key_valid = _valid_model_key(model_key)
+            if not model_key_valid:
+                bounded_model = _OTHER_MODEL
+            elif (
+                model_key in self.requests_by_model
+                or len(self.requests_by_model) < MAX_DISTINCT_MODELS
+            ):
+                bounded_model = model_key
             else:
                 bounded_model = _OTHER_MODEL
                 if not self._model_cardinality_warned:
@@ -1058,18 +1074,41 @@ class PrometheusMetrics:
                 # is always a cold start (100% write, 0% read) — not a bust.
                 # Only flag as bust when a previously-warm model suddenly has
                 # high write ratio, indicating prefix invalidation.
-                # bounded_model can be "other" once the cardinality cap trips, which
-                # mixes distinct models in this bust heuristic. That is acceptable:
-                # it only happens past MAX_DISTINCT_MODELS distinct models on cached
-                # anthropic traffic, the worst case is a mis-attributed bust stat,
-                # and it keeps _cache_requests_by_model bounded.
-                model_req_num = self._cache_requests_by_model[bounded_model]
-                self._cache_requests_by_model[bounded_model] += 1
-                if provider == "anthropic" and model_req_num > 0:
-                    total_cached = cache_read_tokens + cache_write_tokens
-                    if total_cached > 0 and cache_write_tokens > total_cached * 0.5:
-                        pc["bust_count"] += 1
-                        pc["bust_write_tokens"] += cache_write_tokens
+                # An invalid model key never warms _cache_requests_by_model:
+                # it counts under "other" in requests_by_model only. Warming
+                # the shared "other" entry would make a later genuine "other"
+                # model's first write look like a bust. Only valid names past
+                # the cardinality cap still attribute to "other" here; that
+                # mixing is confined to past-MAX_DISTINCT_MODELS traffic and
+                # keeps _cache_requests_by_model bounded.
+                # Cache-history identity is the caller's model value, not the
+                # display-coerced string: int 123 and str "123" are distinct
+                # models (as on main) and must not share one cache entry.
+                # Unhashable values fall back to the display key.
+                if model_key_valid:
+                    if bounded_model == model_key and isinstance(model, Hashable):
+                        cache_model = model
+                    else:
+                        cache_model = bounded_model
+                    # Bound cache history independently of the display map:
+                    # raw keys can outnumber display keys (int/str pairs
+                    # share one bucket; distinct NaNs all display as "nan"),
+                    # so admit a new raw key only while the map still has
+                    # room below the cap; beyond that, attribute to "other".
+                    # The cap reserves one slot for "other", so the map never
+                    # exceeds MAX_DISTINCT_MODELS + 1 entries.
+                    if (
+                        cache_model not in self._cache_requests_by_model
+                        and len(self._cache_requests_by_model) >= MAX_DISTINCT_MODELS
+                    ):
+                        cache_model = _OTHER_MODEL
+                    model_req_num = self._cache_requests_by_model[cache_model]
+                    self._cache_requests_by_model[cache_model] += 1
+                    if provider == "anthropic" and model_req_num > 0:
+                        total_cached = cache_read_tokens + cache_write_tokens
+                        if total_cached > 0 and cache_write_tokens > total_cached * 0.5:
+                            pc["bust_count"] += 1
+                            pc["bust_write_tokens"] += cache_write_tokens
 
             self.latency_sum_ms += latency_ms
             self.latency_min_ms = min(self.latency_min_ms, latency_ms)
@@ -1147,6 +1186,7 @@ class PrometheusMetrics:
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,
+                cache_inferred=cache_inferred,
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
