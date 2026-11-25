@@ -8,7 +8,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from headroom.log_safety import redact_url
 from headroom.providers.cloudcode import (
@@ -659,9 +659,37 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         )
         return provider_name, base_url
 
+    def _bedrock_model_ids(request: Request, provider_name: str) -> list[str] | None:
+        # In Bedrock mode an Anthropic-format model lookup has no Anthropic
+        # account behind it (Claude Desktop in gateway mode sends a placeholder
+        # key); answer from the Bedrock models the backend discovered. A
+        # caller-named upstream still gets the passthrough.
+        if provider_name != "anthropic" or request.headers.get("x-headroom-base-url", "").strip():
+            return None
+        backend = getattr(proxy, "anthropic_backend", None)
+        return backend.bedrock_model_ids() if backend is not None else None
+
+    def _anthropic_model_entry(model_id: str) -> dict[str, str]:
+        return {
+            "type": "model",
+            "id": model_id,
+            "display_name": model_id,
+            "created_at": "1970-01-01T00:00:00Z",
+        }
+
     @app.get("/v1/models")
     async def list_models(request: Request):
         provider_name, base_url = await _model_metadata_route(request)
+        bedrock_ids = _bedrock_model_ids(request, provider_name)
+        if bedrock_ids is not None:
+            return JSONResponse(
+                {
+                    "data": [_anthropic_model_entry(m) for m in bedrock_ids],
+                    "has_more": False,
+                    "first_id": bedrock_ids[0] if bedrock_ids else None,
+                    "last_id": bedrock_ids[-1] if bedrock_ids else None,
+                }
+            )
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -673,6 +701,20 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
         provider_name, base_url = await _model_metadata_route(request)
+        bedrock_ids = _bedrock_model_ids(request, provider_name)
+        if bedrock_ids is not None:
+            if model_id in bedrock_ids:
+                return JSONResponse(_anthropic_model_entry(model_id))
+            return JSONResponse(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "not_found_error",
+                        "message": f"Model {model_id!r} is not available on this Bedrock backend.",
+                    },
+                },
+                status_code=404,
+            )
         return await handle_model_metadata_endpoint(
             proxy,
             request,
