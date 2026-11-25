@@ -440,6 +440,10 @@ class LangConfig:
     # `template <...>`). The prefix is kept verbatim and the declaration it
     # wraps is compressed, so the two stay attached.
     prefix_wrapper_node_types: frozenset[str] | None = None
+    # Emit the output in source order instead of grouped by kind. C and C++
+    # declare before use: grouping moved a namespace above the `#define` or
+    # `constexpr` it uses, leaving output that parses but no longer compiles.
+    source_ordered: bool = False
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
@@ -530,6 +534,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("#include", "typedef ", "int main("),
+        source_ordered=True,
     ),
     CodeLanguage.CPP: LangConfig(
         import_nodes=frozenset({"preproc_include"}),
@@ -546,6 +551,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         class_body_node_types=frozenset({"field_declaration_list", "declaration_list"}),
         container_node_types=frozenset({"namespace_definition", "linkage_specification"}),
         prefix_wrapper_node_types=frozenset({"template_declaration"}),
+        source_ordered=True,
     ),
     CodeLanguage.PERL: LangConfig(
         import_nodes=frozenset({"use_statement", "use_version_statement"}),
@@ -658,6 +664,9 @@ class CodeStructure:
     # moves a definition across executable code, changing class bases,
     # decorators, or default expressions evaluated at definition time.
     reorder_unsafe: bool = False
+    # (start_byte, end_byte, text) per emitted top-level fragment, filled for
+    # languages with ``LangConfig.source_ordered``.
+    source_order: list[tuple[int, int, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -1655,7 +1664,10 @@ class CodeAwareCompressor(Transform):
             return code, structure, {}
 
         # Assemble compressed code
-        compressed = self._assemble_compressed(structure, language)
+        if lang_config and lang_config.source_ordered:
+            compressed = _assemble_in_source_order(structure, code)
+        else:
+            compressed = self._assemble_compressed(structure, language)
 
         # Expose scores with short names for the public API
         symbol_scores: dict[str, float] = {}
@@ -1888,7 +1900,11 @@ class CodeAwareCompressor(Transform):
         # its content twice. When that happens, undo the nested captures and
         # let the wrapper go out verbatim, once. Only the root needs this: the
         # sweep is the one place uncaptured nodes are re-emitted.
-        list_fields = [name for name, value in vars(structure).items() if isinstance(value, list)]
+        list_fields = [
+            name
+            for name, value in vars(structure).items()
+            if isinstance(value, list) and name != "source_order"
+        ]
         for child in root.children:
             lists_before = {name: list(getattr(structure, name)) for name in list_fields}
             captured_before = len(captured_byte_ranges)
@@ -1905,6 +1921,11 @@ class CodeAwareCompressor(Transform):
                 del captured_byte_ranges[captured_before:]
                 for start in set(import_entries) - imports_before:
                     del import_entries[start]
+            elif lang_config.source_ordered:
+                # Whatever this root node added to the buckets is its text.
+                for name in list_fields:
+                    for text in getattr(structure, name)[len(lists_before[name]) :]:
+                        structure.source_order.append((child.start_byte, child.end_byte, text))
 
         # Capture top-level code that wasn't handled by any of the above.
         # This preserves global variables, constants, if __name__ blocks,
@@ -1962,6 +1983,8 @@ class CodeAwareCompressor(Transform):
                 else:
                     structure.top_level_code.append(text)
                     saw_top_level_code = True
+                if lang_config.source_ordered:
+                    structure.source_order.append((child.start_byte, child.end_byte, text))
 
         if demoted_import_starts:
             # Python only: the import branch above is the sole producer of
@@ -2001,7 +2024,7 @@ class CodeAwareCompressor(Transform):
         # (methods inside classes).
         code_lines = code.split("\n")
         start_row = node.start_point[0]
-        node_lines = _get_node_lines(node, code_lines)
+        node_lines = _get_exact_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
 
         func_name = _get_definition_name(node)
@@ -2282,7 +2305,6 @@ class CodeAwareCompressor(Transform):
         code_lines = code.split("\n")
         start_row = node.start_point[0]
         node_lines = _get_node_lines(node, code_lines)
-        node_text = "\n".join(node_lines)
 
         # Find the class/member container. For some languages this is not the
         # same node type as a function body's executable block.
@@ -2293,8 +2315,13 @@ class CodeAwareCompressor(Transform):
                 body_node = child
                 break
 
-        if body_node is None:
-            return node_text
+        # Bodiless declarations (`mod a;`, `extern "C" int f();`) and one-line
+        # ones (`mod ffi { pub struct Handle; }`) have nothing to compress:
+        # keep exactly their own text. The line-based rebuild below would
+        # repeat a one-line body after its header, and take in any sibling on
+        # the same line.
+        if body_node is None or node.start_point[0] == node.end_point[0]:
+            return "\n".join(_get_exact_node_lines(node, code_lines))
 
         # Class header (signature) — everything before the body
         node_start_line = node.start_point[0]
@@ -2321,7 +2348,10 @@ class CodeAwareCompressor(Transform):
         # Process each child of the class body individually
         body_parts: list[str] = []
         processed_ranges: list[tuple[int, int]] = []
-        last_processed_end = -1
+        # Rows the header already emitted: a member on the brace line
+        # (`namespace a { int x;`) is in the header text and must not be
+        # emitted again.
+        last_processed_end = node.start_point[0] + len(header_lines) - 1
 
         for child in body_node.children:
             if not child.is_named:
@@ -2410,7 +2440,7 @@ class CodeAwareCompressor(Transform):
         if not lang_config.uses_colon_after_signature:
             if body_end_line != start_row:
                 closing_line = code_lines[body_end_line]
-                closing_text = closing_line[: body_node.end_point[1]]
+                closing_text = closing_line[: _char_col(closing_line, body_node.end_point[1])]
                 if _get_same_line_trailing_semicolon(node) is not None:
                     closing_text += ";"
                 if closing_text.strip():
@@ -2467,7 +2497,7 @@ class CodeAwareCompressor(Transform):
             # Class compression already re-adds the same-line `;`.
             suffix = ""
         first_line = code.split("\n")[node.start_point[0]]
-        indent = first_line[: node.start_point[1]]
+        indent = first_line[: _char_col(first_line, node.start_point[1])]
         if indent.strip():
             indent = ""
         return indent + prefix + compressed + suffix, wraps_class
@@ -2825,11 +2855,68 @@ def _get_node_lines(node: Any, code_lines: list[str]) -> list[str]:
     duplicating it. Trim the sibling prefix from the first line when it's not
     pure whitespace; keep the whole line (indentation intact) otherwise.
     """
-    start_row, start_col = node.start_point
+    start_row, start_byte_col = node.start_point
     end_row = node.end_point[0]
     node_lines = list(code_lines[start_row : end_row + 1])
-    if node_lines and node_lines[0][:start_col].strip():
-        node_lines[0] = node_lines[0][start_col:]
+    if node_lines:
+        start_col = _char_col(node_lines[0], start_byte_col)
+        if node_lines[0][:start_col].strip():
+            node_lines[0] = node_lines[0][start_col:]
+    return node_lines
+
+
+def _assemble_in_source_order(structure: CodeStructure, code: str) -> str:
+    """Join top-level fragments in their original order.
+
+    A blank line separates two fragments when the source had one between
+    them, so the output keeps the file's grouping.
+    """
+    parts: list[str] = []
+    previous: tuple[int, int] | None = None
+    for start, end, text in sorted(structure.source_order, key=lambda entry: entry[0]):
+        if previous is not None:
+            # Some nodes (C `#include`, `#define`) end after their newline.
+            gap_start = previous[1]
+            if _slice_code_bytes(code, previous[0], previous[1]).endswith("\n"):
+                gap_start -= 1
+            if re.search(r"\n[ \t]*\n", _slice_code_bytes(code, gap_start, start)):
+                parts.append("")
+        parts.append(text.rstrip("\n"))
+        previous = (start, end)
+    return "\n".join(parts)
+
+
+def _char_col(line: str, byte_col: int) -> int:
+    """Convert a tree-sitter column (a UTF-8 byte offset) to a str index.
+
+    Slicing a Python str with a byte column cuts a line after any non-ASCII
+    character too far right: `template <typename Größe> bool f()` lost the
+    `bo` of `bool`.
+    """
+    if line.isascii():
+        return byte_col
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
+
+
+def _get_exact_node_lines(node: Any, code_lines: list[str]) -> list[str]:
+    """Like `_get_node_lines`, but also drop code after the node's end.
+
+    A declaration kept as written must not carry a sibling that shares its
+    last line (`mod a; mod b;`, `extern "C" int f(); extern "C" int g();`):
+    the sibling is emitted on its own as well, so the output would hold it
+    twice. A trailing comment stays, as before.
+    """
+    node_lines = _get_node_lines(node, code_lines)
+    if not node_lines:
+        return node_lines
+    end_row, end_byte_col = node.end_point
+    last_line = code_lines[end_row]
+    end_col = _char_col(last_line, end_byte_col)
+    tail = last_line[end_col:].strip()
+    if tail and not tail.startswith(("//", "/*", "#")):
+        # The first line may already be trimmed at the node's start column.
+        keep = len(node_lines[-1]) - (len(last_line) - end_col)
+        node_lines[-1] = node_lines[-1][:keep]
     return node_lines
 
 

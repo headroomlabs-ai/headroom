@@ -235,3 +235,135 @@ def test_bodiless_wrappers_are_kept_once(language, code):
 
     assert result.compressed.count(first_line) == 1, result.compressed
     assert _valid(result.compressed, language)
+
+
+# Mixed files: a wrapper or declaration next to a separate function long
+# enough to compress. Every compressed output here also passed syntax
+# validation before the fix, so each test checks the text itself.
+_RUST_WORK = "fn work() {\n" + _body("    step({i});", 60) + "\n}\n"
+_CPP_WORK = "void work() {\n" + _body("    step({i});", 60) + "\n}\n"
+
+# (name, language, code, declaration that must appear exactly once)
+SAME_LINE_DECLARATIONS = [
+    ("rust-mod-decls", "rust", "mod a; mod b;\n\n" + _RUST_WORK, "mod b;"),
+    (
+        "cpp-extern-c-decls",
+        "cpp",
+        'extern "C" int f(); extern "C" int g();\n\n' + _CPP_WORK,
+        'extern "C" int g();',
+    ),
+    (
+        "rust-one-line-mod",
+        "rust",
+        '#[cfg(feature = "ffi")]\nmod ffi { pub struct Handle; }\n\n' + _RUST_WORK,
+        "mod ffi { pub struct Handle; }",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("language", "code", "declaration"),
+    [pytest.param(lang, code, decl, id=name) for name, lang, code, decl in SAME_LINE_DECLARATIONS],
+)
+def test_mixed_file_declarations_appear_once(language, code, declaration):
+    result = _compress(code, language)
+
+    assert "// [" in result.compressed, "the function should compress"
+    assert result.compressed.count(declaration) == 1, result.compressed
+    assert _valid(result.compressed, language)
+
+
+def test_rust_attribute_stays_on_its_one_line_module():
+    code = '#[cfg(feature = "ffi")]\nmod ffi { pub struct Handle; }\n\n' + _RUST_WORK
+
+    lines = _compress(code, "rust").compressed.splitlines()
+
+    module = lines.index("mod ffi { pub struct Handle; }")
+    assert lines[module - 1] == '#[cfg(feature = "ffi")]', lines
+
+
+# (name, code, definition, its use): C and C++ declare before use, so the
+# definition must stay above the line that uses it.
+DECLARE_BEFORE_USE = [
+    (
+        "cpp-macro-before-namespace",
+        "#include <cstdint>\n#define API_TYPE int\nnamespace api {\nAPI_TYPE query();\n}\n\n"
+        + _CPP_WORK,
+        "#define API_TYPE int",
+        "API_TYPE query();",
+    ),
+    (
+        "cpp-constexpr-before-namespace",
+        "#include <cstdint>\nconstexpr int Seed = 7;\nnamespace ns {\n"
+        "constexpr int value = Seed;\n}\n\n" + _CPP_WORK,
+        "constexpr int Seed = 7;",
+        "constexpr int value = Seed;",
+    ),
+    (
+        "cpp-global-before-function",
+        "static int counter = 0;\n\nvoid work() {\n" + _body("    counter += {i};", 60) + "\n}\n",
+        "static int counter = 0;",
+        "void work() {",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("code", "definition", "use"),
+    [pytest.param(code, d, u, id=name) for name, code, d, u in DECLARE_BEFORE_USE],
+)
+def test_cpp_definitions_stay_above_their_use(code, definition, use):
+    result = _compress(code, "cpp")
+    out = result.compressed
+
+    assert "// [" in out, "the function should compress"
+    assert out.count(definition) == 1, out
+    assert out.index(definition) < out.index(use), out
+
+
+def test_c_global_stays_above_the_function_that_uses_it():
+    code = (
+        "#include <stdio.h>\n\nstatic int counter = 0;\n\nint work(void) {\n"
+        + _body("    counter += {i};", 60)
+        + "\n    return counter;\n}\n"
+    )
+
+    out = _compress(code, "c").compressed
+
+    assert "// [" in out, "the function should compress"
+    assert out.index("static int counter = 0;") < out.index("int work(void) {"), out
+
+
+def test_cpp_compressed_output_keeps_the_source_layout():
+    code = "#include <cstdint>\n#define API_TYPE int\nnamespace api {\nAPI_TYPE query();\n}\n\n" + (
+        _CPP_WORK
+    )
+
+    out = _compress(code, "cpp").compressed
+
+    assert out.startswith(
+        "#include <cstdint>\n#define API_TYPE int\nnamespace api {\nAPI_TYPE query();\n}\n\n"
+        "void work() {\n"
+    ), out
+
+
+def test_template_signature_keeps_non_ascii_spelling():
+    """Tree-sitter columns are UTF-8 byte offsets, not str indexes."""
+    code = (
+        "template <typename Größe> bool valid(Größe x) {\n"
+        + _body("    step({i});", 60)
+        + "\n    return true;\n}\n"
+    )
+
+    out = _compress(code, "cpp").compressed
+
+    assert "// [" in out, "the function should compress"
+    assert out.splitlines()[0] == "template <typename Größe> bool valid(Größe x) {", out
+
+
+def test_class_member_on_the_brace_line_is_not_repeated():
+    code = "namespace app { int first = 1;\nint second = 2;\n}\n\n" + _CPP_WORK
+
+    out = _compress(code, "cpp").compressed
+
+    assert out.count("int first = 1;") == 1, out
