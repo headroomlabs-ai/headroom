@@ -217,6 +217,29 @@ def test_opencode_unwrap_restores_routing_but_preserves_customized_enola(
         assert wrap.ENOLA_INSTRUCTIONS_BLOCK not in Path("AGENTS.md").read_text()
 
 
+@pytest.mark.parametrize("port", [8787, 9876])
+def test_opencode_rewrap_preserves_retrieval_options(project, tmp_path, port):
+    from headroom.mcp_registry import OpencodeRegistrar, build_headroom_spec
+
+    runner = CliRunner()
+    args = ["wrap", "opencode", "--prepare-only", "--code-memory", "none"]
+    result = runner.invoke(main, args)
+    assert result.exit_code == 0, result.output
+    config = tmp_path / ".config/opencode/opencode.json"
+    data = json.loads(config.read_text())
+    options = {"timeout": 123456}
+    data["mcp"]["headroom"].update(options)
+    config.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    result = runner.invoke(main, [*args, "--port", str(port)])
+    assert result.exit_code == 0, result.output
+    observed = OpencodeRegistrar(config_path=config).get_server("headroom")
+    expected = build_headroom_spec(f"http://127.0.0.1:{port}")
+    assert observed.extra == options
+    assert observed.command == expected.command
+    assert observed.args == expected.args
+    assert observed.env == expected.env
+
+
 def install_owned(registrar, spec, *, scope=None):
     assert registrar.register_server(spec).ok
     record_install(
