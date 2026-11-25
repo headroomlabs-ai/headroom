@@ -462,17 +462,18 @@ _PATH_ROW_RE = re.compile(
 )
 # The same with ``\`` also a separator, for the paths Windows tools print
 # (ripgrep, PowerShell). The root may be ``.\`` or ``..\`` but not a lone
-# ``\``, and a Windows name cannot hold ``* ? " |`` (``\x22`` is the quote). A row
-# anchored like a regex (``^id\d``, ``id\d$``) is not a path either.
+# ``\``, a Windows name cannot hold ``* ? " |`` (``\x22`` is the quote), and a row
+# anchored like a regex (``^id\d``) is not a path.
 _PATH_ROW_BACKSLASH_RE = re.compile(
     r"^(?!\^)(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?"
     r"(?:(?=[^/\\]*\w)[^/\\\s:<>;*?\x22|]+[/\\])+)"
-    r"(?P<base>[^/\\\s:<>;*?\x22|]+)(?<!\$)$"
+    r"(?P<base>[^/\\\s:<>;*?\x22|]+)$"
 )
-# A ``\`` that can only be a separator. In a list of regexes every ``\`` is an escape
-# (``\d``, ``\.``, ``\b``), so rules sharing a prefix (``^id\d$``, ``^id\w$``) would pass
-# the row pattern; a listing has some ``\`` no such escape explains.
-_BACKSLASH_SEPARATOR_RE = re.compile(r"\\(?![dDsSwWbB])\w")
+# Row by row a list of regexes (``id\d``, ``row\tname``) looks like Windows paths, so a
+# listing needs its own evidence: files have extensions. A regex escapes its dot
+# (``\.``), so its last piece is not ``name.ext``, and a class letter before the dot
+# (``img\d.png``, ``img\d+.png``, ``img\d{2}.png``) is no evidence either.
+_FILE_NAME_RE = re.compile(r"(?![dDsSwWbB][.+{])[\w+\[].*\.\w+$")
 
 
 def path_heading(text: str, *, backslash: bool = False) -> str:
@@ -492,8 +493,6 @@ def path_heading(text: str, *, backslash: bool = False) -> str:
     With ``backslash=True`` a ``\\`` also ends a directory, as in the paths that
     Windows tools print. Pass the same flag to :func:`path_unheading`.
     """
-    if backslash and not _BACKSLASH_SEPARATOR_RE.search(text):
-        return text
     row_re = _PATH_ROW_BACKSLASH_RE if backslash else _PATH_ROW_RE
     lines, had_trailing = _split_keep_trailing(text)
     matches = []
@@ -502,7 +501,10 @@ def path_heading(text: str, *, backslash: bool = False) -> str:
         if ln and not m:  # not a pure listing; stop at the first such line
             return text
         matches.append(m)
-    if sum(1 for m in matches if m) < 2:
+    rows = [m for m in matches if m]
+    if len(rows) < 2:
+        return text
+    if backslash and 2 * sum(1 for m in rows if _FILE_NAME_RE.match(m["base"])) < len(rows):
         return text
     out: list[str] = []
     current: str | None = None

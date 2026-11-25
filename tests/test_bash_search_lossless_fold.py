@@ -473,30 +473,43 @@ def test_mixed_separator_listing_takes_the_smaller_fold() -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        # In a list of regexes every "\" is an escape, whatever prefix the rules share.
+        # Regex lists: every row reads as a path, so nothing names a file.
         f"{chr(92)}w+{chr(92)}s{chr(92)}w+\n{chr(92)}d+{chr(92)}s{chr(92)}d+\n",
         f"^invoice{chr(92)}d*$\n^invoice{chr(92)}w*$\n",
         f"^invoice{chr(92)}d+$\n^invoice{chr(92)}w+$\n",
         "".join(f"^invoice{chr(92)}{c}$\n" for c in "dDsSwWbB"),
         "".join(f"id{chr(92)}{c}\n" for c in "dDsSwWbB"),
+        f"invoice{chr(92)}d{{2}}{chr(92)}tvalue\ninvoice{chr(92)}d{{2}}{chr(92)}tstatus\n",
+        f"name{chr(92)}p{{L}}x\nname{chr(92)}p{{L}}y\n",
         f"ads{chr(92)}.example{chr(92)}.com\nads{chr(92)}.example{chr(92)}.net\n",
-        # An anchored row is not a path, whatever escape it uses.
-        f"^row{chr(92)}tfoo\n^row{chr(92)}tbar\n",
-        f"row{chr(92)}tfoo$\nrow{chr(92)}tbar$\n",
+        f"ads{chr(92)}.example.com\nads{chr(92)}.example.net\n",
+        f"read{chr(92)}_file\nread{chr(92)}_line\n",
+        "".join(f"img{chr(92)}{c}.png\n" for c in "dDsSwWbB"),
+        "".join(f"img{chr(92)}{c}+.png\n" for c in "dDsSwWbB"),
+        "".join(f"img{chr(92)}{c}{{2}}.png\n" for c in "dDsSwWbB"),
+        f"^log{chr(92)}tday.txt\n^log{chr(92)}tnight.txt\n",
+        f"app{chr(92)}core{chr(92)}a.py\napp{chr(92)}core{chr(92)}make\napp{chr(92)}core{chr(92)}license\n",
         # A lone leading "\" is not a path root.
-        f"{chr(92)}home{chr(92)}a\n{chr(92)}home{chr(92)}b\n",
+        f"{chr(92)}home{chr(92)}a.py\n{chr(92)}home{chr(92)}b.py\n",
         # The "/" fold's markup rule holds with "\" as a separator too.
-        f"{{{{/if}}}}{chr(92)}x\n{{{{/if}}}}{chr(92)}y\n",
+        f"{{{{/if}}}}{chr(92)}x.py\n{{{{/if}}}}{chr(92)}y.py\n",
     ],
     ids=[
         "word-classes",
-        "shared-prefix-star",
-        "shared-prefix-plus",
-        "anchored-plain",
-        "unanchored-plain",
+        "star",
+        "plus",
+        "anchored",
+        "unanchored",
+        "tab-escape",
+        "property-escape",
         "escaped-dots",
-        "anchored-start",
-        "anchored-end",
+        "half-escaped-dots",
+        "markdown-escapes",
+        "class-then-dot",
+        "class-plus-dot",
+        "class-count-dot",
+        "anchored-with-extension",
+        "mostly-no-extension",
         "lone-root",
         "template-closers",
     ],
@@ -504,6 +517,17 @@ def test_mixed_separator_listing_takes_the_smaller_fold() -> None:
 def test_backslash_path_fold_skips_non_listings(text) -> None:
     assert _ph(text, backslash=True) == text
     assert compact_lossless(text, "paths") == text
+
+
+@pytest.mark.parametrize("letter", "dDsSwWbB")
+def test_class_letter_before_a_dot_is_not_a_file_name(letter) -> None:
+    text = f"img{chr(92)}{letter}.png\nimg{chr(92)}{letter}.jpg\n"
+    assert compact_lossless(text, "paths") == text
+
+
+def test_slash_listing_needs_no_extensions() -> None:
+    text = "src/app/main\nsrc/app/lib\n"
+    assert compact_lossless(text, "paths") == "src/app/\nmain\nlib\n"
 
 
 @pytest.mark.parametrize("char", ["*", "?", '"', "|"])
@@ -532,6 +556,29 @@ def test_backslash_path_fold_keeps_names_that_only_look_like_regexes() -> None:
         for name in names
         for base in ("+page.ts", "Foo$1.kt", "w{draft}.txt")
     )
+    windows = posix.replace("/", chr(92))
+    folded = compact_lossless(windows, "paths")
+    assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
+    assert _puh(folded, backslash=True) == windows
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [f"src/services/service_{i:03}.py" for i in range(100)],  # every "\" is followed by "s"
+        [f"routes/blog/+page{i}.svelte" for i in range(3)],
+        [f"pages/blog/[slug{i}].tsx" for i in range(3)],
+        [
+            "app/core/a.py",
+            "app/core/c.py",
+            "app/core/Makefile",
+            "app/core/LICENSE",
+        ],  # half is enough
+    ],
+    ids=["escape-initials", "plus-name", "bracket-name", "half-extensionless"],
+)
+def test_backslash_path_fold_recognizes_listings(rows) -> None:
+    posix = "\n".join(rows) + "\n"
     windows = posix.replace("/", chr(92))
     folded = compact_lossless(windows, "paths")
     assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
