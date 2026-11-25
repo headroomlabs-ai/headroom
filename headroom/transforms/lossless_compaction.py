@@ -471,9 +471,9 @@ _PATH_ROW_BACKSLASH_RE = re.compile(
 )
 # Row by row a list of regexes (``id\d``, ``row\tname``) looks like Windows paths, so a
 # listing needs its own evidence: files have extensions. A regex escapes its dot
-# (``\.``), so its last piece is not ``name.ext``, and a class letter before the dot
-# (``img\d.png``, ``img\d+.png``, ``img\d{2}.png``) is no evidence either.
-_FILE_NAME_RE = re.compile(r"(?![dDsSwWbB][.+{])[\w+\[].*\.\w+$")
+# (``\.``), so its last piece is not ``name.ext``, and a class letter on its own
+# (``img\d.png``, ``img\d+.png``, ``img\d[0-9].png``) is no evidence either.
+_FILE_NAME_RE = re.compile(r"(?![dDsSwWbB]\W)[\w+\[].*\.\w+$")
 
 
 def path_heading(text: str, *, backslash: bool = False) -> str:

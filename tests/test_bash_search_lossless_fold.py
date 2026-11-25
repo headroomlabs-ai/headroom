@@ -519,9 +519,10 @@ def test_backslash_path_fold_skips_non_listings(text) -> None:
     assert compact_lossless(text, "paths") == text
 
 
+@pytest.mark.parametrize("tail", ["", "+", "{2}", "[0-9]", "(a)"])
 @pytest.mark.parametrize("letter", "dDsSwWbB")
-def test_class_letter_before_a_dot_is_not_a_file_name(letter) -> None:
-    text = f"img{chr(92)}{letter}.png\nimg{chr(92)}{letter}.jpg\n"
+def test_class_letter_on_its_own_is_not_a_file_name(letter, tail) -> None:
+    text = f"img{chr(92)}{letter}{tail}.png\nimg{chr(92)}{letter}{tail}.jpg\n"
     assert compact_lossless(text, "paths") == text
 
 
