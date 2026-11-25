@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 _case_insensitive_volumes: dict[str, bool] = {}
 
 
+def _case_variant(name: str) -> str | None:
+    """``name`` with one ASCII letter's case flipped, or None if it has none.
+
+    Only an ASCII swap is safe: filesystems fold case one-to-one, while
+    Python's ``str.upper()`` expands characters (``ß`` -> ``SS``), so a
+    missing expanded spelling would look like a case-sensitive volume and
+    a case-insensitive store would be disowned on restart.
+    """
+    for index, char in enumerate(name):
+        if "a" <= char <= "z":
+            return name[:index] + char.upper() + name[index + 1 :]
+        if "A" <= char <= "Z":
+            return name[:index] + char.lower() + name[index + 1 :]
+    return None
+
+
 def _volume_is_case_insensitive(parent: Path) -> bool | None:
     """Whether ``parent``'s volume treats case-variant spellings as one file.
 
@@ -54,9 +70,10 @@ def _volume_is_case_insensitive(parent: Path) -> bool | None:
         return _case_insensitive_volumes[key]
     try:
         for entry in parent.iterdir():
-            variant = entry.with_name(entry.name.upper())
-            if variant.name == entry.name:
-                continue  # spelling has no case to compare
+            variant_name = _case_variant(entry.name)
+            if variant_name is None:
+                continue  # spelling has no ASCII case to compare
+            variant = entry.with_name(variant_name)
             if not os.path.lexists(variant):
                 # On an insensitive volume the variant spelling is the same
                 # entry and would exist.
@@ -77,10 +94,10 @@ def _volume_is_case_insensitive(parent: Path) -> bool | None:
         os.close(fd)
         try:
             probe = parent / probe_name
-            variant = probe.with_name(probe.name.upper())
-            if variant.name == probe.name:
+            variant_name = _case_variant(probe.name)
+            if variant_name is None:
                 return None  # mkstemp name carries no case to compare
-            result = os.path.lexists(variant)
+            result = os.path.lexists(probe.with_name(variant_name))
         finally:
             (parent / probe_name).unlink(missing_ok=True)
     except OSError:

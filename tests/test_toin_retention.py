@@ -960,19 +960,64 @@ def test_case_probe_cannot_be_redirected_onto_a_victim_file(tmp_path) -> None:
     assert victim.read_text(encoding="utf-8") == "do not truncate"
 
 
-def test_case_classification_from_existing_entries_writes_nothing(tmp_path) -> None:
+def test_case_classification_from_existing_entries_writes_nothing(tmp_path, monkeypatch) -> None:
     """An existing entry classifies the volume without any write.
 
     A readable-but-unwritable store directory (a macOS reader without write
     access) must still be classified, or the reader hashes a different
     owner identity than the writer stamped and rejects its own saved store.
+    Writes are forbidden outright, so the test fails if classification ever
+    falls through to the probe.
     """
     (tmp_path / "store.json").write_text("{}", encoding="utf-8", newline="\n")
+
+    def refuse_write(*args, **kwargs):
+        raise OSError("writes are forbidden during classification")
+
+    monkeypatch.setattr(Path, "mkdir", refuse_write)
+    monkeypatch.setattr(Path, "write_text", refuse_write)
 
     result = _volume_is_case_insensitive(tmp_path)
 
     assert result in (True, False)  # measured, not unknown
     assert list(tmp_path.glob(".headroom_case_probe*")) == []
+
+
+def test_unicode_basename_does_not_spoof_case_sensitivity(tmp_path) -> None:
+    """Case classification must not expand Unicode characters.
+
+    Python's ``str.upper()`` maps ``ß`` to ``SS`` one-to-many, but volumes
+    fold case one-to-one: on an insensitive NTFS volume a missing
+    ``STRASSE.V3.JSON`` spelling is not evidence of case sensitivity. The
+    variant comparison flips a single ASCII letter instead, so the
+    classification of a directory holding only ``Straße.v3.json`` stays
+    measured, and a saved store is not disowned on restart.
+    """
+    (tmp_path / "case_probe").write_text("x", encoding="utf-8", newline="\n")
+    if not (tmp_path / "CASE_PROBE").exists():
+        pytest.skip("case-sensitive volume: the spelling genuinely is a different file")
+    (tmp_path / "case_probe").unlink()
+
+    (tmp_path / "Straße.v3.json").write_text("{}", encoding="utf-8", newline="\n")
+
+    assert _volume_is_case_insensitive(tmp_path) is True
+
+
+def test_unicode_configured_path_survives_restart_on_insensitive_volume(tmp_path) -> None:
+    """Save and reopen a store whose configured basename expands under upper()."""
+    (tmp_path / "case_probe").write_text("x", encoding="utf-8", newline="\n")
+    if not (tmp_path / "CASE_PROBE").exists():
+        pytest.skip("case-sensitive volume: the spelling genuinely is a different file")
+    (tmp_path / "case_probe").unlink()
+
+    toin = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(tmp_path / "Straße.json"), auto_save_interval=0)
+    )
+    _record(toin, 0)
+    toin.save()
+
+    restarted = ToolIntelligenceNetwork(TOINConfig(storage_path=str(tmp_path / "Straße.json")))
+    assert restarted._patterns
 
 
 def test_ownerless_legacy_sibling_is_not_adopted(tmp_path) -> None:
