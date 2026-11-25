@@ -368,3 +368,30 @@ def test_the_configuration_is_read_once_even_when_malformed(
     TokenizerRegistry.clear_cache()
     get_tokenizer(CLAUDE)
     assert len(reads) == 2
+
+
+GATEWAY_GPT4 = "gpt-4-gateway"
+
+
+def test_provider_and_registry_agree_on_an_alias_beside_malformed_pricing(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``gpt-4-*`` alias mapped to ``o200k_base`` next to a malformed price.
+
+    The provider's full loader drops the whole value on the malformed price
+    and fell back to the ``gpt-4`` prefix (``cl100k_base``), while the registry
+    kept the mapping (``o200k_base``): two rulers for one model.
+    """
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"pricing": "per-token", "encodings": {GATEWAY_GPT4: "o200k_base"}}),
+    )
+
+    provider_counter = OpenAIProvider().get_token_counter(GATEWAY_GPT4)
+    registry_counter = get_tokenizer(GATEWAY_GPT4)
+
+    assert isinstance(provider_counter, OpenAITokenCounter), repr(provider_counter)
+    assert provider_counter._encoding.name == "o200k_base"
+    assert isinstance(registry_counter, TiktokenCounter), repr(registry_counter)
+    assert registry_counter.encoding_name == "o200k_base"
+    assert provider_counter.count_messages(MESSAGES) == registry_counter.count_messages(MESSAGES)

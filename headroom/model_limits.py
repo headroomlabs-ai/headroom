@@ -1,8 +1,10 @@
 """Operator-configured model settings (``HEADROOM_MODEL_LIMITS`` / ``models.json``).
 
-The OpenAI section of that configuration is read by ``OpenAIProvider`` (context
-limits, pricing, encodings) and by the tokenizer registry (encodings only). Both
-read the same sources in the same order. It lives here rather than in
+The OpenAI section of that configuration holds context limits, pricing and
+encodings. ``OpenAIProvider`` takes context limits and pricing from
+:func:`load_openai_model_config`; the provider and the tokenizer registry both
+take encodings from :func:`load_openai_encodings`, so they cannot disagree about
+a model's vocabulary. Both functions read the same sources in the same order. It lives here rather than in
 ``headroom.providers.openai`` because ``headroom.tokenizers`` sits below the
 providers and must not import them.
 """
@@ -59,7 +61,9 @@ def load_openai_model_config() -> dict[str, Any]:
     2. ~/.headroom/models.json config file
 
     Returns:
-        Dict with 'context_limits', 'pricing' and 'encodings' keys.
+        Dict with 'context_limits', 'pricing' and 'encodings' keys. Callers
+        that need encodings use :func:`load_openai_encodings` instead, which
+        does not depend on the other sections being well-formed.
     """
     config: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
 
@@ -126,8 +130,10 @@ def load_openai_encodings() -> dict[str, str]:
     (``HEADROOM_MODEL_LIMITS`` wins over ``models.json``) but looks at nothing
     except ``openai.encodings``. The tokenizer registry resolves every model's
     counter from this, so a malformed ``pricing`` or ``context_limits`` section
-    must not change how Claude or Gemini are counted. Anything unusable in the
-    encodings themselves is skipped with a warning; this never raises.
+    must not change how Claude or Gemini are counted, and ``OpenAIProvider``
+    uses it too, so the provider and the registry always agree on a model's
+    encoding. Anything unusable in the encodings themselves is skipped with a
+    warning.
     """
     encodings: dict[str, str] = {}
 

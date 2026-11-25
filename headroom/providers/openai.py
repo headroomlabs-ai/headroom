@@ -14,6 +14,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom.log_safety import describe_exception, safe_id
+from headroom.model_limits import load_openai_encodings
 from headroom.model_limits import load_openai_model_config as _load_custom_model_config
 from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
@@ -418,7 +419,10 @@ class OpenAIProvider(Provider):
         # Load from config file and env var
         custom_config = _load_custom_model_config()
         self._context_limits.update(custom_config["context_limits"])
-        self._encodings.update(custom_config["encodings"])
+        # Encodings come from the encodings-only loader the tokenizer registry
+        # reads, so a malformed pricing or context-limit section cannot drop
+        # the mapping here while the registry keeps it (two rulers).
+        self._encodings.update(load_openai_encodings())
 
         # Handle pricing (can be tuple or list from JSON). Tracked separately as
         # well: an explicitly configured price is a user decision and must beat

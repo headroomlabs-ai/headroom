@@ -544,21 +544,42 @@ def test_openai_responses_http_counts_with_the_configured_encoding(
 # ---------------------------------------------------------------------------
 
 GEMINI = "gemini-2.5-pro"
+GATEWAY_GPT4 = "gpt-4-gateway"
 
 
 @pytest.fixture
 def _alias_mapped_beside_malformed_pricing(
     _alias_mapped_to_cl100k: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A string, not an object: the provider's loader drops the whole
+    # A string, not an object: the provider's full loader drops the whole
     # HEADROOM_MODEL_LIMITS value with a warning, so the proxy still starts.
+    # (Settings that make that loader raise, such as ``pricing: null``, stop
+    # the proxy from starting at all, on main as well.)
     monkeypatch.setenv(
         "HEADROOM_MODEL_LIMITS",
-        json.dumps({"openai": {"pricing": "per-token", "encodings": {ALIAS: "cl100k_base"}}}),
+        json.dumps(
+            {
+                "openai": {
+                    "pricing": "per-token",
+                    "encodings": {ALIAS: "cl100k_base", GATEWAY_GPT4: "o200k_base"},
+                }
+            }
+        ),
     )
 
 
-@pytest.mark.parametrize("model", [ALIAS, CLAUDE, GEMINI, GPT])
+def _ruler_name(counter: Any) -> str:
+    """The tiktoken encoding a counter uses, or the estimator's repr."""
+    from headroom.providers.openai import OpenAITokenCounter
+
+    if isinstance(counter, TiktokenCounter):
+        return counter.encoding_name
+    if isinstance(counter, OpenAITokenCounter):
+        return str(counter._encoding.name)
+    return repr(counter)
+
+
+@pytest.mark.parametrize("model", [ALIAS, GATEWAY_GPT4, CLAUDE, GEMINI, GPT])
 def test_openai_chat_keeps_each_models_counter_beside_malformed_pricing(
     _alias_mapped_beside_malformed_pricing: None, model: str
 ) -> None:
@@ -576,11 +597,13 @@ def test_openai_chat_keeps_each_models_counter_beside_malformed_pricing(
             json={"model": model, "messages": messages},
             headers={"Authorization": "Bearer sk-test"},
         )
+        provider_counter = proxy.openai_provider.get_token_counter(model)
 
     assert r.status_code == 200, r.text
     assert spy.call_count >= 1
     expected = {
         ALIAS: "cl100k_base",
+        GATEWAY_GPT4: "o200k_base",
         CLAUDE: "o200k_base",
         GPT: "o200k_base",
         GEMINI: "EstimatingTokenCounter(chars_per_token=4.0)",
@@ -588,9 +611,8 @@ def test_openai_chat_keeps_each_models_counter_beside_malformed_pricing(
     for call in spy.call_args_list:
         counter = call.kwargs.get("token_counter")
         assert counter is get_tokenizer(model)
-        if isinstance(counter, TiktokenCounter):
-            assert counter.encoding_name == expected
-        else:
-            assert repr(counter) == expected
+        assert _ruler_name(counter) == expected
+    # The provider (context limits, pricing) counts with the same ruler.
+    assert _ruler_name(provider_counter) == expected
     (event,) = hooks.events
     assert event.tokens_before == get_tokenizer(model).count_messages(messages)
