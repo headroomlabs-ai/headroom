@@ -342,6 +342,12 @@ class BatchResultProcessor:
             "messages": messages,
             "max_tokens": request_context.extras.get("max_tokens", 4096),
         }
+        # The original batch request may carry a top-level system prompt (string or
+        # block list). Continuations must replay it verbatim or CCR loses the policy
+        # the first response was conditioned on. Omit it when never captured; never
+        # send an explicit null, which Anthropic rejects.
+        if request_context.extras.get("system") is not None:
+            body["system"] = request_context.extras["system"]
         if tools:
 
             def _tool_sort_key(tool: dict[str, Any]) -> tuple[str, str]:
