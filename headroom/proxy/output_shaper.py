@@ -430,8 +430,16 @@ def shape_openai_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
     level_override: int | None = None,
+    *,
+    credit_input_steering: bool = False,
 ) -> ShapeResult:
-    """Apply OpenAI Responses output-shaping levers in place."""
+    """Apply OpenAI Responses output-shaping levers in place.
+
+    ``credit_input_steering`` labels a turn an extension already steered in its
+    newest user message as shaped. Only per-request callers (HTTP) may set it:
+    a WebSocket session keeps one label list for all its turns, so a label
+    credited there would carry over to later, unsteered turns.
+    """
     if settings is None:
         settings = OutputShaperSettings.from_env()
     result = ShapeResult()
@@ -444,7 +452,7 @@ def shape_openai_responses_request(
     if level > 0 and apply_openai_responses_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
-    elif level > 0:
+    elif level > 0 and credit_input_steering:
         # An extension may already have steered the user turn (Kiro rejects
         # ``instructions``, so headroom-kiro places the block there). The
         # request is shaped; without the label the output-savings ledger books

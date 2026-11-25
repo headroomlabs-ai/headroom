@@ -128,3 +128,24 @@ def test_no_hook_change_books_no_tool_savings() -> None:
 
     assert outcomes
     assert not (outcomes[-1].tags or {}).get("turn_hook_tools_saved_tokens")
+
+
+def test_http_turn_steered_in_its_input_is_booked_as_shaped(monkeypatch) -> None:
+    """Kiro's extension steers the user turn because Kiro rejects ``instructions``;
+    the HTTP outcome must still carry the verbosity label the output ledger reads."""
+    from headroom.proxy.output_verbosity_policy import steering_text
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+
+    outcomes = _post(
+        {
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": f"fix it\n\n{steering_text(3)}"}],
+            "stream": False,
+        }
+    )
+
+    assert outcomes
+    assert "output_shaper:verbosity:L3" in outcomes[-1].transforms_applied

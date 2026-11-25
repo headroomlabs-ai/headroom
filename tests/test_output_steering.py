@@ -185,14 +185,19 @@ def test_openai_chat_steering_level_zero_is_noop() -> None:
 
 
 def _shape_live(payload: dict, monkeypatch, holdout: str = "0") -> tuple[list[str], bool]:
-    """Shape through the Responses path live HTTP and WebSocket traffic takes."""
-    from headroom.proxy.handlers.openai import _shape_openai_responses_payload
+    """Shape as the HTTP ``/v1/responses`` handler does before its upstream send."""
+    from headroom.proxy.handlers.openai import _shape_openai_responses_for_output
 
     monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", holdout)
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
-    return _shape_openai_responses_payload(
-        payload, model="auto", request_id="t", output_shaper_enabled=True
+    result = _shape_openai_responses_for_output(
+        payload,
+        input_tokens=100,
+        model="auto",
+        output_shaper_enabled=True,
+        credit_input_steering=True,
     )
+    return list(result.labels or []), bool(result.changed)
 
 
 def test_responses_turn_steered_by_an_extension_is_labelled_shaped(monkeypatch) -> None:
@@ -250,3 +255,27 @@ def test_extension_steered_turn_is_labelled_with_the_level_in_its_block(monkeypa
     assert mutated is False
     assert "output_shaper:verbosity:L2" in labels
     assert "output_shaper:verbosity:L3" not in labels
+
+
+def test_websocket_frame_does_not_credit_an_extension_steered_turn(monkeypatch) -> None:
+    """A WebSocket session shares one label list across turns, so crediting input
+    steering there would mark the session's later, unsteered turns as shaped too."""
+    import json
+
+    from headroom.proxy.handlers.openai import _shape_openai_response_create_frame
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "auto", "input": f"fix it\n\n{steering_text(3)}"},
+        }
+    )
+
+    raw, changed, labels, _reason = _shape_openai_response_create_frame(
+        frame, input_tokens=100, output_shaper_enabled=True
+    )
+
+    assert changed is False and raw == frame
+    assert not any(label.startswith("output_shaper:verbosity:") for label in labels)

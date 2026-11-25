@@ -997,10 +997,8 @@ def _shape_openai_responses_payload(
 
         level, src = resolve_verbosity_level(settings)
         shape_result = shape_responses_request(payload, settings, level_override=level)
-        # Kept even when the bytes did not change: a turn an extension already
-        # steered (Kiro) is shaped, and the ledger reads the label to know it.
-        labels.extend(shape_result.labels or [])
         if shape_result.changed:
+            labels.extend(shape_result.labels or [])
             logger.info(
                 "[%s] OutputShaper(responses, L%s/%s): %s",
                 request_id,
@@ -1866,8 +1864,12 @@ def _shape_openai_responses_for_output(
     model: str,
     conversation_key: str | None = None,
     output_shaper_enabled: bool | None = None,
+    credit_input_steering: bool = False,
 ) -> Any:
-    """Apply OpenAI Responses output shaping and attach holdout labels."""
+    """Apply OpenAI Responses output shaping and attach holdout labels.
+
+    ``credit_input_steering``: see :func:`shape_openai_responses_request`; HTTP only.
+    """
     from headroom.proxy.output_savings import (
         assign_arm,
         conversation_key_from_body,
@@ -1907,6 +1909,7 @@ def _shape_openai_responses_for_output(
         payload,
         settings=settings,
         level_override=level,
+        credit_input_steering=credit_input_steering,
     )
     shaped.labels = [*result.labels, *(shaped.labels or [])]
     return shaped
@@ -3372,7 +3375,7 @@ class OpenAIHandlerMixin:
                     return None
                 try:
                     return int(_req_ctx.count_tools(without_deferral_flags(tools)))
-                except Exception as e:
+                except (TypeError, ValueError, RuntimeError) as e:
                     logger.debug(
                         "[%s] turn-hook tool token count failed; savings not counted: %s",
                         request_id,
@@ -7165,6 +7168,9 @@ class OpenAIHandlerMixin:
                     else None
                 ),
                 output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
+                # One request, one outcome: safe to credit a turn an extension
+                # steered (Kiro puts the block in the user turn).
+                credit_input_steering=True,
             )
             _append_unique_transforms(transforms_applied, _shape_result.labels)
             if _shape_result.changed:

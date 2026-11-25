@@ -3119,3 +3119,49 @@ async def test_ws_pending_savings_beyond_32_rows_are_all_booked(
     assert math.isclose(sum(float(row["usd"]) for row in hook_rows), 0.01 * frames_n)
     assert ("other" in {row["source"] for row in hook_rows}) is overflowed
     assert stored == [expected_rows]
+
+
+@pytest.mark.asyncio
+async def test_ws_extension_steered_turn_label_does_not_reach_any_turn(monkeypatch):
+    """Two turns on one session: the first carries a level-1 steering block an
+    extension placed in its input, the second carries none. WebSocket outcomes
+    reuse one session label list, so a level credited from turn one's input
+    would be booked on turn two as well. Neither outcome may carry it."""
+    from headroom.proxy.output_verbosity_policy import steering_text
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    monkeypatch.delenv("HEADROOM_OUTPUT_HOLDOUT", raising=False)
+    steered = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "gpt-5.4", "input": f"fix it\n\n{steering_text(1)}"},
+        }
+    )
+    plain = json.dumps(
+        {"type": "response.create", "response": {"model": "gpt-5.4", "input": "now test"}}
+    )
+    usage = {"input_tokens": 10, "output_tokens": 1}
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1", "usage": usage}}),
+            json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_2", "usage": usage}}),
+        ]
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = False
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(_FakeWebSocket(frames=[steered, plain]))
+
+    assert outcomes
+    for outcome in outcomes:
+        assert "output_shaper:verbosity:L1" not in outcome.transforms_applied
