@@ -871,6 +871,67 @@ def test_case_alias_spelling_shares_one_store(tmp_path) -> None:
     assert twin.load() == {"version": "3.0", "patterns": {}}
 
 
+def test_mixed_case_version_marker_on_case_sensitive_volume(tmp_path) -> None:
+    """A mixed-case version marker is recognized on case-sensitive volumes too.
+
+    The lowered comparison means ``toin.V3.json`` is treated as already
+    versioned everywhere; on a case-sensitive volume that spelling is its
+    own file, written in place with no sibling and no pre-upgrade source.
+    """
+    (tmp_path / "case_probe").write_text("x", encoding="utf-8")
+    if (tmp_path / "CASE_PROBE").exists():
+        pytest.skip("case-insensitive volume: covered by the case-alias test")
+
+    path = tmp_path / "toin.V3.json"
+    path.write_text(json.dumps({"version": "3.0", "patterns": {}}), encoding="utf-8", newline="\n")
+
+    backend = FileSystemTOINBackend(str(path), store_version="3.0")
+
+    assert backend.path == path
+    assert backend._pre_upgrade_path is None
+    assert not (tmp_path / "toin.V3.v3.json").exists()
+
+
+def test_case_sensitive_volume_keeps_distinct_owners_across_a_symlink(tmp_path, caplog) -> None:
+    """Case-variant configured paths on a case-sensitive volume are distinct proxies.
+
+    Folding the owner identity unconditionally would let a second proxy whose
+    configured path differs only in case import — and then overwrite — the
+    first proxy's history through a symlink between the two stores. The
+    identity stays exact where the volume says the spellings differ.
+    """
+    (tmp_path / "case_probe").write_text("x", encoding="utf-8")
+    if (tmp_path / "CASE_PROBE").exists():
+        pytest.skip("case-insensitive volume: the alias spellings are one store by design")
+
+    first = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(tmp_path / "team.json"), auto_save_interval=0)
+    )
+    _record(first, 0)
+    first.save()
+    store = first._backend.path
+    assert store == tmp_path / "team.v3.json"
+
+    link = tmp_path / "Team.v3.json"
+    try:
+        link.symlink_to(store)
+    except OSError:
+        pytest.skip("symlink creation unavailable on this platform/user")
+
+    second = ToolIntelligenceNetwork(
+        TOINConfig(storage_path=str(tmp_path / "Team.json"), auto_save_interval=0)
+    )
+    # The first proxy's history must not be imported as the second's own.
+    assert second._patterns == {}
+    before = store.read_bytes()
+    _record(second, 1)
+    with caplog.at_level(logging.WARNING, logger="headroom.telemetry.toin"):
+        second.save()
+    # And its save must not replace the linked store with second's history.
+    assert store.read_bytes() == before
+    assert any(getattr(record, "event", None) == "toin_save_failed" for record in caplog.records)
+
+
 def test_ownerless_legacy_sibling_is_not_adopted(tmp_path) -> None:
     """A legacy store at the derived sibling belongs to another proxy.
 

@@ -18,11 +18,44 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Case-sensitivity of the volume holding a TOIN store's parent directory,
+# keyed by resolved parent. Probed once per directory per process.
+_case_insensitive_volumes: dict[str, bool] = {}
+
+
+def _volume_is_case_insensitive(parent: Path) -> bool:
+    """True when ``parent``'s volume treats case-variant spellings as one file.
+
+    Probed by writing a uniquely named file and checking a case-variant of
+    its name: no standard-library call reports this (``os.path.normcase`` is
+    the identity on macOS, whose default volume is case-insensitive). On a
+    volume that cannot be probed (read-only directory), fall back to the
+    ``normcase`` convention — folding on Windows, exact elsewhere.
+    """
+    key = str(parent)
+    cached = _case_insensitive_volumes.get(key)
+    if cached is not None:
+        return cached
+    result = os.path.normcase("A") != os.path.normcase("a")
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        probe = parent / f".headroom_case_probe_{os.getpid()}"
+        probe.write_text("x", encoding="utf-8")
+        try:
+            result = probe.with_name(probe.name.upper()).exists()
+        finally:
+            probe.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _case_insensitive_volumes[key] = result
+    return result
 
 
 def _version_paths(path: Path, store_version: str) -> tuple[Path, Path | None]:
@@ -94,16 +127,16 @@ class FileSystemTOINBackend:
         # canonicalized but the final filename is kept verbatim: an atomic
         # save replaces the file *at the configured name* (a symlink is
         # replaced, not followed), so the token must identify that name,
-        # not the link target a previous store may have lived at. The whole
-        # identity is lowercased: on case-insensitive volumes (Windows,
-        # default macOS) a case-only respelling of HEADROOM_TOIN_PATH is the
-        # same directory entry and must stay one owner. On case-sensitive
-        # filesystems case-variant spellings are different files with
-        # different write targets, so they never meet to conflict.
+        # not the link target a previous store may have lived at. Whether the
+        # identity folds case is decided per volume (see
+        # ``_volume_is_case_insensitive``): on a case-insensitive volume a
+        # case-only respelling of HEADROOM_TOIN_PATH is the same directory
+        # entry and must stay one owner, while on a case-sensitive volume the
+        # spellings are different files with different write targets and must
+        # keep distinct owners. Computed lazily so construction stays
+        # side-effect free.
         self._configured_path = self._path
-        self._owner = Path(
-            str(self._configured_path.parent.resolve() / self._configured_path.name).lower()
-        )
+        self._owner: Path | None = None
         self._store_version: str | None = None
         if store_version:
             self.configure_version(store_version)
@@ -214,8 +247,15 @@ class FileSystemTOINBackend:
 
         Derived from the caller-supplied path (before versioning), so every
         process pointed at the same configured path agrees, and two processes
-        pointed at different configured paths disagree.
+        pointed at different configured paths disagree — except where the
+        volume itself treats two spellings as one directory entry.
         """
+        if self._owner is None:
+            parent = self._configured_path.parent.resolve()
+            identity = str(parent / self._configured_path.name)
+            if _volume_is_case_insensitive(parent):
+                identity = identity.lower()
+            self._owner = Path(identity)
         return hashlib.sha256(str(self._owner).encode("utf-8", "surrogatepass")).hexdigest()
 
     def _refuse_foreign_store(self) -> None:
