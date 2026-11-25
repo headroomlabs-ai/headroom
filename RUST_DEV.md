@@ -138,7 +138,8 @@ Python proxy trusts loopback callers (no token needed, and access to
 - With `--python-upstream`, a caller that presented the token is
   forwarded with `X-Headroom-Front-Proof`, a value derived from the token
   (never the token itself), and only when `--upstream` is a loopback
-  address or `localhost`. Python proxies that verify the proof accept it
+  address, `localhost`, or a container host alias (`host.docker.internal`,
+  `host.containers.internal`, for a front in a container). Python proxies that verify the proof accept it
   in place of the token the front strips; that verification ships in the
   Python security-gate change that follows this one. Until then the
   Python proxy ignores the header and never forwards it upstream, in any
@@ -180,7 +181,10 @@ Python proxy trusts loopback callers (no token needed, and access to
   through whatever the client sent. For nginx:
 
   ```nginx
-  # WebSocket routes (/v1/responses, /v1/live) need the upgrade forwarded.
+  # WebSocket routes need the upgrade forwarded. Through the Rust proxy they
+  # are /v1/live, /v1/codex/live, /backend-api/live, /backend-api/codex/live,
+  # /v1/codex/responses, /backend-api/responses, /backend-api/codex/responses.
+  # (It mounts /v1/responses for POST only: a WebSocket upgrade there gets 405.)
   map $http_upgrade $connection_upgrade {
       default upgrade;
       ''      close;
@@ -213,6 +217,13 @@ Python proxy trusts loopback callers (no token needed, and access to
   front on a non-loopback address. The front logs
   `event=proxy_loopback_listen_with_token` at startup as a reminder when
   it listens on loopback with a token configured.
+- Every request relayed for a caller that is not local here carries
+  `X-Headroom-Front-Remote: 1`, in every mode and whatever `Host` is sent;
+  the front drops any value a client sends. It is not a secret: the Python
+  proxy never treats a request carrying it as local (loopback or
+  container-alias `Host`), so a remote caller cannot borrow a name the
+  Python proxy would trust from the front's loopback connection. Other
+  backends can ignore it.
 - A non-loopback `--listen` with no token refuses to start. Set
   `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` only when something else
   already restricts who can reach the port.
