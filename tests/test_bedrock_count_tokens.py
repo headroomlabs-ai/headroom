@@ -44,7 +44,7 @@ def _bedrock_backend(runtime: MagicMock) -> LiteLLMBackend:
     return backend
 
 
-def _post(backend, passthrough):
+def _post(backend, passthrough, headers=_HEADERS):
     from fastapi.testclient import TestClient
 
     from headroom.proxy.loopback_guard import require_loopback
@@ -55,7 +55,7 @@ def _post(backend, passthrough):
     with TestClient(app) as client:
         app.state.proxy.anthropic_backend = backend
         with patch.object(app.state.proxy, "handle_passthrough", passthrough):
-            return client.post("/v1/messages/count_tokens", headers=_HEADERS, json=_BODY)
+            return client.post("/v1/messages/count_tokens", headers=headers, json=_BODY)
 
 
 def test_bedrock_counts_tokens_without_an_upstream_call() -> None:
@@ -118,3 +118,26 @@ def test_bedrock_error_maps_to_an_anthropic_error(code, status, error_type) -> N
     error = resp.json()["error"]
     assert error["type"] == error_type
     assert code in error["message"] and "anthropic.claude-sonnet-4-6" in error["message"]
+
+
+def test_caller_named_upstream_keeps_the_passthrough_in_bedrock_mode() -> None:
+    from fastapi.responses import Response
+
+    runtime = MagicMock()
+    passthrough = MagicMock(
+        return_value=Response(b'{"input_tokens": 9}', media_type="application/json")
+    )
+
+    async def forward(*args, **kwargs):
+        return passthrough(*args, **kwargs)
+
+    async def safe(_url):
+        return True
+
+    headers = {**_HEADERS, "x-headroom-base-url": "https://gateway.example.com"}
+    with patch("headroom.providers.proxy_routes.is_safe_upstream_url_async", safe):
+        resp = _post(_bedrock_backend(runtime), forward, headers)
+
+    assert resp.json() == {"input_tokens": 9}
+    assert passthrough.call_args.args[1] == "https://gateway.example.com"
+    assert not runtime.count_tokens.called
