@@ -3255,7 +3255,10 @@ async def test_ws_shaper_label_is_booked_only_on_its_own_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ws_usage_less_turn_leaves_tool_savings_and_labels_pending(monkeypatch):
+async def test_ws_usage_less_turn_keeps_tool_savings_pending_and_drops_its_labels(monkeypatch):
+    """A usage-less turn's input savings wait for the next usage-carrying turn;
+    its shaping labels do not, since the next turn's output is not the one they
+    describe and the ledger reads the first stratum label it finds."""
     from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 
     outcomes = await _run_gated_ws_session(
@@ -3266,7 +3269,8 @@ async def test_ws_usage_less_turn_leaves_tool_savings_and_labels_pending(monkeyp
     usage_outcomes = [o for o in outcomes if o.provider_input_tokens > 0]
     assert len(usage_outcomes) == 1
     assert tool_schema_saved_from_tags(usage_outcomes[0].tags) == 301
-    assert "output_shaper:verbosity:L2" in usage_outcomes[0].transforms_applied
+    assert "text" in usage_outcomes[0].transforms_applied
+    assert "output_shaper:verbosity:L2" not in usage_outcomes[0].transforms_applied
     for outcome in outcomes:
         if outcome.provider_input_tokens <= 0:
             assert tool_schema_saved_from_tags(outcome.tags) == 0

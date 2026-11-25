@@ -10071,12 +10071,14 @@ class OpenAIHandlerMixin:
                             # slice WS turns by tag — same surface
                             # as HTTP turns.
                             # Same gate as ``saved_delta``: a usage-less turn
-                            # leaves its rows, tool-schema tags and transform
-                            # labels pending for a usage-carrying one. Labels
-                            # are per turn: the output-savings ledger reads a
-                            # shaping label as "this outcome's output was
-                            # shaped", so one turn's label must not repeat on
-                            # every later turn of the session.
+                            # leaves its rows and tool-schema tags pending for
+                            # a usage-carrying one. Labels are per turn: the
+                            # output-savings ledger reads a shaping label as
+                            # "this outcome's output was shaped", so a label
+                            # must not repeat on later turns. A usage-less
+                            # turn's labels are dropped, not carried: they
+                            # describe an output nobody measured, and the next
+                            # turn's own labels describe its output.
                             turn_tags = ws_tags
                             turn_transforms: tuple[str, ...] = ()
                             if input_delta > 0:
@@ -10086,7 +10088,7 @@ class OpenAIHandlerMixin:
                                 turn_transforms = tuple(transforms_applied)
                                 ws_turn_savings.clear()
                                 ws_turn_tool_tags.clear()
-                                transforms_applied.clear()
+                            transforms_applied.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
