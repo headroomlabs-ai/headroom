@@ -154,6 +154,11 @@ Two log paths, with very different sensitivity:
   events record the action, method, path, source IP, and status code of `/admin/*`,
   `/cache/clear`, and `/stats/reset` calls.
 
+  Every record is one line: line breaks and other control characters in a message are
+  escaped and traceback lines are indented, in `proxy.log`, on the proxy's stderr, and
+  in uvicorn's own log lines. An application that embeds the proxy and configured the
+  root logger before importing it keeps its own stderr formatter.
+
   Note the permission asymmetry: unlike `copilot_auth.json`, `ccr_store.db`, and
   `settings.json`, this file gets no explicit mode. Under a common `0002` umask it lands
   at `0664` — readable by every account on the host.

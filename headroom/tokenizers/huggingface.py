@@ -439,36 +439,72 @@ class HuggingFaceTokenizer(BaseTokenizer):
             return super().count_messages(messages)
 
         # Try to use chat template for accurate counting
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            try:
-                # ``return_dict=False`` is load-bearing. transformers >= 5 defaults
-                # ``apply_chat_template(tokenize=True)`` to ``return_dict=True``,
-                # which hands back a BatchEncoding — so ``len(formatted)`` counted
-                # DICT KEYS (2: input_ids, attention_mask) instead of tokens.
-                # Measured on Qwen2.5-72B, a 6,000-char message: count_messages
-                # returned 2 and count_message returned -1 (base subtracts a
-                # 3-token reply overhead), against a true 1,003 tokens. That is a
-                # ~99.8% undercount on every HF-routed family whose resolved
-                # tokenizer carries a chat template — llama, qwen, deepseek, phi,
-                # yi, falcon, starcoder. pyproject pins transformers>=5.5.0,<6.0,
-                # so the affected version is the only installable one.
-                formatted = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_dict=False,
-                )
-                # Recent transformers return a BatchEncoding (dict-like with
-                # input_ids/attention_mask) here; len() of it is the key count
-                # (2), not the token count.
-                if hasattr(formatted, "keys") and "input_ids" in formatted:
-                    return len(formatted["input_ids"])
-                return len(formatted)
-            except Exception:
-                # Fall back to base implementation
-                pass
+        templated = self._count_with_chat_template(messages, add_generation_prompt=True)
+        if templated is not None:
+            return templated
 
         return super().count_messages(messages)
+
+    def count_message(self, message: dict[str, Any]) -> int:
+        """Count tokens in a single message.
+
+        The base implementation subtracts a fixed reply overhead from
+        ``count_messages([message])``, but a chat template defines its own
+        generation-prompt overhead, so that subtraction can go below zero for a
+        short message (GH #4274). With a chat template, render the message alone
+        without the generation prompt instead.
+
+        Args:
+            message: A message dict with 'role' and 'content'.
+
+        Returns:
+            Token count for this message, never negative.
+        """
+        if not self._use_fallback():
+            templated = self._count_with_chat_template([message], add_generation_prompt=False)
+            if templated is not None:
+                return templated
+        # Estimate without the template. ``super().count_message`` would go
+        # through ``self.count_messages``, which retries the template with a
+        # generation prompt and can still subtract a short message down to 0.
+        return max(0, BaseTokenizer.count_messages(self, [message]) - self.REPLY_OVERHEAD)
+
+    def _count_with_chat_template(
+        self, messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> int | None:
+        """Count ``messages`` through the tokenizer's chat template.
+
+        Returns None when the tokenizer has no usable chat template, so the
+        caller can fall back to the per-message estimate.
+        """
+        if not hasattr(self.tokenizer, "apply_chat_template"):
+            return None
+        try:
+            # ``return_dict=False`` is load-bearing. transformers >= 5 defaults
+            # ``apply_chat_template(tokenize=True)`` to ``return_dict=True``,
+            # which hands back a BatchEncoding — so ``len(formatted)`` counted
+            # DICT KEYS (2: input_ids, attention_mask) instead of tokens.
+            # Measured on Qwen2.5-72B, a 6,000-char message: count_messages
+            # returned 2 and count_message returned -1 (base subtracts a
+            # 3-token reply overhead), against a true 1,003 tokens. That is a
+            # ~99.8% undercount on every HF-routed family whose resolved
+            # tokenizer carries a chat template — llama, qwen, deepseek, phi,
+            # yi, falcon, starcoder. pyproject pins transformers>=5.5.0,<6.0,
+            # so the affected version is the only installable one.
+            formatted = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                return_dict=False,
+            )
+        except Exception:
+            return None
+        # Recent transformers return a BatchEncoding (dict-like with
+        # input_ids/attention_mask) here; len() of it is the key count
+        # (2), not the token count.
+        if hasattr(formatted, "keys") and "input_ids" in formatted:
+            return len(formatted["input_ids"])
+        return len(formatted)
 
     def encode(self, text: str) -> list[int]:
         """Encode text to token IDs.
