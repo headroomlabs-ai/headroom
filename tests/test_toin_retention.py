@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from headroom.proxy.tenant_key import _sanitize_tenant_key
+from headroom.telemetry.backends import filesystem as fs_backend_module
 from headroom.telemetry.backends.filesystem import (
     FileSystemTOINBackend,
     _volume_is_case_insensitive,
@@ -851,6 +852,7 @@ def test_oversized_legacy_store_preserves_old_data_and_persists_new_learning(
     }
 
 
+@pytest.mark.windows_newline
 def test_case_alias_spelling_shares_one_store(tmp_path) -> None:
     """On a case-insensitive volume, a case-alias spelling must not fork the store.
 
@@ -896,6 +898,7 @@ def test_mixed_case_version_marker_on_case_sensitive_volume(tmp_path) -> None:
     assert not (tmp_path / "toin.V3.v3.json").exists()
 
 
+@pytest.mark.windows_newline
 def test_case_sensitive_volume_keeps_distinct_owners_across_a_symlink(tmp_path, caplog) -> None:
     """Case-variant configured paths on a case-sensitive volume are distinct proxies.
 
@@ -938,6 +941,7 @@ def test_case_sensitive_volume_keeps_distinct_owners_across_a_symlink(tmp_path, 
     assert any(getattr(record, "event", None) == "toin_save_failed" for record in caplog.records)
 
 
+@pytest.mark.windows_newline
 def test_case_probe_cannot_be_redirected_onto_a_victim_file(tmp_path) -> None:
     """The probe's write must not follow a symlink pre-planted at a predictable name.
 
@@ -960,6 +964,7 @@ def test_case_probe_cannot_be_redirected_onto_a_victim_file(tmp_path) -> None:
     assert victim.read_text(encoding="utf-8") == "do not truncate"
 
 
+@pytest.mark.windows_newline
 def test_case_classification_from_existing_entries_writes_nothing(tmp_path, monkeypatch) -> None:
     """An existing entry classifies the volume without any write.
 
@@ -983,6 +988,7 @@ def test_case_classification_from_existing_entries_writes_nothing(tmp_path, monk
     assert list(tmp_path.glob(".headroom_case_probe*")) == []
 
 
+@pytest.mark.windows_newline
 def test_unicode_basename_does_not_spoof_case_sensitivity(tmp_path) -> None:
     """Case classification must not expand Unicode characters.
 
@@ -1003,7 +1009,10 @@ def test_unicode_basename_does_not_spoof_case_sensitivity(tmp_path) -> None:
     assert _volume_is_case_insensitive(tmp_path) is True
 
 
-def test_unicode_configured_path_survives_restart_on_insensitive_volume(tmp_path) -> None:
+@pytest.mark.windows_newline
+def test_unicode_configured_path_survives_restart_on_insensitive_volume(
+    tmp_path, monkeypatch
+) -> None:
     """Save and reopen a store whose configured basename expands under upper()."""
     (tmp_path / "case_probe").write_text("x", encoding="utf-8", newline="\n")
     if not (tmp_path / "CASE_PROBE").exists():
@@ -1015,6 +1024,11 @@ def test_unicode_configured_path_survives_restart_on_insensitive_volume(tmp_path
     )
     _record(toin, 0)
     toin.save()
+
+    # A fresh process would measure the directory with the Unicode store
+    # already present; drop the cache the first save populated so the
+    # restart exercises the read-only classification path.
+    monkeypatch.setattr(fs_backend_module, "_case_insensitive_volumes", {})
 
     restarted = ToolIntelligenceNetwork(TOINConfig(storage_path=str(tmp_path / "Straße.json")))
     assert restarted._patterns
