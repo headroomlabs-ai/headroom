@@ -1310,6 +1310,41 @@ _DEFAULT_DETECT_TIMEOUT_SECS = 5.0
 # page from a fenced example embedded in prose.
 _TOP_LEVEL_HTML_DOCUMENT = re.compile(r"^\s*(?:<!doctype\s+html|<html[\s>])", re.IGNORECASE)
 
+# One line of a bare diff tool result: diff headers and hunk lines. The diff
+# detector fires on a single header anywhere in the sample, so a prose answer
+# with a fenced diff also reads as GIT_DIFF; any line outside this shape (prose,
+# fence markers) keeps that content on MIXED.
+_DIFF_DOCUMENT_LINE = re.compile(
+    r"\s*$"
+    r"|[ +\-@\\]"
+    r"|diff |index |Binary files "
+    r"|(?:old|new|deleted file|new file) mode "
+    r"|(?:dis)?similarity index "
+    r"|(?:rename|copy) (?:from|to) "
+)
+# ``git status --short`` / ``git log -p`` lines accepted only before the first
+# diff header. DiffCompressor keeps that preamble verbatim, but reads anything
+# after a header as hunk content, so a second commit's header and message in
+# ``git log -p`` output would be dropped as context.
+_DIFF_PREAMBLE_LINE = re.compile(
+    r"commit [0-9a-f]{7,}"
+    r"|(?:Author|AuthorDate|Commit|CommitDate|Date|Merge):"
+    r"|[MADRCUT?!][ MADRCUT?!] \S"
+)
+
+
+def _is_bare_diff_document(document: str) -> bool:
+    """True when every line is diff output or a preamble before the first header."""
+    in_preamble = True
+    for line in document.split("\n"):
+        if line.startswith("diff "):
+            in_preamble = False
+        elif in_preamble and _DIFF_PREAMBLE_LINE.match(line):
+            continue
+        if not _DIFF_DOCUMENT_LINE.match(line):
+            return False
+    return True
+
 
 def _detect_timeout_secs() -> float:
     """Watchdog budget (seconds) for one native detect call.
@@ -3696,6 +3731,18 @@ class ContentRouter(Transform):
                 # the fence lines. Keep that shape on MIXED.
                 document = _strip_detection_envelope(content)
                 if _TOP_LEVEL_HTML_DOCUMENT.match(document):
+                    return self._strategy_from_detection(detection)
+                return CompressionStrategy.MIXED
+            # Same false positive on a unified diff: changed PHP/JS lines start
+            # with ``[``/``{`` and comments read as prose, so a plain
+            # ``git diff`` result trips both signals. MIXED then splits the
+            # hunks into text sections, rejoins them with blank lines inside
+            # hunks, and can hand changed lines to lossy ML compression (#5050).
+            # Only a result made entirely of diff lines gets the override; a
+            # diff embedded in prose, or multi-commit ``git log -p`` output,
+            # stays on MIXED.
+            if detection.content_type == ContentType.GIT_DIFF:
+                if _is_bare_diff_document(_strip_detection_envelope(content)):
                     return self._strategy_from_detection(detection)
                 return CompressionStrategy.MIXED
             return CompressionStrategy.MIXED
