@@ -14,7 +14,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom.log_safety import describe_exception, safe_id
-from headroom.model_limits import load_openai_encodings
+from headroom.model_limits import configured_encoding, load_openai_encodings
 from headroom.model_limits import load_openai_model_config as _load_custom_model_config
 from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
@@ -244,8 +244,11 @@ def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = 
     reach a better tokenizer should use it rather than guess an encoding.
     """
     # Check custom encodings first
-    if custom_encodings and model in custom_encodings:
-        return custom_encodings[model]
+    if custom_encodings:
+        # The same lookup the tokenizer registry uses (case-insensitive).
+        encoding = configured_encoding(model, custom_encodings)
+        if encoding is not None:
+            return encoding
 
     # Direct match
     if model in _MODEL_ENCODINGS:

@@ -425,3 +425,45 @@ def test_provider_and_registry_agree_on_an_alias_beside_malformed_pricing(
     assert isinstance(registry_counter, TiktokenCounter), repr(registry_counter)
     assert registry_counter.encoding_name == "o200k_base"
     assert provider_counter.count_messages(MESSAGES) == registry_counter.count_messages(MESSAGES)
+
+
+@pytest.mark.parametrize(
+    ("configured", "requested"),
+    [("GPT-4-GW", "gpt-4-gw"), ("gpt-4-gw", "GPT-4-GW")],
+    ids=["mixed-case-key", "mixed-case-request"],
+)
+def test_provider_and_registry_match_configured_names_alike(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch, configured: str, requested: str
+) -> None:
+    """The registry matched case-insensitively, the provider exactly.
+
+    A miss sent the provider to the ``gpt-4`` prefix (``cl100k_base``) while
+    the registry used the configured ``o200k_base``.
+    """
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", json.dumps({"openai": {"encodings": {configured: "o200k_base"}}})
+    )
+
+    provider_counter = OpenAIProvider().get_token_counter(requested)
+    registry_counter = get_tokenizer(requested)
+
+    assert isinstance(provider_counter, OpenAITokenCounter), repr(provider_counter)
+    assert provider_counter._encoding.name == "o200k_base"
+    assert isinstance(registry_counter, TiktokenCounter), repr(registry_counter)
+    assert registry_counter.encoding_name == "o200k_base"
+
+
+def test_the_env_mapping_wins_over_models_json_in_any_case(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom import paths
+
+    models_json = paths.models_config_path()
+    models_json.parent.mkdir(parents=True, exist_ok=True)
+    models_json.write_text(json.dumps({"openai": {"encodings": {"my-alias": "o200k_base"}}}))
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", json.dumps({"openai": {"encodings": {"My-Alias": "cl100k_base"}}})
+    )
+
+    assert get_tokenizer("my-alias").encoding_name == "cl100k_base"
+    assert OpenAIProvider().get_token_counter("MY-ALIAS")._encoding.name == "cl100k_base"

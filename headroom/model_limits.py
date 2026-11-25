@@ -2,11 +2,13 @@
 
 The OpenAI section of that configuration holds context limits, pricing and
 encodings. ``OpenAIProvider`` takes context limits and pricing from
-:func:`load_openai_model_config`; the provider and the tokenizer registry both
-take encodings from :func:`load_openai_encodings`, so they cannot disagree about
-a model's vocabulary. Both functions read the same sources in the same order. It lives here rather than in
-``headroom.providers.openai`` because ``headroom.tokenizers`` sits below the
-providers and must not import them.
+:func:`load_openai_model_config`. The provider and the tokenizer registry both
+take encodings from :func:`load_openai_encodings` and match a model against
+them with :func:`configured_encoding`, so they cannot disagree about a model's
+vocabulary. Both loaders read the same sources in the same order.
+
+This lives here rather than in ``headroom.providers.openai`` because
+``headroom.tokenizers`` sits below the providers and must not import them.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -135,6 +137,11 @@ def load_openai_encodings() -> dict[str, str]:
     encoding. Anything unusable (unreadable source, invalid JSON, non-object
     sections, non-string or empty encodings) is skipped with a warning; this
     never raises.
+
+    Model names are matched case-insensitively (see :func:`configured_encoding`),
+    so keys are returned lowercased. ``HEADROOM_MODEL_LIMITS`` still wins over
+    ``models.json`` for the same name in any case; within one source, the later
+    of two names differing only in case wins, as for a repeated JSON key.
     """
     encodings: dict[str, str] = {}
 
@@ -157,6 +164,24 @@ def load_openai_encodings() -> dict[str, str]:
             encodings.setdefault(model, encoding)
 
     return encodings
+
+
+def configured_encoding(model: str, encodings: Mapping[str, str]) -> str | None:
+    """The operator-configured tiktoken encoding for ``model``, if any.
+
+    The one lookup ``OpenAIProvider`` and the tokenizer registry both use, so
+    their matching cannot drift apart. Names match case-insensitively: the
+    registry caches counters under the lowercased name, so ``GPT-4-GW`` and
+    ``gpt-4-gw`` must resolve alike. An exact key wins, which keeps hand-built
+    mappings (``OpenAITokenCounter(custom_encodings=...)``) working unchanged.
+    """
+    if model in encodings:
+        return encodings[model]
+    lowered = model.lower()
+    for name, encoding in encodings.items():
+        if name.lower() == lowered:
+            return encoding
+    return None
 
 
 def _encodings_from(source: str, read: Callable[[], Any], *, env_source: bool) -> dict[str, str]:
@@ -199,11 +224,15 @@ def _encodings_from(source: str, read: Callable[[], Any], *, env_source: bool) -
         return {}
 
     encodings = {
-        model: encoding
+        model.lower(): encoding
         for model, encoding in raw.items()
         if isinstance(encoding, str) and encoding.strip()
     }
-    skipped = sorted(model for model in raw if model not in encodings)
+    skipped = sorted(
+        model
+        for model, encoding in raw.items()
+        if not (isinstance(encoding, str) and encoding.strip())
+    )
     if skipped:
         logger.warning(
             "Ignoring model encodings from %s for %s: the encoding must be a non-empty string",
