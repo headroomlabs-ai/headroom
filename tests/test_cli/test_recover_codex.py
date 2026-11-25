@@ -252,6 +252,64 @@ def test_recovery_refuses_a_source_swapped_after_the_owner_check(
     assert codex_recovery.discover_retained_sources(target) == []
 
 
+_unreadable_dirs = pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="needs POSIX permissions that bind the current user (not root)",
+)
+
+
+@pytest.fixture
+def locked_dirs() -> Any:
+    """Directories made unreadable for a test, restored afterwards so tmp_path can be removed."""
+    locked: list[Path] = []
+    yield locked
+    for path in locked:
+        path.chmod(0o700)
+
+
+@_unreadable_dirs
+def test_recovery_refuses_a_source_with_an_unreadable_directory(
+    tmp_path: Path, locked_dirs: list[Path]
+) -> None:
+    """A session directory the copy cannot list must not be silently left out."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-locked"
+    target.mkdir()
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    (source / "sessions" / "2026").mkdir(parents=True)
+    (source / "sessions" / "2026" / "a.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "sessions" / "locked").mkdir()
+    (source / "sessions" / "locked" / "b.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "sessions" / "locked").chmod(0)
+    locked_dirs.append(source / "sessions" / "locked")
+
+    with pytest.raises(RuntimeError, match=r"cannot read .*sessions/locked"):
+        recover_codex_home(source=source, target=target)
+    assert sorted(p.name for p in target.iterdir()) == ["config.toml"]
+    assert codex_recovery.discover_retained_sources(target) == []
+    assert not list(tmp_path.rglob("source-pinned*"))
+
+
+@_unreadable_dirs
+def test_recovery_refuses_a_target_whose_backup_would_be_incomplete(
+    tmp_path: Path, locked_dirs: list[Path]
+) -> None:
+    """The by-path copy (the target backup, and the source pin on Windows) fails closed too."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-ok"
+    (target / "sessions" / "locked").mkdir(parents=True)
+    (target / "sessions" / "locked" / "b.jsonl").write_text("{}\n", encoding="utf-8")
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    source.mkdir()
+    (source / "config.toml").write_text('model = "theirs"\n', encoding="utf-8")
+    (target / "sessions" / "locked").chmod(0)
+    locked_dirs.append(target / "sessions" / "locked")
+
+    with pytest.raises(RuntimeError, match=r"cannot read .*sessions/locked"):
+        recover_codex_home(source=source, target=target)
+    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+
+
 def test_recovery_offers_no_snapshot_when_the_pinning_copy_fails_midway(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

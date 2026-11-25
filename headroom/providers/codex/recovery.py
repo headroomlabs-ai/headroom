@@ -308,67 +308,101 @@ def _secure_tree(path: Path) -> None:
         entry.chmod(0o700 if entry.is_dir() else 0o600)
 
 
+def _unreadable(path: Path, err: OSError) -> RuntimeError:
+    return RuntimeError(
+        f"cannot read {path} while copying a Codex home ({err.strerror}); nothing was "
+        "recovered. Make it readable by the current user, or move it aside, and rerun."
+    )
+
+
 def _copy_home(source: Path, destination: Path, skipped: list[str]) -> None:
+    """Copy ``source`` by path; a directory that cannot be listed aborts the copy."""
+
+    def refuse(err: OSError) -> None:
+        raise _unreadable(Path(err.filename or source), err) from err
+
     destination.mkdir(parents=True, exist_ok=False)
     destination.chmod(0o700)
-    for entry in source.rglob("*"):
-        relative = entry.relative_to(source)
-        output = destination / relative
-        try:
-            metadata = entry.lstat()
-        except FileNotFoundError:
-            continue
-        if stat.S_ISSOCK(metadata.st_mode):
-            skipped.append(str(relative))
-            continue
-        if entry.is_symlink():
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.symlink_to(os.readlink(entry))
-        elif entry.is_dir():
-            output.mkdir(parents=True, exist_ok=True)
-        elif entry.is_file():
-            output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(entry, output, follow_symlinks=False)
-        else:
-            skipped.append(str(relative))
-    _secure_tree(destination)
-
-
-def _copy_held_home(source_fd: int, destination: Path, skipped: list[str]) -> None:
-    """``_copy_home`` for a held directory: every read goes through ``source_fd``.
-
-    Paths are resolved relative to directory descriptors and never through a
-    symlink, so renaming or replacing the source path meanwhile cannot change
-    what is copied. Symlinks are recreated as links, sockets and other special
-    files are recorded in ``skipped``, and file times are kept for the merge.
-    """
-    destination.mkdir(parents=True, exist_ok=False)
-    destination.chmod(0o700)
-    for dirpath, dirnames, filenames, dir_fd in os.fwalk(
-        ".", dir_fd=source_fd, follow_symlinks=False
-    ):
-        relative_dir = Path(dirpath)
+    for dirpath, dirnames, filenames in os.walk(source, onerror=refuse):
         for name in [*dirnames, *filenames]:
-            relative = relative_dir / name
+            entry = Path(dirpath) / name
+            relative = entry.relative_to(source)
             output = destination / relative
             try:
-                metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                metadata = entry.lstat()
             except FileNotFoundError:
                 continue
-            if stat.S_ISLNK(metadata.st_mode):
-                output.symlink_to(os.readlink(name, dir_fd=dir_fd))
-            elif stat.S_ISDIR(metadata.st_mode):
-                output.mkdir(exist_ok=True)
-            elif stat.S_ISREG(metadata.st_mode):
-                _copy_file_at(dir_fd, name, output)
+            if stat.S_ISSOCK(metadata.st_mode):
+                skipped.append(str(relative))
+                continue
+            if entry.is_symlink():
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.symlink_to(os.readlink(entry))
+            elif entry.is_dir():
+                output.mkdir(parents=True, exist_ok=True)
+            elif entry.is_file():
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(entry, output, follow_symlinks=False)
             else:
                 skipped.append(str(relative))
     _secure_tree(destination)
 
 
-def _copy_file_at(dir_fd: int, name: str, output: Path) -> None:
-    """Copy regular file ``name`` in ``dir_fd`` to ``output``, keeping its times."""
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+def _copy_held_home(source_fd: int, source: Path, destination: Path, skipped: list[str]) -> None:
+    """``_copy_home`` for a held directory: every read goes through ``source_fd``.
+
+    Entries are opened relative to their parent's descriptor and never through
+    a symlink, so renaming or replacing the source path meanwhile cannot change
+    what is copied. Symlinks are recreated as links, sockets and other special
+    files are recorded in ``skipped``, file times are kept for the merge, and
+    anything that cannot be read aborts the copy (``source`` names it).
+    """
+    destination.mkdir(parents=True, exist_ok=False)
+    destination.chmod(0o700)
+    _copy_held_dir(source_fd, source, Path(), destination, skipped)
+    _secure_tree(destination)
+
+
+def _copy_held_dir(
+    dir_fd: int, source: Path, relative: Path, destination: Path, skipped: list[str]
+) -> None:
+    try:
+        names = sorted(os.listdir(dir_fd))
+    except OSError as err:
+        raise _unreadable(source / relative, err) from err
+    for name in names:
+        entry = relative / name
+        output = destination / entry
+        try:
+            metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                output.symlink_to(os.readlink(name, dir_fd=dir_fd))
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+                )
+            elif stat.S_ISREG(metadata.st_mode):
+                file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            else:
+                skipped.append(str(entry))
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError as err:
+            raise _unreadable(source / entry, err) from err
+        if stat.S_ISDIR(metadata.st_mode):
+            try:
+                output.mkdir()
+                _copy_held_dir(child_fd, source, entry, destination, skipped)
+            finally:
+                os.close(child_fd)
+        else:
+            _copy_file_from(file_fd, output)
+
+
+def _copy_file_from(fd: int, output: Path) -> None:
+    """Copy the open regular file ``fd`` to ``output`` (closing ``fd``), keeping its times."""
     with os.fdopen(fd, "rb") as src, output.open("xb") as dst:
         shutil.copyfileobj(src, dst)
         metadata = os.fstat(src.fileno())
@@ -865,7 +899,7 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
             if held_fd is None:
                 _copy_home(source, staging, report.skipped_runtime)
             else:
-                _copy_held_home(held_fd, staging, report.skipped_runtime)
+                _copy_held_home(held_fd, source, staging, report.skipped_runtime)
             copied_from = source.lstat()
             if home_fingerprint(source) != before:
                 raise RuntimeError("source Codex home changed while it was being pinned")
