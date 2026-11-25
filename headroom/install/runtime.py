@@ -654,12 +654,14 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         # as a different process. The identity and exiting probes can also
         # straddle the reap itself: if the PID is already gone by the time
         # they run, that is stopped too. A live process that is not exiting
-        # and does not match still means the PID was reused.
-        if (
-            _process_identity(pid, manifest) is False
-            and not _process_is_exiting(pid)
-            and pid_alive(pid)
-        ):
+        # and does not match still means the PID was reused. The same
+        # second liveness check also decides the final poll: if the PID is
+        # reaped between the poll's first check and this one, the stop is
+        # complete even though no further poll will run.
+        if _process_identity(pid, manifest) is False and not _process_is_exiting(pid):
+            if not pid_alive(pid):
+                _clear_pid(manifest.profile, expected_pid=pid)
+                return
             raise RuntimeError(
                 f"Cannot stop deployment '{manifest.profile}': runtime identity changed"
             )
