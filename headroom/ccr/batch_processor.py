@@ -240,11 +240,20 @@ class BatchResultProcessor:
         """
         custom_id = request_context.custom_id
 
+        # Count this result's own continuation API rounds. The handler's
+        # ``_retrieval_count`` is a cumulative aggregate across the processor's
+        # lifetime (shared handler instance), so it misreports every result
+        # after the first and counts parallel retrievals resolved by one round
+        # as multiple rounds (#4184).
+        continuation_rounds = 0
+
         # Create API call function for continuations
         async def api_call_fn(
             messages: list[dict[str, Any]],
             tools: list[dict[str, Any]] | None,
         ) -> dict[str, Any]:
+            nonlocal continuation_rounds
+            continuation_rounds += 1
             return await self._make_continuation_call(
                 messages,
                 tools,
@@ -273,7 +282,7 @@ class BatchResultProcessor:
             custom_id=custom_id,
             result=updated_result,
             was_processed=True,
-            continuation_rounds=self.ccr_handler._retrieval_count,
+            continuation_rounds=continuation_rounds,
         )
 
     async def _make_continuation_call(

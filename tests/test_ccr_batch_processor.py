@@ -1073,6 +1073,47 @@ class TestProcessSingleResult:
         assert processed.custom_id == "req_1"
         assert processed.was_processed is True
 
+    @pytest.mark.asyncio
+    async def test_continuation_rounds_counts_this_results_api_rounds(self):
+        """``continuation_rounds`` must be this result's own continuation API
+        rounds, not the shared handler's cumulative retrieval count (#4184).
+
+        A single round resolving two parallel retrievals reports 1, not 2, and
+        later results do not inherit earlier results' counts.
+        """
+        processor = BatchResultProcessor(AsyncMock(spec=httpx.AsyncClient))
+
+        # Simulate handle_response making N continuation API calls.
+        async def fake_handle_response(response, messages, tools, api_call_fn, provider):
+            await api_call_fn(messages, tools)  # round 1
+            await api_call_fn(messages, tools)  # round 2
+            return {"content": [{"type": "text", "text": "done"}]}
+
+        processor.ccr_handler.handle_response = fake_handle_response
+        # The shared handler's aggregate counter is non-zero, as it would be
+        # after an earlier result was processed.
+        processor.ccr_handler._retrieval_count = 7
+
+        original_result = {
+            "custom_id": "req_1",
+            "result": {"message": {"content": [{"type": "tool_use", "name": CCR_TOOL_NAME}]}},
+        }
+        response = original_result["result"]["message"]
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Get data"}],
+            tools=[{"name": CCR_TOOL_NAME}],
+            model="claude-3-opus",
+        )
+        batch_context = BatchContext(batch_id="batch_123", provider="anthropic", api_key="k")
+
+        processed = await processor._process_single_result(
+            original_result, response, request_context, batch_context, "anthropic"
+        )
+
+        # Two API rounds for THIS result, not the handler's aggregate 7.
+        assert processed.continuation_rounds == 2
+
 
 class TestConvenienceFunction:
     """Test process_batch_results convenience function."""
