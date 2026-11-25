@@ -28,6 +28,7 @@ _ENCODING_URLS = {
     "o200k_harmony": ("https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",),
     "cl100k_base": ("https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",),
     "p50k_base": ("https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",),
+    "p50k_edit": ("https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",),
     "r50k_base": ("https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken",),
     "gpt2": (
         "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/vocab.bpe",
@@ -40,6 +41,7 @@ _ENCODING_HASHES = {
     "o200k_harmony": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
     "cl100k_base": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
     "p50k_base": "94b5ca7dff4d00767bc256fdd1b27e5b17361d7b8a5f968547f9f23eb70d2069",
+    "p50k_edit": "94b5ca7dff4d00767bc256fdd1b27e5b17361d7b8a5f968547f9f23eb70d2069",
     "r50k_base": "306cd27f03c1a714eca7108e03d66b7dc042abe8c258b44c199a7ed9838dd930",
     "gpt2_vocab": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
     "gpt2_encoder": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783",
@@ -107,7 +109,7 @@ _ENCODING_PAT_STR = {
             r"""\s+""",
         ]
     ),
-    "cl100k_base": r"""(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s""",
+    "cl100k_base": r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s""",
     "p50k_base": r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s""",
     "r50k_base": r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s""",
     "p50k_edit": r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s""",
@@ -115,14 +117,15 @@ _ENCODING_PAT_STR = {
 }
 
 # Only encodings where explicit_n_vocab == len(mergeable_ranks) + len(special_tokens)
-# For cl100k_base, o200k_base, o200k_harmony, p50k_edit this does NOT hold (they have reserved indices)
+# For cl100k_base, o200k_base, o200k_harmony this does NOT hold (they have reserved indices)
 # tiktoken's own constructors OMIT explicit_n_vocab for these encodings to skip validation.
 # We do the same: only pass explicit_n_vocab for encodings where it matches.
 _ENCODING_EXPLICIT_N_VOCAB = {
     "gpt2": 50257,
     "r50k_base": 50257,
     "p50k_base": 50281,
-    # cl100k_base, o200k_base, o200k_harmony, p50k_edit: omitted (have reserved tokens)
+    "p50k_edit": 50281,
+    # cl100k_base, o200k_base, o200k_harmony: omitted (have reserved tokens)
 }
 
 
@@ -321,16 +324,11 @@ def _load_encoding_worker(encoding_name: str, queue: Any) -> None:
     """Worker function to load encoding in a separate process.
 
     Uses multiprocessing so we can actually terminate on timeout.
-    Does cache check AND load inside the timeout boundary.
-    Returns the encoding object via queue on success, or status string on failure.
+    Does cache check AND hash verification inside the timeout boundary.
+    Returns status via queue on success/failure, does NOT send the encoding object
+    (to avoid large object transfer through queue pipe).
     """
     try:
-        # Fast path: already in memory (won't happen in child but check anyway)
-        if encoding_name in tiktoken.registry.ENCODINGS:
-            enc = tiktoken.get_encoding(encoding_name)
-            queue.put(("ok", enc))
-            return
-
         # Check local cache FIRST (inside the timeout boundary)
         # This includes filesystem I/O: file open, read, hash verification
         is_cached, has_invalid = _encoding_cached_locally(encoding_name)
@@ -340,9 +338,9 @@ def _load_encoding_worker(encoding_name: str, queue: Any) -> None:
             return
 
         if is_cached:
-            # Cache exists and is valid - build encoding in worker (bounded)
-            enc = _build_encoding_from_cache(encoding_name)
-            queue.put(("ok", enc))
+            # Cache exists and is valid - just signal success
+            # Parent will build the encoding from cache files
+            queue.put(("ok", encoding_name))
             return
 
         # Not cached, would need download - but we don't do that here

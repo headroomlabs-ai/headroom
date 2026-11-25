@@ -28,11 +28,15 @@ def _reset_encoding_state():
     tc._get_encoding.cache_clear()
     tc._download_failed.clear()
     tc._disk_load_failed.clear()
+    tc._disk_load_permanently_failed.clear()
+    tc._load_timed_out.clear()
     tiktoken.registry.ENCODINGS.clear()
     yield
     tc._get_encoding.cache_clear()
     tc._download_failed.clear()
     tc._disk_load_failed.clear()
+    tc._disk_load_permanently_failed.clear()
+    tc._load_timed_out.clear()
     tiktoken.registry.ENCODINGS.clear()
 
 
@@ -363,6 +367,7 @@ def test_online_corrupt_cache_repairs(monkeypatch: pytest.MonkeyPatch) -> None:
 
         monkeypatch.setenv("TIKTOKEN_CACHE_DIR", cache_dir)
         monkeypatch.setenv("HEADROOM_OFFLINE", "0")  # Online mode
+        monkeypatch.setenv("HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS", "60")  # Download can be slow
 
         # load_encoding should detect corrupt cache and trigger tiktoken's repair
         # (tiktoken.get_encoding will overwrite corrupt cache with fresh download)

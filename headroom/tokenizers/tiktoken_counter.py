@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import queue as queue_module
 from functools import lru_cache
 from typing import Any
 
@@ -23,6 +24,7 @@ from headroom.offline import guard_egress, is_offline
 
 from ._tiktoken_worker import (
     _load_encoding_worker,
+    _build_encoding_from_cache,
 )
 from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
@@ -45,9 +47,11 @@ class TiktokenLoadError(RuntimeError):
 # _download_failed: download failures (network issues, etc.) - blocks retries
 # _disk_load_failed: disk load timeout/miss - does NOT block retries, retryable after vocab available
 # _disk_load_permanently_failed: disk load corruption/errors - blocks retries
+# _load_timed_out: disk load timed out - short-circuits retries to avoid "every request times out"
 _download_failed: set[str] = set()
 _disk_load_failed: set[str] = set()
 _disk_load_permanently_failed: set[str] = set()
+_load_timed_out: set[str] = set()
 
 
 def _load_timeout_seconds() -> float:
@@ -145,9 +149,16 @@ def _get_encoding(encoding_name: str):
             f"tiktoken encoding {encoding_name!r} previously failed to download"
         )
 
+    # Check if this encoding previously timed out on load (short-circuit to avoid "every request times out")
+    if encoding_name in _load_timed_out:
+        raise TiktokenLoadError(
+            f"tiktoken encoding {encoding_name!r} previously timed out on load"
+        )
+
     # NOTE: _disk_load_failed tracks transient disk load failures (timeout/crash).
     # These are NOT short-circuited - they remain retryable once vocabulary is available.
     # _disk_load_permanently_failed tracks corruption/invalid cache - only blocks in offline mode.
+    # _load_timed_out tracks load timeouts - short-circuits to prevent cascade timeouts.
 
     # Try to load from disk cache with timeout using multiprocessing (can actually terminate)
     # This moves the cache check AND the load inside the timeout boundary
@@ -155,10 +166,14 @@ def _get_encoding(encoding_name: str):
     queue = ctx.Queue()
     proc = ctx.Process(target=_load_encoding_worker, args=(encoding_name, queue), daemon=False)
     proc.start()
-    proc.join(_load_timeout_seconds())
 
-    if proc.is_alive():
-        proc.terminate()
+    # Consume queue WHILE process is alive to ensure result is transferred (fixes warm-disk path)
+    try:
+        result = queue.get(timeout=_load_timeout_seconds())
+    except queue_module.Empty:
+        # Timeout - process is still running or dead without putting result
+        if proc.is_alive():
+            proc.terminate()
         proc.join(1.0)
         logger.warning(
             "tiktoken encoding %r did not load from disk cache within %.1fs (stalled constructor); "
@@ -169,9 +184,13 @@ def _get_encoding(encoding_name: str):
         )
         # Do NOT add to _download_failed - disk load timeout is retryable
         # Do NOT add to _disk_load_permanently_failed - timeout is not corruption
-        # Only track in _disk_load_failed for observability
+        # Track in _load_timed_out for short-circuit on retries (prevents "every request times out")
+        _load_timed_out.add(encoding_name)
         _disk_load_failed.add(encoding_name)
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load timed out")
+
+    # Got result from queue, now wait for process to finish cleanly
+    proc.join(1.0)
 
     if proc.exitcode != 0:
         logger.warning(
@@ -181,23 +200,21 @@ def _get_encoding(encoding_name: str):
         )
         # Process crash could be transient - add to _disk_load_failed for tracking only
         _disk_load_failed.add(encoding_name)
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load failed")
-
-    try:
-        result = queue.get_nowait()
-    except Exception as e:
-        # Only add to _disk_load_permanently_failed for actual errors, not timeouts (queue.Empty)
-        # Timeouts are retryable - the cache might become available
-        if not isinstance(e, queue.Empty):
-            _disk_load_permanently_failed.add(encoding_name)
-        raise TiktokenLoadError(
-            f"tiktoken encoding {encoding_name!r} disk load returned no result"
-        ) from e
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} disk load failed with exit code {proc.exitcode}")
 
     status = result[0]
     if status == "ok":
-        # Worker built and returned the encoding
-        enc = result[1]
+        # Worker verified cache is valid - build encoding in parent (fast, no network)
+        try:
+            enc = _build_encoding_from_cache(encoding_name)
+        except Exception as exc:
+            logger.warning(
+                "tiktoken encoding %r failed to build from verified cache: %s",
+                encoding_name,
+                exc,
+            )
+            _disk_load_permanently_failed.add(encoding_name)
+            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to build from cache: {exc}")
         # Register in tiktoken's in-memory cache for future fast loads
         tiktoken.registry.ENCODINGS[encoding_name] = enc
         return enc
@@ -246,10 +263,14 @@ def _get_encoding_with_timeout(encoding_name: str, ctx) -> Any:
     queue = ctx.Queue()
     proc = ctx.Process(target=_download_encoding_worker, args=(encoding_name, queue), daemon=False)
     proc.start()
-    proc.join(_load_timeout_seconds())
 
-    if proc.is_alive():
-        proc.terminate()
+    # Consume queue WHILE process is alive to ensure result is transferred
+    try:
+        result = queue.get(timeout=_load_timeout_seconds())
+    except queue_module.Empty:
+        # Timeout - process is still running or dead without putting result
+        if proc.is_alive():
+            proc.terminate()
         proc.join(1.0)
         logger.warning(
             "tiktoken encoding %r download timed out after %.1fs; falling back to estimation",
@@ -259,6 +280,9 @@ def _get_encoding_with_timeout(encoding_name: str, ctx) -> Any:
         _download_failed.add(encoding_name)
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} download timed out")
 
+    # Got result from queue, now wait for process to finish cleanly
+    proc.join(1.0)
+
     if proc.exitcode != 0:
         logger.warning(
             "tiktoken encoding %r download process exited with code %d",
@@ -266,15 +290,7 @@ def _get_encoding_with_timeout(encoding_name: str, ctx) -> Any:
             proc.exitcode,
         )
         _download_failed.add(encoding_name)
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} download failed")
-
-    try:
-        result = queue.get_nowait()
-    except Exception as e:
-        _download_failed.add(encoding_name)
-        raise TiktokenLoadError(
-            f"tiktoken encoding {encoding_name!r} download returned no result"
-        ) from e
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} download failed with exit code {proc.exitcode}")
 
     if result[0] == "ok":
         enc = result[1]
