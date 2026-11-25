@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -249,3 +250,121 @@ def test_a_mapped_alias_is_one_ruler_for_provider_and_registry(
     registry_count = get_tokenizer(ALIAS).count_messages(MESSAGES)
 
     assert provider_count == registry_count
+
+
+# ---------------------------------------------------------------------------
+# The registry reads only ``openai.encodings``. Every model's counter is
+# resolved through it, so a malformed pricing or context-limit section (or a
+# malformed encodings section) must leave Claude, Gemini and OpenAI models on
+# the counters they get without any configuration.
+# ---------------------------------------------------------------------------
+
+CLAUDE = "claude-sonnet-4-6"
+GEMINI = "gemini-2.5-pro"
+
+
+def _assert_ordinary_counters() -> None:
+    """The counters these models get with no operator configuration at all."""
+    claude = get_tokenizer(CLAUDE)
+    assert isinstance(claude, TiktokenCounter), repr(claude)
+    assert claude.encoding_name == "o200k_base"
+    gemini = get_tokenizer(GEMINI)
+    assert repr(gemini) == "EstimatingTokenCounter(chars_per_token=4.0)"
+    assert get_tokenizer("gpt-4o").encoding_name == "o200k_base"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param({"openai": {"pricing": None}}, id="pricing-null"),
+        pytest.param({"openai": {"context_limits": [1]}}, id="context-limits-list"),
+        pytest.param({"openai": {"encodings": None}}, id="encodings-not-an-object"),
+        pytest.param({"openai": 5}, id="openai-not-an-object"),
+        pytest.param("{not json", id="not-json"),
+    ],
+)
+def test_malformed_settings_leave_every_model_on_its_own_counter(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch, config: object
+) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", config if isinstance(config, str) else json.dumps(config)
+    )
+    _assert_ordinary_counters()
+
+
+def test_malformed_settings_in_models_json_leave_every_model_on_its_own_counter(
+    _isolated_registry: None,
+) -> None:
+    from headroom import paths
+
+    models_json = paths.models_config_path()
+    models_json.parent.mkdir(parents=True, exist_ok=True)
+    models_json.write_text(
+        json.dumps({"openai": {"pricing": None, "encodings": {ALIAS: "cl100k_base"}}})
+    )
+
+    _assert_ordinary_counters()
+    assert get_tokenizer(ALIAS).encoding_name == "cl100k_base"
+
+
+def test_valid_encodings_beside_malformed_pricing_are_still_honored(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"openai": {"pricing": None, "encodings": {ALIAS: "cl100k_base"}}}),
+    )
+
+    counter = get_tokenizer(ALIAS)
+    assert isinstance(counter, TiktokenCounter), repr(counter)
+    assert counter.encoding_name == "cl100k_base"
+    _assert_ordinary_counters()
+
+
+def test_a_bad_encoding_entry_only_affects_its_own_alias(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps(
+            {
+                "openai": {
+                    "encodings": {
+                        ALIAS: "cl100k_base",
+                        "alias-with-a-number": 5,
+                        "alias-with-an-unknown-encoding": "no_such_encoding",
+                    }
+                }
+            }
+        ),
+    )
+
+    assert get_tokenizer(ALIAS).encoding_name == "cl100k_base"
+    assert isinstance(get_tokenizer("alias-with-a-number"), EstimatingTokenCounter)
+    assert isinstance(get_tokenizer("alias-with-an-unknown-encoding"), EstimatingTokenCounter)
+    _assert_ordinary_counters()
+
+
+def test_the_configuration_is_read_once_even_when_malformed(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed read used to stay uncached, so every cache miss re-read it."""
+    raw = json.dumps({"openai": {"pricing": None}})
+    monkeypatch.setenv("HEADROOM_MODEL_LIMITS", raw)
+    reads: list[str] = []
+    real_loads = json.loads
+
+    def _counting_loads(s: Any, *args: Any, **kwargs: Any) -> Any:
+        if s == raw:
+            reads.append(s)
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", _counting_loads)
+
+    for model in (CLAUDE, GEMINI, "gpt-4o", "unknown-model-xyz"):
+        get_tokenizer(model)
+    assert len(reads) == 1
+
+    TokenizerRegistry.clear_cache()
+    get_tokenizer(CLAUDE)
+    assert len(reads) == 2

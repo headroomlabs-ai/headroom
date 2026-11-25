@@ -1,8 +1,8 @@
 """Operator-configured model settings (``HEADROOM_MODEL_LIMITS`` / ``models.json``).
 
 The OpenAI section of that configuration is read by ``OpenAIProvider`` (context
-limits, pricing, encodings) and by the tokenizer registry (encodings), so both
-see one parse of the same file. It lives here rather than in
+limits, pricing, encodings) and by the tokenizer registry (encodings only). Both
+read the same sources in the same order. It lives here rather than in
 ``headroom.providers.openai`` because ``headroom.tokenizers`` sits below the
 providers and must not import them.
 """
@@ -12,11 +12,43 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
+from functools import partial
+from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
 
 logger = logging.getLogger(__name__)
+
+_ENV_VAR = "HEADROOM_MODEL_LIMITS"
+
+
+def _read_env_config(value: str) -> Any:
+    """Parse ``HEADROOM_MODEL_LIMITS``: a path to a JSON file, else a JSON string."""
+    if os.path.isfile(value):
+        return _read_json_file(value)
+    return json.loads(value)
+
+
+def _read_json_file(path: str | Path) -> Any:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _models_config_file() -> Path | None:
+    """The ``models.json`` to read, if any.
+
+    Prefer the canonical config-dir location, then fall back to the legacy
+    workspace-root location for backward compatibility.
+    """
+    config_file = _paths.models_config_path()
+    if config_file.exists():
+        return config_file
+    legacy_models = _paths.workspace_dir() / "models.json"
+    if legacy_models.exists():
+        return legacy_models
+    return None
 
 
 def load_openai_model_config() -> dict[str, Any]:
@@ -32,16 +64,10 @@ def load_openai_model_config() -> dict[str, Any]:
     config: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
 
     # Check environment variable
-    env_config = os.environ.get("HEADROOM_MODEL_LIMITS", "")
+    env_config = os.environ.get(_ENV_VAR, "")
     if env_config:
         try:
-            # Check if it's a file path
-            if os.path.isfile(env_config):
-                with open(env_config, encoding="utf-8") as f:
-                    loaded = json.load(f)
-            else:
-                # Try to parse as JSON string
-                loaded = json.loads(env_config)
+            loaded = _read_env_config(env_config)
 
             if not isinstance(loaded, dict):
                 raise ValueError(
@@ -63,17 +89,11 @@ def load_openai_model_config() -> dict[str, Any]:
             # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
-    # Check config file. Prefer the canonical config-dir location, then fall
-    # back to the legacy workspace-root location for backward compatibility.
-    config_file = _paths.models_config_path()
-    if not config_file.exists():
-        legacy_models = _paths.workspace_dir() / "models.json"
-        if legacy_models.exists():
-            config_file = legacy_models
-    if config_file.exists():
+    # Check config file
+    config_file = _models_config_file()
+    if config_file is not None:
         try:
-            with open(config_file, encoding="utf-8") as f:
-                loaded = json.load(f)
+            loaded = _read_json_file(config_file)
 
             if not isinstance(loaded, dict):
                 raise ValueError(f"{config_file} must contain a JSON object")
@@ -97,3 +117,79 @@ def load_openai_model_config() -> dict[str, Any]:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config
+
+
+def load_openai_encodings() -> dict[str, str]:
+    """Load only the operator's model -> tiktoken encoding mapping.
+
+    Reads the same sources in the same order as :func:`load_openai_model_config`
+    (``HEADROOM_MODEL_LIMITS`` wins over ``models.json``) but looks at nothing
+    except ``openai.encodings``. The tokenizer registry resolves every model's
+    counter from this, so a malformed ``pricing`` or ``context_limits`` section
+    must not change how Claude or Gemini are counted. Anything unusable in the
+    encodings themselves is skipped with a warning; this never raises.
+    """
+    encodings: dict[str, str] = {}
+
+    env_config = os.environ.get(_ENV_VAR, "")
+    if env_config:
+        encodings.update(
+            _encodings_from(_ENV_VAR, partial(_read_env_config, env_config), env_source=True)
+        )
+
+    config_file = _models_config_file()
+    if config_file is not None:
+        for model, encoding in _encodings_from(
+            str(config_file), partial(_read_json_file, config_file), env_source=False
+        ).items():
+            encodings.setdefault(model, encoding)
+
+    return encodings
+
+
+def _encodings_from(source: str, read: Callable[[], Any], *, env_source: bool) -> dict[str, str]:
+    """The valid ``model -> encoding`` entries of one configuration source.
+
+    ``env_source`` keeps the convention of :func:`load_openai_model_config`:
+    ``HEADROOM_MODEL_LIMITS`` may hold the OpenAI section at the top level,
+    ``models.json`` must nest it under ``"openai"``.
+    """
+    try:
+        loaded = read()
+    except (ValueError, OSError) as e:
+        logger.warning("Ignoring model encodings from %s: %s", source, e)
+        return {}
+    if not isinstance(loaded, dict):
+        logger.warning(
+            "Ignoring model encodings from %s: expected a JSON object, got %s",
+            source,
+            type(loaded).__name__,
+        )
+        return {}
+
+    section = loaded.get("openai", loaded if env_source else {})
+    if not isinstance(section, dict):
+        logger.warning(
+            "Ignoring model encodings from %s: 'openai' must be an object, got %s",
+            source,
+            type(section).__name__,
+        )
+        return {}
+    raw = section.get("encodings", {})
+    if not isinstance(raw, dict):
+        logger.warning(
+            "Ignoring model encodings from %s: 'encodings' must be an object, got %s",
+            source,
+            type(raw).__name__,
+        )
+        return {}
+
+    encodings = {model: encoding for model, encoding in raw.items() if isinstance(encoding, str)}
+    skipped = sorted(model for model in raw if model not in encodings)
+    if skipped:
+        logger.warning(
+            "Ignoring model encodings from %s for %s: the encoding must be a string",
+            source,
+            ", ".join(skipped),
+        )
+    return encodings

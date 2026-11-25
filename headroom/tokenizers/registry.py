@@ -156,7 +156,8 @@ class TokenizerRegistry:
 
     # Operator-configured model -> tiktoken encoding, lowercased (``openai.
     # encodings`` in HEADROOM_MODEL_LIMITS / models.json; the mapping
-    # OpenAIProvider honours). Read on first use; clear_cache() re-reads it.
+    # OpenAIProvider honours). Read once on first use, also when it is empty or
+    # malformed; clear_cache() re-reads it.
     _configured_encodings: dict[str, str] | None = None
 
     def __new__(cls) -> TokenizerRegistry:
@@ -311,13 +312,16 @@ class TokenizerRegistry:
         vocabulary the registry cannot infer from the name. Proxy handlers and
         the pipeline both count with the registry, so the mapping has to be
         honoured here for it to govern compression gates and savings alike.
+
+        Only the encodings section is read: every model's counter is resolved
+        through here, so a malformed ``pricing`` or ``context_limits`` entry
+        must not turn Claude or Gemini into the generic estimator.
         """
         if TokenizerRegistry._configured_encodings is None:
-            from ..model_limits import load_openai_model_config
+            from ..model_limits import load_openai_encodings
 
             TokenizerRegistry._configured_encodings = {
-                str(name).lower(): str(encoding)
-                for name, encoding in load_openai_model_config()["encodings"].items()
+                name.lower(): encoding for name, encoding in load_openai_encodings().items()
             }
         return TokenizerRegistry._configured_encodings.get(model.lower())
 

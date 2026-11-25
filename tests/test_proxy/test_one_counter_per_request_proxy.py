@@ -536,3 +536,61 @@ def test_openai_responses_http_counts_with_the_configured_encoding(
     assert r.status_code == 200, r.text
     (kwargs,) = seen
     _assert_request_ruler(kwargs.get("token_counter"), model)
+
+
+# ---------------------------------------------------------------------------
+# A malformed setting next to ``openai.encodings`` must not change any
+# request's counter: the registry reads only the encodings section.
+# ---------------------------------------------------------------------------
+
+GEMINI = "gemini-2.5-pro"
+
+
+@pytest.fixture
+def _alias_mapped_beside_malformed_pricing(
+    _alias_mapped_to_cl100k: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A string, not an object: the provider's loader drops the whole
+    # HEADROOM_MODEL_LIMITS value with a warning, so the proxy still starts.
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"openai": {"pricing": "per-token", "encodings": {ALIAS: "cl100k_base"}}}),
+    )
+
+
+@pytest.mark.parametrize("model", [ALIAS, CLAUDE, GEMINI, GPT])
+def test_openai_chat_keeps_each_models_counter_beside_malformed_pricing(
+    _alias_mapped_beside_malformed_pricing: None, model: str
+) -> None:
+    hooks = _CaptureHooks()
+    app = create_app(_config(hooks, mode="token"))
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.openai_pipeline.transforms = [_HalveLastUser()]
+        spy = MagicMock(side_effect=proxy.openai_pipeline.apply)
+        proxy.openai_pipeline.apply = spy
+        proxy._retry_request = AsyncMock(return_value=_chat_response())
+        messages = [{"role": "user", "content": BODY}]
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": model, "messages": messages},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert r.status_code == 200, r.text
+    assert spy.call_count >= 1
+    expected = {
+        ALIAS: "cl100k_base",
+        CLAUDE: "o200k_base",
+        GPT: "o200k_base",
+        GEMINI: "EstimatingTokenCounter(chars_per_token=4.0)",
+    }[model]
+    for call in spy.call_args_list:
+        counter = call.kwargs.get("token_counter")
+        assert counter is get_tokenizer(model)
+        if isinstance(counter, TiktokenCounter):
+            assert counter.encoding_name == expected
+        else:
+            assert repr(counter) == expected
+    (event,) = hooks.events
+    assert event.tokens_before == get_tokenizer(model).count_messages(messages)
