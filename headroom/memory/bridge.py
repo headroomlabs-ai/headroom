@@ -58,6 +58,10 @@ _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _THEMATIC_BREAK_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
 _BLOCK_QUOTE_RE = re.compile(r"^ {0,3}>")
 _LIST_ITEM_INTERRUPT_RE = re.compile(r"^ {0,3}(?:[-+*]|1[.)])[ \t]+\S")
+_CONTAINER_MARKER_RE = re.compile(r"^(?:(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)|>)")
+_LIST_ITEM_MARKER_RE = re.compile(
+    r"^(?P<indent> {0,3})(?P<marker>[-+*]|\d{1,9}[.)])(?:(?P<spacing> +)\S.*|[ \t]*)$"
+)
 _HTML_BLOCK_TAGS = (
     "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
     "dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|"
@@ -148,14 +152,59 @@ def _interrupts_reference_candidate(line: str) -> bool:
     )
 
 
+def _leading_indent(line: str) -> int:
+    """Return leading indentation, treating a tab as reaching a 4-column stop."""
+    indent = 0
+    for character in line:
+        if character == " ":
+            indent += 1
+        elif character == "\t":
+            indent += 4 - indent % 4
+        else:
+            break
+    return indent
+
+
+def _list_item_fence_base(
+    lines: list[str], opener: int, indent: int, continuation_lines: set[int]
+) -> int:
+    """Return the content offset of the list item holding a fence, or zero at top level."""
+    limit = indent  # every line between the item's marker and the fence is indented this far
+    below_blank = False
+    for index in range(opener - 1, -1, -1):
+        line = lines[index].removesuffix("\r")
+        if not line.strip():
+            below_blank = True
+            continue
+        if index in continuation_lines:  # paragraph text, possibly a lazy continuation
+            below_blank = False
+            continue
+        line_indent = _leading_indent(line)
+        marker_match = _LIST_ITEM_MARKER_RE.match(line)
+        if marker_match is not None and line_indent < limit:
+            marker_end = len(marker_match.group("indent")) + len(marker_match.group("marker"))
+            spacing = len(marker_match.group("spacing") or "")
+            content_offset = marker_end + (spacing if 1 <= spacing <= 4 else 1)
+            if content_offset <= limit:
+                # An empty list item ends at a blank line right below its marker.
+                empty_item = marker_match.group("spacing") is None
+                return 0 if empty_item and below_blank else content_offset
+        limit = min(limit, line_indent)
+        below_blank = False
+    return 0
+
+
 def _markdown_structure(
     lines: list[str],
-) -> tuple[list[tuple[int, str]], int | None, set[int]]:
-    """Return real headings, an unterminated opener, and blank-line HTML block ends."""
-    headings: list[tuple[int, str]] = []
-    block: tuple[re.Pattern[str], int, bool] | None = None
+) -> tuple[list[tuple[int, str | None]], int | None, set[int], set[int]]:
+    """Return placement boundaries and opaque-block insertion metadata."""
+    headings: list[tuple[int, str | None]] = []
+    block: tuple[re.Pattern[str], int, bool, int | None] | None = None
     blank_line_block_ends: set[int] = set()
+    setext_boundaries: set[int] = set()
+    continuation_lines: set[int] = set()
     in_paragraph = False
+    paragraph_start = 0
     reference_end = -1
 
     for index, original_line in enumerate(lines):
@@ -163,28 +212,37 @@ def _markdown_structure(
             continue
         line = original_line.removesuffix("\r")
         if block is not None:
-            end_pattern, _, ends_at_blank_line = block
+            end_pattern, _, ends_at_blank_line, fence_base = block
             if end_pattern.search(line):
                 if ends_at_blank_line:
                     blank_line_block_ends.add(index)
                 block = None
                 in_paragraph = False
-            continue
+                continue
+            if fence_base is None or not line.strip() or _leading_indent(line) >= fence_base:
+                continue
+            block = None
+            in_paragraph = False
 
         fence_match = _FENCE_RE.match(line)
         if fence_match and not (
             fence_match.group(1).startswith("`") and "`" in fence_match.group(2)
         ):
             marker = fence_match.group(1)
-            end_pattern = re.compile(rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$")
-            block = (end_pattern, index, False)
+            indent = fence_match.start(1)
+            fence_base = _list_item_fence_base(lines, index, indent, continuation_lines)
+            end_pattern = re.compile(
+                rf"^ {{{fence_base},{fence_base + 3}}}"
+                rf"{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$"
+            )
+            block = (end_pattern, index, False, fence_base)
             in_paragraph = False
             continue
 
         for html_type, (start_pattern, end_pattern) in enumerate(_HTML_BLOCKS):
             if start_pattern.match(line):
                 if not end_pattern.search(line):
-                    block = (end_pattern, index, html_type == len(_HTML_BLOCKS) - 1)
+                    block = (end_pattern, index, html_type == len(_HTML_BLOCKS) - 1, None)
                 in_paragraph = False
                 break
         else:
@@ -209,27 +267,41 @@ def _markdown_structure(
                     in_paragraph = False
                     continue
             if not in_paragraph and _HTML_TYPE_7_RE.match(line):
-                block = (_HTML_BLOCKS[-1][1], index, True)
+                block = (_HTML_BLOCKS[-1][1], index, True, None)
                 in_paragraph = False
             elif heading_match := _HEADING_RE.match(line):
                 headings.append((index, heading_match.group(2).strip()))
+                in_paragraph = False
+            elif _ATX_HEADING_START_RE.match(line):
+                if not line.startswith(" "):
+                    headings.append((index, None))
+                in_paragraph = False
+            elif in_paragraph and _SETEXT_UNDERLINE_RE.match(line):
+                # A paragraph opened on a list item, block quote or indented line is not a
+                # top-level setext heading.
+                start_line = lines[paragraph_start].removesuffix("\r")
+                if not start_line[:1].isspace() and not _CONTAINER_MARKER_RE.match(start_line):
+                    headings.append((paragraph_start, None))
+                    setext_boundaries.add(paragraph_start)
                 in_paragraph = False
             elif _THEMATIC_BREAK_RE.match(line):
                 in_paragraph = False
             elif not line.strip():
                 in_paragraph = False
-            else:
-                if in_paragraph:
-                    in_paragraph = not _SETEXT_UNDERLINE_RE.match(line)
-                else:
-                    in_paragraph = not _NO_PARAGRAPH_RE.match(line)
+            elif not in_paragraph:
+                in_paragraph = not _NO_PARAGRAPH_RE.match(line)
+                paragraph_start = index
+            elif not (_BLOCK_QUOTE_RE.match(line) or _LIST_ITEM_MARKER_RE.match(line)):
+                continuation_lines.add(index)
 
     if block is not None and block[2]:
         blank_line_block_ends.add(len(lines))
     return (
         headings,
-        block[1] if block is not None and not block[2] else None,
+        # A list item's fence also ends where the item ends, so it is never left open.
+        block[1] if block is not None and not block[2] and not block[3] else None,
         blank_line_block_ends,
+        setext_boundaries,
     )
 
 
@@ -243,7 +315,9 @@ def _merge_bullets_into_markdown(
     land under a later section or a sub-heading.
     """
     lines = existing_content.split("\n")
-    headings, unterminated_block, blank_line_block_ends = _markdown_structure(lines)
+    headings, unterminated_block, blank_line_block_ends, setext_boundaries = _markdown_structure(
+        lines
+    )
     inserts: dict[int, list[str]] = defaultdict(list)
     appended: list[str] = []
 
@@ -257,7 +331,8 @@ def _merge_bullets_into_markdown(
             continue
 
         start = headings[position][0] + 1
-        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+        section_end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+        end = section_end
         if unterminated_block is not None and start <= unterminated_block < end:
             end = unterminated_block
         while end > start and not lines[end - 1].strip():
@@ -269,6 +344,8 @@ def _merge_bullets_into_markdown(
             else:
                 inserts[end].append(line_suffix)
         inserts[end].extend(f"{bullet}{line_suffix}" for bullet in bullets)
+        if end == section_end and section_end in setext_boundaries:
+            inserts[end].append(line_suffix)
 
     merged: list[str] = []
     for index, line in enumerate(lines):
