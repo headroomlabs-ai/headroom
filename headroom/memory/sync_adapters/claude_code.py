@@ -28,6 +28,8 @@ from typing import Any
 
 from headroom.memory.sync import AgentMemory, AgentMemoryAdapter
 
+_JSON_FRONTMATTER_MARKER = "# headroom-frontmatter: json-v1"
+
 
 def _sanitize_for_filename(text: str) -> str:
     """Convert text to a safe filename slug."""
@@ -67,15 +69,18 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
 
     fm_text = match.group(1).strip()
     body = content[match.end() :].strip()
+    encoded_strings = _JSON_FRONTMATTER_MARKER in (line.strip() for line in fm_text.split("\n"))
 
     fm: dict[str, str] = {}
     for line in fm_text.split("\n"):
+        if line.strip() == _JSON_FRONTMATTER_MARKER:
+            continue
         if ":" in line:
             key, _, value = line.partition(":")
             value = value.strip()
-            # The writer uses JSON string literals, a YAML-compatible subset.
-            # Decode their escapes while preserving the tolerant legacy reader.
-            if value.startswith('"'):
+            # Only marked exports encode escapes. Older files may contain
+            # literal quoted paths such as "C:\temp\notes".
+            if encoded_strings and value.startswith('"'):
                 try:
                     decoded = json.loads(value)
                 except json.JSONDecodeError:
@@ -89,11 +94,12 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
     return fm, body
 
 
-def _build_frontmatter(fields: dict[str, str]) -> str:
+def _build_frontmatter(fields: dict[str, Any]) -> str:
     """Build YAML frontmatter block."""
-    lines = ["---"]
+    lines = ["---", _JSON_FRONTMATTER_MARKER]
     for key, value in fields.items():
         if value:
+            value = str(value)
             # Keep ordinary identifiers byte-stable. Everything else is a JSON
             # string literal (also valid YAML), so ': ', comments, dates and
             # booleans cannot change a native agent's interpretation.
@@ -110,9 +116,15 @@ def _build_frontmatter(fields: dict[str, str]) -> str:
                 "n",
             }:
                 value = json.dumps(value, ensure_ascii=False)
-                # YAML 1.1 readers normalize these literal Unicode line breaks.
-                for separator in ("\x85", "\u2028", "\u2029"):
-                    value = value.replace(separator, f"\\u{ord(separator):04x}")
+                # Escape characters forbidden or normalized by YAML readers.
+                value = "".join(
+                    f"\\u{ord(char):04x}"
+                    if 0x7F <= ord(char) <= 0x9F
+                    or 0xD800 <= ord(char) <= 0xDFFF
+                    or char in "\u2028\u2029\ufffe\uffff"
+                    else char
+                    for char in value
+                )
             lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines)
