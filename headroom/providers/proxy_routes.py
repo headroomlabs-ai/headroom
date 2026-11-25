@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
+from headroom.exceptions import ProviderError
 from headroom.log_safety import redact_url
 from headroom.providers.bedrock_models import newest_snapshot
 from headroom.providers.cloudcode import (
@@ -76,6 +77,7 @@ from headroom.providers.vertex import (
     vertex_publisher_provider_name,
     with_vertex_diagnostics,
 )
+from headroom.proxy.buffered_ccr_response import ANTHROPIC_ERROR_TYPES
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -111,6 +113,41 @@ async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Re
     )
 
 
+async def _count_tokens_on_backend(proxy: Any, request: Request) -> Response | None:
+    """Answer ``/v1/messages/count_tokens`` from the Anthropic backend, or None to pass through.
+
+    In Bedrock mode there is no Anthropic account behind the placeholder key
+    clients send, so the passthrough would 401; the backend counts instead.
+    """
+    backend = getattr(proxy, "anthropic_backend", None)
+    if backend is None:
+        return None
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    try:
+        tokens = await backend.count_tokens(body, dict(request.headers))
+    except ProviderError as exc:
+        status = int(exc.details.get("status", 502))
+        logger.warning("count_tokens on backend %s failed: %s", backend.name, exc)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {
+                    "type": ANTHROPIC_ERROR_TYPES.get(status, "api_error"),
+                    "message": str(exc),
+                },
+            },
+            status_code=status,
+        )
+    if tokens is None:
+        return None
+    return JSONResponse({"input_tokens": tokens})
+
+
 def _register_provider_passthrough_route(
     app: FastAPI,
     proxy: Any,
@@ -141,6 +178,10 @@ def _register_provider_passthrough_route(
                 spec.sub_path,
                 spec.provider_name,
             )
+        if spec.provider_name == "anthropic" and spec.sub_path == "count_tokens":
+            counted = await _count_tokens_on_backend(proxy, request)
+            if counted is not None:
+                return counted
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, spec.provider_name),

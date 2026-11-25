@@ -126,6 +126,17 @@ class Backend(ABC):
         """
         return None
 
+    async def count_tokens(self, body: dict[str, Any], headers: dict[str, str]) -> int | None:
+        """Input tokens for an Anthropic ``/v1/messages/count_tokens`` body.
+
+        None means this backend does not count, and the proxy passes the
+        request through to Anthropic. Backends with no Anthropic account
+        behind them (Bedrock) answer here instead; failures raise
+        :class:`~headroom.exceptions.ProviderError` with ``details["status"]``.
+        Backends that wrap another one should delegate.
+        """
+        return None
+
     async def send_openai_message(
         self,
         body: dict[str, Any],

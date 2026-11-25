@@ -12,6 +12,7 @@ LiteLLM handles all the auth and format translation internally.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -116,6 +117,26 @@ _BEDROCK_REGION_PREFIXES: dict[str, str] = {
     "ap-southeast-2": "au",
     "ap": "apac",
 }
+# Leading segment of a system-defined cross-region inference profile ID
+# ("us.anthropic.claude-...", "global.anthropic.claude-...").
+_BEDROCK_CROSS_REGION_PREFIXES = ("au.", "us.", "eu.", "apac.", "global.")
+#: Top-level InvokeModel body keys for Claude; anything else 400s on Bedrock.
+_BEDROCK_INVOKE_BODY_KEYS = frozenset(
+    {
+        "messages",
+        "system",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop_sequences",
+        "tools",
+        "tool_choice",
+        "thinking",
+        "metadata",
+    }
+)
+_BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31"
 
 
 def _bedrock_region_prefix(region: str) -> str:
@@ -814,6 +835,21 @@ def _reasoning_from_stream_delta(delta: Any) -> tuple[str, str | None]:
     return text, signature
 
 
+def _bedrock_base_model_id(litellm_model: str) -> str:
+    """The foundation-model ID for a mapped Bedrock model.
+
+    CountTokens rejects inference-profile IDs ("us.anthropic.claude-...",
+    "global.anthropic.claude-...") with "The provided model doesn't support
+    counting tokens"; it takes the base model ID ("anthropic.claude-...").
+    """
+    model_id = litellm_model.removeprefix("bedrock/")
+    for route in ("converse/", "invoke/"):
+        model_id = model_id.removeprefix(route)
+    if model_id.startswith(_BEDROCK_CROSS_REGION_PREFIXES):
+        model_id = model_id.split(".", 1)[1]
+    return model_id
+
+
 class LiteLLMBackend(Backend):
     """Backend using LiteLLM for multi-provider support.
 
@@ -865,6 +901,7 @@ class LiteLLMBackend(Backend):
         self.region = region
         self.profile_name = profile_name
         self.kwargs = kwargs
+        self._bedrock_runtime: Any = None  # boto3 client, built on first count_tokens
 
         # Get provider config from registry
         self._config = get_provider_config(provider)
@@ -959,12 +996,11 @@ class LiteLLMBackend(Backend):
             # that also wraps the same foundation model). This applies whether the
             # prefix arrives bare ("us.anthropic...") or already LiteLLM-qualified
             # ("bedrock/us.anthropic...").
-            _CROSS_REGION_PREFIXES = ("au.", "us.", "eu.", "apac.", "global.")
-            if anthropic_model.startswith(_CROSS_REGION_PREFIXES):
+            if anthropic_model.startswith(_BEDROCK_CROSS_REGION_PREFIXES):
                 return f"bedrock/{anthropic_model}"
             if anthropic_model.startswith("bedrock/") and anthropic_model[
                 len("bedrock/") :
-            ].startswith(_CROSS_REGION_PREFIXES):
+            ].startswith(_BEDROCK_CROSS_REGION_PREFIXES):
                 return anthropic_model
 
             normalized = _normalize_bedrock_profile_id(anthropic_model)
@@ -1021,6 +1057,96 @@ class LiteLLMBackend(Backend):
         if self.provider != "bedrock":
             return None
         return sorted(set(self._model_map) | set(self._model_overrides))
+
+    async def count_tokens(self, body: dict[str, Any], headers: dict[str, str]) -> int | None:
+        """Input tokens from Bedrock's CountTokens API; None for other providers.
+
+        In Bedrock mode there is no Anthropic account to pass
+        ``/v1/messages/count_tokens`` to (clients send a placeholder key).
+        """
+        if self.provider != "bedrock":
+            return None
+        # Local import: the module pulls in litellm at import time.
+        from headroom.providers.anthropic import sanitize_anthropic_model_id
+
+        model_id = _bedrock_base_model_id(
+            self.map_model_id(sanitize_anthropic_model_id(body.get("model", "")))
+        )
+        invoke_body = {k: v for k, v in body.items() if k in _BEDROCK_INVOKE_BODY_KEYS}
+        if isinstance(invoke_body.get("thinking"), dict):
+            # Claude Code sends first-party-only ``display`` values Bedrock rejects.
+            invoke_body["thinking"] = {
+                k: v for k, v in invoke_body["thinking"].items() if k != "display"
+            }
+        invoke_body["anthropic_version"] = _BEDROCK_ANTHROPIC_VERSION
+        # CountTokens validates the body as an InvokeModel call, which needs it.
+        invoke_body.setdefault("max_tokens", 1)
+        payload = json.dumps(invoke_body).encode()
+        return await asyncio.to_thread(self._bedrock_count_tokens, model_id, payload)
+
+    def _bedrock_count_tokens(self, model_id: str, payload: bytes) -> int:
+        """Blocking CountTokens call; boto errors become ``ProviderError`` with a status."""
+        from headroom.exceptions import ProviderError
+
+        try:
+            import boto3
+            from botocore.exceptions import (
+                BotoCoreError,
+                ClientError,
+                CredentialRetrievalError,
+                NoCredentialsError,
+                PartialCredentialsError,
+                ProfileNotFound,
+                SSOError,
+                TokenRetrievalError,
+            )
+        except ImportError as exc:
+            raise ProviderError(
+                "Counting tokens on Bedrock needs boto3. Install the bedrock extra: "
+                "pip install 'headroom-ai[bedrock]'.",
+                details={"status": 500},
+            ) from exc
+
+        context = {"model": model_id, "region": self.region or "default"}
+        try:
+            if self._bedrock_runtime is None:
+                session = (
+                    boto3.Session(profile_name=self.profile_name)
+                    if self.profile_name
+                    else boto3.Session()
+                )
+                self._bedrock_runtime = session.client("bedrock-runtime", region_name=self.region)
+            response = self._bedrock_runtime.count_tokens(
+                modelId=model_id, input={"invokeModel": {"body": payload}}
+            )
+        except ClientError as exc:
+            err = exc.response.get("Error", {})
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 502
+            raise ProviderError(
+                f"Bedrock CountTokens failed ({err.get('Code', 'error')}): "
+                f"{err.get('Message', exc)}",
+                details={**context, "status": int(status)},
+            ) from exc
+        except (
+            NoCredentialsError,
+            PartialCredentialsError,
+            CredentialRetrievalError,
+            TokenRetrievalError,
+            SSOError,
+            ProfileNotFound,
+        ) as exc:
+            raise ProviderError(
+                f"AWS credentials for Bedrock are unavailable "
+                f"(profile: {self.profile_name or 'default'}): {exc}. "
+                "Refresh them (e.g. `aws sso login`) and retry.",
+                details={**context, "status": 401},
+            ) from exc
+        except BotoCoreError as exc:
+            raise ProviderError(
+                f"Could not reach Bedrock CountTokens: {exc}",
+                details={**context, "status": 502},
+            ) from exc
+        return int(response["inputTokens"])
 
     def supports_model(self, model: str) -> bool:
         """Check if model is supported."""
