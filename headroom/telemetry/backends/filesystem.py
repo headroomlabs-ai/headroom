@@ -86,7 +86,7 @@ class FileSystemTOINBackend:
         # store instead of silently overwriting it.
         self._configured_path = self._path
         self._owner = self._path.resolve()
-        self._store_version = None
+        self._store_version: str | None = None
         if store_version:
             self.configure_version(store_version)
 

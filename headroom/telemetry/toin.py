@@ -578,11 +578,13 @@ class ToolIntelligenceNetwork:
                      Pass a custom backend for Redis, PostgreSQL, etc.
         """
         from .backends import FileSystemTOINBackend
+        from .backends.base import TOINBackend
 
         self._config = config or TOINConfig()
         self._lock = threading.RLock()  # RLock for reentrant locking (save calls export_patterns)
 
         # Storage backend
+        self._backend: TOINBackend | None
         if isinstance(backend, FileSystemTOINBackend):
             backend.configure_version(_TOIN_STORE_VERSION)
             self._backend = backend
