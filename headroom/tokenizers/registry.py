@@ -154,6 +154,11 @@ class TokenizerRegistry:
     _cache: dict[str, TokenCounter] = {}
     _CACHE_MAXSIZE = 64
 
+    # Operator-configured model -> tiktoken encoding, lowercased (``openai.
+    # encodings`` in HEADROOM_MODEL_LIMITS / models.json; the mapping
+    # OpenAIProvider honours). Read on first use; clear_cache() re-reads it.
+    _configured_encodings: dict[str, str] | None = None
+
     def __new__(cls) -> TokenizerRegistry:
         """Singleton pattern."""
         if cls._instance is None:
@@ -297,6 +302,24 @@ class TokenizerRegistry:
         """Clear the tokenizer cache."""
         registry = cls()
         registry._cache.clear()
+        TokenizerRegistry._configured_encodings = None
+
+    def _configured_encoding(self, model: str) -> str | None:
+        """Return the operator-configured tiktoken encoding for ``model``, if any.
+
+        A gateway alias such as ``my-model`` -> ``cl100k_base`` names a real
+        vocabulary the registry cannot infer from the name. Proxy handlers and
+        the pipeline both count with the registry, so the mapping has to be
+        honoured here for it to govern compression gates and savings alike.
+        """
+        if TokenizerRegistry._configured_encodings is None:
+            from ..model_limits import load_openai_model_config
+
+            TokenizerRegistry._configured_encodings = {
+                str(name).lower(): str(encoding)
+                for name, encoding in load_openai_model_config()["encodings"].items()
+            }
+        return TokenizerRegistry._configured_encodings.get(model.lower())
 
     def _create_tokenizer(
         self,
@@ -348,6 +371,11 @@ class TokenizerRegistry:
         """
         model_lower = model.lower()
 
+        # An operator mapping names the vocabulary outright; it beats any
+        # name pattern, as it does in OpenAIProvider.
+        if self._configured_encoding(model_lower) is not None:
+            return "tiktoken"
+
         for candidate in _name_candidates(model_lower):
             for pattern, backend in MODEL_PATTERNS:
                 if re.match(pattern, candidate):
@@ -361,6 +389,7 @@ class TokenizerRegistry:
 
         Forces the (bounded) encoding load up front so a stalled vocab download
         falls back to estimation instead of hanging later inside a request (GH #956).
+        An operator-configured encoding for ``model`` wins over name inference.
         """
         try:
             from .tiktoken_counter import (
@@ -370,12 +399,13 @@ class TokenizerRegistry:
                 load_encoding,
             )
 
+            encoding = self._configured_encoding(model)
             try:
-                load_encoding(get_encoding_for_model(model))
+                load_encoding(encoding or get_encoding_for_model(model))
             except TiktokenLoadError as exc:
                 logger.warning("tiktoken unavailable (%s); using estimation.", exc)
                 return EstimatingTokenCounter()
-            return TiktokenCounter(model)
+            return TiktokenCounter(model, encoding=encoding)
         except ImportError:
             logger.warning("tiktoken not installed. Install with: pip install tiktoken")
             return EstimatingTokenCounter()

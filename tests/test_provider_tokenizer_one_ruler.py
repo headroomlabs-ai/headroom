@@ -23,11 +23,19 @@ Claude with ``cl100k_base`` x 1.1 while the registry prices Claude against
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from headroom.providers.anthropic import AnthropicProvider, AnthropicTokenCounter
 from headroom.providers.openai import OpenAIProvider, OpenAITokenCounter
-from headroom.tokenizers import get_tokenizer
+from headroom.tokenizers import (
+    EstimatingTokenCounter,
+    TiktokenCounter,
+    TokenizerRegistry,
+    get_tokenizer,
+)
 
 # Long enough that a wrong tokenizer shows up as a real gap, not rounding.
 MESSAGES = [
@@ -178,3 +186,66 @@ def test_no_client_warning_still_points_at_the_same_frame(monkeypatch: pytest.Mo
     (warning,) = [w for w in caught if "No client provided" in str(w.message)]
     assert warning.filename == __file__
     assert warning.lineno == expected_line
+
+
+# ---------------------------------------------------------------------------
+# Operator encoding mappings (``openai.encodings`` in HEADROOM_MODEL_LIMITS /
+# models.json) must reach every caller of the one ruler, not only
+# OpenAIProvider.
+# ---------------------------------------------------------------------------
+
+ALIAS = "my-private-deployment"
+
+
+@pytest.fixture
+def _isolated_registry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Fresh registry state and no developer ``models.json``; restored afterwards."""
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: empty_home))
+    registry = TokenizerRegistry()
+    for attr in ("_tokenizers", "_model_factories"):
+        monkeypatch.setattr(registry, attr, getattr(registry, attr).copy())
+    monkeypatch.setattr(registry, "_cache", {})
+    # raising=False: the attribute does not exist before the registry learned
+    # about configured encodings.
+    monkeypatch.setattr(TokenizerRegistry, "_configured_encodings", None, raising=False)
+
+
+@pytest.fixture
+def _alias_mapped_to_cl100k(_isolated_registry: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"openai": {"encodings": {ALIAS: "cl100k_base"}}}),
+    )
+
+
+def test_registry_honors_an_operator_encoding_mapping(_alias_mapped_to_cl100k: None) -> None:
+    """A gateway alias mapped to ``cl100k_base`` is counted with ``cl100k_base``.
+
+    The proxy hands the registry's counter to the pipeline, so the mapping must
+    live in the registry to govern the compression gates as well as savings.
+    """
+    counter = get_tokenizer(ALIAS)
+    assert isinstance(counter, TiktokenCounter)
+    assert counter.encoding_name == "cl100k_base"
+    assert get_tokenizer(ALIAS.upper()) is counter
+
+    # Models without a mapping resolve exactly as before.
+    assert get_tokenizer("gpt-4o").encoding_name == "o200k_base"
+    assert isinstance(get_tokenizer("unknown-model-xyz"), EstimatingTokenCounter)
+
+    # An explicitly registered tokenizer still beats the mapping.
+    custom = EstimatingTokenCounter(chars_per_token=3.0)
+    TokenizerRegistry.register(ALIAS, tokenizer=custom)
+    assert get_tokenizer(ALIAS) is custom
+
+
+def test_a_mapped_alias_is_one_ruler_for_provider_and_registry(
+    _alias_mapped_to_cl100k: None,
+) -> None:
+    """Before, OpenAIProvider used the mapping and the registry estimated."""
+    provider_count = OpenAIProvider().get_token_counter(ALIAS).count_messages(MESSAGES)
+    registry_count = get_tokenizer(ALIAS).count_messages(MESSAGES)
+
+    assert provider_count == registry_count

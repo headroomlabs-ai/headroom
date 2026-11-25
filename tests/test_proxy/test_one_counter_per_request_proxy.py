@@ -17,6 +17,7 @@ or an uncached fallback counter (#4990).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,7 +33,12 @@ from headroom.pipeline import PipelineStage  # noqa: E402
 from headroom.providers.anthropic import AnthropicProvider  # noqa: E402
 from headroom.providers.openai import OpenAIProvider  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
-from headroom.tokenizers import EstimatingTokenCounter, get_tokenizer  # noqa: E402
+from headroom.tokenizers import (  # noqa: E402
+    EstimatingTokenCounter,
+    TiktokenCounter,
+    TokenizerRegistry,
+    get_tokenizer,
+)
 
 CLAUDE = "claude-sonnet-4-6"
 GPT = "gpt-4o"
@@ -233,6 +239,70 @@ def test_openai_chat_post_compress_hook_sees_one_ruler() -> None:
 
 
 # ---------------------------------------------------------------------------
+# HEADROOM_MODEL_LIMITS ``openai.encodings``: the pipeline used to resolve its
+# counter through OpenAIProvider, which honours the mapping; it now gets the
+# handler's registry counter, so the registry must honour it too, or a gateway
+# alias falls back to estimation for the compression gates as well as savings.
+# ---------------------------------------------------------------------------
+
+ALIAS = "my-private-deployment"
+UNMAPPED = "my-unmapped-deployment"
+
+
+@pytest.fixture
+def _alias_mapped_to_cl100k(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Map ``ALIAS`` to ``cl100k_base``, with fresh registry state; restored after."""
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: empty_home))
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS",
+        json.dumps({"openai": {"encodings": {ALIAS: "cl100k_base"}}}),
+    )
+    monkeypatch.setattr(TokenizerRegistry(), "_cache", {})
+    # raising=False: the attribute does not exist before the registry learned
+    # about configured encodings.
+    monkeypatch.setattr(TokenizerRegistry, "_configured_encodings", None, raising=False)
+
+
+def _assert_request_ruler(counter: Any, model: str) -> None:
+    """The counter the request ran on: the mapped encoding, or the registry's own."""
+    assert counter is get_tokenizer(model)
+    if model == ALIAS:
+        assert isinstance(counter, TiktokenCounter), type(counter).__name__
+        assert counter.encoding_name == "cl100k_base"
+    else:
+        assert isinstance(counter, EstimatingTokenCounter), type(counter).__name__
+
+
+@pytest.mark.parametrize("model", [ALIAS, UNMAPPED])
+def test_openai_chat_counts_with_the_configured_encoding(
+    _alias_mapped_to_cl100k: None, model: str
+) -> None:
+    hooks = _CaptureHooks()
+    app = create_app(_config(hooks, mode="token"))
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.openai_pipeline.transforms = [_HalveLastUser()]
+        spy = MagicMock(side_effect=proxy.openai_pipeline.apply)
+        proxy.openai_pipeline.apply = spy
+        proxy._retry_request = AsyncMock(return_value=_chat_response())
+        messages = [{"role": "user", "content": BODY}]
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": model, "messages": messages},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert r.status_code == 200, r.text
+    assert spy.call_count >= 1
+    for call in spy.call_args_list:
+        _assert_request_ruler(call.kwargs.get("token_counter"), model)
+    (event,) = hooks.events
+    assert event.tokens_before == get_tokenizer(model).count_messages(messages)
+
+
+# ---------------------------------------------------------------------------
 # /v1/responses: every count looked the provider's counter up again, and the
 # turn-hook fold subtracted one lookup's count from another's.
 # ---------------------------------------------------------------------------
@@ -422,3 +492,47 @@ def test_openai_responses_http_hands_the_compressor_the_handlers_counter() -> No
     assert r.status_code == 200, r.text
     (kwargs,) = seen
     assert kwargs.get("token_counter") is get_tokenizer(GPT)
+
+
+@pytest.mark.parametrize("model", [ALIAS, UNMAPPED])
+def test_openai_responses_http_counts_with_the_configured_encoding(
+    _alias_mapped_to_cl100k: None, model: str
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    async def _spy(payload: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return payload, False, 0, [], None, 0, 0, 0, {}
+
+    import httpx
+
+    upstream = httpx.Response(
+        200,
+        json={
+            "id": "resp_1",
+            "object": "response",
+            "model": model,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+        },
+    )
+    app = create_app(_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy._compress_openai_responses_payload_in_executor = _spy
+        proxy._retry_request = AsyncMock(return_value=upstream)
+        r = client.post(
+            "/v1/responses",
+            json={"model": model, "input": [{"role": "user", "content": BODY}]},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert r.status_code == 200, r.text
+    (kwargs,) = seen
+    _assert_request_ruler(kwargs.get("token_counter"), model)
