@@ -462,15 +462,17 @@ _PATH_ROW_RE = re.compile(
 )
 # The same with ``\`` also a separator, for the paths Windows tools print
 # (ripgrep, PowerShell). The root may be ``.\`` or ``..\`` but not a lone
-# ``\``, so a list of regexes such as ``\w+\s\w+`` is not a listing. A Windows
-# name cannot hold ``* ? " |`` (``\x22`` is the quote), and a segment that is a
-# regex class with a quantifier (``\d+``, ``\w{2}``) is not a name either, so
-# rules sharing a prefix (``^invoice\d*$``, ``^invoice\w+$``) stay whole lines.
+# ``\``, and a Windows name cannot hold ``* ? " |`` (``\x22`` is the quote). A row
+# anchored like a regex (``^id\d``, ``id\d$``) is not a path either.
 _PATH_ROW_BACKSLASH_RE = re.compile(
-    r"^(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?"
-    r"(?:(?=[^/\\]*\w)(?![dDsSwWbB][+{])[^/\\\s:<>;*?\x22|]+[/\\])+)"
-    r"(?P<base>(?![dDsSwWbB][+{])[^/\\\s:<>;*?\x22|]+)$"
+    r"^(?!\^)(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?"
+    r"(?:(?=[^/\\]*\w)[^/\\\s:<>;*?\x22|]+[/\\])+)"
+    r"(?P<base>[^/\\\s:<>;*?\x22|]+)(?<!\$)$"
 )
+# A ``\`` that can only be a separator. In a list of regexes every ``\`` is an escape
+# (``\d``, ``\.``, ``\b``), so rules sharing a prefix (``^id\d$``, ``^id\w$``) would pass
+# the row pattern; a listing has some ``\`` no such escape explains.
+_BACKSLASH_SEPARATOR_RE = re.compile(r"\\(?![dDsSwWbB])\w")
 
 
 def path_heading(text: str, *, backslash: bool = False) -> str:
@@ -490,6 +492,8 @@ def path_heading(text: str, *, backslash: bool = False) -> str:
     With ``backslash=True`` a ``\\`` also ends a directory, as in the paths that
     Windows tools print. Pass the same flag to :func:`path_unheading`.
     """
+    if backslash and not _BACKSLASH_SEPARATOR_RE.search(text):
+        return text
     row_re = _PATH_ROW_BACKSLASH_RE if backslash else _PATH_ROW_RE
     lines, had_trailing = _split_keep_trailing(text)
     matches = []

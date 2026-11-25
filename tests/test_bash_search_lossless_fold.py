@@ -473,28 +473,32 @@ def test_mixed_separator_listing_takes_the_smaller_fold() -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        # A lone leading "\" is not a path root: a list of regexes is not a listing.
-        "".join(f"{chr(92)}{c}+{chr(92)}s{chr(92)}{c}+\n" for c in "wdS"),
-        f"{chr(92)}bfoo{chr(92)}b\n{chr(92)}bfoo{chr(92)}B\n",
-        # The "/" fold's markup rule holds with "\" as a separator too.
-        "{{/if}}\n{{/each}}\n",
-        # Regex rules that share a prefix before an escape, with a character no
-        # Windows name can hold or a quantified class.
+        # In a list of regexes every "\" is an escape, whatever prefix the rules share.
+        f"{chr(92)}w+{chr(92)}s{chr(92)}w+\n{chr(92)}d+{chr(92)}s{chr(92)}d+\n",
         f"^invoice{chr(92)}d*$\n^invoice{chr(92)}w*$\n",
-        f"^invoice{chr(92)}d?$\n^invoice{chr(92)}w?$\n",
         f"^invoice{chr(92)}d+$\n^invoice{chr(92)}w+$\n",
-        f"^invoice{chr(92)}d{{2}}$\n^invoice{chr(92)}w{{4}}$\n",
-        f"^invoice{chr(92)}d+{chr(92)}.csv$\n^invoice{chr(92)}d+{chr(92)}.txt$\n",
+        "".join(f"^invoice{chr(92)}{c}$\n" for c in "dDsSwWbB"),
+        "".join(f"id{chr(92)}{c}\n" for c in "dDsSwWbB"),
+        f"ads{chr(92)}.example{chr(92)}.com\nads{chr(92)}.example{chr(92)}.net\n",
+        # An anchored row is not a path, whatever escape it uses.
+        f"^row{chr(92)}tfoo\n^row{chr(92)}tbar\n",
+        f"row{chr(92)}tfoo$\nrow{chr(92)}tbar$\n",
+        # A lone leading "\" is not a path root.
+        f"{chr(92)}home{chr(92)}a\n{chr(92)}home{chr(92)}b\n",
+        # The "/" fold's markup rule holds with "\" as a separator too.
+        f"{{{{/if}}}}{chr(92)}x\n{{{{/if}}}}{chr(92)}y\n",
     ],
     ids=[
-        "regexes",
-        "word-boundaries",
-        "template-closers",
+        "word-classes",
         "shared-prefix-star",
-        "shared-prefix-optional",
         "shared-prefix-plus",
-        "shared-prefix-count",
-        "quantified-directory",
+        "anchored-plain",
+        "unanchored-plain",
+        "escaped-dots",
+        "anchored-start",
+        "anchored-end",
+        "lone-root",
+        "template-closers",
     ],
 )
 def test_backslash_path_fold_skips_non_listings(text) -> None:
@@ -503,15 +507,31 @@ def test_backslash_path_fold_skips_non_listings(text) -> None:
 
 
 @pytest.mark.parametrize("char", ["*", "?", '"', "|"])
-@pytest.mark.parametrize("row", ["src/a{0}b/{1}.py", "src/app/{1}{0}.py"], ids=["dir", "base"])
+@pytest.mark.parametrize(
+    "row", ["src/core/a{0}b/{1}.py", "src/core/{1}{0}.py"], ids=["dir", "base"]
+)
 def test_backslash_path_fold_rejects_names_windows_cannot_hold(row, char) -> None:
     text = "".join(row.format(char, n) + "\n" for n in "xyz").replace("/", chr(92))
     assert _ph(text, backslash=True) == text
 
 
 def test_backslash_path_fold_keeps_names_that_only_look_like_regexes() -> None:
-    names = ("C++", "[slug]", "(auth)", "{{cookiecutter.name}}", "$out", "d", "w2", "s-3")
-    posix = "".join(f"app/{name}/{base}\n" for name in names for base in ("+page.ts", "Foo$1.kt"))
+    names = (
+        "C++",
+        "[slug]",
+        "(auth)",
+        "{{cookiecutter.name}}",
+        "$out",
+        "d",
+        "w2",
+        "s-3",
+        "w{draft}",
+    )
+    posix = "".join(
+        f"app/{name}/{base}\n"
+        for name in names
+        for base in ("+page.ts", "Foo$1.kt", "w{draft}.txt")
+    )
     windows = posix.replace("/", chr(92))
     folded = compact_lossless(windows, "paths")
     assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
