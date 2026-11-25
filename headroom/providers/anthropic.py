@@ -874,7 +874,9 @@ class AnthropicProvider(Provider):
         _, litellm_get_model_info = _get_litellm_clients()
         if litellm_get_model_info is not None:
             try:
-                info = litellm_get_model_info(model)
+                from headroom.pricing.litellm_pricing import catalog_key
+
+                info = litellm_get_model_info(catalog_key(model) or model)
                 if info:
                     if "max_input_tokens" in info and info["max_input_tokens"] is not None:
                         limit = int(info["max_input_tokens"])

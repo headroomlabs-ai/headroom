@@ -33,9 +33,6 @@ LITELLM_PRICES_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 )
 REFRESH_INTERVAL_SECONDS = 24 * 3600
-#: Seconds after a refresh before litellm's lowercase index is invalidated
-#: again; far longer than a rebuild of the index takes.
-INDEX_SETTLE_SECONDS = 5.0
 _FETCH_TIMEOUT_SECONDS = 15.0
 #: A real table lists thousands of models. Anything far smaller is an error
 #: page or a truncated download, and must not be merged.
@@ -124,17 +121,6 @@ def _resolve_aliases(models: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return resolved
 
 
-def _invalidate_lowercase_index() -> None:
-    """Drop litellm's lowercase model-name index, so its next lookup rebuilds it."""
-    from headroom.pricing.litellm_pricing import litellm
-
-    invalidate = getattr(
-        getattr(litellm, "utils", None), "_invalidate_model_cost_lowercase_map", None
-    )
-    if invalidate is not None:
-        invalidate()
-
-
 def merge_litellm_prices(models: dict[str, Any]) -> int:
     """Merge ``models`` into LiteLLM's table and drop stale caches.
 
@@ -149,9 +135,17 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
     growing the dict, even in one ``dict.update``, fails that iteration, so
     the model reads as unmapped. The merged table is built aside and bound to
     ``litellm.model_cost`` in one assignment; a reader already holding the old
-    table finishes on it.
+    table finishes on it. Headroom's own lookups match names against an index
+    published with the table (:func:`~headroom.pricing.litellm_pricing.catalog_key`),
+    so a stale copy of LiteLLM's lowercase index, which a lookup overlapping
+    the swap can leave behind, never hides a refreshed model from them.
     """
-    from headroom.pricing.litellm_pricing import deepseek_rows, litellm, mirrored_rows
+    from headroom.pricing.litellm_pricing import (
+        deepseek_rows,
+        litellm,
+        mirrored_rows,
+        publish_price_table,
+    )
 
     if litellm is None:
         return 0
@@ -169,12 +163,14 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
     if not changed:
         return 0
     try:
-        litellm.model_cost = {**current, **changed}
+        publish_price_table({**current, **changed})
         # litellm infers a bare model's provider from per-provider name sets
         # built at import, and caches a lowercase index of the keys; new models
         # need both, or `cost_per_token` cannot place them.
         litellm.add_known_models(changed)
-        _invalidate_lowercase_index()
+        invalidate = getattr(litellm.utils, "_invalidate_model_cost_lowercase_map", None)
+        if invalidate is not None:
+            invalidate()
     finally:
         _clear_price_caches()
     return len(changed)
@@ -238,14 +234,6 @@ async def refresh_periodically(interval: float = REFRESH_INTERVAL_SECONDS) -> No
         return
     while True:
         await _refresh_in_daemon_thread()
-        # A lookup that was rebuilding litellm's lowercase index when the
-        # refresh swapped the table can store an index of the old table after
-        # the refresh invalidated it, and litellm rebuilds only when an indexed
-        # name disappears. Invalidating once more shortly after discards that
-        # index: until then a refreshed model may miss by a mixed-case name,
-        # never by its exact name.
-        await asyncio.sleep(INDEX_SETTLE_SECONDS)
-        _invalidate_lowercase_index()
         await asyncio.sleep(interval)
 
 

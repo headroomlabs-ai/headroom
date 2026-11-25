@@ -100,60 +100,51 @@ def _input_rate(model: str, provider: str) -> object:
         return exc
 
 
-def test_a_refresh_overlapping_a_lookup_keeps_it_priced_and_settles_the_index(
-    monkeypatch, isolated_catalog
-):
-    """A lookup reading the table when a refresh lands still prices its model.
+def test_a_refresh_overlapping_a_lookup_keeps_every_lookup_priced(isolated_catalog):
+    """A refresh landing while a lookup reads the table breaks neither that lookup nor later ones.
 
-    litellm resolves a mixed-case name by rebuilding a lowercase index, which
-    iterates ``litellm.model_cost``. Growing that dict in place, even in one
-    ``dict.update``, made the running iteration fail and the model read as
-    unmapped. The rebuild still stores an index of the replaced table after the
-    refresh invalidated it, so a refreshed model can miss by a mixed-case name
-    until the periodic refresh invalidates the index again. A key whose
-    ``lower()`` blocks pauses the rebuild mid-iteration.
+    litellm resolves a mixed-case name by rebuilding a global lowercase index,
+    which iterates ``litellm.model_cost``. Growing that dict in place, even in
+    one ``dict.update``, failed the running iteration and the model read as
+    unmapped. The overlapped rebuild also stores an index of the replaced
+    table after the refresh invalidated it, so litellm's own mixed-case lookup
+    of a refreshed model misses; Headroom's lookups use their own index,
+    published with the table, and still price it. A key whose ``lower()``
+    blocks pauses the rebuild mid-iteration.
     """
-    monkeypatch.setenv("HEADROOM_PRICE_REFRESH", "on")
-    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
-    monkeypatch.setattr(live_prices, "INDEX_SETTLE_SECONDS", 0)
+    from headroom.pricing.litellm_pricing import get_model_pricing, resolve_litellm_model
+
     started, resume = threading.Event(), threading.Event()
 
     class PausingKey(str):
         def lower(self) -> str:
-            started.set()
-            resume.wait(5)
+            # Only the lookup's rebuild pauses, not the refresh's own indexing.
+            if threading.current_thread() is reader:
+                started.set()
+                resume.wait(5)
             return str(self).lower()
 
     litellm.model_cost[PausingKey("headroom-test-pause")] = {"input_cost_per_token": 0.0}
     litellm.utils._invalidate_model_cost_lowercase_map()
     during: list[object] = []
-    after_overlap: list[object] = []
-
-    def overlapped_refresh() -> None:
-        reader = threading.Thread(target=lambda: during.append(_input_rate("GPT-4O", "openai")))
-        reader.start()
+    reader = threading.Thread(target=lambda: during.append(_input_rate("GPT-4O", "openai")))
+    reader.start()
+    try:
         assert started.wait(5)
         live_prices.merge_litellm_prices({NEW_MODEL: NEW_ROW})
+    finally:
         resume.set()
         reader.join(5)
-        after_overlap.append(_input_rate(NEW_MODEL.upper(), "anthropic"))
-
-    monkeypatch.setattr(live_prices, "refresh_litellm_prices", overlapped_refresh)
-
-    async def run_one_tick() -> None:
-        task = asyncio.create_task(live_prices.refresh_periodically(interval=3600))
-        while not after_overlap:
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.05)  # past INDEX_SETTLE_SECONDS into the long sleep
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-    asyncio.run(run_one_tick())
+    assert not reader.is_alive()
 
     assert during == [pytest.approx(2.5e-06)]
-    assert isinstance(after_overlap[0], Exception)  # the stale index, bounded:
-    assert _input_rate(NEW_MODEL.upper(), "anthropic") == NEW_ROW["input_cost_per_token"]
-    assert _input_rate(NEW_MODEL, "anthropic") == NEW_ROW["input_cost_per_token"]
+    # The overlapped rebuild left litellm a stale index of the replaced table.
+    assert isinstance(_input_rate(NEW_MODEL.upper(), "anthropic"), Exception)
+    # Headroom's lookups never consult it.
+    assert resolve_litellm_model(NEW_MODEL.upper()) == NEW_MODEL
+    pricing = get_model_pricing(NEW_MODEL.upper())
+    assert pricing is not None
+    assert pricing.input_cost_per_1m == pytest.approx(NEW_ROW["input_cost_per_token"] * 1e6)
 
 
 def test_refresh_keeps_headroom_deepseek_off_peak_rates(monkeypatch, isolated_catalog):

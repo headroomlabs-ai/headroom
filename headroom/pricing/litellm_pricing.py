@@ -130,6 +130,49 @@ def resolve_litellm_model(model: str) -> str:
     return resolved
 
 
+#: ``(table, its size, lowercase key -> key)`` for the price table Headroom
+#: last indexed. Read and written as one tuple, so an index is only ever used
+#: with the table it was built from: one built from a table since replaced or
+#: grown is rebuilt, never consulted.
+_catalog_index: tuple[dict[str, Any], int, dict[str, str]] | None = None
+
+
+def publish_price_table(table: dict[str, Any]) -> None:
+    """Make ``table`` LiteLLM's price table, with Headroom's index of it built first.
+
+    ``table`` must not be changed afterwards: readers may be iterating it.
+    """
+    global _catalog_index
+    _catalog_index = (table, len(table), {key.lower(): key for key in table})
+    litellm.model_cost = table
+
+
+def catalog_key(name: str) -> str | None:
+    """The ``litellm.model_cost`` key for ``name``, matched case-insensitively.
+
+    Headroom looks names up through this, then hands LiteLLM the exact key, so
+    LiteLLM's own lowercase index is never consulted. That index is a global
+    LiteLLM rebuilds without a lock: a lookup rebuilding it while a price
+    refresh replaces the table can store an index of the old table, hiding the
+    refreshed models from mixed-case names. ``None`` when no key matches.
+    """
+    global _catalog_index
+    if not LITELLM_AVAILABLE:
+        return None
+    table = litellm.model_cost
+    if name in table:
+        return name
+    index = _catalog_index
+    if index is None or index[0] is not table or index[1] != len(table):
+        try:
+            index = (table, len(table), {key.lower(): key for key in table})
+        except RuntimeError:  # something grew the table in place mid-scan
+            return None
+        _catalog_index = index
+    key = index[2].get(name.lower())
+    return key if key is not None and key in table else None
+
+
 def _resolve_litellm_model_uncached(model: str) -> str:
     """Uncached resolution — called once per unique model name."""
     if not LITELLM_AVAILABLE:
@@ -137,12 +180,15 @@ def _resolve_litellm_model_uncached(model: str) -> str:
 
     def is_known_model(candidate: str) -> bool:
         try:
-            litellm.cost_per_token(model=candidate, prompt_tokens=1, completion_tokens=0)
+            litellm.cost_per_token(
+                model=catalog_key(candidate) or candidate, prompt_tokens=1, completion_tokens=0
+            )
             return True
         except Exception:
             return False
 
-    return resolve_litellm_model_name(model, is_known_model)
+    resolved = resolve_litellm_model_name(model, is_known_model)
+    return catalog_key(resolved) or resolved
 
 
 #: Bare names Claude Code sends that LiteLLM lists only under a provider prefix.
@@ -240,7 +286,7 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
 
     info = None
     for candidate in pricing_lookup_candidates(model):
-        info = cost_data.get(candidate)
+        info = cost_data.get(catalog_key(candidate) or candidate)
         if info is not None:
             break
 
