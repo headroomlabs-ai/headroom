@@ -531,6 +531,175 @@ async def test_prometheus_metrics_caps_model_cardinality() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prometheus_metrics_buckets_invalid_model_keys() -> None:
+    """A model key with control characters or past 128 chars counts under
+    "other", never as its own key, while legitimate names stay untouched.
+    Invalid writes are also excluded from per-model cache-bust attribution,
+    so they never warm _cache_requests_by_model."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str) -> None:
+        await metrics.record_request(
+            provider="openai",
+            model=model,
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+
+    await record("pasted terminal output\nsecond line\n" + "x" * 200)
+    await record("bad\tmodel")
+    await record("x" * 129)
+    await record("claude-opus-4-7[1m]")
+    await record("x" * 128)
+
+    assert metrics.requests_by_model["other"] == 3
+    assert metrics.requests_by_model["claude-opus-4-7[1m]"] == 1
+    assert metrics.requests_by_model["x" * 128] == 1
+    assert len(metrics.requests_by_model) == 3
+    # The three invalid writes never warm the cache-bust dict; only the two
+    # valid models are tracked there.
+    assert "other" not in metrics._cache_requests_by_model
+    assert len(metrics._cache_requests_by_model) == 2
+    assert sum(metrics.requests_by_model.values()) == 5
+    assert 'headroom_requests_by_model{model="other"} 3' in await metrics.export()
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_write_does_not_bust_valid_other_model() -> None:
+    """An invalid model's cache write must not warm the "other" entry used
+    for cache-bust attribution, or a genuine "other" model's first write
+    would be misread as a bust (issue #4942 review). Both requests still
+    count under "other" in requests_by_model."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_write_tokens=100,
+            cache_read_tokens=0,
+        )
+
+    await record("x" * 129)
+    await record("other")
+
+    assert metrics.requests_by_model["other"] == 2
+    assert metrics._cache_requests_by_model["other"] == 1
+    assert metrics.cache_by_provider["anthropic"]["bust_count"] == 0
+    assert 'headroom_provider_cache_bust_total{provider="anthropic"} 0' in (await metrics.export())
+
+
+@pytest.mark.asyncio
+async def test_mixed_type_model_keys_do_not_share_cache_history() -> None:
+    """A numeric model and its string form are distinct cache histories:
+    int 123 then str "123" are both first-time writes, so neither is a
+    bust (issue #4942 review). Both still count under the "123" display
+    bucket in requests_by_model, keeping numeric input exporter-compatible."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str | int) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,  # type: ignore[arg-type]
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_write_tokens=100,
+            cache_read_tokens=0,
+        )
+
+    await record(123)
+    await record("123")
+
+    assert metrics.requests_by_model["123"] == 2
+    assert metrics._cache_requests_by_model[123] == 1
+    assert metrics._cache_requests_by_model["123"] == 1
+    assert len(metrics._cache_requests_by_model) == 2
+    assert metrics.cache_by_provider["anthropic"]["bust_count"] == 0
+    assert 'headroom_provider_cache_bust_total{provider="anthropic"} 0' in (await metrics.export())
+
+
+@pytest.mark.asyncio
+async def test_mixed_type_model_keys_respect_cache_history_cap() -> None:
+    """Int/str pairs share one display bucket but are distinct cache
+    histories, so raw keys can outnumber display keys two-to-one. Cache
+    history is bounded independently: once it holds MAX_DISTINCT_MODELS
+    entries, further new raw keys attribute to "other" and the map never
+    exceeds the cap plus "other"."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str | int) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,  # type: ignore[arg-type]
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+
+    # Fill cache history to the cap with distinct ints; the display map
+    # holds their string forms.
+    for i in range(MAX_DISTINCT_MODELS):
+        await record(i)
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS
+
+    # The same values as strings are new raw keys, but the cache map is
+    # full: they collapse into "other" instead of growing it.
+    for i in range(MAX_DISTINCT_MODELS):
+        await record(str(i))
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS + 1
+    assert metrics._cache_requests_by_model["other"] == MAX_DISTINCT_MODELS
+
+
+@pytest.mark.asyncio
+async def test_distinct_nan_models_share_one_display_bucket() -> None:
+    """Distinct NaN values all display as "nan" but are unequal dict keys,
+    so each is its own cache history while sharing one display bucket.
+    Once cache history is full, further NaNs attribute to "other"."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: float | int) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,  # type: ignore[arg-type]
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+
+    for _ in range(3):
+        await record(float("nan"))
+    assert metrics.requests_by_model["nan"] == 3
+    assert len(metrics._cache_requests_by_model) == 3
+
+    # Fill the remaining cache-history slots with distinct ints, then two
+    # more distinct NaNs must collapse into "other" instead of growing it.
+    for i in range(MAX_DISTINCT_MODELS - 3):
+        await record(i)
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS
+    for _ in range(2):
+        await record(float("nan"))
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS + 1
+    assert metrics._cache_requests_by_model["other"] == 2
+    assert metrics.requests_by_model["nan"] == 5
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS - 2
+
+
+@pytest.mark.asyncio
 async def test_prometheus_metrics_model_cardinality_warns_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

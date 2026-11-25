@@ -106,7 +106,7 @@ rate(headroom_cache_bust_total[5m])
 | `headroom_requests_total` | **Completed** requests — the denominator for success-side stats, not total traffic. A request that ended in a 4xx, 5xx or 429 never reaches it. Unlabelled. |
 | `headroom_inbound_requests_total` | Every inbound HTTP request the proxy accepted, whatever the outcome. This is the all-traffic counter. |
 | `headroom_requests_by_provider{provider}` | Traffic split by provider — `anthropic`, `openai`, `gemini`, `bedrock`… **Completed requests only**, same denominator as `headroom_requests_total`. Use `headroom_requests_failed_total{provider}` for the failure side. |
-| `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct; overflow lands in `model="other"`. Completed requests only. |
+| `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct; overflow lands in `model="other"`, as do names with control characters or over 128 chars. Completed requests only. |
 | `headroom_requests_failed_total{provider}` | Requests that failed upstream — **4xx and 5xx**, excluding 429. Excluded from `headroom_requests_total`, so add it back when you compute a rate. |
 | `headroom_requests_rate_limited_total{source}` | Requests rejected with 429, by **either** Headroom's own rate limiter (`source="headroom"`) or the upstream provider (`source="upstream"`). Excluded from `headroom_requests_total`. |
 | `headroom_compression_failed_total{reason}` | Compression failures — `timeout` or `error`. Fails open, so traffic keeps flowing but savings quietly stop. **Worth an alert.** |

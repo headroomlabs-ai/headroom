@@ -1455,11 +1455,31 @@ class CodeAwareCompressor(Transform):
 
             # Verify syntax validity (checks both ERROR and MISSING nodes)
             syntax_valid = self._verify_syntax(compressed, detected_lang)
-            original_syntax_valid = True
 
-            if not syntax_valid and detected_lang == CodeLanguage.PYTHON:
-                original_syntax_valid = self._verify_syntax(code, detected_lang)
-                if original_syntax_valid:
+            if not syntax_valid:
+                # Blame the compressor only for input that parsed. Fragments
+                # (a Read with an offset, a file cut mid-function, grep
+                # context) were invalid before compression; counting them
+                # would warn about the grammar and trip the breaker, pausing
+                # compression of valid files in that language.
+                if not self._verify_syntax(code, detected_lang):
+                    logger.debug(
+                        "Code input for %s (%d tokens) is not valid syntax, returning original",
+                        detected_lang.value,
+                        original_tokens,
+                    )
+                    return CodeCompressionResult(
+                        compressed=code,
+                        original=code,
+                        original_tokens=original_tokens,
+                        compressed_tokens=original_tokens,
+                        compression_ratio=1.0,
+                        language=detected_lang,
+                        language_confidence=confidence,
+                        # The original goes back unchanged and it does not parse.
+                        syntax_valid=False,
+                    )
+                if detected_lang == CodeLanguage.PYTHON:
                     compressed, structure, symbol_scores = self._compress_with_ast(
                         code,
                         detected_lang,
