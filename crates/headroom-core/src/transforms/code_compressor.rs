@@ -161,6 +161,10 @@ struct LangConfig {
     /// Wrappers that prefix exactly one declaration (C++ `template <...>`):
     /// the prefix is kept and the declaration it wraps is compressed.
     prefix_wrapper_node_types: &'static [&'static str],
+    /// Emit the output in source order instead of grouped by kind. C and C++
+    /// declare before use: grouping moved a namespace above the `#define` or
+    /// `constexpr` it uses. Mirrors `LangConfig.source_ordered`.
+    source_ordered: bool,
 }
 
 impl LangConfig {
@@ -215,6 +219,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_body_node_types: &[],
             container_node_types: &[],
             prefix_wrapper_node_types: &[],
+            source_ordered: false,
         },
         CodeLanguage::Javascript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -229,6 +234,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_body_node_types: &["class_body"],
             container_node_types: &[],
             prefix_wrapper_node_types: &[],
+            source_ordered: false,
         },
         CodeLanguage::Typescript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -243,6 +249,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_body_node_types: &["class_body"],
             container_node_types: &[],
             prefix_wrapper_node_types: &[],
+            source_ordered: false,
         },
         CodeLanguage::Go => LangConfig {
             import_nodes: &["import_declaration"],
@@ -257,6 +264,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_body_node_types: &[],
             container_node_types: &[],
             prefix_wrapper_node_types: &[],
+            source_ordered: false,
         },
         CodeLanguage::Rust => LangConfig {
             import_nodes: &["use_declaration"],
@@ -272,6 +280,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             // Inline modules (`mod tests { ... }`); `mod name;` has no body.
             container_node_types: &["mod_item"],
             prefix_wrapper_node_types: &[],
+            source_ordered: false,
         },
         CodeLanguage::Java => LangConfig {
             import_nodes: &["import_declaration"],
@@ -286,6 +295,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_body_node_types: &["class_body"],
             container_node_types: &[],
             prefix_wrapper_node_types: &[],
+            source_ordered: false,
         },
         CodeLanguage::C => LangConfig {
             import_nodes: &["preproc_include"],
@@ -300,6 +310,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_body_node_types: &[],
             container_node_types: &[],
             prefix_wrapper_node_types: &[],
+            source_ordered: true,
         },
         CodeLanguage::Cpp => LangConfig {
             import_nodes: &["preproc_include"],
@@ -316,6 +327,7 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_body_node_types: &["field_declaration_list", "declaration_list"],
             container_node_types: &["namespace_definition", "linkage_specification"],
             prefix_wrapper_node_types: &["template_declaration"],
+            source_ordered: true,
         },
         CodeLanguage::Unknown => return None,
     })
@@ -427,6 +439,9 @@ struct CodeStructure {
     /// Set when the fixed assembly order (declarations before top-level
     /// code) would move a Python definition across executable code.
     reorder_unsafe: bool,
+    /// `(start_byte, end_byte, text)` per emitted top-level fragment, filled
+    /// for languages with `LangConfig::source_ordered`.
+    source_order: Vec<(usize, usize, String)>,
 }
 
 /// Mutable state of one structure extraction: the structure being built,
@@ -1016,6 +1031,7 @@ impl CodeAwareCompressor {
         let body_limits = self.allocate_body_budget(&analysis, code);
 
         let lang = lang_config(language);
+        let source_ordered = lang.as_ref().is_some_and(|l| l.source_ordered);
         let (structure, symbol_scores) = if let Some(lang) = lang {
             let code_lines: Vec<&str> = code.split('\n').collect();
             let ctx = Ctx {
@@ -1056,7 +1072,11 @@ impl CodeAwareCompressor {
             return Some((code.to_string(), structure, Vec::new()));
         }
 
-        let compressed = assemble_compressed(&structure);
+        let compressed = if source_ordered {
+            assemble_in_source_order(&structure, code)
+        } else {
+            assemble_compressed(&structure)
+        };
         Some((compressed, structure, symbol_scores))
     }
 
@@ -1099,6 +1119,55 @@ fn extract_generic_structure(code: &str) -> CodeStructure {
         other: code.split('\n').map(|s| s.to_string()).collect(),
         ..Default::default()
     }
+}
+
+/// Join top-level fragments in their original order, with a blank line
+/// between two fragments where the source had one. Mirrors
+/// `_assemble_in_source_order`.
+fn assemble_in_source_order(structure: &CodeStructure, code: &str) -> String {
+    let mut entries: Vec<&(usize, usize, String)> = structure.source_order.iter().collect();
+    // Stable, like Python's `sorted`: fragments of one node keep their order.
+    entries.sort_by_key(|entry| entry.0);
+    let mut parts: Vec<&str> = Vec::new();
+    let mut previous: Option<(usize, usize)> = None;
+    for (start, end, text) in entries {
+        if let Some((prev_start, prev_end)) = previous {
+            // Some nodes (C `#include`, `#define`) end after their newline.
+            let mut gap_start = prev_end;
+            if code[prev_start..prev_end].ends_with('\n') {
+                gap_start -= 1;
+            }
+            if has_blank_line(&code[gap_start..*start]) {
+                parts.push("");
+            }
+        }
+        parts.push(text.trim_end_matches('\n'));
+        previous = Some((*start, *end));
+    }
+    parts.join("\n")
+}
+
+/// True when `gap` has a line holding only spaces or tabs between two line
+/// breaks (Python's `\n[ \t]*\n`).
+fn has_blank_line(gap: &str) -> bool {
+    let lines: Vec<&str> = gap.split('\n').collect();
+    lines.len() > 2
+        && lines[1..lines.len() - 1]
+            .iter()
+            .any(|line| line.chars().all(|c| c == ' ' || c == '\t'))
+}
+
+/// Convert a tree-sitter column (a UTF-8 byte offset) to a char index, for
+/// slicing with `chars()`. Mirrors `_char_col`.
+fn char_col(line: &str, byte_col: usize) -> usize {
+    if line.is_ascii() {
+        return byte_col;
+    }
+    let mut end = byte_col.min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].chars().count()
 }
 
 /// Assemble compressed code from structure. Mirrors `_assemble_compressed`.
@@ -1478,9 +1547,32 @@ impl<'a> Ctx<'a> {
             .map(|s| s.to_string())
             .collect();
         if let Some(first) = lines.first_mut() {
+            let start_col = char_col(first, start_col);
             let prefix: String = first.chars().take(start_col).collect();
             if !prefix.trim().is_empty() {
                 *first = first.chars().skip(start_col).collect();
+            }
+        }
+        lines
+    }
+
+    /// Like `node_lines`, but also drops code after the node's end, so a
+    /// declaration kept as written does not carry a sibling sharing its last
+    /// line (`mod a; mod b;`). A trailing comment stays. Mirrors
+    /// `_get_exact_node_lines`.
+    fn exact_node_lines(&self, node: Node) -> Vec<String> {
+        let mut lines = self.node_lines(node);
+        let end = node.end_position();
+        let last_line = self.code_lines[end.row];
+        let end_col = char_col(last_line, end.column);
+        let last_len = last_line.chars().count();
+        let tail: String = last_line.chars().skip(end_col).collect();
+        let tail = tail.trim();
+        if !tail.is_empty() && !["//", "/*", "#"].iter().any(|p| tail.starts_with(p)) {
+            if let Some(last) = lines.last_mut() {
+                // The first line may already be trimmed at the node's start.
+                let keep = last.chars().count() - (last_len - end_col);
+                *last = last.chars().take(keep).collect();
             }
         }
         lines
@@ -1543,6 +1635,28 @@ impl<'a> Ctx<'a> {
                 st.structure = snapshot;
                 st.captured.truncate(captured_before);
                 st.import_entries.truncate(imports_before);
+            } else if self.lang.source_ordered {
+                // Whatever this root node added to the buckets is its text.
+                let added: Vec<String> = [
+                    (&snapshot.header_code, &st.structure.header_code),
+                    (&snapshot.imports, &st.structure.imports),
+                    (&snapshot.type_definitions, &st.structure.type_definitions),
+                    (&snapshot.class_definitions, &st.structure.class_definitions),
+                    (
+                        &snapshot.function_signatures,
+                        &st.structure.function_signatures,
+                    ),
+                    (&snapshot.top_level_code, &st.structure.top_level_code),
+                    (&snapshot.other, &st.structure.other),
+                ]
+                .into_iter()
+                .flat_map(|(before, after)| after[before.len()..].iter().cloned())
+                .collect();
+                for text in added {
+                    st.structure
+                        .source_order
+                        .push((child.start_byte(), child.end_byte(), text));
+                }
             }
         }
 
@@ -1592,6 +1706,13 @@ impl<'a> Ctx<'a> {
                 } else {
                     st.structure.top_level_code.push(text.to_string());
                     saw_top_level_code = true;
+                }
+                if self.lang.source_ordered {
+                    st.structure.source_order.push((
+                        child.start_byte(),
+                        child.end_byte(),
+                        text.to_string(),
+                    ));
                 }
             }
         }
@@ -1761,7 +1882,7 @@ impl<'a> Ctx<'a> {
     /// Compress a function/method body. Mirrors `_compress_function_ast`.
     fn compress_function_ast(&self, node: Node) -> String {
         let start_row = node.start_position().row;
-        let node_lines_owned = self.node_lines(node);
+        let node_lines_owned = self.exact_node_lines(node);
         let node_lines: Vec<&str> = node_lines_owned.iter().map(|s| s.as_str()).collect();
         let node_text = node_lines.join("\n");
 
@@ -2003,7 +2124,6 @@ impl<'a> Ctx<'a> {
         let start_row = node.start_position().row;
         let node_lines_owned = self.node_lines(node);
         let node_lines: Vec<&str> = node_lines_owned.iter().map(|s| s.as_str()).collect();
-        let node_text = node_lines.join("\n");
 
         // The class/member container: not always a function body's node type.
         let mut body_node: Option<Node> = None;
@@ -2014,8 +2134,12 @@ impl<'a> Ctx<'a> {
                 break;
             }
         }
-        let Some(body_node) = body_node else {
-            return node_text;
+        // Bodiless declarations (`mod a;`, `extern "C" int f();`) and one-line
+        // ones (`mod ffi { pub struct Handle; }`) keep exactly their own text:
+        // the line-based rebuild below would repeat a one-line body after its
+        // header, and take in any sibling on the same line.
+        let Some(body_node) = body_node.filter(|_| start_row != node.end_position().row) else {
+            return self.exact_node_lines(node).join("\n");
         };
 
         let node_start_line = start_row;
@@ -2039,7 +2163,9 @@ impl<'a> Ctx<'a> {
         };
 
         let mut body_parts: Vec<String> = Vec::new();
-        let mut last_processed_end: i64 = -1;
+        // Rows the header already emitted: a member on the brace line
+        // (`namespace a { int x;`) must not be emitted again.
+        let mut last_processed_end: i64 = (node_start_line + header_lines.len()) as i64 - 1;
         let mut bcursor = body_node.walk();
         for child in body_node.children(&mut bcursor) {
             if !child.is_named() {
@@ -2109,7 +2235,7 @@ impl<'a> Ctx<'a> {
                 let closing_line = self.code_lines[body_end_line];
                 let mut closing_text: String = closing_line
                     .chars()
-                    .take(body_node.end_position().column)
+                    .take(char_col(closing_line, body_node.end_position().column))
                     .collect();
                 if same_line_trailing_semicolon(node).is_some() {
                     closing_text.push(';');
@@ -2154,7 +2280,7 @@ impl<'a> Ctx<'a> {
         let first_line = self.code_lines[node.start_position().row];
         let mut indent: String = first_line
             .chars()
-            .take(node.start_position().column)
+            .take(char_col(first_line, node.start_position().column))
             .collect();
         if !indent.trim().is_empty() {
             indent.clear();
@@ -2590,5 +2716,165 @@ def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n   
             );
             assert!(parses(&r.compressed, lang));
         }
+    }
+
+    // ─── Mixed files (mirrors the mixed-file tests in
+    // tests/test_code_compressor_wrapper_nodes.py) ──
+    //
+    // A wrapper or declaration next to a function long enough to compress.
+    // Each compressed output here also passed syntax validation before the
+    // fix, so the tests check the text itself.
+
+    fn rust_work() -> String {
+        format!("fn work() {{\n{}\n}}\n", body("    step({i});", 60))
+    }
+
+    fn cpp_work() -> String {
+        format!("void work() {{\n{}\n}}\n", body("    step({i});", 60))
+    }
+
+    #[test]
+    fn mixed_file_declarations_appear_once() {
+        for (lang, code, declaration) in [
+            (
+                "rust",
+                format!("mod a; mod b;\n\n{}", rust_work()),
+                "mod b;",
+            ),
+            (
+                "cpp",
+                format!(
+                    "extern \"C\" int f(); extern \"C\" int g();\n\n{}",
+                    cpp_work()
+                ),
+                "extern \"C\" int g();",
+            ),
+            (
+                "rust",
+                format!(
+                    "#[cfg(feature = \"ffi\")]\nmod ffi {{ pub struct Handle; }}\n\n{}",
+                    rust_work()
+                ),
+                "mod ffi { pub struct Handle; }",
+            ),
+        ] {
+            let r = compress_as(&code, lang);
+            assert!(r.compressed.contains("// ["), "{}", r.compressed);
+            assert_eq!(
+                r.compressed.matches(declaration).count(),
+                1,
+                "{}",
+                r.compressed
+            );
+            assert!(parses(&r.compressed, lang));
+        }
+    }
+
+    #[test]
+    fn rust_attribute_stays_on_its_one_line_module() {
+        let code = format!(
+            "#[cfg(feature = \"ffi\")]\nmod ffi {{ pub struct Handle; }}\n\n{}",
+            rust_work()
+        );
+        let r = compress_as(&code, "rust");
+        let lines: Vec<&str> = r.compressed.lines().collect();
+        let module = lines
+            .iter()
+            .position(|l| *l == "mod ffi { pub struct Handle; }")
+            .unwrap();
+        assert_eq!(lines[module - 1], "#[cfg(feature = \"ffi\")]", "{lines:?}");
+    }
+
+    #[test]
+    fn cpp_definitions_stay_above_their_use() {
+        for (code, definition, usage) in [
+            (
+                format!(
+                    "#include <cstdint>\n#define API_TYPE int\nnamespace api {{\nAPI_TYPE query();\n}}\n\n{}",
+                    cpp_work()
+                ),
+                "#define API_TYPE int",
+                "API_TYPE query();",
+            ),
+            (
+                format!(
+                    "#include <cstdint>\nconstexpr int Seed = 7;\nnamespace ns {{\nconstexpr int value = Seed;\n}}\n\n{}",
+                    cpp_work()
+                ),
+                "constexpr int Seed = 7;",
+                "constexpr int value = Seed;",
+            ),
+            (
+                format!(
+                    "static int counter = 0;\n\nvoid work() {{\n{}\n}}\n",
+                    body("    counter += {i};", 60)
+                ),
+                "static int counter = 0;",
+                "void work() {",
+            ),
+        ] {
+            let out = compress_as(&code, "cpp").compressed;
+            assert!(out.contains("// ["), "{out}");
+            assert_eq!(out.matches(definition).count(), 1, "{out}");
+            assert!(
+                out.find(definition).unwrap() < out.find(usage).unwrap(),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_global_stays_above_the_function_that_uses_it() {
+        let code = format!(
+            "#include <stdio.h>\n\nstatic int counter = 0;\n\nint work(void) {{\n{}\n    return counter;\n}}\n",
+            body("    counter += {i};", 60)
+        );
+        let out = compress_as(&code, "c").compressed;
+        assert!(out.contains("// ["), "{out}");
+        assert!(
+            out.find("static int counter = 0;").unwrap() < out.find("int work(void) {").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cpp_compressed_output_keeps_the_source_layout() {
+        let code = format!(
+            "#include <cstdint>\n#define API_TYPE int\nnamespace api {{\nAPI_TYPE query();\n}}\n\n{}",
+            cpp_work()
+        );
+        let out = compress_as(&code, "cpp").compressed;
+        assert!(
+            out.starts_with(
+                "#include <cstdint>\n#define API_TYPE int\nnamespace api {\nAPI_TYPE query();\n}\n\nvoid work() {\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn template_signature_keeps_non_ascii_spelling() {
+        // Tree-sitter columns are UTF-8 byte offsets, not char indexes.
+        let code = format!(
+            "template <typename Größe> bool valid(Größe x) {{\n{}\n    return true;\n}}\n",
+            body("    step({i});", 60)
+        );
+        let out = compress_as(&code, "cpp").compressed;
+        assert!(out.contains("// ["), "{out}");
+        assert_eq!(
+            out.lines().next(),
+            Some("template <typename Größe> bool valid(Größe x) {"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn class_member_on_the_brace_line_is_not_repeated() {
+        let code = format!(
+            "namespace app {{ int first = 1;\nint second = 2;\n}}\n\n{}",
+            cpp_work()
+        );
+        let out = compress_as(&code, "cpp").compressed;
+        assert_eq!(out.matches("int first = 1;").count(), 1, "{out}");
     }
 }

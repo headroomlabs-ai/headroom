@@ -19,10 +19,10 @@
   "input_sha256": "095be1adad76b588f996e2c39b843e28ef41ec58b2ca8bb963c4fe9389027413",
   "output": {
     "cache_key": null,
-    "compressed": "#include <stdio.h>\n\n#include <stdlib.h>\n\n#include <string.h>\n\n\ntypedef struct {\n    char name[64];\n    int count;\n} Processor;\n\nint process(Processor *p, const char **items, int n) {\n    int kept = 0;\n    // [8 lines omitted]\n}\nint main(void) {\n    Processor p = {\"main\", 0};\n    const char *items[] = {\"a\", \"b\"};\n    printf(\"%d\\n\", process(&p, items, 2));\n    return 0;\n}",
+    "compressed": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct {\n    char name[64];\n    int count;\n} Processor;\n\nint process(Processor *p, const char **items, int n) {\n    int kept = 0;\n    // [8 lines omitted]\n}\n\nint main(void) {\n    Processor p = {\"main\", 0};\n    const char *items[] = {\"a\", \"b\"};\n    printf(\"%d\\n\", process(&p, items, 2));\n    return 0;\n}",
     "compressed_bodies": 0,
-    "compressed_tokens": 93,
-    "compression_ratio": 0.7045454545454546,
+    "compressed_tokens": 92,
+    "compression_ratio": 0.696969696969697,
     "language": "cpp",
     "language_confidence": 1.0,
     "original": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct {\n    char name[64];\n    int count;\n} Processor;\n\nint process(Processor *p, const char **items, int n) {\n    int kept = 0;\n    for (int i = 0; i < n; i++) {\n        if (items[i] == NULL || strlen(items[i]) == 0) {\n            continue;\n        }\n        kept++;\n        p->count++;\n    }\n    return kept;\n}\n\nint main(void) {\n    Processor p = {\"main\", 0};\n    const char *items[] = {\"a\", \"b\"};\n    printf(\"%d\\n\", process(&p, items, 2));\n    return 0;\n}\n",
@@ -32,6 +32,6 @@
     "symbol_scores": {},
     "syntax_valid": true
   },
-  "recorded_at": "2026-06-19T00:15:16.333831+00:00",
+  "recorded_at": "2026-11-25T07:33:22.305542+00:00",
   "transform": "code_aware_compressor"
 }
