@@ -907,6 +907,10 @@ def _is_cors_listed_origin(origin: str) -> bool:
 #: there. The value is derived from the token (:func:`front_relay_proof`), so
 #: only a process that knows the token can produce it.
 _FRONT_RELAY_PROOF_CONTEXT = b"headroom-front-relay-v1\0"
+#: Header the Rust front sets to ``1`` on every request it relays for a caller
+#: that is not local there, whatever ``Host`` it sends (and drops from what
+#: clients send). Not a secret: it only takes local trust away.
+FRONT_REMOTE_HEADER = "x-headroom-front-remote"
 #: ``Host`` the Rust front sends for every caller that is not local there.
 _FRONT_RELAY_HOST = "headroom-remote.invalid"
 
@@ -1007,7 +1011,13 @@ def _loopback_trusted(
     are loopback literals and ``localhost``; the container host aliases count
     too, but only on this proxy's own port and for a request without browser
     provenance. This is the rule for the token exemption on both transports.
+    A request the Rust front marks as relayed for a remote caller
+    (:data:`FRONT_REMOTE_HEADER`) is never local, whatever its ``Host``: a
+    containerised front reaching this proxy as ``host.docker.internal``
+    arrives from loopback under Docker Desktop.
     """
+    if headers.get(FRONT_REMOTE_HEADER) is not None:
+        return False
     if not is_loopback_host(peer):
         return False
     if is_loopback_host_header(host_header):

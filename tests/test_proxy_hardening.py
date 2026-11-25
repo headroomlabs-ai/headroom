@@ -441,6 +441,29 @@ class TestWebSocketAuthMiddleware:
         assert downstream.called is False
         assert _closed_with_policy_violation(sent)
 
+    async def test_rust_front_remote_marker_takes_alias_trust_away(self):
+        # host.docker.internal on our own port from loopback is a container on
+        # Docker Desktop; marked by the Rust front, it is a relayed remote caller.
+        def scope(*extra):
+            return {
+                **_ws_scope(
+                    client=LOOPBACK, headers=[("host", "host.docker.internal:8787"), *extra]
+                ),
+                "server": ("127.0.0.1", 8787),
+            }
+
+        unmarked = _SpyApp()
+        await _drive(WebSocketAuthMiddleware(unmarked, proxy_token="s3cr3t-token"), scope())
+        marked = _SpyApp()
+        sent = await _drive(
+            WebSocketAuthMiddleware(marked, proxy_token="s3cr3t-token"),
+            scope(("x-headroom-front-remote", "1")),
+        )
+
+        assert unmarked.called is True
+        assert marked.called is False
+        assert _closed_with_policy_violation(sent)
+
     async def test_rejects_wrong_credential(self):
         downstream = _SpyApp()
         mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")

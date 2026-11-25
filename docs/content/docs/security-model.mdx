@@ -294,7 +294,9 @@ answer those names too. They count from a loopback peer because Docker Desktop d
 container callers to the host from 127.0.0.1. The Rust front never forwards an alias a
 remote caller chose, and a front that reaches this proxy as
 `http://host.docker.internal:<port>` must run with `--python-upstream true` so its
-relayed callers arrive as `headroom-remote.invalid`. Requests the Rust front (`crates/headroom-proxy`) relays for a
+relayed callers arrive as `headroom-remote.invalid`. Every request the front relays for a remote caller also
+carries `X-Headroom-Front-Remote: 1`; a request carrying it is never treated as local here,
+whatever its `Host`. Requests the Rust front (`crates/headroom-proxy`) relays for a
 caller it authenticated carry `X-Headroom-Front-Proof`, derived from
 `HEADROOM_PROXY_TOKEN`; with the same token configured here that proof stands in for the
 token the front strips. With a token configured, the front's `Host:

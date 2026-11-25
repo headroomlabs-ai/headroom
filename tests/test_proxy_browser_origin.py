@@ -314,6 +314,26 @@ def test_container_alias_matches_the_listener_port(base_url: str, host: str) -> 
     assert len(transport.requests) == 1
 
 
+@pytest.mark.parametrize("host", ["host.docker.internal:8787", "127.0.0.1:8787", "localhost:8787"])
+def test_rust_front_remote_marker_is_never_local(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    # A front relaying a remote caller to this proxy as host.docker.internal
+    # arrives from loopback (Docker Desktop) under a name trusted as local;
+    # its remote marker takes that trust away: refused at the local-Host
+    # check like any foreign name (a front with --python-upstream sends the
+    # relay Host and proof instead).
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "proxy-token")
+    client, transport = _client()
+
+    marked = client.get(_PATH, headers={"Host": host, "X-Headroom-Front-Remote": "1"})
+    unmarked = client.get(_PATH, headers={"Host": host})
+
+    assert marked.status_code == 403, marked.text
+    assert unmarked.status_code == 200, unmarked.text
+    assert len(transport.requests) == 1
+
+
 RELAY_HOST = "headroom-remote.invalid"
 
 
