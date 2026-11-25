@@ -72,7 +72,9 @@ class _Capturing(httpx.AsyncBaseTransport):
         return httpx.Response(200, json=body)
 
 
-def _client(base_url: str = "http://127.0.0.1:8787") -> tuple[TestClient, _Capturing]:
+def _client(
+    base_url: str = "http://127.0.0.1:8787", peer: str = "127.0.0.1"
+) -> tuple[TestClient, _Capturing]:
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -91,7 +93,7 @@ def _client(base_url: str = "http://127.0.0.1:8787") -> tuple[TestClient, _Captu
     app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
     # The browser and the proxy share the host, so the peer is loopback.
     # base_url sets the Host a local client sends (TestClient defaults to "testserver").
-    return TestClient(app, client=("127.0.0.1", 51000), base_url=base_url), transport
+    return TestClient(app, client=(peer, 51000), base_url=base_url), transport
 
 
 _ROUTES = {
@@ -394,6 +396,28 @@ def test_health_probe_relayed_without_a_proof_still_answers(
     assert body["service"] == local.json()["service"]
     assert payload_key in body
     assert "config" not in body  # operator config is for local callers only
+
+
+def test_rust_front_relay_from_a_container_gateway_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A front in a container on Linux reaches this proxy from the bridge
+    # gateway, not loopback; its proof stands in for the token all the same.
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "proxy-token")
+    client, transport = _client(peer="172.17.0.1")
+
+    resp = client.get(
+        _PATH,
+        headers={
+            "Host": RELAY_HOST,
+            "X-Headroom-Front-Remote": "1",
+            FRONT_RELAY_PROOF_HEADER: front_relay_proof("proxy-token"),
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(transport.requests) == 1
+    assert FRONT_RELAY_PROOF_HEADER not in {k.lower() for k in transport.requests[0].headers}
 
 
 def test_rust_front_relay_with_its_proof_forwards_without_the_proof(

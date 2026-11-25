@@ -987,13 +987,16 @@ def front_relay_proof(token: str) -> str:
     return hashlib.sha256(_FRONT_RELAY_PROOF_CONTEXT + token.encode("utf-8")).hexdigest()
 
 
-def _is_front_relay(peer: str | None, headers: Mapping[str, str], proof: bytes) -> bool:
-    """A loopback peer carrying the Rust front's proof for this proxy's token."""
+def _is_front_relay(headers: Mapping[str, str], proof: bytes) -> bool:
+    """A request carrying the Rust front's proof for this proxy's token.
+
+    Accepted from any peer, as the token itself is: a front in a container
+    reaches this proxy from the bridge gateway on Linux, not from loopback.
+    """
     sent = headers.get(FRONT_RELAY_PROOF_HEADER)
     return (
         bool(proof)
         and sent is not None
-        and is_loopback_host(peer)
         and hmac.compare_digest(sent.encode("utf-8", "replace"), proof)
     )
 
@@ -3588,6 +3591,9 @@ class WebSocketAuthMiddleware:
         # compare_digest on str raises TypeError for non-ASCII input, which
         # would turn a rejected handshake into a 500.
         self.token_bytes = proxy_token.encode("utf-8") if proxy_token else b""
+        self.front_relay_proof = (
+            front_relay_proof(proxy_token).encode("ascii") if proxy_token else b""
+        )
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] != "websocket":
@@ -3622,9 +3628,12 @@ class WebSocketAuthMiddleware:
             return
 
         provided = read_proxy_token(headers)
-        if provided is not None and hmac.compare_digest(
+        token_ok = provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
-        ):
+        )
+        # The Rust front stripped the token of a caller it authenticated and
+        # sends the proof instead, as on HTTP.
+        if token_ok or _is_front_relay(headers, self.front_relay_proof):
             scrub_proxy_token_headers(scope, self.token_bytes)
             await self.app(scope, receive, send)
             return
@@ -4816,7 +4825,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         client = getattr(request, "client", None)
         client_host = getattr(client, "host", None) if client is not None else None
         # Relayed by the Rust front for a caller that presented this token there.
-        front_relay = _is_front_relay(client_host, request.headers, _front_relay_proof)
+        front_relay = _is_front_relay(request.headers, _front_relay_proof)
         # With no token here there is nothing to prove: a token-less front
         # (acknowledged open bind) relays its remote callers under its relay
         # Host without a proof. They pass as remote, unauthenticated callers,

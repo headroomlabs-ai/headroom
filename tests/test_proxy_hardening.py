@@ -464,6 +464,35 @@ class TestWebSocketAuthMiddleware:
         assert marked.called is False
         assert _closed_with_policy_violation(sent)
 
+    @pytest.mark.parametrize("client", [LOOPBACK, ("172.17.0.1", 40000)])
+    async def test_accepts_the_rust_front_relay_proof(self, client):
+        # The Rust front strips the token of a remote caller it authenticated
+        # and sends the proof instead; a container front arrives from the
+        # bridge gateway on Linux.
+        from headroom.proxy.server import front_relay_proof
+
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+        headers = [
+            ("host", "127.0.0.1:8788"),
+            ("x-headroom-front-remote", "1"),
+            ("x-headroom-front-proof", front_relay_proof("s3cr3t-token")),
+        ]
+
+        await _drive(mw, _ws_scope(client=client, headers=headers))
+
+        assert downstream.called is True
+
+    async def test_rejects_a_wrong_rust_front_relay_proof(self):
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+        headers = [("x-headroom-front-remote", "1"), ("x-headroom-front-proof", "0" * 64)]
+
+        sent = await _drive(mw, _ws_scope(client=LOOPBACK, headers=headers))
+
+        assert downstream.called is False
+        assert _closed_with_policy_violation(sent)
+
     async def test_rejects_wrong_credential(self):
         downstream = _SpyApp()
         mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")

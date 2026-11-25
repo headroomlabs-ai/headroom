@@ -296,7 +296,8 @@ remote caller chose, and a front that reaches this proxy as
 `http://host.docker.internal:<port>` must run with `--python-upstream true` so its
 relayed callers arrive as `headroom-remote.invalid`. Every request the front relays for a remote caller also
 carries `X-Headroom-Front-Remote: 1`; a request carrying it is never treated as local here,
-whatever its `Host`. Requests the Rust front (`crates/headroom-proxy`) relays for a
+whatever its `Host`. The proof is accepted from any peer, as the token is (a containerised
+front on Linux arrives from the bridge gateway), and on WebSocket handshakes as on HTTP. Requests the Rust front (`crates/headroom-proxy`) relays for a
 caller it authenticated carry `X-Headroom-Front-Proof`, derived from
 `HEADROOM_PROXY_TOKEN`; with the same token configured here that proof stands in for the
 token the front strips. With a token configured, the front's `Host:
