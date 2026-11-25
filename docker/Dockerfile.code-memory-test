@@ -16,7 +16,8 @@ with open('/tmp/headroom-pyproject.toml', 'rb') as stream:
 requirements = project['dependencies'] + project['optional-dependencies']['enola']
 requirements += project['optional-dependencies']['strands']
 requirements += project['optional-dependencies']['mcp']
-requirements += ['pytest>=7', 'pytest-asyncio>=0.21', 'ruff==0.16.8']
+requirements += ['pytest>=7', 'pytest-asyncio>=0.21']
+requirements += [dep for dep in project['optional-dependencies']['dev'] if dep.startswith('ruff==')]
 subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', *requirements])
 entry = Path('/usr/local/bin/headroom')
 entry.write_text('#!/usr/local/bin/python\nfrom headroom.cli import main\nmain()\n')

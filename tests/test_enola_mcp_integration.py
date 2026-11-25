@@ -1,7 +1,5 @@
 """Exercise the installed Enola CLI over stdio MCP; optional extra required."""
 
-from datetime import timedelta
-
 import pytest
 
 
@@ -24,9 +22,7 @@ async def test_enola_snapshot_navigation_and_delta(tmp_path, monkeypatch):
         command=spec.command, args=list(spec.args), env=spec.env, cwd=str(tmp_path)
     )
     async with stdio_client(params) as (reader, writer):
-        async with mcp.ClientSession(
-            reader, writer, read_timeout_seconds=timedelta(seconds=60)
-        ) as session:
+        async with mcp.ClientSession(reader, writer, read_timeout_seconds=60) as session:
             await session.initialize()
             tools = await session.list_tools()
             names = {tool.name for tool in tools.tools}
