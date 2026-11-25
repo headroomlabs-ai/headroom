@@ -21,6 +21,7 @@ Each .md file has:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,18 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
     for line in fm_text.split("\n"):
         if ":" in line:
             key, _, value = line.partition(":")
+            value = value.strip()
+            # The writer uses JSON string literals, a YAML-compatible subset.
+            # Decode their escapes while preserving the tolerant legacy reader.
+            if value.startswith('"'):
+                try:
+                    decoded = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(decoded, str):
+                        fm[key.strip()] = decoded
+                        continue
             fm[key.strip()] = value.strip().strip('"').strip("'")
 
     return fm, body
@@ -81,6 +94,25 @@ def _build_frontmatter(fields: dict[str, str]) -> str:
     lines = ["---"]
     for key, value in fields.items():
         if value:
+            # Keep ordinary identifiers byte-stable. Everything else is a JSON
+            # string literal (also valid YAML), so ': ', comments, dates and
+            # booleans cannot change a native agent's interpretation.
+            plain_identifier = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value)
+            if not plain_identifier or value.lower() in {
+                "null",
+                "true",
+                "false",
+                "yes",
+                "no",
+                "on",
+                "off",
+                "y",
+                "n",
+            }:
+                value = json.dumps(value, ensure_ascii=False)
+                # YAML 1.1 readers normalize these literal Unicode line breaks.
+                for separator in ("\x85", "\u2028", "\u2029"):
+                    value = value.replace(separator, f"\\u{ord(separator):04x}")
             lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines)
