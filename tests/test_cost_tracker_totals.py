@@ -110,3 +110,45 @@ def test_totals_prices_requests_without_a_usage_breakdown(
     stats = tracker.stats()
     assert stats["total_input_tokens"] == 2000
     assert stats["total_input_cost_usd"] == round(2000 * uncached_price, 4)
+
+
+@pytest.mark.parametrize(
+    ("estimated_tokens", "cache_read_tokens", "fallback_tokens", "expected_cost"),
+    [(50000, 40000, 0, 0.012), (1000, 4000, 1000, 0.0042)],
+)
+@pytest.mark.parametrize("fallback_first", [False, True])
+def test_totals_use_per_request_fallback_with_mismatched_estimates(
+    monkeypatch: pytest.MonkeyPatch,
+    estimated_tokens: int,
+    cache_read_tokens: int,
+    fallback_tokens: int,
+    expected_cost: float,
+    fallback_first: bool,
+) -> None:
+    monkeypatch.setattr(
+        CostTracker, "_get_cache_prices", lambda *args, **kwargs: (0.3e-6, 3.75e-6, 6e-6, 3e-6)
+    )
+    tracker = CostTracker()
+    model = "claude-sonnet-4-5"
+    if fallback_first:
+        tracker.record_tokens(model, 0, fallback_tokens)
+    tracker.record_tokens(model, 0, estimated_tokens, cache_read_tokens=cache_read_tokens)
+    if not fallback_first:
+        tracker.record_tokens(model, 0, fallback_tokens)
+
+    assert tracker.totals() == (estimated_tokens + fallback_tokens, expected_cost)
+    assert tracker.stats()["total_input_cost_usd"] == expected_cost
+
+
+def test_runtime_reset_discards_no_usage_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        CostTracker, "_get_cache_prices", lambda *args, **kwargs: (0.3e-6, 3.75e-6, 6e-6, 3e-6)
+    )
+    tracker = CostTracker()
+    model = "claude-sonnet-4-5"
+    tracker.record_tokens(model, 0, 1000)
+    tracker.reset_runtime()
+    tracker.record_tokens(model, 0, 50000, cache_read_tokens=40000)
+
+    assert tracker.totals() == (50000, 0.012)
+    assert tracker.stats()["total_input_cost_usd"] == 0.012

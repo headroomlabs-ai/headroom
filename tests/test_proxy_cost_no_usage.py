@@ -20,6 +20,24 @@ def test_stats_include_stream_without_usage(
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
     monkeypatch.setenv(HEADROOM_SAVINGS_PATH_ENV_VAR, str(tmp_path / "savings.json"))
+
+    class FixedTokenizer:
+        def count_messages(self, messages: list[dict]) -> int:
+            return 1000
+
+        def count_text(self, text: str) -> int:
+            return 1
+
+    tokenizer = FixedTokenizer()
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda *args, **kwargs: tokenizer)
+    monkeypatch.setattr(
+        "headroom.providers.openai.OpenAIProvider.get_token_counter",
+        lambda *args, **kwargs: tokenizer,
+    )
+    monkeypatch.setattr(
+        "headroom.tokenizers.tiktoken_counter._get_encoding",
+        lambda *args, **kwargs: pytest.fail("the fixed-tokenizer test must not load a vocabulary"),
+    )
     price = 2.5 / 1_000_000
     monkeypatch.setattr(
         CostTracker, "_get_cache_prices", lambda *args, **kwargs: (price / 2, price, price, price)
@@ -59,7 +77,7 @@ def test_stats_include_stream_without_usage(
     )
     with TestClient(app) as client:
         observed = []
-        for prompt in ("measured", "estimated input " * 600):
+        for prompt in ("measured", "no reported usage"):
             result = client.post(
                 "/v1/chat/completions",
                 headers={"authorization": "Bearer test-key"},
@@ -78,6 +96,5 @@ def test_stats_include_stream_without_usage(
 
         measured, combined = observed
         assert measured == (1000, 0.0025)
-        assert combined[0] > measured[0]
-        assert combined[1] == round(combined[0] * price, 4)
+        assert combined == (2000, 0.005)
         assert app.state.proxy.cost_tracker.totals() == combined
