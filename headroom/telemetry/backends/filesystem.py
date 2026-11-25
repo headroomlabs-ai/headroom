@@ -18,7 +18,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -38,15 +37,14 @@ def _version_paths(path: Path, store_version: str) -> tuple[Path, Path | None]:
     major = store_version.split(".", 1)[0]
     versioned_marker = f".v{major}"
     versioned_suffix = f"{versioned_marker}{path.suffix}"
-    # Case-insensitive platforms spell one directory entry many ways, and the
-    # owner identity is case-normalized there — so the version check must be
-    # too, or ``TOIN.V3.JSON`` would derive a different write target while
-    # sharing ``toin.v3.json``'s owner. ``normcase`` is the identity on
-    # case-sensitive filesystems, keeping those comparisons exact.
-    name = os.path.normcase(path.name)
-    if name.endswith(os.path.normcase(versioned_marker)) or name.endswith(
-        os.path.normcase(versioned_suffix)
-    ):
+    # The version check is case-insensitive on every platform: Windows and
+    # the default macOS volume spell one directory entry many ways, and
+    # ``os.path.normcase`` is the identity on macOS, so it cannot be relied
+    # on there. A POSIX file that merely happens to contain ``.v3`` in
+    # another case is unaffected in practice — its owner identity folds the
+    # same way, so owner and write target stay consistent per spelling.
+    name = path.name.lower()
+    if name.endswith(versioned_marker) or name.endswith(versioned_suffix.lower()):
         # The caller already named the versioned file (e.g. ``toin.v3.json``).
         # Write it in place and do not treat the unversioned sibling as a
         # pre-upgrade source: ``toin.json`` and ``toin.v3.json`` must stay
@@ -96,15 +94,15 @@ class FileSystemTOINBackend:
         # canonicalized but the final filename is kept verbatim: an atomic
         # save replaces the file *at the configured name* (a symlink is
         # replaced, not followed), so the token must identify that name,
-        # not the link target a previous store may have lived at. The name
-        # is case-normalized on case-insensitive platforms so a case-only
-        # respelling of HEADROOM_TOIN_PATH stays the same owner there while
-        # remaining distinct on case-sensitive filesystems.
+        # not the link target a previous store may have lived at. The whole
+        # identity is lowercased: on case-insensitive volumes (Windows,
+        # default macOS) a case-only respelling of HEADROOM_TOIN_PATH is the
+        # same directory entry and must stay one owner. On case-sensitive
+        # filesystems case-variant spellings are different files with
+        # different write targets, so they never meet to conflict.
         self._configured_path = self._path
         self._owner = Path(
-            os.path.normcase(
-                str(self._configured_path.parent.resolve() / self._configured_path.name)
-            )
+            str(self._configured_path.parent.resolve() / self._configured_path.name).lower()
         )
         self._store_version: str | None = None
         if store_version:
