@@ -874,12 +874,20 @@ class SavingsRecorder:
         negative ``tokens_saved`` with an "artifact" log for the same reason.
         Keeping the floor here makes that boundary explicit rather than
         relying on every downstream caller to reapply it."""
-        for label in labels or ():
-            parsed = parse_stratum_label(str(label))
+        label_strings = tuple(str(label) for label in labels or ())
+        for label in label_strings:
+            parsed = parse_stratum_label(label)
             if parsed is None:
                 continue
             arm, key = parsed
             if arm != "treatment":
+                return 0
+            # The stratum label is attached before shaping is attempted; only
+            # the ``output_shaper:verbosity:*`` label proves the request was
+            # actually shaped (the same proof ``record_from_labels`` requires).
+            # Without it a treatment request was left unshaped, so it booked
+            # nothing and must not be credited the baseline as saved (#4171).
+            if not any(lbl.startswith(_SHAPED_LABEL_PREFIX) for lbl in label_strings):
                 return 0
             with self._lock:
                 mean, _var, n = self._ledger.baseline.lookup(key)

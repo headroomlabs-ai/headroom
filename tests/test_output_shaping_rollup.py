@@ -72,9 +72,22 @@ def test_estimate_request_savings_treatment_uses_baseline(tmp_path):
     for _ in range(5):
         rec._ledger.baseline.observe(key, 1000)  # baseline mean ~1000
 
-    # Treatment request that emitted 600 -> saved ~400 vs the baseline.
-    saved = rec.estimate_request_savings([stratum_label("treatment", key)], 600)
+    # A *shaped* treatment request that emitted 600 -> saved ~400 vs the baseline.
+    shaped = [stratum_label("treatment", key), "output_shaper:verbosity:L4"]
+    saved = rec.estimate_request_savings(shaped, 600)
     assert saved == 400
+
+
+def test_estimate_request_savings_zero_for_unshaped_treatment(tmp_path):
+    """The stratum label is attached before shaping is attempted; only the
+    verbosity label proves the request was shaped. A treatment request without
+    it saved nothing, so it must not book the baseline as saved (#4171)."""
+    rec = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    key = _key()
+    for _ in range(5):
+        rec._ledger.baseline.observe(key, 1000)
+
+    assert rec.estimate_request_savings([stratum_label("treatment", key)], 600) == 0
 
 
 def test_estimate_request_savings_zero_for_control_and_unknown(tmp_path):
