@@ -807,7 +807,10 @@ def test_save_replaces_a_symlink_without_orphaning_the_store(tmp_path) -> None:
     """
     target = tmp_path / "store.json"
     target.write_text("{}", encoding="utf-8")
-    link = tmp_path / "toin.json"
+    # A version-like configured name is written in place, so the active
+    # write path is the symlink itself (an unversioned name would save to
+    # the .v3 sibling and never touch the link).
+    link = tmp_path / "toin.v3.json"
     try:
         link.symlink_to(target)
     except OSError:
