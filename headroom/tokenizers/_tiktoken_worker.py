@@ -117,15 +117,14 @@ _ENCODING_PAT_STR = {
 }
 
 # Only encodings where explicit_n_vocab == len(mergeable_ranks) + len(special_tokens)
-# For cl100k_base, o200k_base, o200k_harmony this does NOT hold (they have reserved indices)
+# For cl100k_base, o200k_base, o200k_harmony, p50k_edit this does NOT hold (they have reserved indices)
 # tiktoken's own constructors OMIT explicit_n_vocab for these encodings to skip validation.
 # We do the same: only pass explicit_n_vocab for encodings where it matches.
 _ENCODING_EXPLICIT_N_VOCAB = {
     "gpt2": 50257,
     "r50k_base": 50257,
     "p50k_base": 50281,
-    "p50k_edit": 50281,
-    # cl100k_base, o200k_base, o200k_harmony: omitted (have reserved tokens)
+    # cl100k_base, o200k_base, o200k_harmony, p50k_edit: omitted (have reserved tokens)
 }
 
 
@@ -324,9 +323,8 @@ def _load_encoding_worker(encoding_name: str, queue: Any) -> None:
     """Worker function to load encoding in a separate process.
 
     Uses multiprocessing so we can actually terminate on timeout.
-    Does cache check AND hash verification inside the timeout boundary.
-    Returns status via queue on success/failure, does NOT send the encoding object
-    (to avoid large object transfer through queue pipe).
+    Does cache check, hash verification, AND encoding construction inside the timeout boundary.
+    Returns the encoding object via queue on success, or status string on failure.
     """
     try:
         # Check local cache FIRST (inside the timeout boundary)
@@ -338,9 +336,9 @@ def _load_encoding_worker(encoding_name: str, queue: Any) -> None:
             return
 
         if is_cached:
-            # Cache exists and is valid - just signal success
-            # Parent will build the encoding from cache files
-            queue.put(("ok", encoding_name))
+            # Cache exists and is valid - build encoding in worker (bounded by timeout)
+            enc = _build_encoding_from_cache(encoding_name)
+            queue.put(("ok", enc))
             return
 
         # Not cached, would need download - but we don't do that here

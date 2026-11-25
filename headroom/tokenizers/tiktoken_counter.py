@@ -24,7 +24,6 @@ from headroom.offline import guard_egress, is_offline
 
 from ._tiktoken_worker import (
     _load_encoding_worker,
-    _build_encoding_from_cache,
 )
 from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
@@ -204,19 +203,13 @@ def _get_encoding(encoding_name: str):
 
     status = result[0]
     if status == "ok":
-        # Worker verified cache is valid - build encoding in parent (fast, no network)
-        try:
-            enc = _build_encoding_from_cache(encoding_name)
-        except Exception as exc:
-            logger.warning(
-                "tiktoken encoding %r failed to build from verified cache: %s",
-                encoding_name,
-                exc,
-            )
-            _disk_load_permanently_failed.add(encoding_name)
-            raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} failed to build from cache: {exc}")
+        # Worker built and returned the encoding
+        enc = result[1]
         # Register in tiktoken's in-memory cache for future fast loads
         tiktoken.registry.ENCODINGS[encoding_name] = enc
+        # Clear any previous timeout tracking on success (allows recovery from transient timeouts)
+        _load_timed_out.discard(encoding_name)
+        _disk_load_failed.discard(encoding_name)
         return enc
     elif status == "invalid_cache":
         # Corrupted cache - permanent failure for offline, but online can repair by downloading
@@ -293,7 +286,8 @@ def _get_encoding_with_timeout(encoding_name: str, ctx) -> Any:
         raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} download failed with exit code {proc.exitcode}")
 
     if result[0] == "ok":
-        enc = result[1]
+        # Download succeeded - load from tiktoken's in-memory cache
+        enc = tiktoken.get_encoding(encoding_name)
         tiktoken.registry.ENCODINGS[encoding_name] = enc
         return enc
     else:
@@ -302,11 +296,19 @@ def _get_encoding_with_timeout(encoding_name: str, ctx) -> Any:
 
 
 def _download_encoding_worker(encoding_name: str, queue: Any) -> None:
-    """Worker to download encoding via tiktoken.get_encoding (online mode)."""
+    """Worker to download encoding via tiktoken.get_encoding (online mode).
+
+    Does NOT return the encoding object - just signals success/failure.
+    Parent will load from tiktoken's in-memory cache after download completes.
+    """
     try:
         guard_egress("tiktoken encoding download")
         enc = tiktoken.get_encoding(encoding_name)
-        queue.put(("ok", enc))
+        # Verify it's in tiktoken's registry (download succeeded)
+        if encoding_name in tiktoken.registry.ENCODINGS:
+            queue.put(("ok", encoding_name))
+        else:
+            queue.put(("error", "download succeeded but encoding not registered"))
     except BaseException as exc:  # noqa: BLE001
         queue.put(("error", str(exc)))
 
