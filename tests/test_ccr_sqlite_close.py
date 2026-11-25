@@ -63,3 +63,34 @@ def test_closing_one_store_preserves_sibling_and_persisted_entries(tmp_path: Pat
         for item in (backend, sibling_backend):
             if item._conn is not None:
                 item._conn.close()
+
+
+def test_global_lookup_replaces_closed_store_and_keeps_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import headroom.cache.compression_store as stores
+
+    monkeypatch.setattr(stores, "_compression_store", None)
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    path = tmp_path / "explicit.db"
+    backend = SQLiteBackend(path)
+    original = stores.get_compression_store(backend=backend)
+    key = original.store("Persisted result", "Short result")
+    connection = backend._conn
+    try:
+        original.close()
+        replacement = stores.get_compression_store()
+        assert replacement is not original
+        assert replacement.retrieve(key).original_content == "Persisted result"
+        new_key = replacement.store("Another result", "Another short result")
+        assert replacement.retrieve(new_key).original_content == "Another result"
+        original.close()
+        assert stores.get_compression_store() is replacement
+        assert replacement.retrieve(key).original_content == "Persisted result"
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
+        assert backend._conn is None
+    finally:
+        stores.get_compression_store().close()
+        if backend._conn is not None:
+            backend._conn.close()

@@ -258,6 +258,7 @@ class CompressionStore:
 
         self._backend: CompressionStoreBackend = backend or InMemoryBackend()
         self._lock = threading.Lock()
+        self._closed = False
         self._max_entries = max_entries
         self._default_ttl = default_ttl
         self._enable_feedback = enable_feedback
@@ -872,6 +873,7 @@ class CompressionStore:
                     backend.close()
                 except Exception:
                     pass
+            self._closed = True
 
     def _evict_if_needed(self) -> None:
         """Evict expired, then oldest live entries until below capacity.
@@ -1340,6 +1342,8 @@ def get_compression_store(
     If a request-scoped store was set (e.g. by SaaS middleware), returns it.
     Otherwise uses lazy-initialized global singleton. Backend can be supplied
     explicitly or created from env (HEADROOM_CCR_BACKEND) when building the global.
+    After close, the next global lookup creates a new store. SQLite keeps its
+    previous database path unless a replacement backend is supplied.
 
     Args:
         max_entries: Maximum entries (only used on first call for global store).
@@ -1356,9 +1360,15 @@ def get_compression_store(
         return request_store
 
     global _compression_store
-    if _compression_store is None:
+    if _compression_store is None or _compression_store._closed:
         with _store_lock:
-            if _compression_store is None:
+            if _compression_store is None or _compression_store._closed:
+                if backend is None and _compression_store is not None:
+                    from .backends.sqlite import SQLiteBackend
+
+                    previous_backend = _compression_store._backend
+                    if isinstance(previous_backend, SQLiteBackend):
+                        backend = SQLiteBackend(previous_backend._path)
                 if backend is None:
                     backend = _create_default_ccr_backend()
                 effective_default_ttl = (
