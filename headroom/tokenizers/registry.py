@@ -317,13 +317,16 @@ class TokenizerRegistry:
         through here, so a malformed ``pricing`` or ``context_limits`` entry
         must not turn Claude or Gemini into the generic estimator.
         """
-        if TokenizerRegistry._configured_encodings is None:
+        # One read of the class attribute: a concurrent clear_cache() resets it.
+        encodings = TokenizerRegistry._configured_encodings
+        if encodings is None:
             from ..model_limits import load_openai_encodings
 
-            TokenizerRegistry._configured_encodings = {
+            encodings = {
                 name.lower(): encoding for name, encoding in load_openai_encodings().items()
             }
-        return TokenizerRegistry._configured_encodings.get(model.lower())
+            TokenizerRegistry._configured_encodings = encodings
+        return encodings.get(model.lower())
 
     def _create_tokenizer(
         self,
