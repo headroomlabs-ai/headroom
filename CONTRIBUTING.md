@@ -127,7 +127,8 @@ Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
 
 For code-memory/MCP changes, a focused container suite includes the pinned
 Enola executable and exercises its real stdio MCP server. The test image pins
-its Python base by digest and installs dependencies constrained by `uv.lock`.
+its Python base by digest and verifies dependency artifact hashes from `uv.lock`.
+The uv bootstrap wheels also have explicit hashes.
 The integration tests wrap isolated Claude, Codex, Grok, and OpenCode homes,
 then launch Enola from each saved MCP configuration and query a fixture repo.
 Native agent launches and live provider requests are not exercised:

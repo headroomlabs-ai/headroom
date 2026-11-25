@@ -166,14 +166,28 @@ def test_enabled_specs_keep_legacy_ledger_fingerprints():
 
 @pytest.mark.windows_newline
 def test_enola_guidance_is_utf8_lf_on_disk(project, monkeypatch):
+    from headroom import fsutil
+
+    fdopen = fsutil.os.fdopen
+    writes = []
+
+    def checked_fdopen(*args, **kwargs):
+        writes.append(kwargs)
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("newline") == ""
+        return fdopen(*args, **kwargs)
+
+    monkeypatch.setattr(fsutil.os, "fdopen", checked_fdopen)
     path = Path("CLAUDE.md")
     path.write_bytes("# Café\r\n".encode())
     monkeypatch.setenv("HEADROOM_CODE_MEMORY_INSTRUCTIONS", "1")
     wrap._inject_enola_instructions(path)
     assert b"\r" not in path.read_bytes()
     assert "Café".encode() in path.read_bytes()
+    assert len(writes) == 1
     wrap._remove_unused_code_memory_instructions(project, "enola", wrap.ENOLA_INSTRUCTIONS_BLOCK)
     assert path.read_bytes() == "# Café\n".encode()
+    assert len(writes) == 2
 
 
 @pytest.mark.parametrize("customized", [False, True])
