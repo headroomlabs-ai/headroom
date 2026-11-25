@@ -1,0 +1,27 @@
+# Dependency-only image for MCP/wrap tests, including the real pinned Enola.
+# Mount the checkout at /workspace when running; no host Python is needed.
+# This image does not build the Rust compression extension or run the proxy.
+FROM python:3.14-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY pyproject.toml /tmp/headroom-pyproject.toml
+RUN python - <<'PY'
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+with open('/tmp/headroom-pyproject.toml', 'rb') as stream:
+    project = tomllib.load(stream)['project']
+requirements = project['dependencies'] + project['optional-dependencies']['enola']
+requirements += project['optional-dependencies']['strands']
+requirements += project['optional-dependencies']['mcp']
+requirements += ['pytest>=7', 'pytest-asyncio>=0.21', 'ruff==0.16.8']
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', *requirements])
+entry = Path('/usr/local/bin/headroom')
+entry.write_text('#!/usr/local/bin/python\nfrom headroom.cli import main\nmain()\n')
+entry.chmod(0o755)
+PY
+
+WORKDIR /workspace
+CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_enola_code_memory.py", "tests/test_enola_mcp_integration.py", "tests/test_wrap_code_memory.py"]

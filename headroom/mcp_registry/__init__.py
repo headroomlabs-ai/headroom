@@ -18,6 +18,7 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeConfigMutationError, ClaudeRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
+from .enola import build_enola_spec
 from .grok import GrokRegistrar
 from .install import (
     CLAUDE_SERENA_CONTEXT,
@@ -44,6 +45,7 @@ __all__ = [
     "RegisterStatus",
     "ServerSpec",
     "any_succeeded",
+    "build_enola_spec",
     "build_headroom_spec",
     "build_serena_spec",
     "build_server_json",

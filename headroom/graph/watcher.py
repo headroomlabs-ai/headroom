@@ -88,6 +88,7 @@ _IGNORE_DIRS = frozenset(
         ".eggs",
         "*.egg-info",
         ".headroom",
+        ".enola",
         "target",  # Rust/Java
     }
 )

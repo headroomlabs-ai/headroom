@@ -73,6 +73,7 @@ docker-compose*.yml
 .dockerignore
 
 # Misc
+.enola/
 .pi-lens/
 .superpowers/
 examples/

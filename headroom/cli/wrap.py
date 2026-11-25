@@ -1200,11 +1200,15 @@ def _serena_instructions_opt_in() -> bool:
     or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. Serena's ``.serena/``-only
     setup (language scoping, pre-indexing) stays on by default regardless.
     """
-    return os.environ.get("HEADROOM_SERENA_INSTRUCTIONS", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    return any(
+        os.environ.get(key, "").strip().lower()
+        in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        for key in ("HEADROOM_SERENA_INSTRUCTIONS", "HEADROOM_CODE_MEMORY_INSTRUCTIONS")
     )
 
 
@@ -1241,8 +1245,9 @@ _serena_instructions_option = click.option(
 # through each subcommand — the same approach as _serena_instructions_option above.
 _CODE_MEMORY_ENV = "HEADROOM_CODE_MEMORY"
 _CODE_MEMORY_SERENA = "serena"
+_CODE_MEMORY_ENOLA = "enola"
 _CODE_MEMORY_NONE = "none"
-_VALID_CODE_MEMORY = {_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE}
+_VALID_CODE_MEMORY = {_CODE_MEMORY_SERENA, _CODE_MEMORY_ENOLA, _CODE_MEMORY_NONE}
 
 
 def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
@@ -1284,15 +1289,32 @@ def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str |
 # through HEADROOM_CODE_MEMORY.
 _code_memory_option = click.option(
     "--code-memory",
-    type=click.Choice([_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE]),
+    type=click.Choice([_CODE_MEMORY_SERENA, _CODE_MEMORY_ENOLA, _CODE_MEMORY_NONE]),
     default=None,
     expose_value=False,
     is_eager=True,
     callback=_code_memory_flag_callback,
     help=(
-        "Code-memory MCP to register: 'none' (default) or 'serena'. "
+        "Code-memory MCP to register: 'none' (default), 'serena', or 'enola'. "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
     ),
+)
+
+
+def _code_memory_instructions_flag_callback(ctx: Any, param: Any, value: bool) -> bool:
+    """Enable backend-neutral guidance without setting the legacy Serena flag."""
+    if value:
+        os.environ["HEADROOM_CODE_MEMORY_INSTRUCTIONS"] = "1"
+    return value
+
+
+_code_memory_instructions_option = click.option(
+    "--code-memory-instructions",
+    is_flag=True,
+    expose_value=False,
+    is_eager=True,
+    callback=_code_memory_instructions_flag_callback,
+    help="Add guidance for the selected code-memory backend to CLAUDE.md or AGENTS.md.",
 )
 
 
@@ -2589,6 +2611,45 @@ symbol view does not answer the question.
 """
 
 
+ENOLA_INSTRUCTIONS_BLOCK = """\
+<!-- headroom:enola-instructions -->
+# Enola — Code Navigation and Architecture
+
+Use Enola's MCP tools for focused code reads and dependency questions.
+Generate a snapshot of this repository with `generate_snapshot(repo_path=...)`
+before querying a new project, and refresh it after source changes.
+- `explore` lists symbols, dependencies, and reverse dependents for a file or module.
+- `query_facts` finds symbols; `show_symbol` reads their source.
+- `traverse(direction="reverse")` finds callers and dependents; bound depth and nodes.
+- `impact_analysis` shows the blast radius of a proposed change.
+For architecture verification: generate a snapshot, `set_baseline` before editing,
+then refresh and use `diff_snapshot`. Keep the baseline until the task is finished.
+Use the agent's normal editing tools to change source. Fall back to source reads
+when extraction coverage or symbol views cannot answer the question.
+<!-- /headroom:enola-instructions -->
+"""
+
+
+def _remove_code_memory_instructions(file_path: Path, block: str) -> None:
+    """Remove only an intact Headroom-generated block, preserving user edits."""
+    if not file_path.exists():
+        return
+    text = _read_text(file_path)
+    if block in text:
+        updated = text.replace("\n\n" + block, "").replace(block, "")
+        _write_text(file_path, updated)
+
+
+def _inject_enola_instructions(file_path: Path) -> None:
+    if not _serena_instructions_opt_in():
+        return
+    text = _read_text(file_path) if file_path.exists() else ""
+    if "<!-- headroom:enola-instructions -->" in text:
+        return
+    _write_text(file_path, text + ("\n\n" if text else "") + ENOLA_INSTRUCTIONS_BLOCK)
+    click.echo(f"  Enola instructions injected into {file_path}")
+
+
 def _serena_instruction_file(registrar: Any) -> Path:
     """Resolve the project instruction file the agent reads for guidance.
 
@@ -2894,7 +2955,7 @@ def _index_serena_project(*, verbose: bool = False) -> None:
 
 def _setup_serena_mcp(
     registrar: Any, *, context: str, verbose: bool = False, force: bool = False
-) -> None:
+) -> bool:
     """Register Serena MCP with the given agent (idempotent).
 
     A prior ``headroom wrap`` may have persisted a Serena entry built from an
@@ -2916,11 +2977,11 @@ def _setup_serena_mcp(
     if not registrar.detect():
         if verbose:
             click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
-        return
+        return False
 
     if shutil.which("uvx") is None:
         click.echo("  Serena MCP: uvx not found — install uv/uvx to enable Serena; skipping")
-        return
+        return False
 
     # Serena is a real launch now — make sure it won't pop a browser tab.
     _ensure_serena_dashboard_disabled(verbose=verbose)
@@ -2972,6 +3033,9 @@ def _setup_serena_mcp(
     if line is not None:
         click.echo(line)
 
+    if not result.ok:
+        return False
+
     # Say where it landed, so the scope is discoverable without reading docs.
     # Only on an actual write (or in verbose): re-wraps should stay quiet.
     if result.status == RegisterStatus.REGISTERED or verbose:
@@ -2998,8 +3062,9 @@ def _setup_serena_mcp(
     if skip_reason is not None:
         if verbose:
             click.echo(f"  Serena: skipping pre-index ({skip_reason})")
-        return
+        return True
     _index_serena_project(verbose=verbose)
+    return True
 
 
 def _echo_serena_scope_note(registrar: Any) -> None:
@@ -3020,6 +3085,11 @@ def _echo_serena_scope_note(registrar: Any) -> None:
 
 
 def _retire_user_scope_serena(registrar: Any) -> None:
+    """Retire the legacy global Serena entry after project registration."""
+    _retire_user_scope_code_memory(registrar, "serena")
+
+
+def _retire_user_scope_code_memory(registrar: Any, name: str) -> None:
     """Remove a machine-wide Serena entry left by a pre-#2787 wrap.
 
     Headroom used to register Serena at Claude Code's user scope, where a
@@ -3040,25 +3110,30 @@ def _retire_user_scope_serena(registrar: Any) -> None:
     if getattr(registrar, "scope", None) != SCOPE_LOCAL:
         return
     try:
-        global_entry = registrar.get_server("serena", scope=SCOPE_USER)
+        global_entry = registrar.get_server(name, scope=SCOPE_USER)
     except TypeError:  # registrar predates scoped reads
         return
     if not headroom_installed_matching(registrar.name, global_entry):
         return
-    if registrar.unregister_server("serena", scope=SCOPE_USER):
+    if registrar.unregister_server(name, scope=SCOPE_USER):
         # Clear the legacy ledger record along with the config entry it
         # authorized — otherwise its fingerprint outlives the migration and
         # can later be mistaken for proof that Headroom owns a same-named
         # entry the user installs globally themselves.
-        clear_install(registrar.name, "serena")
+        clear_install(registrar.name, name)
         click.echo(
-            "  Serena MCP: removed the machine-wide entry an earlier wrap installed "
+            f"  {name.capitalize()} MCP: removed the machine-wide entry an earlier wrap installed "
             "(it now loads only in this project)"
         )
 
 
 def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     """Remove Serena MCP only if the ledger proves Headroom installed it."""
+    return _remove_headroom_installed_code_memory_mcp(registrar, "serena")
+
+
+def _remove_headroom_installed_code_memory_mcp(registrar: Any, name: str) -> str:
+    """Remove a backend only while its scope-specific ownership still matches."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
 
     # Claude can own one Serena entry per project plus a legacy user entry.
@@ -3069,33 +3144,35 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
 
         found_owned = False
         for scope in (SCOPE_LOCAL, SCOPE_USER):
-            current = registrar.get_server("serena", scope=scope)
-            ownership_key = registrar.ownership_key("serena", scope=scope)
+            current = registrar.get_server(name, scope=scope)
+            ownership_key = registrar.ownership_key(name, scope=scope)
             if current is None:
                 # Nothing left to protect — an ownership record must not
                 # outlive the entry it authorized.
-                clear_install(registrar.name, "serena", ownership_key=ownership_key)
+                clear_install(registrar.name, name, ownership_key=ownership_key)
                 continue
             if not headroom_installed_matching(
                 registrar.name, current, ownership_key=ownership_key
             ):
                 continue
             found_owned = True
-            if not registrar.unregister_server("serena", scope=scope):
+            if not registrar.unregister_server(name, scope=scope):
                 return "failed"
-            clear_install(registrar.name, "serena", ownership_key=ownership_key)
+            clear_install(registrar.name, name, ownership_key=ownership_key)
         return "removed" if found_owned else "not_headroom_owned"
 
-    current = registrar.get_server("serena")
+    current = registrar.get_server(name)
     if not headroom_installed_matching(registrar.name, current):
         return "not_headroom_owned"
-    if registrar.unregister_server("serena"):
-        clear_install(registrar.name, "serena")
+    if registrar.unregister_server(name):
+        clear_install(registrar.name, name)
         return "removed"
     return "failed"
 
 
-def _disable_serena_mcp(registrar: Any, *, verbose: bool = False, explicit: bool = True) -> None:
+def _disable_serena_mcp(
+    registrar: Any, *, verbose: bool = False, explicit: bool = True, reason: str | None = None
+) -> None:
     """Actively disable a Headroom-installed Serena entry, not merely skip it.
 
     Serena used to be registered by default, so a prior ``headroom wrap``
@@ -3106,7 +3183,7 @@ def _disable_serena_mcp(registrar: Any, *, verbose: bool = False, explicit: bool
     untouched, and only reported when the user opted out (``explicit``) or
     asked for ``verbose`` output — otherwise every default wrap would say so.
     """
-    reason = (
+    reason = reason or (
         "--code-memory none / HEADROOM_CODE_MEMORY=none"
         if explicit
         else "Serena is now off by default; pass --code-memory serena to keep it"
@@ -3207,6 +3284,66 @@ def _code_memory_opted_out(kwargs: dict[str, Any]) -> bool:
     return bool(os.environ.get(_CODE_MEMORY_ENV, "").strip() or kwargs.get("no_serena"))
 
 
+def _setup_enola_mcp(registrar: Any, *, verbose: bool = False) -> bool:
+    """Register Enola, updating only a matching Headroom-owned installation."""
+    from headroom.mcp_registry import build_enola_spec, format_result
+    from headroom.mcp_registry.base import RegisterStatus
+    from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
+
+    if not registrar.detect():
+        return False
+    try:
+        spec = build_enola_spec()
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    ownership_key = getattr(registrar, "ownership_key", lambda name: name)("enola")
+    result = registrar.register_server(spec)
+    owned_update = result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
+        registrar.name, registrar.get_server("enola"), ownership_key=ownership_key
+    )
+    if owned_update:
+        result = registrar.register_server(spec, force=True)
+    line = format_result(
+        registrar.name,
+        result,
+        label="Enola MCP",
+        verbose=verbose,
+        overwrite_hint="update or remove the existing enola MCP entry, then rerun headroom wrap",
+    )
+    if line:
+        click.echo(line)
+    if not result.ok:
+        return False
+    _retire_user_scope_code_memory(registrar, "enola")
+    if result.status == RegisterStatus.REGISTERED or owned_update:
+        # A successful forced reconciliation remains ours even if a registrar
+        # reports ALREADY (for example, another writer completed the same update).
+        record_install(registrar.name, spec, ownership_key=ownership_key)
+        if getattr(registrar, "scope", None) == "local":
+            click.echo(
+                "    Enola MCP scoped to this project (--code-memory-scope user for all projects)"
+            )
+    return True
+
+
+def _disable_enola_mcp(registrar: Any, *, explicit: bool = True, verbose: bool = False) -> str:
+    """Shared switch/unwrap cleanup, preserving user-managed Enola entries."""
+    if not registrar.detect():
+        return "not_detected"
+    status = _remove_headroom_installed_code_memory_mcp(registrar, "enola")
+    if status == "removed":
+        click.echo("  Removed Headroom-installed Enola MCP; restart the agent if already running.")
+    elif status == "failed":
+        click.echo("  Enola MCP matched Headroom ledger but could not be removed.")
+    elif registrar.get_server("enola") is not None and (explicit or verbose):
+        click.echo("  Enola MCP is user-managed — leaving it in place.")
+    if status != "failed" and registrar.get_server("enola") is None:
+        _remove_code_memory_instructions(
+            _serena_instruction_file(registrar), ENOLA_INSTRUCTIONS_BLOCK
+        )
+    return status
+
+
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
     """Set up the code-memory MCP, selected via ``--code-memory`` (default none).
 
@@ -3214,6 +3351,7 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 
     * ``none`` (default) — register nothing; remove a Serena entry Headroom installed.
     * ``serena`` — register Serena (offline, symbol-level).
+    * ``enola`` — register the installed Enola code/architecture MCP.
 
     Either way, any Headroom-installed ``tokensave`` entry from a prior release
     is removed (tokensave was retired in favour of Serena). The deprecated
@@ -3229,9 +3367,22 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 
     if selection == _CODE_MEMORY_NONE:
         _disable_serena_mcp(registrar, verbose=verbose, explicit=_code_memory_opted_out(kwargs))
+        _disable_enola_mcp(registrar, explicit=_code_memory_opted_out(kwargs), verbose=verbose)
+        instruction_file = _serena_instruction_file(registrar)
+        _remove_code_memory_instructions(instruction_file, SERENA_INSTRUCTIONS_BLOCK)
+        _remove_code_memory_instructions(instruction_file, ENOLA_INSTRUCTIONS_BLOCK)
         return
 
-    _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
+    if selection == _CODE_MEMORY_ENOLA:
+        if _setup_enola_mcp(registrar, verbose=verbose):
+            _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory enola")
+            instruction_file = _serena_instruction_file(registrar)
+            _remove_code_memory_instructions(instruction_file, SERENA_INSTRUCTIONS_BLOCK)
+            _inject_enola_instructions(instruction_file)
+        return
+
+    if _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force):
+        _disable_enola_mcp(registrar)
 
 
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
@@ -6493,6 +6644,7 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
+@_code_memory_instructions_option
 # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
 @proxy_port_option("--port")
 @click.option(
@@ -7109,6 +7261,7 @@ def unwrap_claude(
             removed_headroom = registrar.unregister_server("headroom")
             removed_code_graph = registrar.unregister_server(_CBM_MCP_SERVER_NAME)
             tokensave_status = _remove_headroom_installed_tokensave_mcp(registrar)
+            _disable_enola_mcp(registrar)
             serena_status = _remove_headroom_installed_serena_mcp(registrar)
             if removed_headroom:
                 click.echo("  Removed Headroom MCP retrieve tool from Claude.")
@@ -7953,6 +8106,7 @@ def _run_codex_wrap(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
+@_code_memory_instructions_option
 @proxy_port_option()
 @click.option(
     "--no-mcp",
@@ -8275,6 +8429,7 @@ def kimi(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
+@_code_memory_instructions_option
 @proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @_code_memory_option
@@ -9098,6 +9253,7 @@ def openclaw(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
+@_code_memory_instructions_option
 @proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @_code_memory_option
@@ -9268,9 +9424,7 @@ def opencode(
 
     from headroom.mcp_registry import OpencodeRegistrar
 
-    # Serena ships no "opencode" context (only agent/codex/claude-code/ide/…);
-    # passing --context opencode crashes Serena on launch (#1549/#1572). Use
-    # the generic "agent" context, which OpenCode is.
+    # OpenCode uses Serena's generic agent context when that backend is selected.
     _setup_coding_compressor(
         OpencodeRegistrar(),
         serena_context="agent",
@@ -9509,6 +9663,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     if opencode_registrar.detect():
         if opencode_registrar.unregister_server("headroom"):
             click.echo("  Removed Headroom MCP server from OpenCode.")
+        _disable_enola_mcp(opencode_registrar)
         serena_status = _remove_headroom_installed_serena_mcp(opencode_registrar)
         if serena_status == "removed":
             click.echo("  Removed Headroom-installed Serena MCP server from OpenCode.")
@@ -9721,6 +9876,7 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
         elif tokensave_status == "failed":
             click.echo("  tokensave MCP server matched Headroom ledger but could not be removed.")
 
+        _disable_enola_mcp(codex_registrar)
         serena_status = _remove_headroom_installed_serena_mcp(codex_registrar)
         if serena_status == "removed":
             click.echo("  Removed Headroom-installed Serena MCP server from Codex.")
@@ -9970,6 +10126,8 @@ def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
         elif tokensave_status == "failed":
             click.echo("  tokensave MCP server matched Headroom ledger but could not be removed.")
 
+        if _disable_enola_mcp(grok_registrar) == "removed":
+            removed_any = True
         serena_status = _remove_headroom_installed_serena_mcp(grok_registrar)
         if serena_status == "removed":
             click.echo("  Removed Headroom-installed Serena MCP server from Grok.")
