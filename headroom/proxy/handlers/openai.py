@@ -56,6 +56,7 @@ from headroom.proxy.savings_attribution import from_tags as savings_from_tags
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
+    accumulate_tool_schema_tags,
     net_hook_tool_saving,
     tool_schema_saved_from_tags,
     without_deferral_flags,
@@ -8006,6 +8007,9 @@ class OpenAIHandlerMixin:
         # keeps running and must not book rows for a frame sent uncompressed.
         # Coalesced per source by ``accumulate_savings``, so it stays small.
         ws_turn_savings: list[dict[str, Any]] = []
+        # The same frames' tool-schema savings tags (TOOL_SCHEMA_SAVINGS_TAGS),
+        # summed. Additive to ``tokens_saved``; pending under the same rule.
+        ws_turn_tool_tags: dict[str, int] = {}
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -9180,6 +9184,7 @@ class OpenAIHandlerMixin:
                                 accumulate_savings(
                                     ws_turn_savings, savings_from_tags(_frame_savings)
                                 )
+                                accumulate_tool_schema_tags(ws_turn_tool_tags, _frame_savings)
                                 ws_conversation_tokens_saved = int(_ws_saved)
                                 ws_conversation_key = savings_conversation_key(
                                     _send_body, session_id=f"ws:{session_id}"
@@ -9700,6 +9705,7 @@ class OpenAIHandlerMixin:
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
                         accumulate_savings(ws_turn_savings, savings_from_tags(frame_savings))
+                        accumulate_tool_schema_tags(ws_turn_tool_tags, frame_savings)
                         ws_conversation_tokens_saved = int(frame_saved)
                         ws_conversation_key = savings_conversation_key(
                             new_inner, session_id=f"ws:{session_id}"
@@ -10065,14 +10071,22 @@ class OpenAIHandlerMixin:
                             # slice WS turns by tag — same surface
                             # as HTTP turns.
                             # Same gate as ``saved_delta``: a usage-less turn
-                            # leaves its rows pending for a usage-carrying one.
+                            # leaves its rows, tool-schema tags and transform
+                            # labels pending for a usage-carrying one. Labels
+                            # are per turn: the output-savings ledger reads a
+                            # shaping label as "this outcome's output was
+                            # shaped", so one turn's label must not repeat on
+                            # every later turn of the session.
                             turn_tags = ws_tags
-                            if ws_turn_savings and input_delta > 0:
-                                turn_tags = {
-                                    **ws_tags,
-                                    SAVINGS_ATTRIBUTION_TAG: list(ws_turn_savings),
-                                }
+                            turn_transforms: tuple[str, ...] = ()
+                            if input_delta > 0:
+                                turn_tags = {**ws_tags, **ws_turn_tool_tags}
+                                if ws_turn_savings:
+                                    turn_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
+                                turn_transforms = tuple(transforms_applied)
                                 ws_turn_savings.clear()
+                                ws_turn_tool_tags.clear()
+                                transforms_applied.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -10097,7 +10111,7 @@ class OpenAIHandlerMixin:
                                     overhead_ms=overhead_delta_ms,
                                     ttfb_ms=ttfb_for_record_ms,
                                     pipeline_timing=dashboard_pipeline_timing,
-                                    transforms_applied=tuple(transforms_applied),
+                                    transforms_applied=turn_transforms,
                                     num_messages=len(
                                         body.get("messages") or body.get("input") or []
                                     )
@@ -10729,10 +10743,13 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
-            if ws_turn_savings and residual_input_tokens > 0:
-                # Rows no per-turn record claimed ride with the residual, under
-                # the same input-usage gate as ``residual_tokens_saved``.
-                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
+            # Rows, tool-schema tags and labels no per-turn record claimed ride
+            # with the residual, under the same input-usage gate as
+            # ``residual_tokens_saved``.
+            if residual_input_tokens > 0:
+                ws_session_tags.update(ws_turn_tool_tags)
+                if ws_turn_savings:
+                    ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
@@ -10786,7 +10803,9 @@ class OpenAIHandlerMixin:
                         overhead_ms=final_overhead_delta_ms,
                         ttfb_ms=final_ttfb_ms,
                         pipeline_timing=final_pipeline_timing,
-                        transforms_applied=tuple(transforms_applied),
+                        transforms_applied=tuple(transforms_applied)
+                        if residual_input_tokens > 0
+                        else (),
                         tags=ws_session_tags,
                         conversation_key=ws_conversation_key,
                         conversation_tokens_saved=ws_conversation_tokens_saved,
