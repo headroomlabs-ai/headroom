@@ -132,8 +132,9 @@ def load_openai_encodings() -> dict[str, str]:
     counter from this, so a malformed ``pricing`` or ``context_limits`` section
     must not change how Claude or Gemini are counted, and ``OpenAIProvider``
     uses it too, so the provider and the registry always agree on a model's
-    encoding. Anything unusable in the encodings themselves is skipped with a
-    warning.
+    encoding. Anything unusable (unreadable source, invalid JSON, non-object
+    sections, non-string encodings) is skipped with a warning; this never
+    raises.
     """
     encodings: dict[str, str] = {}
 
@@ -143,7 +144,12 @@ def load_openai_encodings() -> dict[str, str]:
             _encodings_from(_ENV_VAR, partial(_read_env_config, env_config), env_source=True)
         )
 
-    config_file = _models_config_file()
+    try:
+        config_file = _models_config_file()
+    except Exception as e:
+        # Path.exists() raises PermissionError on Python 3.11/3.12.
+        logger.warning("Ignoring model encodings from models.json: %s", e)
+        config_file = None
     if config_file is not None:
         for model, encoding in _encodings_from(
             str(config_file), partial(_read_json_file, config_file), env_source=False
@@ -162,7 +168,9 @@ def _encodings_from(source: str, read: Callable[[], Any], *, env_source: bool) -
     """
     try:
         loaded = read()
-    except (ValueError, OSError) as e:
+    except Exception as e:
+        # Broad on purpose: besides ValueError/OSError, deeply nested JSON
+        # raises RecursionError. Every model's counter depends on this read.
         logger.warning("Ignoring model encodings from %s: %s", source, e)
         return {}
     if not isinstance(loaded, dict):

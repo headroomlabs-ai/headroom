@@ -370,6 +370,34 @@ def test_the_configuration_is_read_once_even_when_malformed(
     assert len(reads) == 2
 
 
+def test_deeply_nested_settings_leave_every_model_on_its_own_counter(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deep nesting makes ``json.loads`` raise RecursionError, not ValueError."""
+    depth = 100_000
+    monkeypatch.setenv("HEADROOM_MODEL_LIMITS", "[" * depth + "]" * depth)
+    _assert_ordinary_counters()
+
+
+def test_an_unreadable_config_dir_leaves_every_model_on_its_own_counter(
+    _isolated_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.exists()`` raises PermissionError on Python 3.11/3.12."""
+    from headroom import paths
+
+    class _Unreadable:
+        def exists(self) -> bool:
+            raise PermissionError("denied")
+
+    monkeypatch.setattr(paths, "models_config_path", lambda: _Unreadable())
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", json.dumps({"openai": {"encodings": {ALIAS: "cl100k_base"}}})
+    )
+
+    _assert_ordinary_counters()
+    assert get_tokenizer(ALIAS).encoding_name == "cl100k_base"
+
+
 GATEWAY_GPT4 = "gpt-4-gateway"
 
 
