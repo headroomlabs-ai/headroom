@@ -1682,6 +1682,7 @@ def payload_tokens(text: str) -> int:
     if _payload_encoder is None:
         try:
             from headroom.tokenizers.tiktoken_counter import load_encoding
+
             _payload_encoder = load_encoding("cl100k_base")
         except Exception:
             _payload_encoder = False

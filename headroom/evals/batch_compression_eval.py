@@ -1354,6 +1354,7 @@ def evaluate_token_counting_accuracy(
         # against a reference tokenizer.
         try:
             from headroom.tokenizers.tiktoken_counter import load_encoding
+
             enc = load_encoding("cl100k_base")
             actual = len(enc.encode(text))
         except Exception:
