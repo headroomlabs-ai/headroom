@@ -150,6 +150,31 @@ class TestClaudeCodeParser:
         assert parsed.file_hash
         assert len(parsed.file_hash) == 64
 
+    @pytest.mark.parametrize(
+        "fence",
+        ["```", "~~~", "````"],
+        ids=["backticks", "tildes", "four_backticks"],
+    )
+    def test_ignores_headings_and_bullets_inside_fenced_code_blocks(self, fence):
+        inner_fence = "\n```yaml\n## nested\n- nested_item\n```" if fence == "````" else ""
+        content = (
+            "# Project Memory\n\n"
+            "## Deploy\n"
+            f"{fence}bash\n"
+            "# Restart service\n"
+            "systemctl restart headroom\n"
+            "- not a bullet\n"
+            f"{inner_fence}\n"
+            f"{fence}\n"
+            "- Check logs after restart\n"
+        )
+        parsed = parse_claude_code_memory(content)
+        headings = [s.heading for s in parsed.sections if s.heading]
+        assert headings == ["Project Memory", "Deploy"]
+        deploy = parsed.sections[1]
+        assert "# Restart service" in deploy.content
+        assert deploy.facts == ["Check logs after restart"]
+
 
 class TestChatGPTParser:
     def test_parse_flat_facts(self):
@@ -187,6 +212,24 @@ class TestGenericParser:
         # "The system uses FastAPI..." and bullets should all be facts
         assert len(arch.facts) >= 3
 
+    def test_ignores_headings_and_fence_lines_inside_fenced_code_blocks(self):
+        content = (
+            "# Notes\n\n"
+            "## Deploy\n"
+            "Run the deploy script:\n"
+            "```bash\n"
+            "# Restart service\n"
+            "systemctl restart headroom\n"
+            "```\n"
+            "- Verify health endpoint\n"
+        )
+        parsed = parse_generic_markdown(content)
+        headings = [s.heading for s in parsed.sections if s.heading]
+        assert headings == ["Notes", "Deploy"]
+        deploy = parsed.sections[1]
+        assert "# Restart service" in deploy.content
+        assert deploy.facts == ["Run the deploy script:", "Verify health endpoint"]
+
 
 class TestFormatDetection:
     def test_detect_claude_code(self):
@@ -201,6 +244,16 @@ class TestFormatDetection:
 
     def test_empty_content(self):
         assert detect_format("") == "generic"
+
+    def test_ignores_fenced_code_when_detecting_claude_code(self):
+        content = (
+            "```markdown\n"
+            "## Heading Inside Code\n"
+            "- bullet inside code\n"
+            "```\n"
+            "This is a long prose explanation that continues for more than one hundred and twenty characters to avoid looking like ChatGPT facts."
+        )
+        assert detect_format(content) == "generic"
 
 
 class TestAutoParser:

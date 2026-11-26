@@ -210,8 +210,35 @@ def extract_relationships_from_section(
 
 
 # ---------------------------------------------------------------------------
-# Format detection
+# Format detection & fenced code blocks
 # ---------------------------------------------------------------------------
+
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _next_fence_state(
+    line: str,
+    active_fence: tuple[str, int] | None,
+) -> tuple[tuple[str, int] | None, bool]:
+    """Update CommonMark fenced code block state for a single line.
+
+    Returns ``(new_fence_state, is_fence_or_inside)`` where the boolean is
+    True for opening/closing fence lines and any lines inside a fence.
+    """
+    if active_fence is None:
+        match = _FENCE_OPEN_RE.match(line)
+        if not match:
+            return None, False
+        marker, info = match.group(1), match.group(2)
+        fence_char = marker[0]
+        if fence_char == "`" and "`" in info:
+            return None, False
+        return (fence_char, len(marker)), True
+
+    fence_char, min_len = active_fence
+    if re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{min_len},}}[ \t]*$", line):
+        return None, True
+    return active_fence, True
 
 
 def detect_format(content: str) -> str:
@@ -228,17 +255,20 @@ def detect_format(content: str) -> str:
     has_bullets = False
     short_line_count = 0
     total_lines = 0
+    fence: tuple[str, int] | None = None
 
     for line in lines:
+        fence, in_fence = _next_fence_state(line, fence)
         stripped = line.strip()
         if not stripped:
             continue
         total_lines += 1
 
-        if stripped.startswith("## "):
-            has_h2_headers = True
-        if stripped.startswith("- "):
-            has_bullets = True
+        if not in_fence:
+            if stripped.startswith("## "):
+                has_h2_headers = True
+            if stripped.startswith("- "):
+                has_bullets = True
         if len(stripped) < 120:
             short_line_count += 1
 
@@ -295,7 +325,11 @@ def parse_claude_code_memory(content: str, file_path: str = "") -> ParsedFile:
             return
 
         facts = []
+        fact_fence: tuple[str, int] | None = None
         for line in current_lines:
+            fact_fence, in_fence = _next_fence_state(line, fact_fence)
+            if in_fence:
+                continue
             stripped = line.strip()
             if stripped.startswith("- "):
                 fact = stripped[2:].strip()
@@ -315,8 +349,10 @@ def parse_claude_code_memory(content: str, file_path: str = "") -> ParsedFile:
             )
         )
 
+    fence: tuple[str, int] | None = None
     for line in content.splitlines():
-        header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+        fence, in_fence = _next_fence_state(line, fence)
+        header_match = None if in_fence else re.match(r"^(#{1,6})\s+(.+)$", line)
         if header_match:
             flush_section()
             current_level = len(header_match.group(1))
@@ -407,7 +443,11 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
             return
 
         facts = []
+        fact_fence: tuple[str, int] | None = None
         for line in current_lines:
+            fact_fence, in_fence = _next_fence_state(line, fact_fence)
+            if in_fence:
+                continue
             stripped = line.strip()
             if stripped.startswith("- "):
                 fact = stripped[2:].strip()
@@ -430,8 +470,10 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
             )
         )
 
+    fence: tuple[str, int] | None = None
     for line in content.splitlines():
-        header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+        fence, in_fence = _next_fence_state(line, fence)
+        header_match = None if in_fence else re.match(r"^(#{1,6})\s+(.+)$", line)
         if header_match:
             flush_section()
             current_level = len(header_match.group(1))
