@@ -217,6 +217,7 @@ _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _ATX_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$")
 _PRE_OPEN_RE = re.compile(r"^ {0,3}<pre(?:\s|>|$)", re.IGNORECASE)
 _PRE_CLOSE_RE = re.compile(r"</pre>", re.IGNORECASE)
+_THEMATIC_BREAK_RE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 _LIST_ITEM_RE = re.compile(r"^( {0,3})([-+*]|\d{1,9}[.)])(?:([ \t]+).*|[ \t]*)$")
 
 
@@ -225,7 +226,9 @@ class _BlockState:
     fence: tuple[str, int] | None = None
     fence_indent: int = 0
     in_pre: bool = False
+    pre_indent: int = 0
     list_indent: int | None = None
+    block_id: int = 0
 
 
 def _next_fence_state(
@@ -280,14 +283,21 @@ def _advance_block_state(
             return True, None
 
     if state.in_pre:
-        if _PRE_CLOSE_RE.search(line):
+        if stripped and leading < state.pre_indent:
+            # Dedented non-blank line closes the enclosing list item and its <pre> block.
             state.in_pre = False
-        return True, None
+            state.pre_indent = 0
+            state.list_indent = None
+        else:
+            if _PRE_CLOSE_RE.search(line):
+                state.in_pre = False
+                state.pre_indent = 0
+            return True, None
 
     if state.list_indent is not None and stripped and leading < state.list_indent:
         state.list_indent = None
 
-    if state.list_indent is None:
+    if state.list_indent is None and not _THEMATIC_BREAK_RE.match(line):
         list_match = _LIST_ITEM_RE.match(line)
         if list_match:
             lead, marker, sep = list_match.group(1), list_match.group(2), list_match.group(3)
@@ -299,11 +309,14 @@ def _advance_block_state(
     inner_line = line[container_indent:] if container_indent else line
 
     if _PRE_OPEN_RE.match(inner_line):
+        state.block_id += 1
         state.in_pre = not bool(_PRE_CLOSE_RE.search(inner_line))
+        state.pre_indent = container_indent if state.in_pre else 0
         return True, None
 
     next_fence, in_fence = _next_fence_state(inner_line, None)
     if in_fence:
+        state.block_id += 1
         state.fence = next_fence
         state.fence_indent = container_indent
         return True, None
@@ -520,9 +533,14 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
         facts: list[str] = []
         fact_state = _BlockState()
         block_buf: list[str] = []
+        active_block_id = 0
         for line in current_lines:
             in_block, _ = _advance_block_state(line, fact_state)
             if in_block:
+                if block_buf and fact_state.block_id != active_block_id:
+                    facts.append("\n".join(block_buf))
+                    block_buf = []
+                active_block_id = fact_state.block_id
                 block_buf.append(line)
                 if fact_state.fence is None and not fact_state.in_pre:
                     facts.append("\n".join(block_buf))

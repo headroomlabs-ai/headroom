@@ -275,6 +275,27 @@ class TestGenericParser:
         assert parsed.format == "generic"
         assert parsed.sections[0].facts == ["Short note"]
 
+    def test_dedenting_out_of_list_pre_block_restores_following_headings(self):
+        content = "## Deployment\n- Example\n  <pre>\n  sample\n## Next\n- Done\n"
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections] == ["Deployment", "Next"]
+        assert parsed.sections[1].facts == ["Done"]
+
+    def test_thematic_break_does_not_hide_following_indented_heading(self):
+        content = "## First\n* * *\n  ## Second\n- Kept\n"
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections] == ["First", "Second"]
+        assert parsed.sections[1].facts == ["Kept"]
+
+    def test_dedented_fence_following_unclosed_list_fence_stays_separate_fact(self):
+        content = "- Item\n  ```bash\n  echo 1\n```python\nprint(2)\n```\n"
+        parsed = parse_generic_markdown(content)
+        assert parsed.sections[0].facts == [
+            "Item",
+            "  ```bash\n  echo 1",
+            "```python\nprint(2)\n```",
+        ]
+
 
 class TestFormatDetection:
     def test_detect_claude_code(self):
