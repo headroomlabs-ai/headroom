@@ -19,10 +19,10 @@
   "input_sha256": "b8fa00d165cd059a0549473920e4d61bcbde3980257d328f2cbc76fc3a3db787",
   "output": {
     "cache_key": null,
-    "compressed": "use std::collections::HashMap;\n\npub struct Processor {\n    name: String,\n    count: u32,\n}\n#[derive(Debug)]\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nimpl Processor {\n    pub fn new(name: String) -> Self {\n        Self { name, count: 0 }\n    }\n    pub fn process(&mut self, items: Vec<String>) -> Vec<String> {\n        let mut results = Vec::new();\n        // [9 lines omitted; calls: new]\n    }\n}\n\nfn main() {\n    let mut p = Processor::new(\"main\".to_string());\n    // [1 lines omitted; calls: Processor, new, process]\n}\n\n// variant 1",
+    "compressed": "use std::collections::HashMap;\n\npub struct Processor {\n    name: String,\n    count: u32,\n}\n\nimpl Processor {\n    pub fn new(name: String) -> Self {\n        Self { name, count: 0 }\n    }\n    pub fn process(&mut self, items: Vec<String>) -> Vec<String> {\n        let mut results = Vec::new();\n        // [9 lines omitted; calls: new]\n    }\n}\n\n#[derive(Debug)]\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nfn main() {\n    let mut p = Processor::new(\"main\".to_string());\n    // [1 lines omitted; calls: Processor, new, process]\n}\n\n// variant 1",
     "compressed_bodies": 0,
-    "compressed_tokens": 134,
-    "compression_ratio": 0.7403314917127072,
+    "compressed_tokens": 135,
+    "compression_ratio": 0.7458563535911602,
     "language": "rust",
     "language_confidence": 1.0,
     "original": "use std::collections::HashMap;\n\npub struct Processor {\n    name: String,\n    count: u32,\n}\n\nimpl Processor {\n    pub fn new(name: String) -> Self {\n        Self { name, count: 0 }\n    }\n\n    pub fn process(&mut self, items: Vec<String>) -> Vec<String> {\n        let mut results = Vec::new();\n        for item in items {\n            if item.is_empty() {\n                continue;\n            }\n            let clean = item.trim().to_lowercase();\n            results.push(clean);\n            self.count += 1;\n        }\n        results\n    }\n}\n\n#[derive(Debug)]\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nfn main() {\n    let mut p = Processor::new(\"main\".to_string());\n    println!(\"{:?}\", p.process(vec![]));\n}\n\n// variant 1",
@@ -37,6 +37,6 @@
     },
     "syntax_valid": true
   },
-  "recorded_at": "2026-11-21T08:10:00.968330+00:00",
+  "recorded_at": "2026-11-26T02:33:02.811526+00:00",
   "transform": "code_aware_compressor"
 }

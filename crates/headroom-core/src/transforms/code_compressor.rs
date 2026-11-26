@@ -280,7 +280,9 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             // Inline modules (`mod tests { ... }`); `mod name;` has no body.
             container_node_types: &["mod_item"],
             prefix_wrapper_node_types: &[],
-            source_ordered: false,
+            // `macro_rules!` is textually scoped: grouping moved a function or
+            // module above the macro it invokes.
+            source_ordered: true,
         },
         CodeLanguage::Java => LangConfig {
             import_nodes: &["import_declaration"],
@@ -2139,7 +2141,14 @@ impl<'a> Ctx<'a> {
         // the line-based rebuild below would repeat a one-line body after its
         // header, and take in any sibling on the same line.
         let Some(body_node) = body_node.filter(|_| start_row != node.end_position().row) else {
-            return self.exact_node_lines(node).join("\n");
+            let mut text = self.exact_node_lines(node).join("\n");
+            // C++ `class S {};`: the `;` is a sibling of the class node, and the
+            // extractor marks it captured with the class, so it must be emitted
+            // here or the output loses it and fails validation.
+            if same_line_trailing_semicolon(node).is_some() {
+                text.push(';');
+            }
+            return text;
         };
 
         let node_start_line = start_row;
@@ -2166,26 +2175,68 @@ impl<'a> Ctx<'a> {
         // Rows the header already emitted: a member on the brace line
         // (`namespace a { int x;`) must not be emitted again.
         let mut last_processed_end: i64 = (node_start_line + header_lines.len()) as i64 - 1;
+        // The closing-brace row is emitted whole after the members, so a member
+        // that ends on it (`int f() { return 1; } }`) must not be emitted again.
+        let closing_row: Option<usize> = (!self.lang.uses_colon_after_signature
+            && body_node.end_position().row != start_row)
+            .then(|| body_node.end_position().row);
+
+        let rows = |member: Node| -> (usize, usize) {
+            let first = member.start_position().row;
+            let mut last = member.end_position().row;
+            if member.end_position().column == 0 && last > first {
+                last -= 1;
+            }
+            (first, last)
+        };
+
+        // Rows are emitted whole and each row at most once. Members that share
+        // a row (`void ping() {} int version = 1;`, `x = 1; y = 2`) form one
+        // group: compressing one of them on its own would cut its siblings out
+        // of the shared row, so the group's rows are kept verbatim instead. A
+        // trailing comment on a member's last row stays with that member.
+        let mut groups: Vec<(Vec<Node>, usize, usize)> = Vec::new();
         let mut bcursor = body_node.walk();
         for child in body_node.children(&mut bcursor) {
             if !child.is_named() {
                 continue;
             }
-            let ck = child.kind();
-            let mut child_start = child.start_position().row;
-            let mut child_end = child.end_position().row;
-            if child.end_position().column == 0 && child_end > child_start {
-                child_end -= 1;
-            }
-            // Statements can share a physical line: skip rows already
-            // emitted, keeping any continuation lines of this node.
-            if child_start as i64 <= last_processed_end {
-                child_start = (last_processed_end + 1) as usize;
-                if child_start > child_end {
-                    continue;
+            let (first, last) = rows(child);
+            match groups.last_mut() {
+                Some((members, _, group_last)) if first <= *group_last => {
+                    members.push(child);
+                    *group_last = (*group_last).max(last);
                 }
+                _ => groups.push((vec![child], first, last)),
             }
-            last_processed_end = child_end as i64;
+        }
+
+        for (members, group_first, group_last) in groups {
+            let is_comment = |member: &Node| COMMENT_NODE_TYPES.contains(&member.kind());
+            let owns_rows = !is_comment(&members[0])
+                && members[1..].iter().all(is_comment)
+                && group_first as i64 > last_processed_end
+                && !matches!(closing_row, Some(closing) if group_last >= closing);
+            if !owns_rows {
+                let verbatim_first = (last_processed_end + 1).max(group_first as i64);
+                let mut verbatim_last = group_last as i64;
+                if let Some(closing) = closing_row {
+                    if verbatim_last >= closing as i64 {
+                        verbatim_last = closing as i64 - 1;
+                    }
+                }
+                if verbatim_first <= verbatim_last {
+                    body_parts
+                        .push(self.lines_joined(verbatim_first as usize, verbatim_last as usize));
+                }
+                last_processed_end = last_processed_end.max(group_last as i64);
+                continue;
+            }
+
+            let child = members[0];
+            let ck = child.kind();
+            let (child_start, child_end) = rows(child);
+            last_processed_end = group_last as i64;
             let child_text = self.lines_joined(child_start, child_end);
 
             if self.lang.is_function(ck) {
@@ -2827,6 +2878,152 @@ def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n   
                 r.compressed
             );
             assert!(parses(&r.compressed, lang));
+        }
+    }
+
+    fn java_work() -> String {
+        format!(
+            "    void work() {{\n        int n = 0;\n{}\n    }}\n",
+            body("        n += 1;", 100)
+        )
+    }
+
+    /// Members that share a physical row with a sibling, the container's
+    /// header or its closing brace (mirrors `SHARED_ROW_MEMBERS` in
+    /// tests/test_code_compressor_wrapper_nodes.py). Compressing one such
+    /// member on its own used to drop the sibling from the shared row or
+    /// repeat the member before the closing brace.
+    #[test]
+    fn members_sharing_a_row_appear_once() {
+        let cases: Vec<(&str, &str, String, Vec<&str>)> = vec![
+            (
+                "rust-fn-and-const-in-mod",
+                "rust",
+                format!(
+                    "mod n {{\n    fn f() {{}} pub const X: i32 = 2;\n}}\n\n{}",
+                    rust_work()
+                ),
+                vec!["fn f() {}", "pub const X: i32 = 2;"],
+            ),
+            (
+                "rust-fn-on-mod-closing-row",
+                "rust",
+                format!("mod n {{\n    fn f() {{}} }}\n\n{}", rust_work()),
+                vec!["fn f() {}"],
+            ),
+            (
+                "rust-two-methods-in-impl",
+                "rust",
+                format!(
+                    "struct S;\nimpl S {{\n    fn a(&self) {{}} fn b(&self) {{}}\n}}\n\n{}",
+                    rust_work()
+                ),
+                vec!["fn a(&self) {}", "fn b(&self) {}"],
+            ),
+            (
+                "java-method-and-field",
+                "java",
+                format!(
+                    "class C {{\n    void ping() {{}} int version = 1;\n{}}}\n",
+                    java_work()
+                ),
+                vec!["void ping() {}", "int version = 1;"],
+            ),
+            (
+                "java-two-methods",
+                "java",
+                format!(
+                    "class C {{\n    void a() {{}} void b() {{}}\n{}}}\n",
+                    java_work()
+                ),
+                vec!["void a() {}", "void b() {}"],
+            ),
+            (
+                "cpp-function-on-namespace-closing-row",
+                "cpp",
+                format!(
+                    "namespace n {{\nint f() {{ return 1; }} }}\n\n{}",
+                    cpp_work()
+                ),
+                vec!["int f() { return 1; }"],
+            ),
+            (
+                "cpp-comment-before-namespace-closing-brace",
+                "cpp",
+                format!(
+                    "namespace n {{ // c\nint f() {{ return 1; }} /* x */ }}\n\n{}",
+                    cpp_work()
+                ),
+                vec!["int f() { return 1; }", "/* x */"],
+            ),
+            (
+                "cpp-one-line-class",
+                "cpp",
+                format!("class S {{}};\n\n{}", cpp_work()),
+                vec!["class S {};"],
+            ),
+            (
+                "cpp-two-one-line-classes",
+                "cpp",
+                format!("class A {{}}; class B {{}};\n\n{}", cpp_work()),
+                vec!["class A {};", "class B {};"],
+            ),
+            (
+                "cpp-one-line-class-in-namespace",
+                "cpp",
+                format!("namespace n {{\nclass S {{}};\n}}\n\n{}", cpp_work()),
+                vec!["class S {};"],
+            ),
+        ];
+        for (name, lang, code, declarations) in cases {
+            let r = compress_as(&code, lang);
+            assert!(
+                r.compressed.contains("// ["),
+                "[{name}] the separate long function should compress:\n{}",
+                r.compressed
+            );
+            assert!(
+                r.compressed_tokens * 2 < r.original_tokens,
+                "[{name}] did not shrink enough:\n{}",
+                r.compressed
+            );
+            for declaration in declarations {
+                assert_eq!(
+                    r.compressed.matches(declaration).count(),
+                    1,
+                    "[{name}] {declaration}:\n{}",
+                    r.compressed
+                );
+            }
+            assert!(
+                parses(&r.compressed, lang),
+                "[{name}] output does not parse"
+            );
+        }
+    }
+
+    /// `macro_rules!` is textually scoped (mirrors `RUST_MACRO_BEFORE_USE`
+    /// in tests/test_code_compressor_wrapper_nodes.py): an item invoking a
+    /// macro must stay below its definition.
+    #[test]
+    fn rust_macro_stays_above_its_use() {
+        for code in [
+            format!(
+                "use std::fmt;\nmacro_rules! make {{ () => {{ 1 }} }}\n\nfn v() -> i32 {{ make!() }}\n\n{}",
+                rust_work()
+            ),
+            format!(
+                "fn a() {{}}\nmacro_rules! make {{ () => {{ 1 }} }}\nmod m {{\n    pub fn v() -> i32 {{ make!() }}\n}}\n\n{}",
+                rust_work()
+            ),
+        ] {
+            let out = compress_as(&code, "rust").compressed;
+            assert!(out.contains("// ["), "{out}");
+            assert_eq!(out.matches("macro_rules! make").count(), 1, "{out}");
+            assert!(
+                out.find("macro_rules! make") < out.find("make!()"),
+                "macro moved below its use:\n{out}"
+            );
         }
     }
 
