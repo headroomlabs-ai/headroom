@@ -295,12 +295,18 @@ def test_generic_session_headers_do_not_change_the_body_holdout_arm(
     """Generic session identifiers must not change which requests receive treatment."""
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
     monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
-    opener = {"model": "gpt-5.5", "input": _user("fix the failing test"), "stream": False}
+    from headroom.proxy.output_savings import assign_arm
 
-    outcomes = _post_turns(
-        [opener],
-        headers={header_name: "client-session-1"},
+    opener = {"model": "gpt-5.5", "input": _user("fix the failing test"), "stream": False}
+    # A header value whose key lands in the other arm, so honouring the header
+    # would show up as a different arm.
+    session = next(
+        f"client-session-{i}"
+        for i in range(200)
+        if assign_arm(f"header:{header_name}:client-session-{i}", 0.3) != _body_arm(opener)
     )
+
+    outcomes = _post_turns([opener], headers={header_name: session})
 
     assert len(outcomes) == 1
     assert _arms(outcomes[0]) == {_body_arm(opener)}
