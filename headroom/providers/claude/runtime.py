@@ -227,6 +227,56 @@ def remote_control_applies_to_auth(environ: Mapping[str, object]) -> bool:
     )
 
 
+# GH #4951: Claude Code's Code Mode (experimental) is opt-in through
+# CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 and is not offered through a gateway or
+# proxy, so a session routed through Headroom starts without it ("Code Mode
+# (experimental) isn't available: it isn't offered yet through a gateway or
+# proxy"). The check is in the client and Headroom cannot lift it; the fix is
+# an accurate notice for users who turned Code Mode on. Claude Code reads the
+# opt-in from the shell or user settings, ignores the variable in project
+# settings files, and lets a "0" (in either of those or in managed settings)
+# keep Code Mode off.
+CODE_MODE_ENV = "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"
+CODE_MODE_FEATURE = "Code Mode (experimental)"
+CODE_MODE_MIN_VERSION = (2, 1, 323)
+
+
+def code_mode_requested(
+    *,
+    shell: Mapping[str, object],
+    user_settings: Mapping[str, object],
+    managed_settings: Mapping[str, object],
+) -> bool:
+    """Return whether the user turned Claude Code's Code Mode on.
+
+    ``"1"`` in the shell or the user settings ``env`` turns it on; ``"0"`` in
+    any of the three keeps it off. Project settings are not taken: Claude Code
+    ignores this variable there.
+    """
+    values = [
+        str(env.get(CODE_MODE_ENV) or "").strip()
+        for env in (shell, user_settings, managed_settings)
+    ]
+    if "0" in values:
+        return False
+    return "1" in values[:2]
+
+
+def code_mode_gate_short_message(*, version: tuple[int, int, int] | None = None) -> str:
+    """One-line notice for a routed ``wrap claude`` launch with Code Mode on (#4951)."""
+    if version is not None and version < CODE_MODE_MIN_VERSION:
+        return (
+            f"{CODE_MODE_FEATURE} needs Claude Code "
+            f"{_version_str(CODE_MODE_MIN_VERSION)}+, and it is not offered through "
+            "a gateway or proxy; it is off in this session."
+        )
+    return (
+        f"{CODE_MODE_FEATURE} is off in this session: Claude Code does not offer it "
+        "through a gateway or proxy such as Headroom. Run `claude` without wrap for "
+        "Code Mode sessions; Headroom's MCP tools work there without the proxy."
+    )
+
+
 def claude_effective_env(
     *layers: tuple[str, Mapping[str, object]],
 ) -> dict[str, tuple[str, str]]:
