@@ -346,7 +346,15 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
             tc_id = block.get("tool_use_id", "")
             result_content = block.get("content", "")
-            if not isinstance(result_content, str):
+            if isinstance(result_content, list):
+                # MCP, Agent and image Read results are a list of blocks. Keep
+                # their text: str() of the list counts an image's base64 as output.
+                result_content = "\n".join(
+                    sub["text"]
+                    for sub in result_content
+                    if isinstance(sub, dict) and isinstance(sub.get("text"), str)
+                )
+            elif not isinstance(result_content, str):
                 result_content = str(result_content)
 
             if tc_id not in tool_uses:
