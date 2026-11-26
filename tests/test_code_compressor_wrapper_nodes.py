@@ -483,3 +483,61 @@ def test_rust_macro_stays_above_its_use(code):
     assert "// [" in out, "the function should compress"
     assert out.count("macro_rules! make") == 1, out
     assert out.index("macro_rules! make") < out.index("make!()"), out
+
+
+# A block comment that starts after a member and ends on a later row
+# (`int limit = 42; /* Maximum` / `request size. */`). Rendering the member
+# alone kept the `/*` and dropped the `*/`, so a later comment's terminator
+# closed it and swallowed the declarations in between, with valid syntax.
+# (name, language, code, declaration hidden before the fix)
+COMMENT_TAIL_MEMBERS = [
+    (
+        "cpp-namespace",
+        "cpp",
+        "namespace n {\nint limit = 42; /* Maximum\nrequest size. */\nint timeout = 30;\n"
+        "/* Defaults for retries. */\n}\n\n" + _CPP_WORK,
+        "timeout",
+    ),
+    (
+        "java-class",
+        "java",
+        "class C {\n    int limit = 42; /* Maximum\n       request size. */\n    int timeout = 30;\n"
+        + _JAVA_WORK
+        + "}\n",
+        "timeout",
+    ),
+    (
+        "rust-mod",
+        "rust",
+        "mod n {\n    pub const LIMIT: i32 = 42; /* Maximum\n       request size. */\n"
+        "    pub const TIMEOUT: i32 = 30;\n}\n\n" + _RUST_WORK,
+        "TIMEOUT",
+    ),
+]
+
+
+def _identifiers(code: str, language: str) -> set[str]:
+    """Identifier texts in the parsed output (comments contribute none)."""
+    tree = cc._get_parser(language).parse(code.encode("utf-8"))
+    found: set[str] = set()
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type in ("identifier", "field_identifier"):
+            found.add(node.text.decode("utf-8"))
+        stack.extend(node.children)
+    return found
+
+
+@pytest.mark.parametrize(
+    ("language", "code", "name"),
+    [pytest.param(lang, code, name, id=case) for case, lang, code, name in COMMENT_TAIL_MEMBERS],
+)
+def test_comment_after_a_member_keeps_its_terminator(language, code, name):
+    result = _compress(code, language)
+    out = result.compressed
+
+    assert "// [" in out, "the separate long function should compress"
+    assert out.count("request size. */") == 1, out
+    assert name in _identifiers(out, language), out
+    assert _valid(out, language)
