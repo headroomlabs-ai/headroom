@@ -305,6 +305,38 @@ def test_a_successful_zero_exists_is_a_definite_miss_despite_a_failing_write():
     assert backend.available() is False, "the failed write is still recorded"
 
 
+def test_recompression_restores_the_original_in_the_explicit_store():
+    """A request's explicit store is the one its compressors must write to.
+
+    The reviewer's reproduction: warm a log marker with
+    ``compression_store=explicit`` while the request-scoped store is a
+    different, empty store, clear the original from the explicit store, and
+    repeat twice. Recompression used to persist only to the request-scoped
+    store, so the explicit store never healed and every repeat recompressed.
+    """
+    explicit = CompressionStore(max_entries=4, backend=InMemoryBackend())
+    ambient = CompressionStore(max_entries=4, backend=InMemoryBackend())
+    set_request_compression_store(ambient)
+    try:
+        router = ContentRouter(ContentRouterConfig(enable_kompress=False))
+        args = (payload("explicit-store"), Tokenizer())
+
+        first = tool_output(router.apply(*args, compression_store=explicit))
+        (hash_key,) = _ccr_marker_hashes(first)
+        assert explicit.exists(hash_key), "the request store holds the original"
+        assert ambient.exists(hash_key) is False, "the process store never saw it"
+
+        explicit._backend.delete(hash_key)  # the original is gone, the result is not
+        again = tool_output(router.apply(*args, compression_store=explicit))
+        assert explicit.exists(hash_key), "recompression restores it in the request store"
+        assert ambient.exists(hash_key) is False, "and not in the process store"
+
+        assert tool_output(router.apply(*args, compression_store=explicit)) == again
+        assert router._cache.stats["cache_hits"] == 1, "the restored original is a hit"
+    finally:
+        clear_request_compression_store()
+
+
 def test_a_permission_denied_exists_falls_back_to_get():
     """A Redis user may be allowed GET but not EXISTS (ACL ``-exists``).
 

@@ -6488,6 +6488,28 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
+        # Bind the request's effective CCR store for the whole call (#4796):
+        # the writers below resolve the store through get_compression_store()
+        # (dense elision, external-compressor mirroring, the Rust log/search/
+        # diff persist), and each must land in the same store this request's
+        # reads check — an explicit ``compression_store`` kwarg otherwise
+        # recompresses into the process default, leaving the request's own
+        # marker unredeemable. The helper restores the previous value, so the
+        # binding never outlives this call on a reused thread.
+        explicit_store = kwargs.get("compression_store")
+        if explicit_store is not None:
+            from ..cache.compression_store import request_compression_store
+
+            with request_compression_store(explicit_store):
+                return self._apply(messages, tokenizer, **kwargs)
+        return self._apply(messages, tokenizer, **kwargs)
+
+    def _apply(
+        self,
+        messages: list[dict[str, Any]],
+        tokenizer: Tokenizer,
+        **kwargs: Any,
+    ) -> TransformResult:
         # #3486: bind a brand-new, request-exclusive `_PerRequestRuntimeState`
         # as this call's ContextVar value BEFORE anything else runs. This
         # `ContentRouter` is a shared singleton dispatched onto a
