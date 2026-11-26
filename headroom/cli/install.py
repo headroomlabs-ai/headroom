@@ -580,7 +580,7 @@ def _build_deployment_manifest(
     memory: bool,
     learn_enabled: bool | None,
     memory_storage_mode: str,
-    traffic_learning_min_evidence: int,
+    traffic_learning_min_evidence: int | None,
     memory_project_root: str,
     telemetry: bool,
     no_telemetry: bool,
@@ -879,7 +879,10 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "--learn/--no-learn",
     "learn_enabled",
     default=None,
-    help="Explicitly enable or disable traffic learning.",
+    help=(
+        "Explicitly enable or disable traffic learning. "
+        "Project-scoped Codex turns currently skip learning to preserve project isolation."
+    ),
 )
 @click.option(
     "--memory-storage",
@@ -893,9 +896,11 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "--min-evidence",
     "traffic_learning_min_evidence",
     type=click.IntRange(min=1),
-    default=5,
-    show_default=True,
-    help="Evidence count required before learning persists a pattern.",
+    default=None,
+    help=(
+        "Evidence count required before learning persists a pattern. "
+        "Omit to use runtime/settings defaults."
+    ),
 )
 @click.option(
     "--memory-project-root",
@@ -999,7 +1004,7 @@ def install_apply(
     memory: bool,
     learn_enabled: bool | None,
     memory_storage_mode: str,
-    traffic_learning_min_evidence: int,
+    traffic_learning_min_evidence: int | None,
     memory_project_root: str,
     telemetry: bool,
     no_telemetry: bool,
@@ -1134,7 +1139,10 @@ def install_apply(
     "--learn/--no-learn",
     "learn_enabled",
     default=None,
-    help="Explicitly enable or disable traffic learning.",
+    help=(
+        "Explicitly enable or disable traffic learning. "
+        "Project-scoped Codex turns currently skip learning to preserve project isolation."
+    ),
 )
 @click.option(
     "--memory-storage",
@@ -1148,9 +1156,11 @@ def install_apply(
     "--min-evidence",
     "traffic_learning_min_evidence",
     type=click.IntRange(min=1),
-    default=5,
-    show_default=True,
-    help="Evidence count required before learning persists a pattern.",
+    default=None,
+    help=(
+        "Evidence count required before learning persists a pattern. "
+        "Omit to use runtime/settings defaults."
+    ),
 )
 @click.option(
     "--memory-project-root",
@@ -1197,7 +1207,7 @@ def deploy(
     memory: bool,
     learn_enabled: bool | None,
     memory_storage_mode: str,
-    traffic_learning_min_evidence: int,
+    traffic_learning_min_evidence: int | None,
     memory_project_root: str,
     telemetry: bool,
     no_telemetry: bool,
@@ -1266,9 +1276,9 @@ def install_status(profile: str) -> None:
     click.echo(f"Learning:   {learning}")
     click.echo(f"Storage:    {getattr(manifest, 'memory_storage_mode', 'project')}")
     min_evidence = getattr(manifest, "base_env", {}).get("HEADROOM_MIN_EVIDENCE") or getattr(
-        manifest, "traffic_learning_min_evidence", 5
+        manifest, "traffic_learning_min_evidence", None
     )
-    click.echo(f"Min evidence: {min_evidence}")
+    click.echo(f"Min evidence: {min_evidence if min_evidence is not None else 'runtime default'}")
     click.echo(f"Project root: {getattr(manifest, 'memory_project_root', '') or 'runtime default'}")
     click.echo(f"Port:       {manifest.port}")
     click.echo(f"Status:     {status}")

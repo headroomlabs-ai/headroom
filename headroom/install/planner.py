@@ -155,7 +155,7 @@ def build_manifest(
     image: str,
     learn_enabled: bool | None = None,
     memory_storage_mode: str = "project",
-    traffic_learning_min_evidence: int = 5,
+    traffic_learning_min_evidence: int | None = None,
     memory_project_root: str = "",
     no_rate_limit: bool = False,
     no_http2: bool = False,
@@ -293,7 +293,7 @@ def build_manifest(
     if learn_enabled is not None:
         proxy_args.append("--learn" if learn_enabled else "--no-learn")
     proxy_args.extend(["--memory-storage", memory_storage_mode])
-    if not base_env.get("HEADROOM_MIN_EVIDENCE"):
+    if traffic_learning_min_evidence is not None and not base_env.get("HEADROOM_MIN_EVIDENCE"):
         proxy_args.extend(["--min-evidence", str(traffic_learning_min_evidence)])
     if memory_project_root and not Path(memory_project_root).is_absolute():
         memory_project_root = str(Path(memory_project_root).expanduser().resolve())

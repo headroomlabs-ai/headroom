@@ -716,6 +716,134 @@ def _powershell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
 
 
+@pytest.mark.parametrize("shell", ["bash", "powershell"])
+def test_native_installer_preserves_learning_controls(shell: str, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    image = "headroom:test-image"
+    env["HEADROOM_DOCKER_IMAGE"] = image
+    env["HEADROOM_MIN_EVIDENCE"] = "11"
+    project = tmp_path / "project root=demo="
+    project.mkdir()
+    cdpath = tmp_path / "cdpath"
+    (cdpath / project.name).mkdir(parents=True)
+    env["CDPATH"] = str(cdpath)
+    profile_path = home / ".headroom" / "deploy" / "learning"
+
+    if shell == "bash":
+        if os.name == "nt" or not _bash_supports_4_3():
+            pytest.skip("Docker-native Bash installer requires Bash >= 4.3 on Unix")
+        command = ["bash"]
+        installer = "install.sh"
+        wrapper = home / ".local" / "bin" / "headroom"
+        wrapper_command = [str(wrapper)]
+        state_path = profile_path / "docker-native.env"
+    else:
+        powershell = _powershell_executable()
+        if powershell is None:
+            pytest.skip("PowerShell is unavailable")
+        command = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+        installer = "install.ps1"
+        wrapper = home / ".local" / "bin" / "headroom.ps1"
+        wrapper_command = [*command, str(wrapper)]
+        state_path = profile_path / "docker-native.json"
+
+    def apply(*options: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return _run(
+            [
+                *wrapper_command,
+                "install",
+                "apply",
+                "--profile",
+                "learning",
+                "--port",
+                str(port),
+                *options,
+            ],
+            cwd=tmp_path,
+            env=env,
+            check=check,
+        )
+
+    def launched_args() -> list[str]:
+        call = next(
+            call
+            for call in reversed(_read_fake_docker_log(env))
+            if call[:2] == ["run", "-d"] and "headroom-learning" in call
+        )
+        return call[call.index(image) + 1 :]
+
+    manifest_path = profile_path / "manifest.json"
+    port = _free_port()
+    try:
+        _run([*command, str(REPO_ROOT / "scripts" / installer)], env=env)
+        for option, value, error in (
+            ("--memory-storage", "invalid", "Invalid memory storage"),
+            ("--min-evidence", "0", "Invalid value"),
+        ):
+            result = apply(option, value, check=False)
+            assert result.returncode != 0
+            assert error in result.stderr
+        assert not profile_path.exists()
+
+        apply(
+            "--learn",
+            "--memory-storage=USER",
+            "--min-evidence",
+            "007",
+            f"--memory-project-root={project.name}",
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["memory_enabled"] is True
+        assert manifest["learn_enabled"] is True
+        assert manifest["memory_storage_mode"] == "user"
+        assert manifest["traffic_learning_min_evidence"] == 7
+        assert Path(manifest["memory_project_root"]) == project.resolve()
+        assert b"\r" not in manifest_path.read_bytes()
+        assert b"\r" not in state_path.read_bytes()
+        launch = launched_args()
+        assert launch == ["--host", "0.0.0.0", *manifest["proxy_args"][2:]]
+        assert launch[-7:] == [
+            "--learn",
+            "--memory-storage",
+            "user",
+            "--min-evidence",
+            "7",
+            "--memory-project-root",
+            manifest["memory_project_root"],
+        ]
+
+        other_cwd = tmp_path / "another directory"
+        other_cwd.mkdir()
+        _run(
+            [*wrapper_command, "install", "restart", "--profile", "learning"],
+            cwd=other_cwd,
+            env=env,
+        )
+        assert launched_args() == launch
+        assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+
+        apply("--memory", "--no-learn")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["learn_enabled"] is False
+        assert manifest["traffic_learning_min_evidence"] is None
+        assert "--no-learn" in launched_args()
+        assert "--learn" not in launched_args()
+        assert "--min-evidence" not in launched_args()
+        assert _persistent_container_env(env, "learning")["HEADROOM_MIN_EVIDENCE"] == "11"
+        launch = launched_args()
+        _run(
+            [*wrapper_command, "install", "restart", "--profile", "learning"],
+            cwd=other_cwd,
+            env=env,
+        )
+        assert launched_args() == launch
+        assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+    finally:
+        _cleanup_fake_docker(env)
+
+
 def _read_user_path_entry() -> tuple[str, int] | None:
     """Read the raw ``HKCU\\Environment`` PATH value and its registry kind, if it exists.
 

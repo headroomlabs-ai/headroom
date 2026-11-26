@@ -115,6 +115,48 @@ def test_install_apply_no_learn_is_persistent_override(monkeypatch) -> None:
     assert "--no-learn" in manifest.proxy_args
 
 
+@pytest.mark.parametrize("command", [["install", "apply"], ["deploy", "--no-docker"]])
+@pytest.mark.parametrize("threshold", [None, 5, 7])
+@pytest.mark.parametrize("saved_threshold", [None, 11])
+def test_saved_threshold_reaches_proxy_unless_install_overrides_it(
+    monkeypatch,
+    tmp_path: Path,
+    command: list[str],
+    threshold: int | None,
+    saved_threshold: int | None,
+) -> None:
+    from headroom import settings_store
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    settings_store.save({} if saved_threshold is None else {"min_evidence": saved_threshold})
+    manifests = []
+    configs = []
+    monkeypatch.setattr("headroom.cli.install._apply_manifest", manifests.append)
+    monkeypatch.setattr(
+        "headroom.proxy.server.run_server", lambda config, **kwargs: configs.append(config)
+    )
+    monkeypatch.setattr(
+        "headroom.cli.port_discovery.probe_headroom_proxy", lambda *args, **kwargs: False
+    )
+    args = [*command, "--learn", "--providers", "manual"]
+    if threshold is not None:
+        args.extend(["--min-evidence", str(threshold)])
+
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == 0, result.output
+    save_manifest(manifests[0])
+    loaded = load_manifest(manifests[0].profile)
+    assert loaded is not None
+    result = CliRunner().invoke(main, ["proxy", *loaded.proxy_args], env=loaded.base_env)
+    assert result.exit_code == 0, result.output
+    assert len(configs) == 1
+    expected = threshold if threshold is not None else (saved_threshold or 5)
+    assert configs[0].traffic_learning_min_evidence == expected
+    assert loaded.traffic_learning_min_evidence == threshold
+
+
 @pytest.mark.parametrize("env_threshold", ["11", ""])
 def test_min_evidence_env_precedence(env_threshold: str) -> None:
     manifest = build_manifest(

@@ -286,6 +286,7 @@ def test_load_old_manifest_uses_memory_defaults_and_one_mode_authority(
             }
         ),
         encoding="utf-8",
+        newline="\n",
     )
 
     loaded = load_manifest("old") if reader is load_manifest else list_manifests()[0]
@@ -293,7 +294,7 @@ def test_load_old_manifest_uses_memory_defaults_and_one_mode_authority(
     assert loaded is not None
     assert loaded.learn_enabled is None
     assert loaded.memory_storage_mode == "project"
-    assert loaded.traffic_learning_min_evidence == 5
+    assert loaded.traffic_learning_min_evidence is None
     assert loaded.memory_project_root == ""
     assert loaded.proxy_mode == "cache"
     if env_mode == "cache":

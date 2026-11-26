@@ -108,7 +108,7 @@ class DeploymentManifest:
     memory_db_path: str = ""
     learn_enabled: bool | None = None
     memory_storage_mode: str = "project"
-    traffic_learning_min_evidence: int = 5
+    traffic_learning_min_evidence: int | None = None
     memory_project_root: str = ""
     # None: the operator chose neither --telemetry nor --no-telemetry.
     # The default stays True for manifests saved before the field existed.
