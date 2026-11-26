@@ -156,6 +156,16 @@ def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     return entry
 
 
+def _valid_timeout(value: Any) -> bool:
+    """Match OpenCode's positive, JSON-safe integer timeout constraint."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 < value <= 2**53 - 1
+        and (isinstance(value, int) or value.is_integer())
+    )
+
+
 class OpencodeRegistrar(MCPRegistrar):
     """Register MCP servers with OpenCode."""
 
@@ -181,13 +191,22 @@ class OpencodeRegistrar(MCPRegistrar):
         return _entry_to_spec(server_name, entry)
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
+        if "timeout" in spec.extra and not _valid_timeout(spec.extra["timeout"]):
+            return RegisterResult(
+                RegisterStatus.FAILED,
+                "timeout must be a positive integer no greater than 9007199254740991",
+            )
         existing = self.get_server(spec.name)
 
         # An unspecified timeout does not change how the requested server is
         # launched. Accept it without writing or adopting the user's options;
         # the complete spec still participates in ownership fingerprints.
         comparable = existing
-        if existing is not None and "timeout" not in spec.extra:
+        if (
+            existing is not None
+            and "timeout" not in spec.extra
+            and _valid_timeout(existing.extra.get("timeout"))
+        ):
             comparable = replace(
                 existing, extra={k: v for k, v in existing.extra.items() if k != "timeout"}
             )
@@ -217,6 +236,8 @@ class OpencodeRegistrar(MCPRegistrar):
         if existing is not None:
             for key in ("timeout", "cwd"):
                 if key in existing.extra:
+                    if key == "timeout" and not _valid_timeout(existing.extra[key]):
+                        continue
                     extra.setdefault(key, existing.extra[key])
         return replace(spec, extra=extra)
 

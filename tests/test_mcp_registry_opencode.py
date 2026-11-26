@@ -316,9 +316,12 @@ def test_register_server_force_overwrites_mismatch(tmp_path: Path) -> None:
     assert updated.command == "headroom"
 
 
-def test_timeout_compatibility_preserves_identity_and_explicit_requests(tmp_path: Path) -> None:
+@pytest.mark.parametrize("timeout", [1, 1.0, 120000, 120000.0, 2**53 - 1])
+def test_timeout_compatibility_preserves_identity_and_explicit_requests(
+    tmp_path: Path, timeout
+) -> None:
     registrar = _registrar(tmp_path)
-    existing = ServerSpec("enola", "/bin/enola", extra={"timeout": 120000})
+    existing = ServerSpec("enola", "/bin/enola", extra={"timeout": timeout})
     requested = ServerSpec("enola", "/bin/enola")
     assert registrar.register_server(existing).ok
     path = tmp_path / "opencode.json"
@@ -329,6 +332,31 @@ def test_timeout_compatibility_preserves_identity_and_explicit_requests(tmp_path
     explicit = ServerSpec("enola", "/bin/enola", extra={"timeout": 1000})
     assert registrar.register_server(explicit).status == RegisterStatus.MISMATCH
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 1.5, True, False, "120000", None, 2**53])
+def test_invalid_requested_timeout_is_rejected_even_with_force(tmp_path: Path, timeout) -> None:
+    registrar = _registrar(tmp_path)
+    spec = ServerSpec("enola", "/bin/enola")
+    assert registrar.register_server(spec).ok
+    path = tmp_path / "opencode.json"
+    original = path.read_bytes()
+    invalid = ServerSpec("enola", "/bin/enola", extra={"timeout": timeout})
+    assert registrar.register_server(invalid, force=True).status == RegisterStatus.FAILED
+    assert path.read_bytes() == original
+
+
+def test_retrieval_refresh_discards_invalid_timeout(tmp_path: Path) -> None:
+    from headroom.cli.wrap import _setup_headroom_mcp
+
+    registrar = _registrar(tmp_path)
+    _setup_headroom_mcp(registrar, 8787, force=True)
+    path = tmp_path / "opencode.json"
+    data = json.loads(path.read_text())
+    data["mcp"]["headroom"]["timeout"] = 0
+    _write_json(path, data)
+    _setup_headroom_mcp(registrar, 8787, force=True)
+    assert "timeout" not in json.loads(path.read_text())["mcp"]["headroom"]
 
 
 def test_unregister_removes_mcp_key_when_empty(tmp_path: Path) -> None:

@@ -322,6 +322,33 @@ def test_opencode_timeout_only_enola_installs_guidance_without_adoption(
     assert registrar.get_server("serena") is None
 
 
+@pytest.mark.parametrize("timeout", [0, -1, 1.5, True, False, "120000", None, 2**53])
+def test_invalid_enola_timeout_preserves_serena_until_forced_repair(project, tmp_path, timeout):
+    from headroom.mcp_registry import OpencodeRegistrar
+
+    config = tmp_path / ".config/opencode/opencode.json"
+    registrar = OpencodeRegistrar(config_path=config)
+    spec = enola.build_enola_spec()
+    assert registrar.register_server(spec).ok
+    record_install("opencode", spec)
+    serena = build_serena_spec("agent")
+    assert registrar.register_server(serena).ok
+    record_install("opencode", serena)
+    data = json.loads(config.read_text())
+    data["mcp"]["enola"]["timeout"] = timeout
+    config.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    original = config.read_bytes()
+    assert not wrap._setup_enola_mcp(registrar)
+    wrap._setup_coding_compressor(registrar, serena_context="agent", force=True)
+    assert config.read_bytes() == original
+    assert registrar.get_server("serena") == serena
+    assert not headroom_installed_matching("opencode", registrar.get_server("enola"))
+    assert registrar.register_server(spec, force=True).status == RegisterStatus.REGISTERED
+    assert "timeout" not in json.loads(config.read_text())["mcp"]["enola"]
+    wrap._setup_coding_compressor(registrar, serena_context="agent")
+    assert registrar.get_server("serena") is None
+
+
 def install_owned(registrar, spec, *, scope=None):
     assert registrar.register_server(spec).ok
     record_install(
