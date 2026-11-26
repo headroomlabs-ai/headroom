@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -110,9 +111,13 @@ def parse_extra_model_spec(spec: str) -> tuple[str, dict[str, Any]]:
     return model_id, {"name": name, "limit": {"context": context, "output": output}}
 
 
-def extra_models_from_env() -> dict[str, Any]:
-    """Parse extra models from ``HEADROOM_OPENCODE_EXTRA_MODELS`` (comma-separated)."""
-    raw = os.environ.get(HEADROOM_OPENCODE_EXTRA_MODELS_ENV, "")
+def extra_models_from_env(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Parse extra models from ``HEADROOM_OPENCODE_EXTRA_MODELS`` (comma-separated).
+
+    Reads ``environ`` when given (a deployment manifest's env), else ``os.environ``.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(HEADROOM_OPENCODE_EXTRA_MODELS_ENV, "")
     models: dict[str, Any] = {}
     for spec in raw.split(","):
         spec = spec.strip()
