@@ -277,6 +277,16 @@ class TestAutoParser:
         parsed = parse_markdown(CLAUDE_CODE_MEMORY, format="generic")
         assert parsed.format == "generic"
 
+    def test_auto_parses_short_fenced_note_with_hash_prefixed_fact(self):
+        content = "#123 tracks deployment\n```bash\n# comment\necho ok\n```\n"
+        parsed = parse_markdown(content)
+        assert parsed.format == "generic"
+        assert len(parsed.sections) == 1
+        assert parsed.sections[0].facts == [
+            "#123 tracks deployment",
+            "```bash\n# comment\necho ok\n```",
+        ]
+
 
 class TestEntityExtraction:
     def test_bold_text(self):

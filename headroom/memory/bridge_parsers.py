@@ -460,8 +460,8 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
                 fact = stripped[2:].strip()
                 if fact:
                     facts.append(fact)
-            elif stripped and not stripped.startswith("#"):
-                # Non-bullet, non-empty lines are also facts in generic mode
+            elif stripped:
+                # Non-bullet, non-empty lines (including #tags/#123) are also facts in generic mode
                 facts.append(stripped)
         if fence_buf:
             facts.append("\n".join(fence_buf))
