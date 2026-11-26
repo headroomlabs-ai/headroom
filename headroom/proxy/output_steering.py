@@ -116,7 +116,7 @@ def apply_openai_chat_verbosity_steering(
     return False
 
 
-def _input_already_steered(items: Any) -> bool:
+def input_already_steered(items: Any) -> bool:
     """True when a user message in a Responses ``input`` ends with a steering block.
 
     Only user messages are read, and only a block at the very end counts: that is where
@@ -160,7 +160,7 @@ def apply_openai_responses_verbosity_steering(
     text = steering_text(level)
     if text is None:
         return False
-    if _input_already_steered(body.get("input")):
+    if input_already_steered(body.get("input")):
         return False
 
     instructions = body.get("instructions")

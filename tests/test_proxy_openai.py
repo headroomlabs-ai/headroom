@@ -377,6 +377,10 @@ def test_native_responses_route_carries_the_client_decision(
     Deleting the kwargs splat at the native call site leaves every other test in
     this file green; this one fails.
     """
+    from headroom.proxy.output_savings import conversation_key_from_body
+
+    # No session header and no previous response: the holdout key is the body's.
+    expected = {**expected, "output_arm_key": conversation_key_from_body(_responses_body())}
     for client, seen, transport in _native_responses_client():
         response = client.post(
             "/v1/responses",

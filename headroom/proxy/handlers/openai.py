@@ -941,6 +941,7 @@ def _shape_openai_responses_payload(
     model: str,
     request_id: str,
     output_shaper_enabled: bool | None = None,
+    conversation_key: str | None = None,
 ) -> tuple[list[str], bool]:
     """Output shaping for a Responses payload (opt-in, HEADROOM_OUTPUT_SHAPER).
 
@@ -977,7 +978,9 @@ def _shape_openai_responses_payload(
             return [], False
 
         holdout = output_holdout_fraction()
-        conversation = conversation_key_from_responses_body(payload)
+        # A caller that shapes the same request twice passes one key, so both
+        # passes land in the same arm.
+        conversation = conversation_key or conversation_key_from_responses_body(payload)
         arm = assign_arm(conversation, holdout)
 
         turn_kind = classify_responses_turn(payload.get("input")).value
@@ -1864,8 +1867,12 @@ def _shape_openai_responses_for_output(
     model: str,
     conversation_key: str | None = None,
     output_shaper_enabled: bool | None = None,
+    credit_input_steering: bool = False,
 ) -> Any:
-    """Apply OpenAI Responses output shaping and attach holdout labels."""
+    """Apply OpenAI Responses output shaping and attach holdout labels.
+
+    ``credit_input_steering``: see :func:`shape_openai_responses_request`; HTTP only.
+    """
     from headroom.proxy.output_savings import (
         assign_arm,
         conversation_key_from_body,
@@ -1905,6 +1912,7 @@ def _shape_openai_responses_for_output(
         payload,
         settings=settings,
         level_override=level,
+        credit_input_steering=credit_input_steering,
     )
     shaped.labels = [*result.labels, *(shaped.labels or [])]
     return shaped
@@ -3349,6 +3357,7 @@ class OpenAIHandlerMixin:
                 ),
                 conversation=conversation,
             )
+
             # Streaming turns get fold-only hooks, same rule as the
             # chat-completions path. A hook that defers work to `on_response`
             # cannot run here: the response side is wired on the buffered branch
@@ -3361,9 +3370,39 @@ class OpenAIHandlerMixin:
             # the client's request rather than the effective one — conservative
             # in the safe direction: at worst a buffered-by-CCR turn misses a
             # saving, never a stranded tool call.
+            def _tool_tokens(tools: Any) -> int | None:
+                # Deferral flags stripped: deferral is booked on its own tag.
+                # Accounting must never break a request, so a failed count
+                # books nothing.
+                if _req_ctx.count_tools is None:
+                    return None
+                try:
+                    return int(_req_ctx.count_tools(without_deferral_flags(tools)))
+                except (TypeError, ValueError, RuntimeError) as e:
+                    logger.debug(
+                        "[%s] turn-hook tool token count failed; savings not counted: %s",
+                        request_id,
+                        describe_exception(e),
+                    )
+                    return None
+
+            # Counted before the hooks run: a hook may edit the tools in place.
+            _tool_tokens_before = _tool_tokens(working.get("tools"))
             run_request_hooks(_req_ctx, stream_safe_only=bool(payload.get("stream")))
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
+            # Tool definitions a hook shrank (description condensing) go on the
+            # tag every surface sums into the tool-savings headline, as on the
+            # chat-completions path.
+            _tool_tokens_after = _tool_tokens(_req_ctx.tools)
+            _hook_tool_saved = 0
+            if _tool_tokens_before is not None and _tool_tokens_after is not None:
+                _hook_tool_saved = max(0, _tool_tokens_before - _tool_tokens_after)
+            if _hook_tool_saved > 0 and savings_tags is not None:
+                savings_tags["turn_hook_tools_saved_tokens"] = (
+                    int(savings_tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _hook_tool_saved
+                )
+                transforms.append(f"turn_hook:tools:{_hook_tool_saved}tok")
             # A hook may also fold the messages (replace or in-place). Write back a
             # replaced list — previously dropped on this path — then re-count so the
             # message-fold saving is both applied AND recorded in tokens_saved.
@@ -3374,8 +3413,11 @@ class OpenAIHandlerMixin:
                     _mt_after = self.openai_provider.get_token_counter(model).count_text(
                         _json_debug_dumps(working.get(_msg_key) or [])
                     )
-                    if _mt_after < _mt_before:
-                        tokens_saved += _mt_before - _mt_after
+                    # Signed, then clamped once: message text a hook added
+                    # offsets the tool definitions it removed.
+                    tokens_saved += net_hook_tool_saving(
+                        _mt_before - _mt_after, savings_tags, _hook_tool_saved
+                    )
                 except Exception as e:
                     logger.debug(
                         "[%s] turn-hook message fold token count failed; savings not counted: %s",
@@ -3470,10 +3512,12 @@ class OpenAIHandlerMixin:
         savings_tags: dict[str, Any] | None = None,
         conversation: str | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        output_arm_key: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         """``conversation`` is the caller's ``turn_conversation_key``,
         derived before compression rewrites the body; turn hooks see it as
-        ``TurnContext.conversation``."""
+        ``TurnContext.conversation``. ``output_arm_key`` is the holdout key
+        for output shaping, when the caller shapes this request again later."""
         timing: dict[str, float] = {}
 
         # Codex >= 0.149.0 nests tool definitions in `input` items of type
@@ -3512,6 +3556,7 @@ class OpenAIHandlerMixin:
                 model=model,
                 request_id=request_id,
                 output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
+                conversation_key=output_arm_key,
             )
             compression_kwargs: dict[str, Any] = {
                 "model": model,
@@ -6395,6 +6440,17 @@ class OpenAIHandlerMixin:
             body=body,
             metadata={"path": request.url.path, "stream": body.get("stream", False)},
         )
+        # One holdout arm per request. Output shaping runs in the compression
+        # pass and again before the send; deriving the key twice (from
+        # different body views) could put one request in both arms, and the
+        # ledger reads the first. Derived from the body as the client sent it,
+        # before the create hooks below, which is the body headroom-kiro
+        # decides its steering on; a hook that drops ``instructions`` or
+        # steers the user turn then cannot move the arm. Bypassed requests
+        # are never shaped, so they derive no key.
+        from headroom.proxy.output_arm_key import output_arm_key, remember_response_arm_key
+
+        _output_arm_key = None if _bypass else output_arm_key(body, request.headers)
         # Before every stage that reads the body, so a hook's replacement is
         # what compression, deferral, token counting, pricing and the
         # stream/buffered dispatch all see.
@@ -7026,6 +7082,7 @@ class OpenAIHandlerMixin:
                     client=client,
                     savings_tags=tags,
                     conversation=_turn_conversation,
+                    output_arm_key=_output_arm_key,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -7118,17 +7175,15 @@ class OpenAIHandlerMixin:
                     ) from _e
 
         if not _bypass:
-            _http_conversation_key = request.headers.get("x-headroom-session-id")
             _shape_result = _shape_openai_responses_for_output(
                 body,
                 input_tokens=message_input_tokens,
                 model=str(model or ""),
-                conversation_key=(
-                    f"header:x-headroom-session-id:{_http_conversation_key}"
-                    if _http_conversation_key
-                    else None
-                ),
+                conversation_key=_output_arm_key,
                 output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
+                # One request, one outcome: safe to credit a turn an extension
+                # steered (Kiro puts the block in the user turn).
+                credit_input_steering=True,
             )
             _append_unique_transforms(transforms_applied, _shape_result.labels)
             if _shape_result.changed:
@@ -7267,6 +7322,7 @@ class OpenAIHandlerMixin:
                     conversation_key=responses_conversation_key,
                     conversation_tokens_saved=tokens_saved,
                     savings_measure=savings_measure,
+                    output_arm_key=_output_arm_key,
                 )
             else:
 
@@ -7708,6 +7764,9 @@ class OpenAIHandlerMixin:
                     # it correctly.
                     from headroom.proxy.helpers import compute_turn_id
 
+                    # A next turn naming this response keeps this arm.
+                    if isinstance(resp_json, dict):
+                        remember_response_arm_key(resp_json.get("id"), _output_arm_key)
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,

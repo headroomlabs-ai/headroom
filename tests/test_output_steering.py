@@ -182,3 +182,100 @@ def test_openai_chat_steering_level_zero_is_noop() -> None:
     body = {"messages": [{"role": "system", "content": "S."}]}
     assert apply_openai_chat_verbosity_steering(body, 0) is False
     assert body["messages"][0]["content"] == "S."
+
+
+def _shape_live(payload: dict, monkeypatch, holdout: str = "0") -> tuple[list[str], bool]:
+    """Shape as the HTTP ``/v1/responses`` handler does before its upstream send."""
+    from headroom.proxy.handlers.openai import _shape_openai_responses_for_output
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", holdout)
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    result = _shape_openai_responses_for_output(
+        payload,
+        input_tokens=100,
+        model="auto",
+        output_shaper_enabled=True,
+        credit_input_steering=True,
+    )
+    return list(result.labels or []), bool(result.changed)
+
+
+def test_responses_turn_steered_by_an_extension_is_labelled_shaped(monkeypatch) -> None:
+    """Kiro rejects ``instructions``, so headroom-kiro steers the user turn itself.
+
+    Core must not add a second copy, but the request was shaped: without the
+    verbosity label the output-savings ledger books every Kiro turn as unshaped.
+    """
+    steered = f"fix it\n\n{steering_text(3)}"
+    payload = {"model": "auto", "input": [{"role": "user", "content": steered}]}
+
+    labels, mutated = _shape_live(payload, monkeypatch)
+
+    assert "output_shaper:verbosity:L3" in labels
+    assert mutated is False
+    assert payload == {"model": "auto", "input": [{"role": "user", "content": steered}]}
+
+
+def test_control_arm_turn_is_not_labelled_shaped(monkeypatch) -> None:
+    steered = f"fix it\n\n{steering_text(3)}"
+    payload = {"model": "auto", "input": [{"role": "user", "content": steered}]}
+
+    labels, _ = _shape_live(payload, monkeypatch, holdout="1")
+
+    assert not any(label.startswith("output_shaper:verbosity:") for label in labels)
+
+
+def test_older_steered_prompt_does_not_label_an_unsteered_turn(monkeypatch) -> None:
+    """An earlier prompt keeps its block; this turn's prompt carries none, and
+    core will not add a second copy, so nothing shaped this turn."""
+    payload = {
+        "model": "auto",
+        "input": [
+            {"role": "user", "content": f"fix it\n\n{steering_text(3)}"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "now run the tests"},
+        ],
+    }
+
+    labels, mutated = _shape_live(payload, monkeypatch)
+
+    assert mutated is False
+    assert not any(label.startswith("output_shaper:verbosity:") for label in labels)
+
+
+def test_extension_steered_turn_is_labelled_with_the_level_in_its_block(monkeypatch) -> None:
+    """Savings are modelled per level, so the label names the block actually sent."""
+    payload = {
+        "model": "auto",
+        "input": [{"role": "user", "content": f"fix it\n\n{steering_text(2)}"}],
+    }
+
+    labels, mutated = _shape_live(payload, monkeypatch)  # proxy configured for L3
+
+    assert mutated is False
+    assert "output_shaper:verbosity:L2" in labels
+    assert "output_shaper:verbosity:L3" not in labels
+
+
+def test_websocket_frame_does_not_credit_an_extension_steered_turn(monkeypatch) -> None:
+    """A WebSocket session shares one label list across turns, so crediting input
+    steering there would mark the session's later, unsteered turns as shaped too."""
+    import json
+
+    from headroom.proxy.handlers.openai import _shape_openai_response_create_frame
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "auto", "input": f"fix it\n\n{steering_text(3)}"},
+        }
+    )
+
+    raw, changed, labels, _reason = _shape_openai_response_create_frame(
+        frame, input_tokens=100, output_shaper_enabled=True
+    )
+
+    assert changed is False and raw == frame
+    assert not any(label.startswith("output_shaper:verbosity:") for label in labels)

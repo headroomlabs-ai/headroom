@@ -26,6 +26,7 @@ from headroom.proxy.helpers import (
     parse_sse_events_from_byte_buffer,
     retry_after_ms,
 )
+from headroom.proxy.output_arm_key import remember_response_arm_key
 from headroom.proxy.provider_usage import (
     anthropic_cache_ttl_buckets,
     billed_input_for_provider,
@@ -384,11 +385,14 @@ class StreamingMixin:
                                 usage_found[key] = value
 
             elif provider == "openai":
+                response = data.get("response")
+                if isinstance(response, dict) and isinstance(response.get("id"), str):
+                    # Responses ``response.*`` events: the id a next turn's
+                    # ``previous_response_id`` names.
+                    stream_state["response_id"] = response["id"]
                 chunk_usage = data.get("usage")
-                if not isinstance(chunk_usage, dict):
-                    response = data.get("response")
-                    if isinstance(response, dict):
-                        chunk_usage = response.get("usage")
+                if not isinstance(chunk_usage, dict) and isinstance(response, dict):
+                    chunk_usage = response.get("usage")
                 if isinstance(chunk_usage, dict):
                     # Chat Completions streams report prompt/completion tokens.
                     # Responses streams report input/output tokens under
@@ -1159,6 +1163,7 @@ class StreamingMixin:
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
         serve_ccr_retrieval: bool = False,
+        output_arm_key: str | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1208,6 +1213,7 @@ class StreamingMixin:
                 server_memory_tool_names=server_memory_tool_names,
                 client_beta=client_beta,
                 serve_ccr_retrieval=serve_ccr_retrieval,
+                output_arm_key=output_arm_key,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1244,6 +1250,7 @@ class StreamingMixin:
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
         serve_ccr_retrieval: bool = False,
+        output_arm_key: str | None = None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -2133,6 +2140,8 @@ class StreamingMixin:
                     conversation_tokens_saved=conversation_tokens_saved,
                     savings_measure=savings_measure,
                 )
+                # A next turn naming this response keeps this request's arm.
+                remember_response_arm_key(stream_state.get("response_id"), output_arm_key)
                 if supports_mid_turn_coalescing(client) and pending_messages:
                     pending_event = json.dumps(
                         {"type": "headroom_pending_messages", "messages": pending_messages}

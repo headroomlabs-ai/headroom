@@ -6,6 +6,8 @@ import hashlib
 from collections.abc import Iterable
 from typing import Any, cast
 
+from .output_verbosity_policy import without_trailing_steering_block
+
 # Coarse input-token buckets. Coarse on purpose: too many strata make
 # per-stratum baselines sparse and noisy. Boundaries in tokens.
 _INPUT_BUCKETS = (2_000, 8_000, 32_000, 128_000)
@@ -166,7 +168,7 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
     body = _unwrap_response_create_body(body)
     digest = hashlib.sha256()
     digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
-    for msg in body.get("messages", []):
+    for msg in body.get("messages") or []:
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content")
             if isinstance(content, str):
@@ -186,8 +188,42 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
         if stable_response_key:
             _absorb(digest, stable_response_key)
         elif not body.get("messages"):
+            # No conversation id: seed on the first user turn of ``input``, as
+            # for chat. A constant here put every such conversation of a model
+            # in one holdout arm.
             _absorb(digest, "responses")
+            _absorb_first_responses_user_turn(digest, body.get("input"))
     return digest.hexdigest()
+
+
+def _absorb_first_responses_user_turn(digest: Any, input_data: Any) -> None:
+    """Fold the first user turn of ``input`` into ``digest``, minus any steering.
+
+    An extension that cannot use ``instructions`` (headroom-kiro) appends the
+    steering block to the user turn itself. Dropping it keeps the key, and so
+    the holdout arm, the same before and after that insertion.
+    """
+    if isinstance(input_data, str):
+        _absorb(digest, without_trailing_steering_block(input_data))
+        return
+    if not isinstance(input_data, list):
+        return
+    for item in input_data:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            _absorb(digest, without_trailing_steering_block(content))
+        elif isinstance(content, list):
+            _absorb_text_blocks(
+                digest,
+                (
+                    without_trailing_steering_block(part["text"])
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ),
+            )
+        return
 
 
 def conversation_key_from_responses_body(body: dict[str, Any]) -> str:
@@ -201,26 +237,7 @@ def conversation_key_from_responses_body(body: dict[str, Any]) -> str:
     body = _unwrap_response_create_body(body)
     digest = hashlib.sha256()
     digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
-    input_data = body.get("input")
-    if isinstance(input_data, str):
-        _absorb(digest, input_data)
-    elif isinstance(input_data, list):
-        for item in input_data:
-            if not isinstance(item, dict) or item.get("role") != "user":
-                continue
-            content = item.get("content")
-            if isinstance(content, str):
-                _absorb(digest, content)
-            elif isinstance(content, list):
-                _absorb_text_blocks(
-                    digest,
-                    (
-                        part["text"]
-                        for part in content
-                        if isinstance(part, dict) and isinstance(part.get("text"), str)
-                    ),
-                )
-            break
+    _absorb_first_responses_user_turn(digest, body.get("input"))
     return digest.hexdigest()
 
 
