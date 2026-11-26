@@ -530,20 +530,64 @@ class TestMemoryReceiptsWithRetrievalAndClientTool:
 
     @pytest.mark.asyncio
     async def test_receipts_off_keeps_the_mixed_round_identical(self) -> None:
+        """With receipts off the client gets the round bytes unchanged.
+
+        Byte equality, not selected parsed fields: a receipt that leaked into
+        the stream, a changed stop reason or an unreconciled usage total would
+        otherwise pass.
+        """
         proxy = self._proxy("off")
-        events = await _client_view(
+        raw = await _client_raw(
             proxy, server_memory_tool_names=MEMORY_TOOLS, serve_ccr_retrieval=True
         )
 
-        texts = [
-            e["delta"]["text"]
-            for e in events
-            if e["type"] == "content_block_delta" and "text" in e["delta"]
-        ]
-        assert texts == ["Saving that.", "Done."]
-        assert [e["index"] for e in events if e["type"] == "content_block_start"] == [0, 1]
+        expected = b"".join(
+            _frame(payload)
+            for payload in (
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [],
+                        "stop_reason": None,
+                        "usage": {"input_tokens": 10, "output_tokens": 1},
+                    },
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "Saving that."},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": "Done."},
+                },
+                {"type": "content_block_stop", "index": 1},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 10},
+                },
+                {"type": "message_stop"},
+            )
+        )
+        assert raw == expected
         assert proxy.ccr_response_handler.calls == [RETRIEVE]
-        assert not any(e.get("content_block", {}).get("name") == "Bash" for e in events)
 
     @pytest.mark.asyncio
     async def test_held_client_tool_precedes_the_receipt_for_client_and_finalizer(
