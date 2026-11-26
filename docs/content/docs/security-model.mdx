@@ -408,6 +408,12 @@ Beyond your configured LLM providers, Headroom may contact:
 | `api.github.com` | GitHub Copilot quota poll (`/copilot_internal/user`); sends a GitHub token as a bearer credential | On, but it only polls when one of `GITHUB_COPILOT_GITHUB_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` or `GITHUB_COPILOT_API_TOKEN` is set; every 60 s | No dedicated switch found. Unset those variables, or use `HEADROOM_OFFLINE` |
 | `mobile.events.data.microsoft.com` | ONNX Runtime's own usage telemetry to Microsoft (ORT 1.31+ on Linux and macOS): hashed device id, model file and graph names, model hashes, execution providers, hardware ids | **Off**: importing `headroom` sets `ORT_DISABLE_TELEMETRY=1` unless it is already set | Leave `ORT_DISABLE_TELEMETRY` unset or `1`; setting it to `0` turns ORT's telemetry back on |
 
+Model and tokenizer downloads are pinned to immutable commit SHAs, so the artifacts fetched
+on first use stay the same bytes for a given Headroom version even if an upstream repository
+is updated. See
+[HuggingFace revision pinning](/docs/configuration#huggingface-revision-pinning) for the
+pins, the upgrade path, and `HEADROOM_HF_PIN`.
+
 ### The beacon is on by default
 
 This is the one egress path that is enabled by default whatever credentials you have, so it
