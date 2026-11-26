@@ -32,20 +32,6 @@ _PROXY_OWNED_OPTIONS = frozenset({"baseURL"})
 logger = logging.getLogger(__name__)
 
 
-def _named_upstream(manifest: DeploymentManifest) -> bool:
-    """True when the deployment forwards OpenAI-compatible traffic to a named upstream.
-
-    Only then may a third-party credential stay in the OpenCode config: with
-    the default upstream the proxy forwards to OpenAI, and a kept DeepSeek key
-    would be sent there. Mirrors the wrap path, which keeps the user's entries
-    only for an explicit upstream.
-    """
-    base_env = manifest.base_env or {}
-    if (base_env.get("OPENAI_TARGET_API_URL") or "").strip():
-        return True
-    return "--openai-api-url" in (manifest.proxy_args or [])
-
-
 def _canonicalize_url(raw: str) -> str:
     """Canonicalize a URL for upstream identity: lowercase scheme/hostname, preserve path case."""
     parts = urlsplit(raw)
@@ -80,17 +66,16 @@ def _canonicalize_url(raw: str) -> str:
 
 
 def _upstream_url(manifest: DeploymentManifest) -> str | None:
-    """Return the raw upstream URL, or None when no upstream is named."""
-    base_env = manifest.base_env or {}
-    url = (base_env.get("OPENAI_TARGET_API_URL") or "").strip()
-    if url:
-        return url
-    if "--openai-api-url" in (manifest.proxy_args or []):
-        args = manifest.proxy_args or []
-        for i, arg in enumerate(args):
-            if arg == "--openai-api-url" and i + 1 < len(args):
-                return args[i + 1]
-    return None
+    """Resolve the saved URL using the proxy CLI's flag-over-env precedence."""
+    args = manifest.proxy_args or []
+    flag_url = None
+    for i, arg in enumerate(args):
+        if arg == "--openai-api-url" and i + 1 < len(args):
+            flag_url = args[i + 1]
+        elif arg.startswith("--openai-api-url="):
+            flag_url = arg.split("=", 1)[1]
+    url = flag_url or (manifest.base_env or {}).get("OPENAI_TARGET_API_URL")
+    return url or None
 
 
 def _upstream_identity(manifest: DeploymentManifest) -> str | None:
@@ -167,17 +152,38 @@ def _stored_options(manifest: DeploymentManifest) -> dict[str, Any]:
     current_raw = _upstream_url(manifest)
 
     if not _binding_matches(stored, current_upstream, current_raw):
-        stored_upstream = stored.get("_upstream")
-        if stored_upstream is not None:
+        if stored.get("_upstream") is not None:
             logger.warning(
-                "Stored OpenCode credential upstream '%s' does not match current '%s'; "
-                "credential must be set again",
-                stored_upstream,
-                current_upstream,
+                "Stored OpenCode credential was saved for a different upstream; "
+                "set a new credential for this upstream (URLs redacted)"
             )
         return {}
 
     return {k: v for k, v in stored.items() if k not in ("_upstream", "_upstream_v")}
+
+
+def _stored_entry(manifest: DeploymentManifest) -> dict[str, Any] | None:
+    """Return the raw deployment-state entry for OpenCode, if any."""
+    store = manifest.provider_options
+    if not isinstance(store, dict):
+        return None
+    stored = store.get(ToolTarget.OPENCODE.value)
+    return stored if isinstance(stored, dict) else None
+
+
+def _stored_binding_rejected(manifest: DeploymentManifest) -> bool:
+    """True when a recorded binding exists and names a different upstream.
+
+    The credential in the ACTIVE config carries no upstream of its own: it was
+    written by the install for whatever upstream was in effect then. When the
+    state records a binding for another upstream, that config credential is
+    that other upstream's -- recapturing it would hand it to the new
+    destination and re-bless it as if the user had set it there.
+    """
+    stored = _stored_entry(manifest)
+    if stored is None or stored.get("_upstream") is None:
+        return False
+    return not _binding_matches(stored, _upstream_identity(manifest), _upstream_url(manifest))
 
 
 def _store_options(manifest: DeploymentManifest, options: dict[str, Any]) -> None:
@@ -205,7 +211,13 @@ def _capture_options(path: Path, manifest: DeploymentManifest) -> None:
     activation resurrects it from the store. Only a config with no provider
     entry at all (already deactivated) leaves the store untouched.
     """
-    if not _named_upstream(manifest):
+    if _upstream_url(manifest) is None:
+        return
+    # The active credential was written for the upstream this deployment had
+    # when it was applied. If the state still records a binding for a
+    # different upstream, this deployment's saved URL changed: that credential
+    # belongs to the old destination, so never recapture it as the new one.
+    if _stored_binding_rejected(manifest):
         return
     data = _parse_json_loose(fsutil.read_text(path, default=""))
     entry = _headroom_entry(data)
@@ -259,11 +271,25 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     # owns npm, name, baseURL and models. It is read from the config and from
     # the deployment state, which holds it across the deactivate/activate
     # cycle that rewrites the config without it.
-    if _named_upstream(manifest):
-        preserved = {**_stored_options(manifest), **_user_options(_headroom_entry(data))}
+    if _upstream_url(manifest) is not None:
+        # A binding recorded for a DIFFERENT upstream wins over the active
+        # config: that config credential belongs to the old destination, so it
+        # must not be recaptured for (and re-blessed as) the new one. Checking
+        # the old binding BEFORE reading the config is what keeps the drop
+        # across a restart.
+        active_options = (
+            {} if _stored_binding_rejected(manifest) else _user_options(_headroom_entry(data))
+        )
+        preserved = {**_stored_options(manifest), **active_options}
         if preserved:
             entry["options"] = {**preserved, **entry["options"]}
             _store_options(manifest, preserved)
+        elif _stored_binding_rejected(manifest):
+            # The rejected old credential was the only source; do not leave a
+            # stale binding in the state after dropping it.
+            store = manifest.provider_options
+            if isinstance(store, dict):
+                store.pop(ToolTarget.OPENCODE.value, None)
 
     provider = {"headroom": entry}
     data = _inject_key_into_json(data, "provider", provider)
