@@ -250,6 +250,31 @@ class TestGenericParser:
         assert parsed.sections[2].heading_level == 3
         assert parsed.sections[2].facts == ["#123 tracks deployment"]
 
+    def test_preserves_pre_block_with_hash_lines_and_fence_delimiters(self):
+        content = "## Deployment\n<pre>\n  ###\n```bash\n</pre>\n## Next\n- Done\n"
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections] == ["Deployment", "Next"]
+        assert parsed.sections[0].content == "<pre>\n  ###\n```bash\n</pre>"
+        assert parsed.sections[0].facts == ["<pre>\n  ###\n```bash\n</pre>"]
+        assert parsed.sections[1].facts == ["Done"]
+
+    def test_keeps_list_contained_headings_and_dedented_siblings_in_enclosing_section(self):
+        content = "## Deployment\n- Primary\n  ### Details\n  - Restart the app\n- Secondary\n"
+        claude_parsed = parse_claude_code_memory(content)
+        assert [s.heading for s in claude_parsed.sections] == ["Deployment"]
+        assert claude_parsed.sections[0].facts == ["Primary", "Restart the app", "Secondary"]
+
+        generic_parsed = parse_generic_markdown(content)
+        assert [s.heading for s in generic_parsed.sections] == ["Deployment"]
+        assert "Secondary" in generic_parsed.sections[0].facts
+
+    def test_detect_format_treats_empty_heading_note_as_generic(self):
+        content = "##\nShort note\n"
+        assert detect_format(content) == "generic"
+        parsed = parse_markdown(content)
+        assert parsed.format == "generic"
+        assert parsed.sections[0].facts == ["Short note"]
+
 
 class TestFormatDetection:
     def test_detect_claude_code(self):

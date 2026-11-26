@@ -215,6 +215,17 @@ def extract_relationships_from_section(
 
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _ATX_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$")
+_PRE_OPEN_RE = re.compile(r"^ {0,3}<pre(?:\s|>|$)", re.IGNORECASE)
+_PRE_CLOSE_RE = re.compile(r"</pre>", re.IGNORECASE)
+_LIST_ITEM_RE = re.compile(r"^( {0,3})([-+*]|\d{1,9}[.)])(?:([ \t]+).*|[ \t]*)$")
+
+
+@dataclass
+class _BlockState:
+    fence: tuple[str, int] | None = None
+    fence_indent: int = 0
+    in_pre: bool = False
+    list_indent: int | None = None
 
 
 def _next_fence_state(
@@ -242,6 +253,65 @@ def _next_fence_state(
     return active_fence, True
 
 
+def _advance_block_state(
+    line: str,
+    state: _BlockState,
+) -> tuple[bool, re.Match[str] | None]:
+    """Advance markdown block state across fences, ``<pre>`` blocks, and lists.
+
+    Returns ``(is_verbatim_block, top_level_atx_heading_match)``.
+    """
+    stripped = line.strip()
+    leading = len(line) - len(line.lstrip(" "))
+
+    if state.fence is not None:
+        strip_n = min(leading, state.fence_indent)
+        next_fence, _ = _next_fence_state(line[strip_n:], state.fence)
+        if next_fence is None:
+            state.fence = None
+            state.fence_indent = 0
+            return True, None
+        if stripped and leading < state.fence_indent:
+            # Dedented non-blank line closes the enclosing list item and its fence.
+            state.fence = None
+            state.fence_indent = 0
+            state.list_indent = None
+        else:
+            return True, None
+
+    if state.in_pre:
+        if _PRE_CLOSE_RE.search(line):
+            state.in_pre = False
+        return True, None
+
+    if state.list_indent is not None and stripped and leading < state.list_indent:
+        state.list_indent = None
+
+    if state.list_indent is None:
+        list_match = _LIST_ITEM_RE.match(line)
+        if list_match:
+            lead, marker, sep = list_match.group(1), list_match.group(2), list_match.group(3)
+            state.list_indent = len(lead) + len(marker) + (len(sep) if sep else 1)
+
+    container_indent = (
+        state.list_indent if (state.list_indent is not None and leading >= state.list_indent) else 0
+    )
+    inner_line = line[container_indent:] if container_indent else line
+
+    if _PRE_OPEN_RE.match(inner_line):
+        state.in_pre = not bool(_PRE_CLOSE_RE.search(inner_line))
+        return True, None
+
+    next_fence, in_fence = _next_fence_state(inner_line, None)
+    if in_fence:
+        state.fence = next_fence
+        state.fence_indent = container_indent
+        return True, None
+
+    header_match = _ATX_HEADING_RE.match(line) if state.list_indent is None else None
+    return False, header_match
+
+
 def detect_format(content: str) -> str:
     """Auto-detect the markdown memory format.
 
@@ -252,24 +322,27 @@ def detect_format(content: str) -> str:
     if not lines:
         return "generic"
 
+    has_headers = False
     has_h2_headers = False
     has_bullets = False
-    has_fence = False
+    has_block = False
     short_line_count = 0
     total_lines = 0
-    fence: tuple[str, int] | None = None
+    block_state = _BlockState()
 
     for line in lines:
-        fence, in_fence = _next_fence_state(line, fence)
-        has_fence = has_fence or in_fence
+        in_block, header_match = _advance_block_state(line, block_state)
+        has_block = has_block or in_block
         stripped = line.strip()
         if not stripped:
             continue
         total_lines += 1
 
-        if not in_fence:
-            if stripped.startswith("## "):
-                has_h2_headers = True
+        if not in_block:
+            if header_match:
+                has_headers = True
+                if len(header_match.group(1)) == 2:
+                    has_h2_headers = True
             if stripped.startswith("- "):
                 has_bullets = True
         if len(stripped) < 120:
@@ -279,8 +352,8 @@ def detect_format(content: str) -> str:
     if has_h2_headers and has_bullets:
         return "claude_code"
 
-    # ChatGPT: mostly short lines, no headers or fenced code, looks like flat facts
-    if total_lines > 0 and not has_h2_headers and not has_fence:
+    # ChatGPT: mostly short lines, no headers or fenced/preformatted code, looks like flat facts
+    if total_lines > 0 and not has_headers and not has_block:
         short_ratio = short_line_count / total_lines
         if short_ratio > 0.8 and total_lines >= 2:
             return "chatgpt"
@@ -328,10 +401,10 @@ def parse_claude_code_memory(content: str, file_path: str = "") -> ParsedFile:
             return
 
         facts = []
-        fact_fence: tuple[str, int] | None = None
+        fact_state = _BlockState()
         for line in current_lines:
-            fact_fence, in_fence = _next_fence_state(line, fact_fence)
-            if in_fence:
+            in_block, _ = _advance_block_state(line, fact_state)
+            if in_block:
                 continue
             stripped = line.strip()
             if stripped.startswith("- "):
@@ -352,11 +425,10 @@ def parse_claude_code_memory(content: str, file_path: str = "") -> ParsedFile:
             )
         )
 
-    fence: tuple[str, int] | None = None
+    block_state = _BlockState()
     for line in content.splitlines():
-        fence, in_fence = _next_fence_state(line, fence)
-        header_match = None if in_fence else _ATX_HEADING_RE.match(line)
-        if header_match:
+        in_block, header_match = _advance_block_state(line, block_state)
+        if not in_block and header_match:
             flush_section()
             current_level = len(header_match.group(1))
             current_heading = (header_match.group(2) or "").strip()
@@ -445,17 +517,20 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
         if not section_content and not current_heading:
             return
 
-        facts = []
-        fact_fence: tuple[str, int] | None = None
-        fence_buf: list[str] = []
+        facts: list[str] = []
+        fact_state = _BlockState()
+        block_buf: list[str] = []
         for line in current_lines:
-            fact_fence, in_fence = _next_fence_state(line, fact_fence)
-            if in_fence:
-                fence_buf.append(line)
-                if fact_fence is None:
-                    facts.append("\n".join(fence_buf))
-                    fence_buf = []
+            in_block, _ = _advance_block_state(line, fact_state)
+            if in_block:
+                block_buf.append(line)
+                if fact_state.fence is None and not fact_state.in_pre:
+                    facts.append("\n".join(block_buf))
+                    block_buf = []
                 continue
+            if block_buf:
+                facts.append("\n".join(block_buf))
+                block_buf = []
             stripped = line.strip()
             if stripped.startswith("- "):
                 fact = stripped[2:].strip()
@@ -464,8 +539,8 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
             elif stripped:
                 # Non-bullet, non-empty lines (including #tags/#123) are also facts in generic mode
                 facts.append(stripped)
-        if fence_buf:
-            facts.append("\n".join(fence_buf))
+        if block_buf:
+            facts.append("\n".join(block_buf))
 
         entities = extract_entities_from_text(section_content) if section_content else []
 
@@ -480,11 +555,10 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
             )
         )
 
-    fence: tuple[str, int] | None = None
+    block_state = _BlockState()
     for line in content.splitlines():
-        fence, in_fence = _next_fence_state(line, fence)
-        header_match = None if in_fence else _ATX_HEADING_RE.match(line)
-        if header_match:
+        in_block, header_match = _advance_block_state(line, block_state)
+        if not in_block and header_match:
             flush_section()
             current_level = len(header_match.group(1))
             current_heading = (header_match.group(2) or "").strip()
