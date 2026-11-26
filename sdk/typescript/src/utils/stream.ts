@@ -24,8 +24,8 @@ export async function* parseSSE<T = any>(
       buffer = done ? "" : lines.pop()!;
 
       for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6).trim();
+        if (line.startsWith("data:")) {
+          const data = line.slice(5).trim();
           if (data === "[DONE]") return;
           try {
             yield JSON.parse(data) as T;

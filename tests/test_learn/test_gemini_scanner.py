@@ -8,6 +8,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from headroom.learn.loops import detect_loops
 from headroom.learn.models import ProjectInfo, Recommendation, RecommendationTarget
 from headroom.learn.scanner import GeminiScanner
 from headroom.learn.writer import GeminiWriter
@@ -130,6 +133,168 @@ class TestProjectDiscovery:
 
 
 class TestJsonSessionParsing:
+    @pytest.mark.parametrize(
+        "call_ids,response_ids,response_order",
+        [
+            (("a", "b"), ("a", "b"), ("a", "b")),
+            (("a", "b"), ("b", "a"), ("b", "a")),
+            ((None, None), (None, None), ("a", "b")),
+            (("a", "b"), (None, None), ("a", "b")),
+            ((None, None), ("a", "b"), ("a", "b")),
+        ],
+    )
+    def test_parallel_same_name_calls(self, tmp_path, call_ids, response_ids, response_order):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        messages = [
+            {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "name": "read_file",
+                            "args": {"path": path},
+                            **({"id": call_id} if call_id is not None else {}),
+                        }
+                    }
+                    for path, call_id in zip(("a", "b"), call_ids)
+                ],
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "name": "read_file",
+                            "response": {"output": output},
+                            **({"id": response_id} if response_id is not None else {}),
+                        }
+                    }
+                    for output, response_id in zip(response_order, response_ids)
+                ],
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [
+            ({"path": path}, path) for path in response_order
+        ]
+
+    def test_parallel_same_name_calls_count_as_a_loop(self, tmp_path):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        call = {"functionCall": {"name": "read_file", "args": {"path": "a"}}}
+        response = {"functionResponse": {"name": "read_file", "response": {"output": "a"}}}
+        messages = [
+            {"role": "model", "parts": [call, call, call]},
+            {"role": "user", "parts": [response, response, response]},
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert len({tc.tool_call_id for tc in session.tool_calls}) == 3
+        loops = detect_loops([session])
+        assert [loop.count for loop in loops] == [3]
+
+    def test_unanswered_call_does_not_take_later_result(self, tmp_path):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        messages = [
+            {
+                "role": "model",
+                "parts": [{"functionCall": {"name": "read_file", "args": {"path": "a"}}}],
+            },
+            {
+                "role": "model",
+                "parts": [{"functionCall": {"name": "read_file", "args": {"path": "b"}}}],
+            },
+            {
+                "role": "user",
+                "parts": [{"functionResponse": {"name": "read_file", "response": {"output": "b"}}}],
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [({"path": "b"}, "b")]
+
+    def test_mixed_id_responses_keep_exact_match(self, tmp_path):
+        scanner = GeminiScanner(gemini_dir=tmp_path)
+        messages = [
+            {
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "read_file", "id": "a", "args": {"path": "a.py"}}},
+                    {"functionCall": {"name": "read_file", "args": {"path": "b.py"}}},
+                ],
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {"functionResponse": {"name": "read_file", "response": {"output": "b"}}},
+                    {
+                        "functionResponse": {
+                            "name": "read_file",
+                            "id": "a",
+                            "response": {"output": "a"},
+                        }
+                    },
+                ],
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert [(tc.input_data, tc.output) for tc in session.tool_calls] == [
+            ({"path": "b.py"}, "b"),
+            ({"path": "a.py"}, "a"),
+        ]
+
+    def test_malformed_ids_treated_as_missing(self, tmp_path):
+        gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
+        session = _make_gemini_session(
+            [
+                {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "read_file", "args": {"path": "a.py"}}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "read_file",
+                                "id": [],
+                                "response": {"output": "a"},
+                            }
+                        },
+                    ],
+                },
+                {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "read_file", "id": {}, "args": {"path": "b.py"}}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {"functionResponse": {"name": "read_file", "response": {"output": "b"}}},
+                    ],
+                },
+            ]
+        )
+        _write_json_session(chats_dir, session)
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        sessions = scanner.scan_project(scanner.discover_projects()[0])
+
+        assert len(sessions) == 1
+        assert [(tc.input_data, tc.output) for tc in sessions[0].tool_calls] == [
+            ({"path": "a.py"}, "a"),
+            ({"path": "b.py"}, "b"),
+        ]
+
     def test_basic_tool_call(self, tmp_path):
         gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
         session = _make_gemini_session(

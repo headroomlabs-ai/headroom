@@ -122,6 +122,7 @@ def _register_commands() -> None:
         tools,  # noqa: F401
         tray,  # noqa: F401
         update,  # noqa: F401
+        verify_hf_cache,  # noqa: F401
         wrap,  # noqa: F401
     )
 

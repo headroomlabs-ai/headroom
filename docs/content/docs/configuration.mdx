@@ -465,6 +465,129 @@ headroom proxy --learn --min-evidence 3
 
 For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
 
+### HuggingFace revision pinning
+
+Headroom downloads tokenizer and ONNX artifacts from the HuggingFace Hub for the optional
+ML paths (token counting, Kompress, the image encoder, relevance embeddings). Every
+repository it ships against is pinned to an **immutable commit SHA**, both in the Python
+package and in the Rust core, so a repo whose `main` branch moves cannot silently change
+the bytes behind your token counts or compression behaviour.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `HEADROOM_HF_PIN` | Set to `off`, `0`, `false`, or `no` to float every repository on its default branch again — for evaluating a newer upstream revision before adopting it. Any other value (including a typo) keeps pinning. | unset (pinned) |
+| `HEADROOM_HF_TOKENIZER_REVISIONS` | `repo=sha,repo=sha` pins for repositories added through `HEADROOM_HF_TOKENIZER_ALLOWLIST`. We can't choose a pin for an id we only learn about from the environment, so operator-added repos float unless named here. | unset |
+| `HEADROOM_HF_TOKENIZER_ALLOWLIST` | Comma-separated extra tokenizer repo ids that `_load_tokenizer` may fetch at all. | unset |
+
+Upgrade path: bump the SHA in `headroom/tokenizers/huggingface.py` (`_TOKENIZER_REVISIONS`)
+and `headroom/onnx_runtime.py` (`_PINNED_REVISIONS`), plus `crates/headroom-core/src/hf_pins.rs`
+for the Rust paths, then run the tests — `tests/test_hf_revision_pinning.py` and the
+`hf_pins` unit tests both fail if the three tables disagree or if a pin is not a full
+40-character SHA. There is no runtime "latest" resolution by design: a floating revision
+is the thing being fixed.
+
+Air-gapped deployments are unaffected at the fetch level — `HEADROOM_OFFLINE=1` refuses these
+downloads before any socket opens, and `from_file` / `from_files` remain network-free. What
+you must pre-provision is the *pinned* snapshot: the native proxy's cache-only reader resolves
+the repo at its pin (a commit SHA names the snapshot directory directly, and the Rust tokenizer
+loader reads `snapshots/<sha>/` even when there is no `refs/<sha>` — which is how Python's own
+cache is laid out). Seeding a different revision is a cache miss, not a silently different
+model.
+
+#### Offline upgrade path — pre-seed the SHA before you upgrade
+
+This catches deployments that were already running before pinning existed. A cache filled
+from the default branch holds an *older* snapshot under `refs/main`; after upgrading, the pin
+names a commit the cache does not have, so:
+
+1. the cache-only attempt misses,
+2. `HEADROOM_OFFLINE=1` refuses the network fallback,
+3. the loader returns `None` and token counting degrades to character estimation.
+
+It does **not** silently keep using the old vocabulary — that would defeat the pin and quietly
+change every count, which is the failure this change exists to prevent. But the fallback is
+ugly if you did not plan for it: it is logged once per process, and because the result is
+cached (`lru_cache`), the process never retries that tokenizer.
+
+So, before upgrading an air-gapped host, warm the cache at the pins *it will use*.
+`warm_kompress_model()` is the direct entry point: it loads the Kompress weights **and**
+their tokenizer synchronously, blocking until both are on disk.
+
+```bash
+# On a host with network access, into the directory you will carry across.
+# HEADROOM_OFFLINE=0 so the warm loads are allowed to fetch.
+HF_HUB_CACHE=/srv/hf-cache HEADROOM_OFFLINE=0 python - <<'PY'
+from headroom.tokenizers.huggingface import _load_tokenizer, get_tokenizer_name
+from headroom.transforms.kompress_compressor import warm_kompress_model
+
+# The model id this deployment serves.
+MODEL = "qwen2.5-7b"
+
+# 1. Kompress: chopratejas/kompress-v2-base (ONNX weights) + the
+#    answerdotai/ModernBERT-base tokenizer they were exported against.
+#    Returns False rather than raising, so check it.
+assert warm_kompress_model(device="cpu"), "Kompress warm failed; see the log"
+
+# 2. Counting: the tokenizer for the model this deployment serves. Resolve it
+#    the way the runtime does — this is the repository the loader will actually
+#    fetch, which is NOT always the string you passed in. `get_tokenizer_name`
+#    maps a bare alias through the family table, while a raw repo id can hit a
+#    shorter prefix and land on a different vocabulary.
+repo = get_tokenizer_name(MODEL)
+assert _load_tokenizer(repo) is not None, f"counting tokenizer warm failed for {repo}"
+
+print(f"kompress weights + tokenizer, and {repo}, are cached")
+PY
+```
+
+Resolve the counting repo rather than hand-writing it: `get_tokenizer_name` is the same
+function the runtime uses, so the snapshot you seed is the snapshot it asks for. Warming a
+repo id literally while the runtime resolves it elsewhere is the failure this section is
+about — the verifier would pass and counting would still fall back to estimation.
+
+`compress()` is **not** a seeding tool: whether it reaches Kompress depends on the router,
+and a short or non-prose message may never invoke it at all, leaving the weights absent. Use
+the explicit loaders above.
+
+Then verify the exact files exist before copying the cache across. `headroom
+verify-hf-cache` derives the requirement from the loader's own candidate list, so it cannot
+drift from what the loader actually accepts:
+
+```bash
+# One supported ONNX candidate is enough; the command knows which ones count.
+headroom verify-hf-cache /srv/hf-cache --model qwen2.5-7b
+```
+
+`--model` accepts the short alias (`qwen2.5-7b`) or a repo id, and checks the repository the
+runtime resolves it to — the same `get_tokenizer_name` mapping the warm step uses, so the two
+cannot disagree. `--tokenizer-repo` names a repository outright when you want that instead.
+
+The revision is resolved the same way, including an operator override from
+`HEADROOM_HF_TOKENIZER_REVISIONS`: if the override names a snapshot you have not seeded, the
+verifier reports it `MISSING` instead of passing a cache the runtime cannot load. With
+`HEADROOM_HF_PIN=off` the loader floats on `main`, so there is no fixed snapshot to verify and
+the check says so rather than reporting `OK`.
+
+It exits non-zero and prints `MISSING …` for every artifact the target host would lack. Two
+things it checks that are easy to miss:
+
+- **The Kompress pair.** At least one supported `onnx/` candidate in the pinned Kompress
+  snapshot, *and* `tokenizer.json` in the pinned ModernBERT snapshot. They are one artifact
+  pair: the export was produced against that tokenizer.
+- **The counting tokenizer for the model you actually serve** (`--model`). Seeding Kompress says
+  nothing about whether token counting for that model can load *its* tokenizer — that is the
+  estimation fallback this whole section is about.
+
+Pass `--no-kompress` on deployments that do not use Kompress, together with `--model` (or
+`--tokenizer-repo`); the flag alone checks nothing and is rejected rather than reporting OK.
+
+`models--…/snapshots/<pin>/` is the directory to look for; `refs/<pin>` is not written by Python
+and is not needed.
+
+To stay on the previously-cached bytes instead, set `HEADROOM_HF_PIN=off` on that host: it
+moves both the download and the cache lookup back to `main`, which is the deliberate escape
+hatch for running an unpinned snapshot.
+
 ### Cold-prefix hook & reasoning compaction
 
 Two related optimizations target tokens that agent harnesses re-send every turn:
