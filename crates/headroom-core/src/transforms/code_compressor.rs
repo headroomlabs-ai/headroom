@@ -2493,6 +2493,66 @@ def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n   
         assert_eq!(score_of(&r, "keep"), 0.5);
     }
 
+    /// A function body whose first row holds two statements, followed by
+    /// enough single-statement rows that the body is truncated.
+    fn shared_line_body(first_line: &str, step: &str, indent: &str) -> String {
+        (0..30)
+            .map(|i| format!("{indent}{}", step.replace("{i}", &i.to_string())))
+            .fold(format!("{indent}{first_line}"), |acc, line| {
+                acc + "\n" + &line
+            })
+    }
+
+    fn assert_emitted_once(compressed: &str, original: &str, needle: &str) {
+        assert_ne!(compressed, original, "body must be truncated");
+        assert_eq!(
+            compressed.matches(needle).count(),
+            1,
+            "{needle:?} not emitted exactly once:\n{compressed}"
+        );
+    }
+
+    #[test]
+    fn statements_sharing_a_line_are_emitted_once() {
+        // `count += 1; total += x` is two statements on one row. Emitting
+        // that row once per statement runs both increments twice in the
+        // compressed function. Rust twin of the Python fix in #4630.
+        let c = CodeAwareCompressor::new(CodeCompressorConfig::default());
+        let body = shared_line_body("count += 1; total += x", "step_{i} = do_{i}(x)", "    ");
+        let code = format!("def process(x):\n{body}\n    return total\n");
+        let r = c.compress_with(&code, Some("python"), "");
+        assert_emitted_once(&r.compressed, &code, "count += 1; total += x");
+    }
+
+    #[test]
+    fn continuation_after_a_shared_line_is_emitted_once() {
+        // The statement after `;` continues onto the next row. Merging the
+        // two ranges must keep that row exactly once: duplicating it breaks
+        // the syntax, dropping it leaves an unclosed parenthesis.
+        let c = CodeAwareCompressor::new(CodeCompressorConfig::default());
+        let body = shared_line_body(
+            "x = 1; y = (2 +\n               3)",
+            "step_{i} = do_{i}(x)",
+            "    ",
+        );
+        let code = format!("def process(x):\n{body}\n    return x + y\n");
+        let r = c.compress_with(&code, Some("python"), "");
+        assert_emitted_once(&r.compressed, &code, "x = 1; y = (2 +");
+        assert_emitted_once(&r.compressed, &code, "               3)");
+    }
+
+    #[test]
+    fn javascript_shared_declarations_are_emitted_once() {
+        // In JavaScript the duplicate is a `let` redeclaration: a SyntaxError
+        // at load time that tree-sitter still parses without ERROR nodes, so
+        // `verify_syntax` cannot catch it.
+        let c = CodeAwareCompressor::new(CodeCompressorConfig::default());
+        let body = shared_line_body("let count = 0; let total = 0;", "step{i}(x);", "  ");
+        let code = format!("function process(x) {{\n{body}\n  return total;\n}}\n");
+        let r = c.compress_with(&code, Some("javascript"), "");
+        assert_emitted_once(&r.compressed, &code, "let count = 0; let total = 0;");
+    }
+
     #[test]
     fn empty_and_short_passthrough() {
         let c = CodeAwareCompressor::new(CodeCompressorConfig::default());
