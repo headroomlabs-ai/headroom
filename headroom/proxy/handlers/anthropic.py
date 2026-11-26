@@ -2208,6 +2208,14 @@ class AnthropicHandlerMixin:
                 cache_affinity=cache_affinity,
                 cache_ttl_seconds=_cc_ttl,
             )
+            # The replayed frozen prefix keeps every earlier turn's compression,
+            # so this request's ``tokens_saved`` is the lineage's running total.
+            # Keyed by tracker, the funnel books only what grew since the last
+            # turn (PERF ``tok_novel``) instead of the whole prefix again (#5069).
+            _savings_key = getattr(prefix_tracker, "savings_key", None)
+            savings_conversation_key = (
+                f"anthropic:{_savings_key}" if isinstance(_savings_key, str) else None
+            )
             # Snapshot lineage state once.  Reusing the same pair for delta
             # extraction, byte-stable replay, and breakpoint placement keeps
             # all three decisions tied to one previous request (and avoids
@@ -4304,6 +4312,8 @@ class AnthropicHandlerMixin:
                             prefix_tracker=prefix_tracker,
                             optimized_messages=optimized_messages,
                             backend=request_backend,
+                            conversation_key=savings_conversation_key,
+                            conversation_tokens_saved=tokens_saved,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
@@ -4468,6 +4478,8 @@ class AnthropicHandlerMixin:
                                 optimized_tokens=optimized_tokens,
                                 output_tokens=output_tokens,
                                 tokens_saved=tokens_saved,
+                                conversation_key=savings_conversation_key,
+                                conversation_tokens_saved=tokens_saved,
                                 attempted_input_tokens=attempted_input_tokens,
                                 provider_input_tokens=(
                                     uncached_input_tokens + cr_tokens + cw_tokens
@@ -4790,6 +4802,8 @@ class AnthropicHandlerMixin:
                         server_memory_tool_names=server_memory_tool_names,
                         client_beta=client_anthropic_beta or "",
                         serve_ccr_retrieval=serve_ccr_retrieval_in_stream,
+                        conversation_key=savings_conversation_key,
+                        conversation_tokens_saved=tokens_saved,
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
@@ -5699,6 +5713,8 @@ class AnthropicHandlerMixin:
                                 ),
                                 output_tokens=output_tokens,
                                 tokens_saved=tokens_saved,
+                                conversation_key=savings_conversation_key,
+                                conversation_tokens_saved=tokens_saved,
                                 attempted_input_tokens=optimized_tokens + tokens_saved,
                                 cache_read_tokens=cr_tokens,
                                 cache_write_tokens=cw_tokens,

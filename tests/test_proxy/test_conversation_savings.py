@@ -3,9 +3,9 @@
 OpenAI's ``/v1/responses`` re-sends the whole transcript every turn and the
 router recompresses all of it, so a turn's ``tokens_saved`` is the running
 total for the conversation. Summing that across turns counts every removed
-token again on every remaining turn. Anthropic's frozen cached prefix means
-its ``tokens_saved`` is already novel-only, which is why the two providers'
-lifetime totals were never comparable.
+token again on every remaining turn. Anthropic's ``/v1/messages`` replays its
+frozen prefix in the compressed form forwarded last turn, so its
+``tokens_saved`` is a running total too (#5069).
 """
 
 from __future__ import annotations
@@ -171,9 +171,8 @@ async def test_the_request_log_keeps_the_wire_truth() -> None:
 
 @pytest.mark.asyncio
 async def test_paths_without_conversation_identity_are_unchanged() -> None:
-    """Anthropic and every other handler leave the pair unset. Their
-    ``tokens_saved`` is already novel-only, so it must reach the trackers
-    untouched however many turns go by."""
+    """Handlers that leave the pair unset report novel-only ``tokens_saved``,
+    so it must reach the trackers untouched however many turns go by."""
     handler = _Handler()
     for _ in range(3):
         await emit_request_outcome(
@@ -244,8 +243,8 @@ def test_the_streaming_constructor_carries_the_pair() -> None:
 
 
 def test_the_streaming_constructor_defaults_the_pair_off() -> None:
-    """Every other streaming caller (Anthropic SSE, Bedrock, OpenAI chat via
-    backend) must keep reporting novel-only savings unchanged."""
+    """A streaming caller that passes no pair (OpenAI chat via backend) must
+    keep reporting its savings unchanged."""
     outcome = RequestOutcome.from_stream(
         body={"model": "claude-opus-5", "messages": []},
         provider="anthropic",
@@ -263,6 +262,126 @@ def test_the_streaming_constructor_defaults_the_pair_off() -> None:
     )
     assert outcome.conversation_key is None
     assert outcome.conversation_tokens_saved is None
+
+
+# --- Anthropic /v1/messages (#5069) -------------------------------------------
+
+
+def _anthropic_outcome(tokens_saved: int, **overrides: Any) -> RequestOutcome:
+    defaults: dict[str, Any] = {
+        "request_id": "req-1",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "original_tokens": 40_000 + tokens_saved,
+        "optimized_tokens": 40_000,
+        "output_tokens": 125,
+        "tokens_saved": tokens_saved,
+        "attempted_input_tokens": 40_000 + tokens_saved,
+        "conversation_key": "anthropic:lineage-a",
+        "conversation_tokens_saved": tokens_saved,
+    }
+    defaults.update(overrides)
+    return RequestOutcome(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_noop_turns_do_not_re_book_the_frozen_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shape reported in #5069: consecutive noop turns of one Claude Code
+    session all logged ``tok_saved=856``, because the replayed prefix keeps the
+    first turn's compression. The running totals must book it once, and the
+    PERF line must say so with ``tok_novel``."""
+    handler = _Handler()
+    with caplog.at_level("INFO", logger="headroom.proxy"):
+        for _ in range(4):
+            await emit_request_outcome(handler, _anthropic_outcome(856))
+        await emit_request_outcome(handler, _anthropic_outcome(2_342))
+
+    booked = [
+        call.kwargs["tokens_saved"] for call in handler.metrics.record_request.await_args_list
+    ]
+    assert booked == [856, 0, 0, 0, 1_486]
+    perf = [r.getMessage() for r in caplog.records if " PERF " in r.getMessage()]
+    assert len(perf) == 5
+    assert "tok_novel" not in perf[0]  # equal to tok_saved: not repeated
+    assert "tok_saved=856 tok_novel=0 " in perf[1]
+    assert "tok_saved=2342 tok_novel=1486 " in perf[4]
+
+
+def _anthropic_app(monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]) -> Any:
+    pytest.importorskip("fastapi")
+    from headroom.proxy.loopback_guard import require_loopback
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    async def _spy(_self: Any, outcome: Any, *a: Any, **kw: Any) -> None:
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(type(app.state.proxy), "_record_request_outcome", _spy, raising=True)
+    return app
+
+
+def test_anthropic_handler_keys_savings_by_conversation_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handler must hand the funnel the pair: one key per conversation,
+    stable across its turns, and the request's ``tokens_saved`` as the running
+    total. Without it the funnel falls back to booking ``tokens_saved`` every
+    turn, which is the #5069 inflation."""
+    httpx = pytest.importorskip("httpx")
+    respx = pytest.importorskip("respx")
+    from fastapi.testclient import TestClient
+
+    outcomes: list[Any] = []
+    app = _anthropic_app(monkeypatch, outcomes)
+    reply = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 100, "output_tokens": 1},
+    }
+    headers = {"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"}
+    turn_one = [{"role": "user", "content": "first question in conversation A"}]
+    turn_two = [
+        *turn_one,
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "follow-up in conversation A"},
+    ]
+    other = [{"role": "user", "content": "an unrelated conversation B"}]
+
+    with respx.mock:
+        respx.post("https://api.anthropic.com/v1/messages").mock(
+            return_value=httpx.Response(200, json=reply)
+        )
+        with TestClient(app) as client:
+            for messages in (turn_one, turn_two, other):
+                result = client.post(
+                    "/v1/messages",
+                    json={"model": "claude-sonnet-4-5", "max_tokens": 16, "messages": messages},
+                    headers=headers,
+                )
+                assert result.status_code == 200
+
+    first, second, unrelated = outcomes
+    assert first.conversation_key and first.conversation_key.startswith("anthropic:")
+    assert second.conversation_key == first.conversation_key
+    assert unrelated.conversation_key != first.conversation_key
+    for outcome in outcomes:
+        assert outcome.conversation_tokens_saved == outcome.tokens_saved
 
 
 # --- identity: real Responses bodies, not an injected key -------------------

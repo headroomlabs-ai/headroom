@@ -194,10 +194,11 @@ class RequestOutcome:
     # conversation_key: stable across every turn of one conversation, from
     #     ``conversation_key_from_body``. Paired with
     #     ``conversation_tokens_saved`` it lets the funnel tell a first-time
-    #     removal from a re-run of one already counted. Both stay ``None`` on
-    #     paths whose ``tokens_saved`` is already novel-only -- every provider
-    #     that freezes its cached prefix, which is all of them except OpenAI's
-    #     ``/v1/responses``. See ``conversation_savings``.
+    #     removal from a re-run of one already counted. Set on OpenAI's
+    #     ``/v1/responses`` and on Anthropic ``/v1/messages`` (keyed by the
+    #     prefix tracker, whose replayed prefix keeps earlier compression);
+    #     ``None`` on paths whose ``tokens_saved`` is already novel-only. See
+    #     ``conversation_savings``.
     # conversation_tokens_saved: the conversation's RUNNING removed-token
     #     total as of this request, which on ``/v1/responses`` is what the
     #     compressor reports every turn because it recompresses the whole

@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -1288,6 +1289,13 @@ class PrefixCacheTracker:
         # highest assistant ordinal dropped + 1, i.e. the count of leading
         # non-kept turns to keep dropped on subsequent warm turns.
         self.reasoning_drop_upto: int = 0
+
+        # Identity of this tracker's conversation for the novel-savings ledger
+        # (headroom.proxy.conversation_savings). A tracker is one lineage, and
+        # the frozen prefix it replays keeps every earlier turn's compression,
+        # so a turn's tokens_saved is that lineage's running total. A tracker
+        # rebuilt after a restart gets a new key and re-counts its prefix once.
+        self.savings_key: str = uuid.uuid4().hex
 
     def get_frozen_message_count(self) -> int:
         """How many leading messages to skip compression on the next turn.
