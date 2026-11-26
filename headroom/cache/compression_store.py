@@ -39,7 +39,8 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -679,7 +680,14 @@ class CompressionStore:
                 # carried out as-is: a failed probe must not read as a miss.
                 probe = getattr(self._backend, "live", None)
                 if probe is not None:
-                    live = probe(hash_key)
+                    try:
+                        live = probe(hash_key)
+                    except Exception as exc:  # noqa: BLE001 - a broken probe is no answer
+                        logger.debug(
+                            "CCR liveness probe raised (%s); treating as unknown",
+                            describe_exception(exc),
+                        )
+                        return None
                     if live is None:
                         return None
                     if not live:
@@ -1274,6 +1282,22 @@ def set_request_compression_store(store: CompressionStore | None) -> None:
 def clear_request_compression_store() -> None:
     """Clear the request-scoped compression store."""
     _request_ccr_store.set(None)
+
+
+@contextmanager
+def request_compression_store(store: CompressionStore | None) -> Iterator[None]:
+    """Bind ``store`` as this context's CCR store, restoring the previous one.
+
+    For code that receives the request's store as an argument while the
+    helpers it calls resolve it through :func:`get_compression_store`: binding
+    it for the duration keeps reads and writes on the same store, and the
+    restore keeps it out of whatever runs next on the same context.
+    """
+    token = _request_ccr_store.set(store)
+    try:
+        yield
+    finally:
+        _request_ccr_store.reset(token)
 
 
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:

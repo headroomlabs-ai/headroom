@@ -358,6 +358,71 @@ def test_a_permission_denied_exists_whose_get_also_fails_is_unknown():
     )
 
 
+def test_a_live_probe_that_raises_is_unknown_not_a_miss():
+    """A backend whose optional ``live()`` raises must not evict, in either path.
+
+    Reviewer's reproduction: the first cache check tolerates the exception, but
+    the router's second (post-get) check aborted the request even though the
+    original was still there.
+    """
+
+    class TimesOut(InMemoryBackend):
+        armed = False
+
+        def live(self, hash_key):
+            if self.armed:
+                raise TimeoutError("probe budget exceeded")
+            return self.exists(hash_key)
+
+    backend = TimesOut()
+    store = CompressionStore(max_entries=4, backend=backend)
+    hash_key = store.store("the original tool output", "the compressed view")
+    assert store.all_live([hash_key]) is True
+
+    backend.armed = True
+    assert store.all_live([hash_key]) is None, "a raising probe cannot answer"
+    assert store.exists(hash_key), "the original is still there"
+
+    router = ContentRouter(ContentRouterConfig(ccr_inject_marker=False))
+    calls: list[str] = []
+
+    def compress(content, context="", bias=1.0, **kwargs):
+        calls.append(content)
+        key = store.store(content, "compressed view")
+        return SimpleNamespace(
+            original=content,
+            compressed=f"compressed copy <<ccr:{key}>>",
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.KOMPRESS,
+            strategy_chain=[],
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(router, "compress", compress)
+        string_args = (payload("timeout-string"), Tokenizer())
+        first = tool_output(router.apply(*string_args, compression_store=store))
+        assert tool_output(router.apply(*string_args, compression_store=store)) == first
+        assert len(calls) == 1, "string path must keep the hit when the probe raises"
+
+        block_message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "timeout-block",
+                    "content": tool_log("timeout-block"),
+                }
+            ],
+        }
+        block_args = ([block_message], Tokenizer())
+        first_blocks = router.apply(*block_args, compression_store=store)
+        cached_block = first_blocks.messages[-1]["content"][0]["content"]
+        backend.armed = True
+        second_blocks = router.apply(*block_args, compression_store=store)
+        assert second_blocks.messages[-1]["content"][0]["content"] == cached_block
+        assert len(calls) == 2, "block path must keep the hit when the probe raises"
+
+
 def test_every_marker_shape_is_read_for_its_hash():
     assert _ccr_marker_hashes(
         "a <<ccr:abcdef012345>> b <<ccr:1234567890ab,base64,2.0KB>> "
