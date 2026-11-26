@@ -56,38 +56,48 @@ def _volume_is_case_insensitive(parent: Path) -> bool | None:
     (``os.path.normcase`` is the identity on macOS, whose default volume is
     case-insensitive), so it is measured in two steps:
 
-    1. Read-only: a directory entry whose case-variant spelling also exists
-       answers by whether the two spellings are the same file — no write,
-       so a readable-but-unwritable store directory is still classified.
+    1. Read-only: the names listed in the directory answer by themselves —
+       two listed spellings are two entries (no folding), one listed
+       spelling whose variant also resolves is one entry folded (insensitive)
+       — no write, so a readable-but-unwritable store directory is still
+       classified.
     2. Otherwise a probe file is created with ``tempfile.mkstemp``
        (exclusively, unpredictable name) and a case-variant of its name is
        checked. The unpredictable name matters: a predictable one could be
        pre-planted as a symlink by a local writer of the directory and the
        probe's write would follow it.
+
+    Step 1 compares the *names listed in this directory*, never file
+    identity. An insensitive volume lists one spelling per entry, so two
+    listed spellings are two entries and the volume does not fold case.
+    Identity cannot answer this: a local writer of the directory can create
+    a hardlink under the variant spelling, a second entry that shares the
+    inode, and ``os.path.samefile`` would call a case-sensitive volume
+    insensitive — folding two proxies' owner identities into one store.
     """
     key = str(parent)
     if key in _case_insensitive_volumes:
         return _case_insensitive_volumes[key]
     try:
-        for entry in parent.iterdir():
-            variant_name = _case_variant(entry.name)
+        names: set[str] | None = {child.name for child in parent.iterdir()}
+    except OSError:
+        # Unreadable directory: no read-only evidence, so the probe decides.
+        names = None
+    if names:
+        for name in names:
+            variant_name = _case_variant(name)
             if variant_name is None:
                 continue  # spelling has no ASCII case to compare
-            variant = entry.with_name(variant_name)
-            if not os.path.lexists(variant):
-                # On an insensitive volume the variant spelling is the same
-                # entry and would exist.
+            if variant_name in names:
+                # Both spellings are listed, so they are two directory
+                # entries: the volume does not fold case.
                 result = False
-                _case_insensitive_volumes[key] = result
-                return result
-            try:
-                result = os.path.samefile(entry, variant)
-            except OSError:
-                continue  # undecidable entry (e.g. broken symlink); try others
+            else:
+                # One spelling listed. It is the same entry on an insensitive
+                # volume exactly when the other spelling resolves.
+                result = os.path.lexists(parent / variant_name)
             _case_insensitive_volumes[key] = result
             return result
-    except OSError:
-        pass
     try:
         parent.mkdir(parents=True, exist_ok=True)
         fd, probe_name = tempfile.mkstemp(dir=parent, prefix=".headroom_case_probe_")

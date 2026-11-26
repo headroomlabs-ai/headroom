@@ -964,6 +964,51 @@ def test_case_probe_cannot_be_redirected_onto_a_victim_file(tmp_path) -> None:
     assert victim.read_text(encoding="utf-8") == "do not truncate"
 
 
+def test_hardlink_at_case_variant_spelling_is_not_insensitive_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    """A hardlink is a second directory entry sharing an inode, not a folded one.
+
+    A local writer of the store directory can hardlink an existing entry
+    under the case-variant spelling: two entries, one inode. Classification
+    that asked ``os.path.samefile`` read that as one folded entry and called
+    a case-sensitive volume insensitive — folding two proxies' owner
+    identities into one store. Comparing the names *listed* in the directory
+    separates the entries without consulting file identity at all.
+    """
+    monkeypatch.setattr(fs_backend_module, "_case_insensitive_volumes", {})
+
+    target = tmp_path / "store.json"
+    target.write_text("{}", encoding="utf-8", newline="\n")
+    variant = tmp_path / "Store.json"
+    try:
+        os.link(target, variant)
+    except OSError:
+        pytest.skip("hardlinks unavailable on this filesystem/volume")
+
+    result = _volume_is_case_insensitive(tmp_path)
+
+    # Classified from the listed names: False, with no probe written.
+    assert result is False
+    assert list(tmp_path.glob(".headroom_case_probe*")) == []
+
+    first = FileSystemTOINBackend(str(target))
+    second = FileSystemTOINBackend(str(variant))
+    assert first._owner_token() != second._owner_token()
+
+
+def test_two_listed_case_spellings_are_distinct_entries(tmp_path, monkeypatch) -> None:
+    """Two spellings listed in the directory are two entries: no folding."""
+    (tmp_path / "store.json").write_text("{}", encoding="utf-8", newline="\n")
+    (tmp_path / "probe_case").write_text("x", encoding="utf-8", newline="\n")
+    if (tmp_path / "PROBE_CASE").exists():
+        pytest.skip("case-insensitive volume: both spellings are one entry by design")
+    (tmp_path / "Store.json").write_text("{}", encoding="utf-8", newline="\n")
+    monkeypatch.setattr(fs_backend_module, "_case_insensitive_volumes", {})
+
+    assert _volume_is_case_insensitive(tmp_path) is False
+
+
 @pytest.mark.windows_newline
 def test_case_classification_from_existing_entries_writes_nothing(tmp_path, monkeypatch) -> None:
     """An existing entry classifies the volume without any write.
