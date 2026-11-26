@@ -19,6 +19,8 @@ import logging
 from collections.abc import Callable
 from typing import Any, cast
 
+from headroom.log_safety import safe_id
+
 logger = logging.getLogger("headroom.proxy")
 
 
@@ -59,7 +61,7 @@ async def _count_offloaded(owner: Any, model: Any, count: Callable[[Any], int]) 
         _record_fallback_model(
             owner,
             model,
-            f"Token counting for model {model} failed or timed out "
+            f"Token counting for model {safe_id(model)} failed or timed out "
             f"({e.__class__.__name__}); falling back to estimation",
         )
         estimator = EstimatingTokenCounter()

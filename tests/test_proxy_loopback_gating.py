@@ -65,6 +65,9 @@ def test_debug_memory_is_available_to_loopback_published_container_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    # The acknowledgement is the operator's statement that the publication is
+    # on host loopback, so the gateway peer can only be the host (#4794).
+    monkeypatch.setenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", "1")
     app = create_app(ProxyConfig(optimize=False, cache_enabled=False, stateless=True))
     loopback = TestClient(app, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 1))
     host = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.1", 1))

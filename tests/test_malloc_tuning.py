@@ -95,7 +95,15 @@ def test_reexec_sets_vars_and_execs_once(monkeypatch):
     assert proxy_cli.os.environ["_HEADROOM_MALLOC_TUNED"] == "1"
     # Re-exec normalizes to `python -m headroom.cli <args>`, preserving the PID.
     assert rec["path"] == "/usr/bin/python3"
-    assert rec["argv"] == ["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8787"]
+    assert rec["argv"] == [
+        "/usr/bin/python3",
+        "-P",
+        "-m",
+        "headroom.cli",
+        "proxy",
+        "--port",
+        "8787",
+    ]
 
 
 # --------------------------------------------------------------------------- #
