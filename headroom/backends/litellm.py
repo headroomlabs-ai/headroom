@@ -1080,7 +1080,10 @@ class LiteLLMBackend(Backend):
             }
         invoke_body["anthropic_version"] = _BEDROCK_ANTHROPIC_VERSION
         # CountTokens validates the body as an InvokeModel call, which needs it.
-        invoke_body.setdefault("max_tokens", 1)
+        # Bedrock requires max_tokens, and above a thinking budget when one is set.
+        thinking = invoke_body.get("thinking")
+        budget = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
+        invoke_body.setdefault("max_tokens", budget + 1 if isinstance(budget, int) else 1)
         payload = json.dumps(invoke_body).encode()
         return await asyncio.to_thread(self._bedrock_count_tokens, model_id, payload)
 

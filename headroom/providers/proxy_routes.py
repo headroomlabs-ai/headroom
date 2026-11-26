@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response
 from headroom.exceptions import ProviderError
 from headroom.log_safety import redact_url
 from headroom.providers.bedrock_models import newest_snapshot
+from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.cloudcode import (
     cloudcode_passthrough_target,
     normalize_cloudcode_passthrough_path,
@@ -178,7 +179,13 @@ def _register_provider_passthrough_route(
                 spec.sub_path,
                 spec.provider_name,
             )
-        if spec.provider_name == "anthropic" and spec.sub_path == "count_tokens":
+        # Only where the passthrough would reach api.anthropic.com: an operator
+        # who points the Anthropic target at a gateway keeps getting its counts.
+        if (
+            spec.provider_name == "anthropic"
+            and spec.sub_path == "count_tokens"
+            and _api_target(proxy, "anthropic").rstrip("/") == DEFAULT_ANTHROPIC_API_URL.rstrip("/")
+        ):
             counted = await _count_tokens_on_backend(proxy, request)
             if counted is not None:
                 return counted

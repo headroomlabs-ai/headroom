@@ -44,13 +44,13 @@ def _bedrock_backend(runtime: MagicMock) -> LiteLLMBackend:
     return backend
 
 
-def _post(backend, passthrough, headers=_HEADERS):
+def _post(backend, passthrough, headers=_HEADERS, **config):
     from fastapi.testclient import TestClient
 
     from headroom.proxy.loopback_guard import require_loopback
     from headroom.proxy.server import ProxyConfig, create_app
 
-    app = create_app(ProxyConfig(cache_enabled=False, rate_limit_enabled=False))
+    app = create_app(ProxyConfig(cache_enabled=False, rate_limit_enabled=False, **config))
     app.dependency_overrides[require_loopback] = lambda: None
     with TestClient(app) as client:
         app.state.proxy.anthropic_backend = backend
@@ -71,7 +71,8 @@ def test_bedrock_counts_tokens_without_an_upstream_call() -> None:
     assert call["modelId"] == "anthropic.claude-sonnet-4-6"
     sent = json.loads(call["input"]["invokeModel"]["body"])
     assert sent["anthropic_version"] == "bedrock-2023-05-31"
-    assert sent["max_tokens"] == 1  # required by Bedrock, absent from count requests
+    # Required by Bedrock and absent from count requests; above the thinking budget.
+    assert sent["max_tokens"] == 1025
     assert sent["system"] == _BODY["system"] and sent["tools"] == _BODY["tools"]
     assert "model" not in sent and "context_management" not in sent
     assert "display" not in sent["thinking"]
@@ -140,4 +141,27 @@ def test_caller_named_upstream_keeps_the_passthrough_in_bedrock_mode() -> None:
 
     assert resp.json() == {"input_tokens": 9}
     assert passthrough.call_args.args[1] == "https://gateway.example.com"
+    assert not runtime.count_tokens.called
+
+
+def test_configured_anthropic_gateway_keeps_the_passthrough_in_bedrock_mode() -> None:
+    """An operator-configured Anthropic target (ANTHROPIC_API_URL) still
+    receives count_tokens; only the default api.anthropic.com target is
+    answered from Bedrock."""
+    from fastapi.responses import Response
+
+    runtime = MagicMock()
+    passthrough = MagicMock(
+        return_value=Response(b'{"input_tokens": 11}', media_type="application/json")
+    )
+
+    async def forward(*args, **kwargs):
+        return passthrough(*args, **kwargs)
+
+    resp = _post(
+        _bedrock_backend(runtime), forward, anthropic_api_url="https://gateway.example.com"
+    )
+
+    assert resp.json() == {"input_tokens": 11}
+    assert passthrough.call_args.args[1].rstrip("/") == "https://gateway.example.com"
     assert not runtime.count_tokens.called
