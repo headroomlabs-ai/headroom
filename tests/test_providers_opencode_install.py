@@ -525,6 +525,86 @@ def test_kept_credential_still_survives_restart(
     assert _headroom_options(config_file)["apiKey"] == "{env:DEEPSEEK_API_KEY}"
 
 
+def _restart(manifest: DeploymentManifest, monkeypatch: pytest.MonkeyPatch) -> None:
+    from headroom.cli import install as cli_install
+
+    monkeypatch.setattr(cli_install, "_require_manifest", lambda profile: manifest)
+    monkeypatch.setattr(cli_install, "_save_apply_manifest", lambda active: None)
+    monkeypatch.setattr(cli_install, "save_manifest", lambda active: None)
+    monkeypatch.setattr(cli_install, "_start_deployment", lambda active: None)
+    monkeypatch.setattr(cli_install, "_stop_deployment", lambda active: None)
+    cli_install.install_restart.callback(manifest.profile)
+
+
+@pytest.mark.parametrize("change", ["flag", "both"])
+def test_restart_drops_credential_when_saved_flag_upstream_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """The old binding is checked before the active config is recaptured."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    _write_credential_config(config_file, "{env:DEEPSEEK_API_KEY}")
+    manifest = _upstream_manifest()
+    manifest.targets = ["opencode"]
+    manifest.proxy_args = ["--openai-api-url", "https://api.deepseek.com/v1"]
+    mutation = apply_provider_scope(manifest)
+    assert mutation is not None
+    manifest.mutations = [mutation]
+
+    manifest.proxy_args = ["--openai-api-url", "https://different-upstream.example/v1"]
+    if change == "both":
+        manifest.base_env = {"OPENAI_TARGET_API_URL": "https://different-upstream.example/v1"}
+
+    _restart(manifest, monkeypatch)
+
+    assert "apiKey" not in _headroom_options(config_file)
+    assert "opencode" not in manifest.provider_options
+
+
+def test_upstream_flag_takes_precedence_over_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same credential survives when only the unused env URL changes."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    _write_credential_config(config_file, "{env:DEEPSEEK_API_KEY}")
+    manifest = _upstream_manifest()
+    manifest.targets = ["opencode"]
+    manifest.proxy_args = ["--openai-api-url", "https://api.deepseek.com/v1"]
+    mutation = apply_provider_scope(manifest)
+    assert mutation is not None
+    manifest.mutations = [mutation]
+
+    manifest.base_env = {"OPENAI_TARGET_API_URL": "https://different-upstream.example/v1"}
+    _restart(manifest, monkeypatch)
+
+    assert _headroom_options(config_file)["apiKey"] == "{env:DEEPSEEK_API_KEY}"
+
+
+def test_changed_upstream_warning_redacts_urls_and_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An upstream mismatch never writes a stored or requested URL to logs."""
+    config_file = _opencode_config_file(tmp_path, monkeypatch)
+    old_url = "https://old.example/v1?token=inert-secret"
+    new_url = "https://new.example/v1?token=other-secret"
+    _write_credential_config(config_file, "{env:DEEPSEEK_API_KEY}")
+    manifest = _upstream_manifest()
+    manifest.base_env = {"OPENAI_TARGET_API_URL": old_url}
+    mutation = apply_provider_scope(manifest)
+    assert mutation is not None
+    revert_provider_scope(mutation, manifest, restore_backup=False)
+    assert manifest.provider_options["opencode"]["_upstream"] == old_url
+
+    manifest.base_env = {"OPENAI_TARGET_API_URL": new_url}
+    with caplog.at_level("WARNING"):
+        apply_provider_scope(manifest)
+
+    assert "set a new credential" in caplog.text
+    assert old_url not in caplog.text
+    assert new_url not in caplog.text
+    assert "inert-secret" not in caplog.text
+    assert "other-secret" not in caplog.text
+
+
 def test_install_apply_carries_credential_into_the_new_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
