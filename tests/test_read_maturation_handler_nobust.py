@@ -236,12 +236,15 @@ def _drive_session(
     convo=_convo,
     cache_hits: bool = True,
     tools: list[dict] | None = None,
+    totals_out: list[int] | None = None,
 ) -> list[list[dict]]:
     """Drive ``n_turns`` cumulative turns of ``convo`` through the real handler
     with a mocked upstream; return the forwarded message arrays per turn. When
     ``saved_out`` is given, each turn's emitted ``x-headroom-tokens-saved`` is
     appended to it. The upstream caches up to the handler's breakpoint, or
-    reports no cache at all when ``cache_hits`` is False."""
+    reports no cache at all when ``cache_hits`` is False. When ``totals_out`` is
+    given, the funnel's running ``tokens_saved_total`` is appended after each
+    turn."""
     app = create_app(config)
     forwarded: list[list[dict]] = []
     with TestClient(app) as client:
@@ -298,6 +301,8 @@ def _drive_session(
                 assert r.status_code == 200, f"turn {n}: {r.text[:300]}"
                 if saved_out is not None:
                     saved_out.append(int(r.headers.get("x-headroom-tokens-saved", 0)))
+                if totals_out is not None:
+                    totals_out.append(int(proxy.metrics.tokens_saved_total))
         finally:
             proxy._retry_request = original_retry
     return forwarded
@@ -626,3 +631,104 @@ def test_replayed_marker_is_not_rebooked_in_the_emitted_savings(monkeypatch):
         f"replayed marker re-booked through the final accounting path: "
         f"matured turn saved {saved[first]}, replay turns saved {replays}"
     )
+
+
+READ2_ID = "toolu_r2"
+BIG2 = BIG.replace("def f_", "def g_")
+
+
+def _two_reads_convo(nquiet: int) -> list[dict]:
+    """Read of /x/foo.py, then on the next turn a Read of /x/bar.py, then
+    ``nquiet`` quiet turns. The two Reads quiesce, and so mature, on
+    consecutive requests."""
+
+    def read(tid: str, path: str, content: str, tail: bool) -> list[dict]:
+        tr: dict = {"type": "tool_result", "tool_use_id": tid, "content": content}
+        if tail:
+            tr["cache_control"] = {"type": "ephemeral"}
+        return [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": tid, "name": "Read", "input": {"file_path": path}}
+                ],
+            },
+            {"role": "user", "content": [tr]},
+        ]
+
+    msgs: list[dict] = [{"role": "user", "content": [{"type": "text", "text": "Read both files"}]}]
+    msgs += read(READ_ID, "/x/foo.py", BIG, tail=(nquiet == 0))
+    if nquiet >= 1:
+        msgs += read(READ2_ID, "/x/bar.py", BIG2, tail=(nquiet == 1))
+    for i in range(2, nquiet + 1):
+        msgs += _quiet_pair(i, tail=(i == nquiet))
+    return msgs
+
+
+def _matured_turn(forwarded: list[list[dict]], tool_use_id: str) -> int | None:
+    for turn, msgs in enumerate(forwarded):
+        for m in msgs:
+            for b in m.get("content") or []:
+                if (
+                    isinstance(b, dict)
+                    and b.get("type") == "tool_result"
+                    and b.get("tool_use_id") == tool_use_id
+                    and "Retrieve original: hash=" in str(b.get("content"))
+                ):
+                    return turn
+    return None
+
+
+def test_consecutive_maturations_each_reach_the_running_total(monkeypatch):
+    """Two Reads maturing on consecutive requests both reach the running total.
+
+    The emitted per-request saving is first-appearance (the replay debt drops
+    the first marker on the second request), but the conversation ledger
+    differences the lineage's running total. Fed the debt-adjusted figure, it
+    subtracted the first Read's removal a second time and booked the second
+    Read as roughly zero (#5069 follow-up). Asserted on the funnel's real
+    running total, with optimization on and no outcome spy.
+    """
+    from headroom.cache.compression_store import reset_compression_store
+    from headroom.proxy.conversation_savings import reset_conversation_savings
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    reset_compression_store()
+    reset_conversation_savings()
+
+    config = ProxyConfig(
+        optimize=True,
+        read_maturation=True,
+        read_maturation_quiesce_turns=2,
+        mode="token",
+        cache_enabled=True,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+    )
+    saved: list[int] = []
+    totals: list[int] = []
+    forwarded = _drive_session(
+        config,
+        n_turns=6,
+        session_id="consecutive-maturation-1",
+        saved_out=saved,
+        convo=_two_reads_convo,
+        cache_hits=False,
+        totals_out=totals,
+    )
+
+    first = _matured_turn(forwarded, READ_ID)
+    second = _matured_turn(forwarded, READ2_ID)
+    assert first is not None and second is not None, (first, second, saved)
+    assert second == first + 1, f"setup: Reads must mature back to back ({first}, {second})"
+
+    booked = [b - a for a, b in zip([0, *totals], totals, strict=False)]
+    assert booked[first] > 0, f"first maturation booked nothing: {booked}"
+    # The two Reads are the same size, so each maturation books about as much.
+    assert booked[second] > booked[first] * 0.5, (
+        f"second maturation lost from the running total: booked per turn {booked}, "
+        f"emitted per request {saved}"
+    )
+    # Each removal still books once: replay turns after both add ~nothing.
+    assert max(booked[second + 1 :], default=0) < booked[first] * 0.2, booked

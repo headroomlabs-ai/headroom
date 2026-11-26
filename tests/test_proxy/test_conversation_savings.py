@@ -536,3 +536,33 @@ async def test_the_snapshot_says_whose_request_it_was() -> None:
     assert seen[0].conversation_key == "conv-a"
     assert seen[0].original_tokens == 156_260
     assert dict(seen[1].attribution) == {}
+
+
+def test_proactive_expansion_does_not_lower_the_anthropic_running_total() -> None:
+    """Expansion text is sent on one turn only; the replayed prefix keeps the
+    removal. The ledger is fed the wire saving with the expansion added back,
+    so expand-then-not does not re-book the same removal (#5069 follow-up)."""
+    from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin, _ProxyExpansionBlock
+
+    def count(text: str) -> int:
+        return len(text.split())
+
+    expanded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
+        [{"role": "user", "content": [{"type": "text", "text": "what failed?"}]}],
+        "word " * 500,
+    )
+    assert any(isinstance(b, _ProxyExpansionBlock) for m in expanded for b in m["content"]), (
+        "setup: no expansion block appended"
+    )
+    expansion = AnthropicHandlerMixin._proactive_expansion_tokens(expanded, count)
+    assert expansion == 500
+    assert AnthropicHandlerMixin._proactive_expansion_tokens([{"role": "user"}], count) == 0
+
+    # Request savings 2,000 / 1,500 (500 expanded back) / 2,000: one removal.
+    ledger = ConversationSavings()
+    booked = [
+        ledger.novel("anthropic:lineage", 2_000),
+        ledger.novel("anthropic:lineage", 1_500 + expansion),
+        ledger.novel("anthropic:lineage", 2_000),
+    ]
+    assert booked == [2_000, 0, 0]
