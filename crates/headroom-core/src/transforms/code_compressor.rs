@@ -2215,6 +2215,10 @@ impl<'a> Ctx<'a> {
             let is_comment = |member: &Node| COMMENT_NODE_TYPES.contains(&member.kind());
             let owns_rows = !is_comment(&members[0])
                 && members[1..].iter().all(is_comment)
+                // A trailing comment that runs past the member's last row
+                // (`int x = 1; /* a` ... `b */`) is cut if the member is
+                // rendered alone, and a later `*/` would then close it.
+                && rows(members[0]).1 == group_last
                 && group_first as i64 > last_processed_end
                 && !matches!(closing_row, Some(closing) if group_last >= closing);
             if !owns_rows {
@@ -3024,6 +3028,52 @@ def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n   
                 out.find("macro_rules! make") < out.find("make!()"),
                 "macro moved below its use:\n{out}"
             );
+        }
+    }
+
+    /// Mirrors `COMMENT_TAIL_MEMBERS` in
+    /// tests/test_code_compressor_wrapper_nodes.py: a block comment that starts
+    /// after a member and ends on a later row keeps its terminator, so the
+    /// declaration after it is still code.
+    #[test]
+    fn comment_after_a_member_keeps_its_terminator() {
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "cpp",
+                format!(
+                    "namespace n {{\nint limit = 42; /* Maximum\nrequest size. */\nint timeout = 30;\n/* Defaults for retries. */\n}}\n\n{}",
+                    cpp_work()
+                ),
+                "int timeout = 30;",
+            ),
+            (
+                "java",
+                format!(
+                    "class C {{\n    int limit = 42; /* Maximum\n       request size. */\n    int timeout = 30;\n{}}}\n",
+                    java_work()
+                ),
+                "int timeout = 30;",
+            ),
+            (
+                "rust",
+                format!(
+                    "mod n {{\n    pub const LIMIT: i32 = 42; /* Maximum\n       request size. */\n    pub const TIMEOUT: i32 = 30;\n}}\n\n{}",
+                    rust_work()
+                ),
+                "pub const TIMEOUT: i32 = 30;",
+            ),
+        ];
+        for (lang, code, declaration) in cases {
+            let out = compress_as(&code, lang).compressed;
+            assert!(out.contains("// ["), "[{lang}] {out}");
+            assert_eq!(out.matches("request size. */").count(), 1, "[{lang}] {out}");
+            let terminator = out.find("request size. */").unwrap();
+            let decl = out.find(declaration).expect("declaration kept");
+            assert!(
+                terminator < decl,
+                "[{lang}] comment not closed first:\n{out}"
+            );
+            assert!(parses(&out, lang), "[{lang}] output does not parse");
         }
     }
 
