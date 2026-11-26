@@ -367,3 +367,90 @@ def test_class_member_on_the_brace_line_is_not_repeated():
     out = _compress(code, "cpp").compressed
 
     assert out.count("int first = 1;") == 1, out
+
+
+_JAVA_WORK = "    void work() {\n        int n = 0;\n" + _body("        n += 1;", 100) + "\n    }\n"
+
+# Members that share a physical row with a sibling, the container's header or
+# its closing brace. Rows are emitted whole, so compressing one such member on
+# its own used to drop the sibling from the shared row (syntax still valid) or
+# repeat the member before the closing brace. Each declaration must appear
+# exactly once while the separate long function still shrinks.
+# (name, language, code, declarations that must each appear exactly once)
+SHARED_ROW_MEMBERS = [
+    (
+        "rust-fn-and-const-in-mod",
+        "rust",
+        "mod n {\n    fn f() {} pub const X: i32 = 2;\n}\n\n" + _RUST_WORK,
+        ["fn f() {}", "pub const X: i32 = 2;"],
+    ),
+    (
+        "rust-fn-on-mod-closing-row",
+        "rust",
+        "mod n {\n    fn f() {} }\n\n" + _RUST_WORK,
+        ["fn f() {}"],
+    ),
+    (
+        "rust-two-methods-in-impl",
+        "rust",
+        "struct S;\nimpl S {\n    fn a(&self) {} fn b(&self) {}\n}\n\n" + _RUST_WORK,
+        ["fn a(&self) {}", "fn b(&self) {}"],
+    ),
+    (
+        "java-method-and-field",
+        "java",
+        "class C {\n    void ping() {} int version = 1;\n" + _JAVA_WORK + "}\n",
+        ["void ping() {}", "int version = 1;"],
+    ),
+    (
+        "java-two-methods",
+        "java",
+        "class C {\n    void a() {} void b() {}\n" + _JAVA_WORK + "}\n",
+        ["void a() {}", "void b() {}"],
+    ),
+    (
+        "cpp-function-on-namespace-closing-row",
+        "cpp",
+        "namespace n {\nint f() { return 1; } }\n\n" + _CPP_WORK,
+        ["int f() { return 1; }"],
+    ),
+    (
+        "cpp-comment-before-namespace-closing-brace",
+        "cpp",
+        "namespace n { // c\nint f() { return 1; } /* x */ }\n\n" + _CPP_WORK,
+        ["int f() { return 1; }", "/* x */"],
+    ),
+    (
+        "cpp-one-line-class",
+        "cpp",
+        "class S {};\n\n" + _CPP_WORK,
+        ["class S {};"],
+    ),
+    (
+        "cpp-two-one-line-classes",
+        "cpp",
+        "class A {}; class B {};\n\n" + _CPP_WORK,
+        ["class A {};", "class B {};"],
+    ),
+    (
+        "cpp-one-line-class-in-namespace",
+        "cpp",
+        "namespace n {\nclass S {};\n}\n\n" + _CPP_WORK,
+        ["class S {};"],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("language", "code", "declarations"),
+    [pytest.param(lang, code, decls, id=name) for name, lang, code, decls in SHARED_ROW_MEMBERS],
+)
+def test_members_sharing_a_row_appear_once(language, code, declarations):
+    result = _compress(code, language)
+    out = result.compressed
+
+    assert "// [" in out, "the separate long function should compress"
+    assert result.compression_ratio < 0.5, out
+    for declaration in declarations:
+        assert out.count(declaration) == 1, (declaration, out)
+    assert _valid(out, language)

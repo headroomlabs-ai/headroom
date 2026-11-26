@@ -2321,7 +2321,13 @@ class CodeAwareCompressor(Transform):
         # repeat a one-line body after its header, and take in any sibling on
         # the same line.
         if body_node is None or node.start_point[0] == node.end_point[0]:
-            return "\n".join(_get_exact_node_lines(node, code_lines))
+            text = "\n".join(_get_exact_node_lines(node, code_lines))
+            # C++ `class S {};`: the `;` is a sibling of the class node, and the
+            # extractor marks it captured with the class, so it must be emitted
+            # here or the output loses it and fails validation.
+            if _get_same_line_trailing_semicolon(node) is not None:
+                text += ";"
+            return text
 
         # Class header (signature) — everything before the body
         node_start_line = node.start_point[0]
@@ -2352,24 +2358,59 @@ class CodeAwareCompressor(Transform):
         # (`namespace a { int x;`) is in the header text and must not be
         # emitted again.
         last_processed_end = node.start_point[0] + len(header_lines) - 1
+        # The closing-brace row is emitted whole after the members, so a member
+        # that ends on it (`int f() { return 1; } }`) must not be emitted again.
+        closing_row: int | None = None
+        if (
+            not lang_config.uses_colon_after_signature
+            and body_node.end_point[0] != node.start_point[0]
+        ):
+            closing_row = body_node.end_point[0]
 
-        for child in body_node.children:
-            if not child.is_named:
+        def _rows(member: Any) -> tuple[int, int]:
+            first, last = member.start_point[0], member.end_point[0]
+            if member.end_point[1] == 0 and last > first:
+                last -= 1
+            return first, last
+
+        # Rows are emitted whole and each row at most once. Members that share
+        # a row (`void ping() {} int version = 1;`, `x = 1; y = 2`) form one
+        # group: compressing one of them on its own would cut its siblings out
+        # of the shared row, so the group's rows are kept verbatim instead. A
+        # trailing comment on a member's last row stays with that member.
+        named_children = [child for child in body_node.children if child.is_named]
+        groups: list[tuple[list[Any], int, int]] = []
+        for child in named_children:
+            first, last = _rows(child)
+            if groups and first <= groups[-1][2]:
+                members, group_first, group_last = groups[-1]
+                members.append(child)
+                groups[-1] = (members, group_first, max(group_last, last))
+            else:
+                groups.append(([child], first, last))
+
+        for members, group_first, group_last in groups:
+            owns_rows = (
+                members[0].type not in _COMMENT_NODE_TYPES
+                and all(m.type in _COMMENT_NODE_TYPES for m in members[1:])
+                and group_first > last_processed_end
+                and (closing_row is None or group_last < closing_row)
+            )
+            if not owns_rows:
+                verbatim_first = max(group_first, last_processed_end + 1)
+                verbatim_last = group_last
+                if closing_row is not None and verbatim_last >= closing_row:
+                    verbatim_last = closing_row - 1
+                if verbatim_first <= verbatim_last:
+                    body_parts.append("\n".join(code_lines[verbatim_first : verbatim_last + 1]))
+                    for member in members:
+                        processed_ranges.append((member.start_byte, member.end_byte))
+                last_processed_end = max(last_processed_end, group_last)
                 continue
 
-            # Use line-based extraction for children too
-            child_start = child.start_point[0]
-            child_end = child.end_point[0]
-            if child.end_point[1] == 0 and child_end > child_start:
-                child_end -= 1
-            # Statements can share a physical line (`x = 1; y = 2`). The line
-            # slice already carries all of them; skip only rows already
-            # emitted, keeping any continuation lines of this node.
-            if child_start <= last_processed_end:
-                child_start = last_processed_end + 1
-                if child_start > child_end:
-                    continue
-            last_processed_end = child_end
+            child = members[0]
+            child_start, child_end = _rows(child)
+            last_processed_end = group_last
             child_text = "\n".join(code_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually
@@ -2871,15 +2912,18 @@ def _assemble_in_source_order(structure: CodeStructure, code: str) -> str:
     A blank line separates two fragments when the source had one between
     them, so the output keeps the file's grouping.
     """
+    # Encode once: tree-sitter offsets are UTF-8 bytes, and slicing through
+    # `_slice_code_bytes` would re-encode the whole file per fragment.
+    code_bytes = code.encode("utf-8")
     parts: list[str] = []
     previous: tuple[int, int] | None = None
     for start, end, text in sorted(structure.source_order, key=lambda entry: entry[0]):
         if previous is not None:
             # Some nodes (C `#include`, `#define`) end after their newline.
             gap_start = previous[1]
-            if _slice_code_bytes(code, previous[0], previous[1]).endswith("\n"):
+            if previous[1] > previous[0] and code_bytes[previous[1] - 1 : previous[1]] == b"\n":
                 gap_start -= 1
-            if re.search(r"\n[ \t]*\n", _slice_code_bytes(code, gap_start, start)):
+            if re.search(rb"\n[ \t]*\n", code_bytes[gap_start:start]):
                 parts.append("")
         parts.append(text.rstrip("\n"))
         previous = (start, end)
