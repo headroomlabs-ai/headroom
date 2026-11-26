@@ -154,6 +154,11 @@ Two log paths, with very different sensitivity:
   events record the action, method, path, source IP, and status code of `/admin/*`,
   `/cache/clear`, and `/stats/reset` calls.
 
+  Every record is one line: line breaks and other control characters in a message are
+  escaped and traceback lines are indented, in `proxy.log`, on the proxy's stderr, and
+  in uvicorn's own log lines. An application that embeds the proxy and configured the
+  root logger before importing it keeps its own stderr formatter.
+
   Note the permission asymmetry: unlike `copilot_auth.json`, `ccr_store.db`, and
   `settings.json`, this file gets no explicit mode. Under a common `0002` umask it lands
   at `0664` — readable by every account on the host.
@@ -401,6 +406,12 @@ Beyond your configured LLM providers, Headroom may contact:
 | `api.anthropic.com` | Subscription usage poll (`/api/oauth/usage`) for the quota panel; sends your Claude OAuth token as a bearer credential | On, but it only polls when a token is found (`CLAUDE_CODE_OAUTH_TOKEN` or the Claude credentials file); every 300 s | `HEADROOM_NO_SUBSCRIPTION_TRACKING=1` or `HEADROOM_OFFLINE` |
 | `api.github.com` | GitHub Copilot quota poll (`/copilot_internal/user`); sends a GitHub token as a bearer credential | On, but it only polls when one of `GITHUB_COPILOT_GITHUB_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` or `GITHUB_COPILOT_API_TOKEN` is set; every 60 s | No dedicated switch found. Unset those variables, or use `HEADROOM_OFFLINE` |
 | `mobile.events.data.microsoft.com` | ONNX Runtime's own usage telemetry to Microsoft (ORT 1.31+ on Linux and macOS): hashed device id, model file and graph names, model hashes, execution providers, hardware ids | **Off**: importing `headroom` sets `ORT_DISABLE_TELEMETRY=1` unless it is already set | Leave `ORT_DISABLE_TELEMETRY` unset or `1`; setting it to `0` turns ORT's telemetry back on |
+
+Model and tokenizer downloads are pinned to immutable commit SHAs, so the artifacts fetched
+on first use stay the same bytes for a given Headroom version even if an upstream repository
+is updated. See
+[HuggingFace revision pinning](/docs/configuration#huggingface-revision-pinning) for the
+pins, the upgrade path, and `HEADROOM_HF_PIN`.
 
 ### The beacon is on by default
 
