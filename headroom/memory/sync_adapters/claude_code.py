@@ -25,6 +25,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from headroom.learn._shared import claude_config_dir
 from headroom.memory.sync import AgentMemory, AgentMemoryAdapter
 
 
@@ -267,7 +268,8 @@ def get_claude_memory_dir(project_path: Path | None = None) -> Path:
 
     Claude Code stores per-project memory at:
         ~/.claude/projects/-<sanitized-path>/memory/
+    (under ``$CLAUDE_CONFIG_DIR`` instead of ``~/.claude`` when that is set).
     """
     project = project_path or Path.cwd()
     sanitized = encode_claude_project_path(project)
-    return Path.home() / ".claude" / "projects" / sanitized / "memory"
+    return claude_config_dir() / "projects" / sanitized / "memory"
