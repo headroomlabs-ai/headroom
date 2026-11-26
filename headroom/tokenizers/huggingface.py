@@ -143,12 +143,121 @@ ALLOWED_TOKENIZER_REPOS: frozenset[str] = frozenset(MODEL_TO_TOKENIZER.values())
 # an unknown model got before this allowlist existed.
 DEFAULT_TOKENIZER: str = MODEL_TO_TOKENIZER["llama-3"]
 
+# Immutable commit SHAs for the allowlisted repositories (GH #4939).
+#
+# Without these, a cache miss resolved ``main`` and the same repo id could hand
+# back different ``tokenizer.json`` bytes a month later — the vocabulary behind
+# every token count in the proxy would drift with no change on our side. Pinned
+# here rather than in ``onnx_runtime._PINNED_REVISIONS`` because this table is
+# keyed by the allowlist above: a repo is pinned exactly when we ship it, so
+# adding a family to MODEL_TO_TOKENIZER without a SHA fails
+# ``test_every_shipped_tokenizer_repo_is_pinned`` instead of silently floating.
+#
+# Refresh deliberately: bump the SHA, re-run the tests, ship it. ``HEADROOM_HF_PIN=off``
+# floats every repository again (same switch the ONNX/model pins use), for
+# evaluating a newer upstream revision before adopting it.
+#
+# ``mosaicml/mpt-7b`` and ``mosaicml/mpt-30b`` are absent on purpose: both repos
+# are gone from the Hub (401/404), so there is no commit to pin and no download
+# to make reproducible. They keep failing closed to estimation, as before.
+_TOKENIZER_REVISIONS: dict[str, str] = {
+    "meta-llama/Meta-Llama-3-8B": "8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920",
+    "meta-llama/Meta-Llama-3-70B": "c82494877ce7f6d7d317c56ec081328e382c72fe",
+    "meta-llama/Llama-3.1-8B": "d04e592bb4f6aa9cfee91e2e20afa771667e1d4b",
+    "meta-llama/Llama-3.1-70B": "349b2ddb53ce8f2849a6c168a81980ab25258dac",
+    "meta-llama/Llama-3.1-405B": "b906e4dc842aa489c962f9db26554dcfdde901fe",
+    "meta-llama/Llama-3.2-1B": "4e20de362430cd3b72f300e6b0f18e50e7166e08",
+    "meta-llama/Llama-3.2-3B": "13afe5124825b4f3751f836b40dafda64c1ed062",
+    "meta-llama/Llama-3.3-70B-Instruct": "6f6073b423013f6a7d4d9f39144961bfbfbc386b",
+    "meta-llama/Llama-2-7b-hf": "01c7f73d771dfac7d292323805ebc428287df4f9",
+    "meta-llama/Llama-2-13b-hf": "5c31dfb671ce7cfe2d7bb7c04375e44c55e815b1",
+    "meta-llama/Llama-2-70b-hf": "3aba440b59558f995867ba6e1f58f21d0336b5bb",
+    "codellama/CodeLlama-7b-hf": "6c284d1468fe6c413cf56183e69b194dcfa27fe6",
+    "codellama/CodeLlama-13b-hf": "8da65ff4ee20f74ecd107ca9d54f9f121b279860",
+    "codellama/CodeLlama-34b-hf": "6008b9656730b71c7d19a15370c7ff6d2902f4ef",
+    "mistralai/Mistral-7B-v0.1": "27d67f1b5f57dc0953326b2601d68371d40ea8da",
+    "mistralai/Mistral-7B-Instruct-v0.2": "63a8b081895390a26e140280378bc85ec8bce07a",
+    "mistralai/Mistral-7B-Instruct-v0.3": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+    "mistralai/Mistral-Nemo-Base-2407": "a4477a2f977929a969745b69bbd62e03043551a5",
+    "mistralai/Mistral-Small-Instruct-2409": "4600506f6b13c7ef89e61a54263f4c9bf483de30",
+    "mistralai/Mistral-Large-Instruct-2407": "a286006d554cb37a61d13c7ae61bc90cc1d372fc",
+    "mistralai/Mixtral-8x7B-v0.1": "fc7ac94680e38d7348cfa806e51218e6273104b0",
+    "mistralai/Mixtral-8x22B-v0.1": "e1cd34ff1747406fb2277635ed25242803009bc2",
+    "Qwen/Qwen-7B": "ef3c5c9c57b252f3149c1408daf4d649ec8b6c85",
+    "Qwen/Qwen-14B": "c4051215126d906ac22bb67fe5edb39a921cd831",
+    "Qwen/Qwen-72B": "b8e18ac61df64d35308695769ff46b976b6a00f4",
+    "Qwen/Qwen2-7B": "453ed1575b739b5b03ce3758b23befdb0967f40e",
+    "Qwen/Qwen2-72B": "5f149cae83c11c408a953dec64b12e7e662e8cb9",
+    "Qwen/Qwen2.5-7B": "d149729398750b98c0af14eb82c78cfe92750796",
+    "Qwen/Qwen2.5-72B": "efba10c8e54e91e0d9570ab5f7b51a958474d4cb",
+    "deepseek-ai/deepseek-llm-7b-base": "7683fea62db869066ddaff6a41d032262c490d4f",
+    "deepseek-ai/deepseek-llm-67b-base": "c3f813a1121c95488a20132d3a4da89f4a46452f",
+    "deepseek-ai/deepseek-coder-6.7b-base": "ce2207a8bfef3ee92bd7dd4cc31c52cfa0046912",
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": "e434a23f91ba5b4923cf6c9d9a238eb4a08e3a11",
+    "deepseek-ai/DeepSeek-V2": "4461458f186c35188585855f28f77af5661ad489",
+    "deepseek-ai/DeepSeek-V2-Lite": "604d5664dddd88a0433dbae533b7fe9472482de0",
+    "deepseek-ai/DeepSeek-V3": "e815299b0bcbac849fa540c768ef21845365c9eb",
+    "deepseek-ai/DeepSeek-V3-0324": "e9b33add76883f293d6bf61f6bd89b497e80e335",
+    "deepseek-ai/DeepSeek-V3.2": "a7e62ac04ecb2c0a54d736dc46601c5606cf10a6",
+    "deepseek-ai/DeepSeek-R1": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad",
+    "deepseek-ai/DeepSeek-R1-0528": "4236a6af538feda4548eca9ab308586007567f52",
+    "deepseek-ai/DeepSeek-V4.1-Flash": "314113f8a7dadb388215396ba5fbee2c610a04d6",
+    "deepseek-ai/DeepSeek-V4-Pro": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": "916b56a44061fd5cd7d6a8fb632557ed4f724f60",
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": "6a6f4aa4197940add57724a7707d069478df56b1",
+    "01-ai/Yi-6B": "80080be87ec5a0103f643195f2d9003b8068941b",
+    "01-ai/Yi-34B": "e1fa7c83283f2e1d5a12cb4adea37c3f829e28f8",
+    "01-ai/Yi-1.5-6B": "157a3d77ab5a8a8f079510eaa25169b547481f06",
+    "microsoft/phi-2": "810d367871c1d460086d9f82db8696f2e0a0fcd0",
+    "microsoft/Phi-3-mini-4k-instruct": "f39ac1d28e925b323eae81227eaba4464caced4e",
+    "microsoft/Phi-3-small-8k-instruct": "188b876e997ee4055df01afe46274c14c400fe40",
+    "microsoft/Phi-3-medium-4k-instruct": "48d87cd5e0523b430d77e93becd3655cd6897230",
+    "tiiuae/falcon-7b": "ec89142b67d748a1865ea4451372db8313ada0d8",
+    "tiiuae/falcon-40b": "05ab2ee8d6b593bdbab17d728de5c028a7a94d83",
+    "tiiuae/falcon-180B": "d2ea5531862d4fe907280234990e6380d2befd97",
+    "bigcode/starcoder": "827cd7721231872c152e3faef5cae1b22964ed58",
+    "bigcode/starcoder2-15b": "46d44742909c03ac8cee08eb03fdebce02e193ec",
+    "bigcode/starcoder2-3b": "733247c55e3f73af49ce8e9c7949bf14af205928",
+    "bigcode/starcoder2-7b": "bb9afde76d7945da5745592525db122d4d729eb1",
+    "google/gemma-7b": "ff6768d9368919a1f025a54f9f5aa0ee591730bb",
+    "google/gemma-2b": "9cf48e52b224239de00d483ec8eb84fb8d0f3a3a",
+    "google/gemma-2-9b": "33c193028431c2fde6c6e51f29e6f17b60cbfac6",
+    "google/gemma-2-27b": "938270f5272feb02779b55c2bb2fffdd0f53ff0c",
+}
+
 # Operator escape hatch for self-hosted or private tokenizer repositories:
 # a comma-separated list of repo ids. This is deliberately environment-only —
 # server-side configuration an operator sets, never anything a client can
 # influence through a request body. Repositories added here are still loaded
-# with ``trust_remote_code=False``.
+# with ``trust_remote_code=False``, and float on the default branch: a pin is a
+# decision about a repository we ship, and we cannot choose one for an id we
+# only learned about from the environment. Set ``HEADROOM_HF_TOKENIZER_REVISIONS``
+# (``repo=sha,repo=sha``) to pin an operator repo as well.
 _ALLOWLIST_ENV = "HEADROOM_HF_TOKENIZER_ALLOWLIST"
+_REVISIONS_ENV = "HEADROOM_HF_TOKENIZER_REVISIONS"
+
+
+def _operator_revisions(extra: str) -> dict[str, str]:
+    """Parse ``repo=sha,...`` from the operator env knob, ignoring malformed pairs."""
+    out: dict[str, str] = {}
+    for part in extra.split(","):
+        repo, sep, sha = part.partition("=")
+        if sep and repo.strip() and sha.strip():
+            out[repo.strip()] = sha.strip()
+    return out
+
+
+def _revision_for(repo: str) -> str | None:
+    """The commit SHA to fetch ``repo`` at, or ``None`` for the default branch.
+
+    Precedence: the operator's ``HEADROOM_HF_TOKENIZER_REVISIONS`` entry, then
+    our shipped pin, and no pin at all when ``HEADROOM_HF_PIN`` is off. Raises
+    nothing — an unpinned repository loads exactly as it did before.
+    """
+    from headroom.onnx_runtime import _resolve_revision
+
+    operator = _operator_revisions(os.environ.get(_REVISIONS_ENV, ""))
+    return _resolve_revision(repo, operator.get(repo), _TOKENIZER_REVISIONS)
 
 
 @lru_cache(maxsize=8)
@@ -225,6 +334,10 @@ def _load_tokenizer(tokenizer_name: str):
     # case-insensitive, so the string that reaches the Hub must be the one we
     # vetted, not a variant the caller chose.
     tokenizer_name = repo
+    # Immutable revision for this repository (GH #4939). Both attempts use it,
+    # including the cache-only one: a cache seeded at a floating `main` is a
+    # different snapshot, and loading it would defeat the pin.
+    revision = _revision_for(tokenizer_name)
 
     from headroom.offline import apply_offline_env, guard_egress, is_offline
 
@@ -242,6 +355,7 @@ def _load_tokenizer(tokenizer_name: str):
         # repo we are not willing to execute.
         return AutoTokenizer.from_pretrained(
             tokenizer_name,
+            revision=revision,
             trust_remote_code=False,
             local_files_only=True,
         )
@@ -275,6 +389,7 @@ def _load_tokenizer(tokenizer_name: str):
             result.append(
                 AutoTokenizer.from_pretrained(
                     tokenizer_name,
+                    revision=revision,
                     trust_remote_code=False,  # see the cache-only attempt above
                 )
             )
