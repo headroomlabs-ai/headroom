@@ -86,9 +86,23 @@ class RedisBackend:
         ``None`` only when the probe could not run (read failing or skipped in
         back-off). A successful ``EXISTS`` returning 0 is a definite miss, even
         if another kind of call — a write, say — is failing right now.
+
+        A user may be allowed ``GET`` but denied ``EXISTS`` (ACL ``-exists``).
+        That denial says nothing about whether the key is there, so the probe
+        falls back to ``GET`` for it; any other failure stays unknown.
         """
-        count = self._guard.call("read", lambda: self._client.exists(self._key(hash_key)), None)
-        return None if count is None else bool(count)
+
+        def probe() -> bool:
+            try:
+                return bool(self._client.exists(self._key(hash_key)))
+            except Exception as exc:  # noqa: BLE001 - only the ACL denial is handled
+                from redis.exceptions import NoPermissionError
+
+                if not isinstance(exc, NoPermissionError):
+                    raise
+                return self._client.get(self._key(hash_key)) is not None
+
+        return self._guard.call("read", probe, None)
 
     def clear(self) -> None:
         keys = self._scan()

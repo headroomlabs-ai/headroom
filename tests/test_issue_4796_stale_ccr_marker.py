@@ -305,6 +305,59 @@ def test_a_successful_zero_exists_is_a_definite_miss_despite_a_failing_write():
     assert backend.available() is False, "the failed write is still recorded"
 
 
+def test_a_permission_denied_exists_falls_back_to_get():
+    """A Redis user may be allowed GET but not EXISTS (ACL ``-exists``).
+
+    The probe used to answer unknown for that denial, so a cached marker whose
+    original had been deleted was served as live. A permission error says
+    nothing about whether the key is there: read it instead. An operator that
+    denies EXISTS still leaves GET, which is all the probe needs.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    redis = pytest.importorskip("redis")
+    from headroom.cache.backends.redis import RedisBackend
+
+    class DeniesExists(fakeredis.FakeRedis):
+        def exists(self, *args, **kwargs):
+            raise redis.exceptions.NoPermissionError(
+                "NOPERM this user has no permissions to run the 'exists' command"
+            )
+
+    backend = RedisBackend("redis://localhost", client=DeniesExists())
+    store = CompressionStore(max_entries=4, backend=backend)
+    hash_key = store.store("the original tool output", "the compressed view")
+    cache = CompressionCache()
+    cache.put("k", f"head <<ccr:{hash_key}>>", 0.2, "x")
+
+    assert backend.live(hash_key) is True
+    assert cache.get("k", store) is not None
+
+    backend._client.delete(backend._key(hash_key))
+    assert backend.live(hash_key) is False, "GET answered what EXISTS was not allowed to"
+    assert cache.get("k", store) is None, "a deleted original must not be served"
+    assert cache.stats["cache_evictions"] == 1
+
+
+def test_a_permission_denied_exists_whose_get_also_fails_is_unknown():
+    """Only a permission error earns the GET fallback; other failures stay unknown."""
+    fakeredis = pytest.importorskip("fakeredis")
+    redis = pytest.importorskip("redis")
+    from headroom.cache.backends.redis import RedisBackend
+
+    class DeniesExistsAndGet(fakeredis.FakeRedis):
+        def exists(self, *args, **kwargs):
+            raise redis.exceptions.NoPermissionError("NOPERM exists")
+
+        def get(self, *args, **kwargs):
+            raise redis.ConnectionError("connection lost")
+
+    backend = RedisBackend("redis://localhost", client=DeniesExistsAndGet())
+    store = CompressionStore(max_entries=4, backend=backend)
+    assert store.all_live(["52a7090074ed6e50f0601afd"]) is None, (
+        "a failed read is unknown, not a miss"
+    )
+
+
 def test_every_marker_shape_is_read_for_its_hash():
     assert _ccr_marker_hashes(
         "a <<ccr:abcdef012345>> b <<ccr:1234567890ab,base64,2.0KB>> "
