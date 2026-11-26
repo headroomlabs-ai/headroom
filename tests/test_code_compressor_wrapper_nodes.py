@@ -454,3 +454,32 @@ def test_members_sharing_a_row_appear_once(language, code, declarations):
     for declaration in declarations:
         assert out.count(declaration) == 1, (declaration, out)
     assert _valid(out, language)
+
+
+# `macro_rules!` is textually scoped: an item that invokes a macro must stay
+# below its definition. Grouped assembly moved functions and modules above
+# top-level code, so the output used the macro before defining it (tree-sitter
+# accepts that; rustc does not).
+RUST_MACRO_BEFORE_USE = [
+    (
+        "rust-macro-before-fn",
+        "use std::fmt;\nmacro_rules! make { () => { 1 } }\n\nfn v() -> i32 { make!() }\n\n"
+        + _RUST_WORK,
+    ),
+    (
+        "rust-macro-before-mod",
+        "fn a() {}\nmacro_rules! make { () => { 1 } }\nmod m {\n    pub fn v() -> i32 { make!() }\n}\n\n"
+        + _RUST_WORK,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "code", [pytest.param(code, id=name) for name, code in RUST_MACRO_BEFORE_USE]
+)
+def test_rust_macro_stays_above_its_use(code):
+    out = _compress(code, "rust").compressed
+
+    assert "// [" in out, "the function should compress"
+    assert out.count("macro_rules! make") == 1, out
+    assert out.index("macro_rules! make") < out.index("make!()"), out
