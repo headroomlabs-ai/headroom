@@ -70,6 +70,12 @@ def onnx_thread_spinning_enabled() -> bool:
 # Repos not listed here fall back to the floating default ref. Set
 # HEADROOM_HF_PIN=off to bypass pinning (e.g. when intentionally evaluating a
 # newer model revision). To upgrade a model, bump its SHA here deliberately.
+#
+# `headroom.tokenizers.huggingface._TOKENIZER_REVISIONS` holds the tokenizer
+# allowlist's pins and the Rust core keeps its own copy in
+# `crates/headroom-core/src/hf_pins.rs`; `tests/test_hf_pin_parity.py` fails if
+# the three disagree. Everything below is reached through this module's download
+# helpers, so a pin added here applies to every caller of them.
 _PINNED_REVISIONS: dict[str, str] = {
     # chopratejas/kompress-v2-base @ 2026-06-10
     "chopratejas/kompress-v2-base": "b1563631b35bfdcee37587ad530147497d820d4c",
@@ -87,17 +93,39 @@ _PINNED_REVISIONS: dict[str, str] = {
     # DEFAULT_MODEL_REVISION in crates/headroom-core/src/relevance/embedding.rs
     # (tests/test_fastembed_pinned_snapshot.py enforces it).
     "Qdrant/bge-small-en-v1.5-onnx-Q": "52398278842ec682c6f32300af41344b1c0b0bb2",
+    # ─── torch-path loaders (ml_models.py) ─────────────────────────────
+    # These load through `transformers` / `sentence-transformers` rather than
+    # `hf_hub_download`, but they resolve the same floating `main` and feed the
+    # same accounting and image-routing decisions, so they are pinned too (both
+    # spellings of the MiniLM default: ST resolves the bare alias, an operator
+    # may configure the canonical id).
+    "sentence-transformers/all-MiniLM-L6-v2": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "all-MiniLM-L6-v2": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "google/siglip-base-patch16-224": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+    # Image technique router (torch path). The ONNX twin is pinned above.
+    "chopratejas/technique-router": "639f08ab1fac0a0eb888bbeb80e752dbf8a780c1",
 }
 
 
-def _resolve_revision(repo_id: str, revision: str | None) -> str | None:
+def _resolve_revision(
+    repo_id: str,
+    revision: str | None,
+    pins: dict[str, str] | None = None,
+) -> str | None:
     """Resolve the HF revision to download: explicit arg wins, else the pinned
-    SHA for a known repo, else ``None`` (floating ref)."""
+    SHA for a known repo, else ``None`` (floating ref).
+
+    ``pins`` selects which table the lookup uses. Callers that ship their own
+    pinned artifacts (the tokenizer allowlist in ``headroom.tokenizers.huggingface``)
+    pass their table; everyone else gets ``_PINNED_REVISIONS``. One resolver and
+    one ``HEADROOM_HF_PIN`` switch, so "pin is off" cannot mean two different
+    things in two places.
+    """
     if revision is not None:
         return revision
     if os.environ.get("HEADROOM_HF_PIN", "").strip().lower() in ("off", "0", "false", "no"):
         return None
-    return _PINNED_REVISIONS.get(repo_id)
+    return (_PINNED_REVISIONS if pins is None else pins).get(repo_id)
 
 
 def hf_hub_download_local_first(
@@ -200,6 +228,7 @@ def hf_from_pretrained_local_first(
     *,
     purpose: str,
     allow_network: bool = True,
+    revision: str | None = None,
     **kwargs: Any,
 ) -> Any:
     """Load a HuggingFace model/tokenizer/processor, local cache first.
@@ -229,7 +258,13 @@ def hf_from_pretrained_local_first(
         purpose: What is being loaded, for the refusal message ("SigLIP model").
         allow_network: When ``False`` a cache miss re-raises the local-lookup
             error instead of falling back to a download.
-        **kwargs: Forwarded to ``loader`` (``revision=``, ``device=``, ...).
+        revision: Explicit git revision. ``None`` applies the pinned SHA for a
+            known repo (see ``_PINNED_REVISIONS``) so the loaded weights cannot
+            drift with an upstream ``main`` push; a repo we do not ship floats,
+            as before. Both attempts use the same value, so a cache seeded at a
+            different revision is a cache miss rather than a silently different
+            model.
+        **kwargs: Forwarded to ``loader`` (``device=``, ``token=``, ...).
 
     Raises:
         OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and the model is not
@@ -239,6 +274,10 @@ def hf_from_pretrained_local_first(
         to fall back to), or when the remote attempt itself fails.
     """
     kwargs.pop("local_files_only", None)
+    # Local directories have no revision to pin — passing `revision=` to a
+    # loader pointed at a path is, at best, ignored and at worst an error.
+    if not os.path.isdir(name_or_path):
+        kwargs["revision"] = _resolve_revision(name_or_path, revision)
     try:
         return loader(name_or_path, local_files_only=True, **kwargs)
     except _hf_not_cached_errors():
