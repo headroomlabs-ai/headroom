@@ -214,6 +214,7 @@ def extract_relationships_from_section(
 # ---------------------------------------------------------------------------
 
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_ATX_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$")
 
 
 def _next_fence_state(
@@ -354,11 +355,11 @@ def parse_claude_code_memory(content: str, file_path: str = "") -> ParsedFile:
     fence: tuple[str, int] | None = None
     for line in content.splitlines():
         fence, in_fence = _next_fence_state(line, fence)
-        header_match = None if in_fence else re.match(r"^(#{1,6})\s+(.+)$", line)
+        header_match = None if in_fence else _ATX_HEADING_RE.match(line)
         if header_match:
             flush_section()
             current_level = len(header_match.group(1))
-            current_heading = header_match.group(2).strip()
+            current_heading = (header_match.group(2) or "").strip()
             current_lines = []
         else:
             current_lines.append(line)
@@ -482,11 +483,11 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
     fence: tuple[str, int] | None = None
     for line in content.splitlines():
         fence, in_fence = _next_fence_state(line, fence)
-        header_match = None if in_fence else re.match(r"^(#{1,6})\s+(.+)$", line)
+        header_match = None if in_fence else _ATX_HEADING_RE.match(line)
         if header_match:
             flush_section()
             current_level = len(header_match.group(1))
-            current_heading = header_match.group(2).strip()
+            current_heading = (header_match.group(2) or "").strip()
             current_lines = []
         else:
             current_lines.append(line)

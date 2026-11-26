@@ -238,6 +238,18 @@ class TestGenericParser:
         content = "Quick script:\n```bash\n# comment inside fence\necho ok\n```\nDone.\n"
         assert detect_format(content) == "generic"
 
+    def test_recognizes_indented_and_empty_atx_headings_without_dropping_hash_facts(self):
+        content = (
+            "## Operations\nOverview\n  ### Deploy\nRestart app\n###\n#123 tracks deployment\n"
+        )
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections if s.heading] == ["Operations", "Deploy"]
+        assert parsed.sections[0].facts == ["Overview"]
+        assert parsed.sections[1].facts == ["Restart app"]
+        assert parsed.sections[2].heading == ""
+        assert parsed.sections[2].heading_level == 3
+        assert parsed.sections[2].facts == ["#123 tracks deployment"]
+
 
 class TestFormatDetection:
     def test_detect_claude_code(self):
