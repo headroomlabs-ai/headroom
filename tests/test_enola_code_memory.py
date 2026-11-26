@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import click
 import pytest
@@ -72,10 +73,24 @@ def project(monkeypatch, tmp_path):
     )
 
 
+@pytest.fixture
+def serena_setup_tools(monkeypatch):
+    """Exercise registration without requiring or launching a real uvx."""
+    real_which = wrap.shutil.which
+
+    def which(name, *args, **kwargs):
+        if name == "uvx":
+            return "/fixture/uvx"
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(wrap.shutil, "which", which)
+    monkeypatch.setattr(wrap, "_index_serena_project", lambda **kwargs: None)
+
+
 @pytest.mark.parametrize("edited_global", [False, True])
 @pytest.mark.parametrize("backend", ["enola", "serena"])
 def test_user_scope_reconciliation_checks_the_user_entry_not_its_project_shadow(
-    project, tmp_path, edited_global, backend
+    project, tmp_path, edited_global, backend, serena_setup_tools
 ):
     registrar = ClaudeRegistrar(
         claude_cli=None, home_dir=tmp_path, project_dir=tmp_path, scope=SCOPE_USER
@@ -84,7 +99,14 @@ def test_user_scope_reconciliation_checks_the_user_entry_not_its_project_shadow(
     def setup():
         if backend == "enola":
             return wrap._setup_enola_mcp(registrar)
-        return wrap._setup_serena_mcp(registrar, context="claude-code")
+        with patch.object(
+            registrar, "register_server", wraps=registrar.register_server
+        ) as register:
+            result = wrap._setup_serena_mcp(registrar, context="claude-code")
+            assert [call.kwargs["force"] for call in register.call_args_list] == (
+                [False] if edited_global else [False, True]
+            )
+            return result
 
     expected = enola.build_enola_spec() if backend == "enola" else build_serena_spec("claude-code")
     old = ServerSpec(backend, f"/old/{backend}")
@@ -358,7 +380,9 @@ def test_invalid_enola_timeout_preserves_serena_until_forced_repair(project, tmp
 
 
 @pytest.mark.parametrize("owned", [False, True])
-def test_opencode_serena_then_none_preserves_unowned_timeout_mismatch(project, tmp_path, owned):
+def test_opencode_serena_then_none_preserves_unowned_timeout_mismatch(
+    project, tmp_path, owned, serena_setup_tools
+):
     from headroom.mcp_registry import OpencodeRegistrar
 
     config = tmp_path / ".config/opencode/opencode.json"
@@ -371,23 +395,35 @@ def test_opencode_serena_then_none_preserves_unowned_timeout_mismatch(project, t
     if owned:
         record_install("opencode", registrar.get_server("serena"))
     runner = CliRunner()
-    for backend in ("serena", "none"):
-        result = runner.invoke(
-            main, ["wrap", "opencode", "--prepare-only", "--no-mcp", "--code-memory", backend]
-        )
-        assert result.exit_code == 0, result.output
-        observed = registrar.get_server("serena")
-        if not owned:
-            assert json.loads(config.read_text())["mcp"]["serena"] == saved
-            assert not headroom_installed_matching("opencode", observed)
-        elif backend == "serena":
-            assert observed == build_serena_spec("agent")
-            assert headroom_installed_matching("opencode", observed)
-        else:
-            assert observed is None
+    with patch.object(
+        OpencodeRegistrar,
+        "register_server",
+        autospec=True,
+        side_effect=OpencodeRegistrar.register_server,
+    ) as register:
+        for backend in ("serena", "none"):
+            result = runner.invoke(
+                main, ["wrap", "opencode", "--prepare-only", "--no-mcp", "--code-memory", backend]
+            )
+            assert result.exit_code == 0, result.output
+            serena_calls = [
+                call for call in register.call_args_list if call.args[1].name == "serena"
+            ]
+            assert [call.kwargs["force"] for call in serena_calls] == (
+                [False, True] if owned else [False]
+            )
+            observed = registrar.get_server("serena")
+            if not owned:
+                assert json.loads(config.read_text())["mcp"]["serena"] == saved
+                assert not headroom_installed_matching("opencode", observed)
+            elif backend == "serena":
+                assert observed == build_serena_spec("agent")
+                assert headroom_installed_matching("opencode", observed)
+            else:
+                assert observed is None
 
 
-def test_explicit_serena_force_can_repair_unowned_timeout(project, tmp_path):
+def test_explicit_serena_force_can_repair_unowned_timeout(project, tmp_path, serena_setup_tools):
     from headroom.mcp_registry import OpencodeRegistrar
 
     config = tmp_path / ".config/opencode/opencode.json"
