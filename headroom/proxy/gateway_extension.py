@@ -137,6 +137,13 @@ class GatewayTurn:
             tags=tags,
             # No re-drive for native shapes, so only stream-safe hooks run.
             caps=replace(self.caps, can_redrive=False) if self.native_shape else self.caps,
+            # Turn hooks see Anthropic's top-level system prompt, as on the
+            # /v1/messages path; a native body (Gemini, Converse) keeps its own.
+            system=(
+                self.body.get("system")
+                if self.provider == "anthropic" and not self.native_shape
+                else None
+            ),
             conversation=self.conversation,
         )
 
@@ -174,6 +181,14 @@ class GatewayTurn:
     @property
     def compaction_tokens_after(self) -> int:
         return self._transformer.compaction_tokens_after if self._transformer is not None else 0
+
+    @property
+    def system_tokens_before(self) -> int:
+        return self._transformer.system_tokens_before if self._transformer is not None else 0
+
+    @property
+    def system_tokens_after(self) -> int:
+        return self._transformer.system_tokens_after if self._transformer is not None else 0
 
     # -- event-loop side ---------------------------------------------------
     def finish(
@@ -220,6 +235,16 @@ class GatewayTurn:
             turn_id=self._turn_id,
             headers=result.headers,
         )
+        if (
+            not self.native_shape
+            and self.provider == "anthropic"
+            and result.system is not self.body.get("system")
+        ):
+            # A hook replaced the system prompt (in-place edits are already in).
+            if result.system is None:
+                self._fields["body"].pop("system", None)
+            else:
+                self._fields["body"]["system"] = result.system
         if not self.native_shape:
             shape_gateway_body(
                 self._fields["body"],

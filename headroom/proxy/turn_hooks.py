@@ -29,10 +29,14 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from headroom.log_safety import describe_exception
 from headroom.proxy.tool_schema_savings_policy import (
+    HOOK_TOOL_DETAIL,
     deferred_booking,
+    hook_tool_counts,
+    loading_history,
     reconcile_deferred_tokens,
-    without_deferral_flags,
+    tools_before_hook,
 )
 
 log = logging.getLogger(__name__)
@@ -77,6 +81,20 @@ class TurnContext:
     # a token set behind the client's own value rather than overwritten. On the
     # gateway contract the merged map is the response's ``headers`` object.
     provider_headers: dict[str, str] = field(default_factory=dict)
+    # A translating backend drops ``defer_loading`` and bills every tool, so the
+    # history does not say which are billed.
+    deferred_tools_billed: bool = False
+    # The request's system prompt: Anthropic's top-level ``system`` (a string or
+    # ``text`` blocks), or on the proxy's Responses path ``instructions`` or a
+    # leading system or developer input item (``input_text`` blocks); ``None``
+    # elsewhere. A hook may rewrite it in place or replace it; the handler forwards
+    # the result, and the hook runner books its token delta with the message and
+    # tool deltas. Anthropic's response hooks see it as the request hooks left it,
+    # which may or may not include the output shaper's later steering block; on
+    # Responses they see ``None``. It comes before the messages in the cache key: a
+    # rewrite that differs between turns of a conversation busts the whole message
+    # prefix, so it must be deterministic.
+    system: Any = None
     # An opaque key, stable for one client conversation (every turn and retry
     # of it), or None when the client names none. A digest, never the client's
     # raw id: from Claude Code's session header, Codex's thread or session id,
@@ -253,8 +271,74 @@ def clear_turn_hooks() -> None:
     _hooks.clear()
 
 
-def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> None:
+def _tool_loading_history(ctx: TurnContext) -> object:
+    if ctx.deferred_tools_billed:
+        return None
+    return loading_history(ctx.provider, ctx.messages)
+
+
+def count_system_tokens(
+    count_messages: Callable[[list[dict[str, Any]]], int] | None, system: Any
+) -> int | None:
+    """Tokens of a request's system prompt (string or blocks), 0 when absent.
+
+    Counted as one message with the same counter as the messages, so a hook's
+    system delta is on the scale of its message delta. ``None`` when there is
+    no counter or it fails: accounting never fails a request.
+    """
+    if count_messages is None:
+        return None
+    if not system:
+        return 0
+    try:
+        return int(count_messages([{"role": "system", "content": system}]))
+    except Exception as exc:
+        # The prompt may be in the exception's message: log only where it failed.
+        log.debug(
+            "system prompt token count failed; its delta is not booked: %s",
+            describe_exception(exc),
+        )
+        return None
+
+
+def accounting_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """``fn(*args, **kwargs)``, or ``None`` when it raises: accounting never
+    fails a request or keeps a hook from running.
+
+    For the token counts around turn hooks (here, in the gateway turn and in
+    the OpenAI handlers), whose counters tokenize prompts and client tool
+    schemas and can raise whatever their tokenizer raises.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        # The arguments are prompts and tool schemas: never their text in a log.
+        log.debug(
+            "turn-hook accounting: %s failed; savings uncounted: %s",
+            getattr(fn, "__name__", type(fn).__name__),
+            describe_exception(exc),
+        )
+        return None
+
+
+def run_request_hooks(
+    ctx: TurnContext,
+    *,
+    stream_safe_only: bool = False,
+    system_forwarded: Callable[[TurnContext], bool] | None = None,
+    measured_messages: Callable[[TurnContext], Any] | None = None,
+) -> None:
     """Run each hook's ``on_request``. Inert when none registered; never raises.
+
+    ``system_forwarded``, asked once every hook has run, says whether the
+    handler will send ``ctx.system`` as the hooks left it. When it will not
+    (the Responses system item a hook removed), the system deltas are not
+    booked: what reaches the provider is the message delta alone.
+
+    ``measured_messages`` gives the messages whose delta is booked, when that is
+    not ``ctx.messages`` itself: a Responses system item the handler overwrites
+    with ``ctx.system`` is booked as a system delta, so an edit of the item
+    through the messages must not be booked as a message delta as well.
 
     ``on_request`` mutates the outbound request before the upstream send, so it is
     safe on a streamed turn *as long as the hook needs no later re-drive*. A hook
@@ -268,12 +352,14 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     """
     # Deferral booked before or by a hook; reconciled once every hook has run,
     # since a later hook may un-defer booked tools (tool search's hot tools).
-    booking = deferred_booking(ctx.tags, ctx.tools)
+    booking = deferred_booking(ctx.tags, ctx.tools, _tool_loading_history(ctx))
     # Positive nets wait until every hook has run: a later hook that grows the
     # request (adds a tool) offsets earlier savings, so the ledger never credits
     # more than the whole sequence actually removed.
     gains: list[tuple[str, int, dict[str, int]]] = []
-    sequence_net = 0
+    sequence_net = system_net = 0
+    count_messages = ctx.count_messages
+    measured = measured_messages or (lambda c: c.messages)
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
@@ -281,42 +367,74 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
         if fn is None:
             continue
         booked_tag = ctx.tags.get("tool_search_deferred_tokens")
+        # Measurements go through accounting_call: a counter that fails leaves
+        # that delta unbooked, never the hook unrun.
         before_messages = before_tools = None
+        if count_messages is not None:
+            before_messages = accounting_call(count_messages, measured(ctx))
+        before_system = count_system_tokens(count_messages, ctx.system)
+        if ctx.count_tools is not None:
+            before_tools = accounting_call(
+                tools_before_hook,
+                ctx.tools,
+                _tool_loading_history(ctx),
+                ctx.count_tools,
+                ctx.tags,
+                deferred_billed=ctx.deferred_tools_billed,
+            )
         try:
-            if ctx.count_messages is not None:
-                before_messages = ctx.count_messages(ctx.messages)
-            if ctx.count_tools is not None:
-                before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
             fn(ctx)
+        except Exception:  # a hook must never break the proxy
+            log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
+        else:
             # Signed deltas, netted: a hook that folds messages but ADDS a tool
             # (skill search's ``search_skills``) saved the difference, not the
             # fold alone. Booked only when the net is a saving.
-            message_saved = (
-                before_messages - ctx.count_messages(ctx.messages)
-                if before_messages is not None and ctx.count_messages is not None
-                else 0
-            )
-            tool_saved = (
-                before_tools - ctx.count_tools(without_deferral_flags(ctx.tools))
-                if before_tools is not None and ctx.count_tools is not None
-                else 0
-            )
-            net_saved = message_saved + tool_saved
-            sequence_net += net_saved
-            if net_saved > 0:
-                gains.append(
-                    (
-                        getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
-                        net_saved,
-                        {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved},
-                    )
+            message_saved = system_saved = tool_saved = 0
+            if count_messages is not None and before_messages is not None:
+                after_messages = accounting_call(count_messages, measured(ctx))
+                if after_messages is not None:
+                    message_saved = before_messages - after_messages
+            after_system = count_system_tokens(count_messages, ctx.system)
+            if before_system is not None and after_system is not None:
+                system_saved = before_system - after_system
+            if before_tools is not None and ctx.count_tools is not None:
+                counts = accounting_call(
+                    hook_tool_counts,
+                    before_tools,
+                    ctx.tools,
+                    _tool_loading_history(ctx),
+                    ctx.count_tools,
                 )
-        except Exception:  # a hook must never break the proxy
-            log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
+                if counts is not None:
+                    tools_was, tools_now = counts
+                    tool_saved = tools_was - tools_now
+            net_saved = message_saved + system_saved + tool_saved
+            sequence_net += net_saved
+            system_net += system_saved
+            details = {"message_tokens_saved": message_saved, HOOK_TOOL_DETAIL: tool_saved}
+            if system_saved:
+                details["system_tokens_saved"] = system_saved
+            gains.append(
+                (
+                    getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
+                    net_saved,
+                    details,
+                )
+            )
         if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
             # This hook booked (or re-booked) the deferral: it is the new baseline.
-            booking = deferred_booking(ctx.tags, ctx.tools)
-    reconcile_deferred_tokens(ctx.tags, booking, ctx.tools, ctx.count_tools)
+            booking = deferred_booking(ctx.tags, ctx.tools, _tool_loading_history(ctx))
+    reconcile_deferred_tokens(
+        ctx.tags, booking, ctx.tools, ctx.count_tools, _tool_loading_history(ctx)
+    )
+    if system_net and system_forwarded is not None and not system_forwarded(ctx):
+        sequence_net -= system_net
+        gains = [
+            (source, net - details.pop("system_tokens_saved", 0), details)
+            for source, net, details in gains
+        ]
+    gains = [gain for gain in gains if gain[1] > 0]
     # Book gains in run order up to the sequence's net saving; a loss that
     # exceeds them all books nothing (never a negative entry).
     budget = max(0, sequence_net)
@@ -327,15 +445,14 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
         budget -= tokens
         if tokens < net_saved:
             # Later hooks' cost comes off this credit; share it across the
-            # message and tool parts so the breakdown still sums to ``tokens``.
-            # The uncapped deltas stay for diagnosis.
-            message_part = round(details["message_tokens_saved"] * tokens / net_saved)
-            details = {
-                "message_tokens_saved": message_part,
-                "tool_tokens_saved": tokens - message_part,
-                "uncapped_message_tokens_saved": details["message_tokens_saved"],
-                "uncapped_tool_tokens_saved": details["tool_tokens_saved"],
-            }
+            # message, system and tool parts so the breakdown still sums to
+            # ``tokens`` (the tool part takes the rounding). The uncapped
+            # deltas stay for diagnosis.
+            capped = {key: round(value * tokens / net_saved) for key, value in details.items()}
+            capped[HOOK_TOOL_DETAIL] = tokens - sum(
+                value for key, value in capped.items() if key != HOOK_TOOL_DETAIL
+            )
+            details = {**capped, **{f"uncapped_{key}": value for key, value in details.items()}}
         try:
             ctx.record_savings(source, tokens=tokens, details=details)
         except Exception:
