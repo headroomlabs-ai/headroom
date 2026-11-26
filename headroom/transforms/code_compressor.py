@@ -2396,6 +2396,10 @@ class CodeAwareCompressor(Transform):
             owns_rows = (
                 members[0].type not in _COMMENT_NODE_TYPES
                 and all(m.type in _COMMENT_NODE_TYPES for m in members[1:])
+                # A trailing comment that runs past the member's last row
+                # (`int x = 1; /* a` ... `b */`) is cut if the member is
+                # rendered alone, and a later `*/` would then close it.
+                and _rows(members[0])[1] == group_last
                 and group_first > last_processed_end
                 and (closing_row is None or group_last < closing_row)
             )
