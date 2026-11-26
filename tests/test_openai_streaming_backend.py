@@ -30,6 +30,7 @@ from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestOpenAIStreamingRealAPI:
     """Test streaming with real OpenAI API calls through the proxy."""
 

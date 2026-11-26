@@ -166,6 +166,8 @@ def _migrate_deprecated_image(image: Any) -> Any:
 
 def _manifest_from_payload(payload: dict[str, Any]) -> DeploymentManifest:
     """Build a manifest from decoded JSON, applying legacy image and mode migrations."""
+    if not isinstance(payload, dict):
+        raise TypeError(f"expected a JSON object, got {type(payload).__name__}")
     payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
     payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
     if "image" in payload:

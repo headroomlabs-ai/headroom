@@ -27,6 +27,7 @@ import pytest
 from headroom.proxy.buffered_ccr_response import (
     ANTHROPIC_ERROR_FORMAT,
     OPENAI_ERROR_FORMAT,
+    OPENAI_RESPONSES_ERROR_FORMAT,
     buffered_ccr_asgi_call,
 )
 
@@ -310,5 +311,47 @@ async def test_openai_late_failures_use_the_openai_error_shape() -> None:
 
     assert b": ping" in rec.body, "OpenAI keepalives are SSE comments, not ping events"
     payload = json.loads(rec.body.split(b"data: ")[-1].strip())
-    assert payload["error"]["type"] == "rate_limit_error"
-    assert payload["error"]["message"] == "too many"
+    assert payload == {"error": {"message": "too many", "type": "rate_limit_error"}}
+    assert b"event:" not in rec.body, "Chat Completions has no event-typed frames"
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_late_failure_is_a_valid_response_error_event() -> None:
+    """The Responses error frame must satisfy ``ResponseErrorEvent``.
+
+    Responses streams are event-typed: clients dispatch on the top-level
+    ``type`` and validate the flat ``message`` and ``sequence_number`` fields.
+    Zed, for one, parses the stream through a ``#[serde(tag = "type")]`` enum,
+    so a frame without the discriminator fails to deserialize and the client
+    reports "missing field `type`" instead of the upstream error -- taking the
+    whole agent turn with it.
+
+    Only the Responses endpoint uses this shape; Chat Completions keeps the
+    nested-only envelope in ``OPENAI_ERROR_FORMAT``. The nested ``error``
+    object here is not decoration: openai-python only raises its typed
+    ``APIError`` from a stream frame that carries ``error``.
+    """
+
+    async def produce():
+        await asyncio.sleep(0.3)
+        return _FakeResult(429, b'{"error":{"message":"too many"}}', {})
+
+    rec = await _drive(produce=produce, grace=0.05, fmt=OPENAI_RESPONSES_ERROR_FORMAT)
+
+    assert b"event: error\n" in rec.body, "the error frame must name its event"
+    payload = json.loads(rec.body.split(b"data: ")[-1].strip())
+
+    # Flat fields: the schema-valid ``ResponseErrorEvent``.
+    assert payload["type"] == "error"
+    assert payload["message"] == "too many"
+    assert payload["code"] == "rate_limit_exceeded"
+    assert payload["param"] is None
+    assert payload["sequence_number"] == 0
+
+    # Nested object: keeps openai-python's stream decoder on its APIError path.
+    assert payload["error"] == {
+        "type": "rate_limit_exceeded",
+        "code": "rate_limit_exceeded",
+        "message": "too many",
+        "param": None,
+    }

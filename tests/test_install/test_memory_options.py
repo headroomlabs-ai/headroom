@@ -44,7 +44,8 @@ def test_learning_project_storage_round_trips_into_runtime(monkeypatch, tmp_path
     assert loaded.memory_storage_mode == "project"
     assert loaded.traffic_learning_min_evidence == 7
     assert loaded.memory_project_root == str(tmp_path / "scratch-project")
-    assert build_runtime_command(loaded)[4:] == [
+    command = build_runtime_command(loaded)
+    assert command[command.index("proxy") + 1 :] == [
         "--host",
         "127.0.0.1",
         "--port",

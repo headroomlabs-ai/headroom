@@ -24,6 +24,12 @@ from ._paths import path_exists
 logger = logging.getLogger(__name__)
 
 
+def _optional_id(part: dict) -> str | None:
+    """Return a call/response ID, treating malformed (non-string) IDs as missing."""
+    value = part.get("id")
+    return value if isinstance(value, str) else None
+
+
 class GeminiPlugin(LearnPlugin, ConversationScanner):
     """Reads Google Gemini CLI session logs from ~/.gemini/tmp/<project>/chats/.
 
@@ -200,7 +206,12 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
     def _parse_messages(self, session_id: str, messages: list) -> SessionData | None:
         """Parse Gemini API format messages into normalized SessionData."""
-        tool_calls_pending: dict[str, tuple[str, dict, int]] = {}
+        # name -> pending calls as (provider id, normalized name, args, msg index, ordinal)
+        tool_calls_pending: dict[str, list[tuple[str | None, str, dict, int, int]]] = {}
+        # name -> msg index of the latest model turn that called it
+        last_call_msg: dict[str, int] = {}
+        # (msg index, name) -> calls seen so far, to keep same-turn call ids distinct
+        call_ordinals: dict[tuple[int, str], int] = {}
         tool_calls: list[ToolCall] = []
         events: list[SessionEvent] = []
         msg_index = 0
@@ -230,6 +241,16 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
             if not isinstance(parts, list):
                 continue
 
+            # Calls answered by ID somewhere in this message are reserved for that
+            # exact match, so an earlier ID-less response can't take them by FIFO.
+            reserved_ids = {
+                (part["functionResponse"].get("name", ""), _optional_id(part["functionResponse"]))
+                for part in parts
+                if isinstance(part, dict)
+                and isinstance(part.get("functionResponse"), dict)
+                and _optional_id(part["functionResponse"]) is not None
+            }
+
             for part in parts:
                 if not isinstance(part, dict):
                     continue
@@ -254,7 +275,12 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                             args = {}
                         normalized_name = normalize_tool_name(name)
                         if name:
-                            tool_calls_pending[name] = (normalized_name, args, msg_index)
+                            ordinal = call_ordinals.get((msg_index, name), 0)
+                            call_ordinals[(msg_index, name)] = ordinal + 1
+                            last_call_msg[name] = msg_index
+                            tool_calls_pending.setdefault(name, []).append(
+                                (_optional_id(fc), normalized_name, args, msg_index, ordinal)
+                            )
 
                 if "functionResponse" in part:
                     fr = part["functionResponse"]
@@ -271,14 +297,43 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                         else:
                             result_content = str(response)
 
-                        if name in tool_calls_pending:
-                            normalized_name, args, call_idx = tool_calls_pending.pop(name)
+                        pending = tool_calls_pending.get(name, [])
+                        response_id = _optional_id(fr)
+                        # Prefer an exact ID match; use FIFO only when either side lacks an ID.
+                        match_idx = next(
+                            (
+                                i
+                                for i, (call_id, *_) in enumerate(pending)
+                                if response_id is not None and call_id == response_id
+                            ),
+                            None,
+                        )
+                        if match_idx is None:
+                            # FIFO only within the latest turn that called this tool, so an
+                            # unanswered call from an earlier turn can't take a later result.
+                            match_idx = next(
+                                (
+                                    i
+                                    for i, (call_id, _, _, idx, _) in enumerate(pending)
+                                    if idx == last_call_msg.get(name)
+                                    and (response_id is None or call_id is None)
+                                    and (call_id is None or (name, call_id) not in reserved_ids)
+                                ),
+                                None,
+                            )
+                        ordinal = 0
+                        if match_idx is not None:
+                            _, normalized_name, args, call_idx, ordinal = pending.pop(match_idx)
                         else:
                             normalized_name = normalize_tool_name(name)
                             args = {}
                             call_idx = msg_index
 
                         call_id = f"{session_id}_{call_idx}_{name}"
+                        if ordinal:
+                            # Same-name calls in one turn need distinct ids, or loop
+                            # detection drops them as replays.
+                            call_id = f"{call_id}_{ordinal}"
                         is_err = is_error_content(result_content)
                         error_cat = (
                             classify_error(result_content) if is_err else ErrorCategory.UNKNOWN

@@ -116,6 +116,26 @@ def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path, ca
     assert not any(str(tmp_path / ".headroom" / "deploy" / "default") in m for m in warnings)
 
 
+@pytest.mark.parametrize("body", ["[]", "null", "5", '"x"'])
+def test_non_object_manifest_is_a_manifest_error_and_does_not_hide_good_profiles(
+    monkeypatch, tmp_path: Path, caplog, body: str
+) -> None:
+    """Valid JSON that is not an object must not escape as a raw AttributeError."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    save_manifest(_manifest())
+    bad = tmp_path / ".headroom" / "deploy" / "bad" / "manifest.json"
+    bad.parent.mkdir(parents=True)
+    bad.write_text(body, encoding="utf-8")
+
+    with pytest.raises(ManifestError, match="is corrupt"):
+        load_manifest("bad")
+
+    with caplog.at_level(logging.WARNING, logger="headroom.install.state"):
+        manifests = list_manifests()
+    assert [m.profile for m in manifests] == ["default"]
+    assert any(str(bad) in r.getMessage() for r in caplog.records)
+
+
 def _broken_profile(tmp_path: Path, name: str) -> Path:
     path = tmp_path / ".headroom" / "deploy" / name / "manifest.json"
     path.parent.mkdir(parents=True)
