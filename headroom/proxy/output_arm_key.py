@@ -8,12 +8,11 @@ key (:func:`conversation_key_from_body`) between turns of one conversation:
   first user turn is the new prompt, not the opener.
 * Nothing else in the body names the conversation, while a header does.
 
-So a recognized session header wins, then the key of the response a request
-continues, then the body. ``x-headroom-session-id`` is checked first and keyed
-exactly as headroom-kiro keys it, so the extension's steering decision and
-core's arm stay the same. headroom-kiro does not apply the other two headers or
-the response chain; Kiro sends neither and resends the whole transcript, so
-they agree today. An extension that must agree on every request should call
+So ``x-headroom-session-id`` wins, then the key of the response a request
+continues, then the body. The header is keyed exactly as headroom-kiro keys it,
+so the extension's steering decision and core's arm stay the same. Kiro resends
+the whole transcript, so it agrees with the body key when the header is absent.
+An extension that must agree on every request should call
 :func:`output_arm_key` rather than repeat the rule.
 """
 
@@ -26,8 +25,8 @@ from typing import Any
 
 from .output_savings_policy import conversation_key_from_body
 
-# Most specific first. ``x-headroom-session-id`` leads for headroom-kiro.
-_SESSION_HEADERS = ("x-headroom-session-id", "conversation_id", "session_id")
+# The Headroom-specific header is also used by headroom-kiro for steering.
+_SESSION_HEADERS = ("x-headroom-session-id",)
 
 # Response id -> the arm key of the request that produced it. In memory and per
 # process: after a restart, or on another replica, an unknown id falls back to

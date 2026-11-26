@@ -288,30 +288,22 @@ def test_a_response_chain_keeps_its_openers_holdout_arm(monkeypatch, stream: boo
     assert [_arms(o) for o in outcomes] == [{_body_arm(opener)}] * 2
 
 
-def test_a_session_header_keeps_one_holdout_arm_when_the_chain_is_unknown(monkeypatch) -> None:
-    """Codex names its session in a ``session_id`` header. After a restart the
-    previous response is unknown; the header still holds the conversation's arm."""
+@pytest.mark.parametrize("header_name", ["conversation_id", "session_id"])
+def test_generic_session_headers_do_not_change_the_body_holdout_arm(
+    monkeypatch, header_name: str
+) -> None:
+    """Generic session identifiers must not change which requests receive treatment."""
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
     monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
     opener = {"model": "gpt-5.5", "input": _user("fix the failing test"), "stream": False}
-    follow_up = {
-        "model": "gpt-5.5",
-        "previous_response_id": "resp_from_before_a_restart",
-        "input": _user("and the lint"),
-        "stream": False,
-    }
-    assert _body_arm(opener) != _body_arm(follow_up)
 
     outcomes = _post_turns(
-        [opener, follow_up],
-        response_ids=["resp_session_1", "resp_session_2"],
-        headers={"session_id": "codex-session-1"},
+        [opener],
+        headers={header_name: "client-session-1"},
     )
 
-    assert len(outcomes) == 2
-    assert len(_arms(outcomes[0]) | _arms(outcomes[1])) == 1, [
-        o.transforms_applied for o in outcomes
-    ]
+    assert len(outcomes) == 1
+    assert _arms(outcomes[0]) == {_body_arm(opener)}
 
 
 class _KiroLikeSteering:
