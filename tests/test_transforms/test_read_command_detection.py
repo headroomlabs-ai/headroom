@@ -97,6 +97,7 @@ def test_chained_reads_are_detected(command: str) -> None:
         "grep -n x foo.py | head -40",
         "grep -n x foo.py |\ncat",
         "printf 'derived output\\n' | # explanation\ncat",
+        "printf 'derived output\\n' |& # explanation\ncat",
         # Writes are never reads.
         "cat > foo.py",
         # The write lives in the read segment itself — a pipeline is one segment,
@@ -160,7 +161,13 @@ def test_git_tree_listing_is_not_protected(command: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "command", ["cat notes.txt", "git show HEAD:notes.txt", "git show HEAD:src; cat notes.txt"]
+    "command",
+    [
+        "cat notes.txt",
+        "git show HEAD:notes.txt",
+        "git show HEAD:src; cat notes.txt",
+        "git show HEAD:src | cat - notes.txt",
+    ],
 )
 def test_file_can_start_with_a_git_tree_header(command: str) -> None:
     assert _read_output_should_be_protected(

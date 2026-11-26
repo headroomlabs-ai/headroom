@@ -912,7 +912,7 @@ def _command_segments(command: str) -> list[str]:
     segments: list[tuple[int, int]] = []
     start = 0
     for m in _CMD_SEPARATOR_RE.finditer(masked):
-        if m.group() == "\n" and masked[start : m.start()].rstrip().endswith("|"):
+        if m.group() == "\n" and masked[start : m.start()].rstrip().endswith(("|", "|&")):
             continue
         segments.append((start, m.start()))
         start = m.end()
@@ -987,6 +987,8 @@ def _segment_is_read(c: str, *, git_tree_operand: str | None = None) -> bool:
         return False
     pipe = masked.find("|")
     if pipe != -1:
+        if git_tree_operand is not None:
+            return False
         c = c[:pipe]
     c = c.strip()
     if not c:
