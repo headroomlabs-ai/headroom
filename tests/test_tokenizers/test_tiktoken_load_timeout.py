@@ -291,8 +291,18 @@ def test_offline_miss_cools_down_instead_of_spawning_each_call(
     assert marker.read_text() == "x", "a request loop spawned a child per call"
 
 
-def test_deadline_covers_parent_reconstruction(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The budget covers the rebuild in the parent, not just the child."""
+def test_successful_reconstruction_is_retained_past_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rebuild that completes is kept, not discarded as a late fallback.
+
+    The timeout bounds the child wait and the payload transfer; the native
+    reconstruction from the transferred dict is a fast in-memory step, so once it
+    starts its result is returned even if it ran past the budget (a documented
+    narrower guarantee). The old install-then-raise left the encoder registered
+    while the caller got a fallback -- which is what let a mid-pair load mix
+    counting units.
+    """
     import tiktoken
 
     payload = _synthetic_payload("slow-enc")
@@ -308,9 +318,11 @@ def test_deadline_covers_parent_reconstruction(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(tiktoken, "Encoding", _slow_constructor)
 
     start = time.perf_counter()
-    with pytest.raises(tc.TiktokenLoadError, match="did not load within"):
-        tc.load_encoding("slow-enc")
-    assert time.perf_counter() - start < 2.5
+    enc = tc.load_encoding("slow-enc")
+    assert isinstance(enc, real_encoding)
+    assert enc.encode("hi") == [ord("h"), ord("i")]
+    assert time.perf_counter() - start >= 1.5  # it really did rebuild, slowly
+    assert "slow-enc" in tiktoken.registry.ENCODINGS  # and the rebuild was retained
 
 
 def test_online_download_times_out_with_empty_cache_dir(
@@ -512,42 +524,146 @@ def test_offline_warm_cache_payload_tokens_works(monkeypatch: pytest.MonkeyPatch
         assert not mock_get.called
 
 
-def test_payload_tokens_recovers_after_a_load_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A transient load failure must not pin the compressor to characters forever.
+def test_payload_tokens_recovers_with_real_cache(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load miss must not pin Kompress to characters; recovery uses the real cache.
 
-    Kompress used to cache ``_payload_encoder = False`` after the first failure,
-    so a miss whose vocabulary later lands on disk permanently compared characters
-    instead of tokens. The loader has its own per-encoding cooldown, so the cache
-    failure is now retried on the next call.
+    Distinct units: "hello world" is 11 characters but 2 cl100k tokens, so the
+    two counts cannot be confused. The vocabulary is a real .tiktoken file on
+    disk, not a stub encoder.
     """
+    import hashlib
+
     import tiktoken
 
     from headroom.transforms import kompress_compressor as kc
 
-    real_encoding = tiktoken.Encoding(
-        name="cl100k_base",
-        pat_str=r"'\s|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
-        mergeable_ranks={bytes([b]): b for b in range(256)},
-        special_tokens={"<|endoftext|>": 256},
-    )
-    state = {"calls": 0}
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(cache_dir))
+
+    # Warm a real vocab into this cache dir, then drop it from memory and disk.
+    tiktoken.get_encoding("cl100k_base")
+    url = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+    cache_path = cache_dir / hashlib.sha1(url.encode()).hexdigest()
+    saved = cache_path.read_bytes()
+    cache_path.unlink()
+    tiktoken.registry.ENCODINGS.clear()
+    tc._get_encoding.cache_clear()
+    tc._cooldown_until.clear()
+    tc._download_failed.clear()
+    kc._payload_encoder = None
+
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    # Miss: no cache, offline -> 11 characters, not 2 tokens; and not pinned.
+    assert kc.payload_tokens("hello world") == 11
+    assert kc._payload_encoder is None
+
+    # Vocabulary lands on disk; the miss cooldown expires.
+    cache_path.write_bytes(saved)
+    tc._cooldown_until.clear()
+    tiktoken.registry.ENCODINGS.clear()
+    tc._get_encoding.cache_clear()
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+
+    # Real encoder now resolves from disk: 2 tokens, distinct from 11 characters.
+    assert kc.payload_tokens("hello world") == 2
+    assert kc._payload_encoder is not None
+
+
+def test_payload_tokens_pair_resolves_one_unit_so_fallback_cannot_show_saving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pair resolves the encoder once, so a mid-pair transition can't mix units.
+
+    Reproduces the owner's probe: an original of 600 characters (~100 tokens)
+    against a 636-character (~106-token) candidate must never read as 600 -> 106.
+    A second resolution -- the bug -- would succeed here and count the candidate
+    in tokens while the original stayed in characters.
+    """
+    from headroom.tokenizers import tiktoken_counter as tc
+    from headroom.transforms import kompress_compressor as kc
+
+    original, candidate = "a" * 600, "b" * 636
+    calls: list[str] = []
+
+    class _SixCharsPerToken:
+        def encode(self, text, disallowed_special=()):
+            return [0] * (len(text) // 6)
 
     def fake_load(name: str):
-        state["calls"] += 1
-        if state["calls"] == 1:
+        calls.append(name)
+        if len(calls) == 1:  # fails once, as in the probe
             raise tc.TiktokenLoadError("vocab missing")
-        return real_encoding
+        return _SixCharsPerToken()
 
     monkeypatch.setattr(kc, "_payload_encoder", None)
     monkeypatch.setattr(tc, "load_encoding", fake_load)
 
-    # First call: vocabulary unavailable -> becomes a miss, falls back to chars.
-    assert kc.payload_tokens("hello world") == len("hello world")
-    # Vocabulary is now on disk; a later call must resolve via the encoder instead
-    # of char-matching.
-    expected = len(real_encoding.encode("hello world", disallowed_special=()))
-    assert kc.payload_tokens("hello world") == expected
-    assert kc._payload_encoder is not None
+    # One resolution, so both counts are characters: 636 >= 600, no apparent saving.
+    assert kc.payload_tokens_pair(original, candidate) == (600, 636)
+    assert len(calls) == 1  # resolved once for the pair, not once per text
+
+    # With an encoder both are tokens in one unit: 100 vs 106, still no saving.
+    monkeypatch.setattr(kc, "_payload_encoder", _SixCharsPerToken())
+    assert kc.payload_tokens_pair(original, candidate) == (100, 106)
+
+
+def test_download_failure_does_not_block_disk_probe(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A download error suppresses the network retry, not the local-cache probe.
+
+    After a miss + an ordinary download error the encoding stays in
+    ``_download_failed``, but a vocabulary that reaches disk must still be found
+    once the miss cooldown expires. The old early check raised before probing the
+    cache, so a network failure blocked local recovery until process restart.
+    """
+    import hashlib
+
+    import tiktoken
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(cache_dir))
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+
+    # A real vocab for the recovery half; keep its bytes, then clear disk + memory.
+    tiktoken.get_encoding("cl100k_base")
+    url = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+    cache_path = cache_dir / hashlib.sha1(url.encode()).hexdigest()
+    saved = cache_path.read_bytes()
+    cache_path.unlink()
+    tiktoken.registry.ENCODINGS.clear()
+    tc._get_encoding.cache_clear()
+    tc._download_failed.clear()
+    tc._cooldown_until.clear()
+
+    # Miss on cache, ordinary error on download (connection reset, not a timeout).
+    def fake_run(mode, name, deadline):
+        return (
+            {"status": "not_cached"}
+            if mode == "cache"
+            else {"status": "error", "error": "connection reset"}
+        )
+
+    orig_run = tc._run_worker
+    monkeypatch.setattr(tc, "_run_worker", fake_run)
+    with pytest.raises(tc.TiktokenLoadError, match="download failed"):
+        tc.load_encoding("cl100k_base")
+    assert "cl100k_base" in tc._download_failed
+
+    # The vocabulary arrives on disk; the miss cooldown expires.
+    cache_path.write_bytes(saved)
+    tc._cooldown_until.clear()
+    tc._get_encoding.cache_clear()
+    tc._run_worker = orig_run  # real worker: a real disk probe now
+
+    enc = tc.load_encoding("cl100k_base")
+    assert isinstance(enc, tiktoken.Encoding)
+    assert enc.encode("hello world") == [15339, 1917]
+    assert "cl100k_base" not in tc._download_failed  # a disk load cleared it
 
 
 

@@ -147,10 +147,12 @@ def _worker_env() -> dict[str, str]:
 
 
 def _check_deadline(encoding_name: str, deadline: float) -> None:
-    """The budget covers the whole load: child, transfer and rebuild.
+    """Reject a result whose child wait and payload transfer already overran.
 
-    A result that arrives late (a slow read or a slow native reconstruction) is
-    still a result the caller did not get in its budget, so it falls back.
+    The budget bounds the subprocess wait and the transfer, not the in-memory
+    rebuild: a reconstruction that starts is a fast native step and its result is
+    kept (see :func:`_get_encoding`), so a late *read* fails here but a completed
+    *rebuild* is never discarded as though fallback had happened on time.
     """
     if time.monotonic() > deadline:
         raise _cooldown_error(
@@ -210,6 +212,7 @@ def _register(encoding_name: str, payload: dict[str, Any]) -> Any:
     )
     tiktoken.registry.ENCODINGS[encoding_name] = enc
     _cooldown_until.pop(encoding_name, None)
+    _download_failed.discard(encoding_name)  # a load from disk clears a past download failure
     return enc
 
 
@@ -217,11 +220,12 @@ def _register(encoding_name: str, payload: dict[str, Any]) -> Any:
 def _get_encoding(encoding_name: str):
     """Get a tiktoken encoding, cached for performance.
 
-    The whole load -- child process, payload transfer and the native
-    reconstruction in this process -- is bounded by
-    ``HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS`` (default 10s), and overrunning it
-    raises :class:`TiktokenLoadError` so callers fall back to estimation instead
-    of blocking a request (GH #956).
+    The subprocess wait and the payload transfer are bounded by
+    ``HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS`` (default 10s); a late read raises
+    :class:`TiktokenLoadError` so callers fall back to estimation instead of
+    blocking a request (GH #956). The native reconstruction in this process is a
+    fast in-memory step: once a payload arrives in budget and the rebuild is
+    started, its result is kept, even if the rebuild itself runs past the budget.
 
     A warm in-memory encoding is returned directly, without any egress check, so
     pre-populated vocabularies keep working under ``HEADROOM_OFFLINE=1``.
@@ -233,10 +237,6 @@ def _get_encoding(encoding_name: str):
     except Exception:
         pass
 
-    if encoding_name in _download_failed:
-        raise TiktokenLoadError(
-            f"tiktoken encoding {encoding_name!r} previously failed to download"
-        )
     if _cooldown_until.get(encoding_name, 0.0) > time.monotonic():
         raise TiktokenLoadError(
             f"tiktoken encoding {encoding_name!r} failed recently; retrying after cooldown"
@@ -247,13 +247,8 @@ def _get_encoding(encoding_name: str):
     status = result["status"]
 
     if status == "ok":
-        # An already-late result fails fast without paying for the native
-        # reconstruction; a reconstruction that itself overruns is still
-        # rejected by the check after _register.
         _check_deadline(encoding_name, deadline)
-        enc = _register(encoding_name, result)
-        _check_deadline(encoding_name, deadline)
-        return enc
+        return _register(encoding_name, result)
     if status == "offline_blocked":
         raise OfflineEgressBlocked("tiktoken encoding download", encoding_name)
     if status == "invalid_cache":
@@ -286,12 +281,17 @@ def _get_encoding(encoding_name: str):
             f"tiktoken encoding {encoding_name!r} not in local cache and HEADROOM_OFFLINE=1"
         )
 
+    if encoding_name in _download_failed:
+        # A past download error only suppresses another network attempt; the disk
+        # probe above already ran, so a vocabulary copied into the cache recovers.
+        raise TiktokenLoadError(
+            f"tiktoken encoding {encoding_name!r} previously failed to download"
+        )
+
     result = _run_worker("download", encoding_name, deadline)
     if result["status"] == "ok":
         _check_deadline(encoding_name, deadline)
-        enc = _register(encoding_name, result)
-        _check_deadline(encoding_name, deadline)
-        return enc
+        return _register(encoding_name, result)
     if result["status"] == "offline_blocked":
         raise OfflineEgressBlocked("tiktoken encoding download", encoding_name)
 

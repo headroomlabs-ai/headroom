@@ -1662,6 +1662,25 @@ class KompressResult:
 _payload_encoder: Any = None
 
 
+def _resolve_payload_encoder() -> Any:
+    """The cl100k encoder for whole-payload counting, or None to count characters.
+
+    Resolution is attempted per call and a load failure is not cached (the loader
+    backs off on its own), so a vocabulary that lands on disk later is picked up
+    without a restart. A caller comparing two texts must share one resolution, or
+    the two counts can land in different units.
+    """
+    global _payload_encoder
+    if _payload_encoder is None:
+        try:
+            from headroom.tokenizers.tiktoken_counter import load_encoding
+
+            _payload_encoder = load_encoding("cl100k_base")
+        except Exception:
+            pass  # leave None; retry next call
+    return _payload_encoder
+
+
 def payload_tokens(text: str) -> int:
     """Token count of a complete payload, in one consistent unit.
 
@@ -1678,24 +1697,32 @@ def payload_tokens(text: str) -> int:
     of the two complete texts in one unit establishes that the shipped
     payload is smaller.
     """
-    global _payload_encoder
-    if _payload_encoder is None:
-        # Do not persist a load failure: the loader's own per-encoding cooldown
-        # throttles retries, so a vocabulary that lands on disk later is picked up
-        # on a later call instead of pinning the compressor to character counts
-        # forever.
+    enc = _resolve_payload_encoder()
+    if enc:
         try:
-            from headroom.tokenizers.tiktoken_counter import load_encoding
-
-            _payload_encoder = load_encoding("cl100k_base")
-        except Exception:
-            pass  # leave None; retry next call
-    if _payload_encoder:
-        try:
-            return len(_payload_encoder.encode(text, disallowed_special=()))
+            return len(enc.encode(text, disallowed_special=()))
         except Exception:
             pass
     return len(text)
+
+
+def payload_tokens_pair(original: str, candidate: str) -> tuple[int, int]:
+    """Count both texts in one resolved unit, so a mid-pair fallback cannot mix units.
+
+    Counting an original in characters and its candidate in tokens (or the
+    reverse) can accept an expansion: 600 characters against 106 tokens reads as
+    a saving. Resolve the encoder once and count both texts, or neither.
+    """
+    enc = _resolve_payload_encoder()
+    if enc:
+        try:
+            return (
+                len(enc.encode(original, disallowed_special=())),
+                len(enc.encode(candidate, disallowed_special=())),
+            )
+        except Exception:
+            pass
+    return len(original), len(candidate)
 
 
 def ccr_retrieval_marker(
@@ -2224,8 +2251,7 @@ class KompressCompressor(Transform):
                     marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
-                    original_tokens = payload_tokens(content)
-                    compressed_tokens = payload_tokens(marked)
+                    original_tokens, compressed_tokens = payload_tokens_pair(content, marked)
                     if compressed_tokens >= original_tokens:
                         return self._passthrough(content, n_words)
                     compressed = marked
@@ -2667,8 +2693,7 @@ class KompressCompressor(Transform):
                     marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
-                    original_tokens = payload_tokens(content)
-                    compressed_tokens = payload_tokens(marked)
+                    original_tokens, compressed_tokens = payload_tokens_pair(content, marked)
                     if compressed_tokens >= original_tokens:
                         results[text_idx] = self._passthrough(content, n_words)
                         continue
