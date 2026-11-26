@@ -619,6 +619,62 @@ class TestContinuationCalls:
         assert call_args.kwargs["headers"]["x-api-key"] == "gateway-credential"
 
     @pytest.mark.asyncio
+    async def test_anthropic_continuation_replays_captured_system_prompt(self):
+        """A captured top-level system prompt must survive a CCR continuation verbatim."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"content": [{"type": "text", "text": "Final answer"}]}
+        mock_response.raise_for_status = MagicMock()
+
+        http_client = AsyncMock(spec=httpx.AsyncClient)
+        http_client.post.return_value = mock_response
+        processor = BatchResultProcessor(http_client)
+
+        system = [
+            {"type": "text", "text": "You add 20% VAT on the subtotal."},
+            {"type": "text", "text": "Reply with the final total only."},
+        ]
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Subtotal is 100"}],
+            model="claude-3-opus-20240229",
+            extras={"max_tokens": 1000, "system": system},
+        )
+        batch_context = BatchContext(batch_id="batch_123", provider="anthropic", api_key="k")
+
+        await processor._anthropic_continuation(
+            [{"role": "user", "content": "Subtotal is 100"}], None, request_context, batch_context
+        )
+
+        payload = http_client.post.call_args.kwargs["json"]
+        assert payload["system"] == system
+
+    @pytest.mark.asyncio
+    async def test_anthropic_continuation_omits_absent_system_prompt(self):
+        """A batch request without a system prompt must not gain an explicit null."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"content": [{"type": "text", "text": "Final answer"}]}
+        mock_response.raise_for_status = MagicMock()
+
+        http_client = AsyncMock(spec=httpx.AsyncClient)
+        http_client.post.return_value = mock_response
+        processor = BatchResultProcessor(http_client)
+
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Hello"}],
+            model="claude-3-opus-20240229",
+            extras={"max_tokens": 1000, "system": None},
+        )
+        batch_context = BatchContext(batch_id="batch_123", provider="anthropic", api_key="k")
+
+        await processor._anthropic_continuation(
+            [{"role": "user", "content": "Hello"}], None, request_context, batch_context
+        )
+
+        payload = http_client.post.call_args.kwargs["json"]
+        assert "system" not in payload
+
+    @pytest.mark.asyncio
     async def test_openai_continuation_uses_configured_api_base_url(self):
         """A trailing slash on the recorded target does not double the separator."""
         mock_response = MagicMock()
@@ -1016,6 +1072,47 @@ class TestProcessSingleResult:
 
         assert processed.custom_id == "req_1"
         assert processed.was_processed is True
+
+    @pytest.mark.asyncio
+    async def test_continuation_rounds_counts_this_results_api_rounds(self):
+        """``continuation_rounds`` must be this result's own continuation API
+        rounds, not the shared handler's cumulative retrieval count (#4184).
+
+        A single round resolving two parallel retrievals reports 1, not 2, and
+        later results do not inherit earlier results' counts.
+        """
+        processor = BatchResultProcessor(AsyncMock(spec=httpx.AsyncClient))
+
+        # Simulate handle_response making N continuation API calls.
+        async def fake_handle_response(response, messages, tools, api_call_fn, provider):
+            await api_call_fn(messages, tools)  # round 1
+            await api_call_fn(messages, tools)  # round 2
+            return {"content": [{"type": "text", "text": "done"}]}
+
+        processor.ccr_handler.handle_response = fake_handle_response
+        # The shared handler's aggregate counter is non-zero, as it would be
+        # after an earlier result was processed.
+        processor.ccr_handler._retrieval_count = 7
+
+        original_result = {
+            "custom_id": "req_1",
+            "result": {"message": {"content": [{"type": "tool_use", "name": CCR_TOOL_NAME}]}},
+        }
+        response = original_result["result"]["message"]
+        request_context = BatchRequestContext(
+            custom_id="req_1",
+            messages=[{"role": "user", "content": "Get data"}],
+            tools=[{"name": CCR_TOOL_NAME}],
+            model="claude-3-opus",
+        )
+        batch_context = BatchContext(batch_id="batch_123", provider="anthropic", api_key="k")
+
+        processed = await processor._process_single_result(
+            original_result, response, request_context, batch_context, "anthropic"
+        )
+
+        # Two API rounds for THIS result, not the handler's aggregate 7.
+        assert processed.continuation_rounds == 2
 
 
 class TestConvenienceFunction:
