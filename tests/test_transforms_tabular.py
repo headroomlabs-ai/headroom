@@ -472,6 +472,7 @@ def test_parse_markdown_table_preserves_pipes_in_inline_code_and_escapes() -> No
         "| id | `string | number` | ``a | `b` | c`` |\n"
         "| mask | `a \\| b` | plain \\| pipe |\n"
         "| trail | path\\\\| exact |\n"
+        "| lit | literal \\` | `string | number` |\n"
         "| stray | `unclosed | still_splits |"
     )
     headers, rows = parse_markdown_table(md)
@@ -479,7 +480,8 @@ def test_parse_markdown_table_preserves_pipes_in_inline_code_and_escapes() -> No
     assert rows[0] == ["id", "`string | number`", "``a | `b` | c``"]
     assert rows[1] == ["mask", "`a | b`", "plain | pipe"]
     assert rows[2] == ["trail", "path\\\\", "exact"]
-    assert rows[3] == ["stray", "`unclosed", "still_splits"]
+    assert rows[3] == ["lit", "literal \\`", "`string | number`"]
+    assert rows[4] == ["stray", "`unclosed", "still_splits"]
 
 
 def test_markdown_table_inline_code_pipes_keep_detection_and_rag_guard_consistent() -> None:
@@ -493,16 +495,23 @@ def test_markdown_table_inline_code_pipes_keep_detection_and_rag_guard_consisten
     assert detect_content_type(ragged).metadata.get("format") != "markdown"
     assert parse_tabular(ragged) is None
 
-    # Valid uniform table with inline-code pipes compresses as markdown.
+    # Escaped pipe in header must still reject mismatched separator column count.
+    mismatched_sep = "| Region \\| Zone | Status |\n| --- | --- | --- |\n" + "\n".join(
+        f"| us-east | ok_{i} |" for i in range(40)
+    )
+    assert detect_content_type(mismatched_sep).metadata.get("format") != "markdown"
+    assert parse_tabular(mismatched_sep) is None
+
+    # Valid uniform table with inline-code and escaped pipes compresses as markdown.
     valid = "| Field | Type | Notes |\n| --- | --- | --- |\n" + "\n".join(
-        f"| field_{i} | `string | number` | union type |" for i in range(40)
+        f"| field_{i} | `string | number` | union \\| type |" for i in range(40)
     )
     detected = detect_content_type(valid)
     assert detected.content_type is ContentType.TABULAR
     assert detected.metadata.get("format") == "markdown"
     parsed = parse_tabular(valid)
     assert parsed is not None
-    assert parsed[1][0] == ["field_0", "`string | number`", "union type"]
+    assert parsed[1][0] == ["field_0", "`string | number`", "union | type"]
     compressed = TabularCompressor().compress(valid)
     assert compressed.was_modified
     assert "`string | number`" in compressed.compressed

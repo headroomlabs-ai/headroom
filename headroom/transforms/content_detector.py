@@ -742,6 +742,11 @@ def _split_markdown_row(row: str, *, unescape: bool = True) -> list[str]:
                 buf.append("|")
                 i = j + 1
                 continue
+            if tick_len == 0 and j < n and s[j] == "`" and bs % 2 == 1:
+                buf.append(s[i:j])
+                buf.append("`")
+                i = j + 1
+                continue
             buf.append(s[i:j])
             i = j
             continue
@@ -881,7 +886,7 @@ def _is_whole_markdown_table(content: str) -> bool:
     if len(rows) < 3 or not _is_md_separator(rows[1]):
         return False
     cols = _md_cell_count(rows[0])
-    if cols < 2:
+    if cols < 2 or _md_cell_count(rows[1]) != cols:
         return False
     leading_pipe = rows[0].lstrip().startswith("|")
     return all(
