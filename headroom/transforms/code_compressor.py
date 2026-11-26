@@ -510,6 +510,9 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         # Inline modules (`mod tests { ... }`); `mod name;` has no body and
         # is kept as written.
         container_node_types=frozenset({"mod_item"}),
+        # `macro_rules!` is textually scoped: grouping moved a function or
+        # module above the macro it invokes.
+        source_ordered=True,
     ),
     CodeLanguage.JAVA: LangConfig(
         import_nodes=frozenset({"import_declaration"}),
