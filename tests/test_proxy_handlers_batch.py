@@ -2366,3 +2366,44 @@ async def test_store_google_batch_context_keeps_every_system_instruction_part(
     assert stored is not None
     # Same text the forwarded request carries; the CCR continuation replays it.
     assert stored.system_instruction == "You are a translator.\nAnswer in French."
+
+
+async def test_store_google_batch_context_replays_the_forwarded_system_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.ccr import batch_store as batch_store_module
+    from headroom.ccr.batch_store import BatchContextStore
+
+    store = BatchContextStore()
+    monkeypatch.setattr(batch_store_module, "_batch_context_store", store)
+    original = {
+        "metadata": {"key": "item"},
+        "request": {
+            "systemInstruction": {"parts": [{"text": "You are a translator."}]},
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        },
+    }
+    forwarded = {
+        "metadata": {"key": "item"},
+        "request": {
+            "systemInstruction": {
+                "parts": [
+                    {"text": "You are a translator.\nUse headroom_retrieve for compressed data."}
+                ]
+            },
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        },
+    }
+
+    await NativeGeminiHandler([])._store_google_batch_context(
+        "batches/1", [original], [forwarded], "gemini-2.5-flash", None
+    )
+
+    context = await store.get("batches/1")
+    assert context is not None
+    stored = context.get_request("item")
+    assert stored is not None
+    assert (
+        stored.system_instruction
+        == "You are a translator.\nUse headroom_retrieve for compressed data."
+    )

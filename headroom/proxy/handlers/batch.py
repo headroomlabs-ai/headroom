@@ -654,9 +654,12 @@ class BatchHandlerMixin:
             # Convert contents to messages format for CCR handler
             messages, _ = self._gemini_contents_to_messages(contents, system_instruction)
 
-            # The converter joined every text part of the system instruction, as it
-            # does for the forwarded request; the continuation must replay all of it.
-            sys_text = next((m["content"] for m in messages if m["role"] == "system"), None)
+            # Replay the system instruction that was forwarded, including any CCR
+            # retrieval instructions injected into it, with every text part joined.
+            forwarded_system, _ = self._gemini_contents_to_messages(
+                [], forwarded_req.get("request", {}).get("systemInstruction")
+            )
+            sys_text = next((m["content"] for m in forwarded_system), None)
 
             context.add_request(
                 BatchRequestContext(
