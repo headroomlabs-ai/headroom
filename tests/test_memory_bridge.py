@@ -228,7 +228,15 @@ class TestGenericParser:
         assert headings == ["Notes", "Deploy"]
         deploy = parsed.sections[1]
         assert "# Restart service" in deploy.content
-        assert deploy.facts == ["Run the deploy script:", "Verify health endpoint"]
+        assert deploy.facts == [
+            "Run the deploy script:",
+            "```bash\n# Restart service\nsystemctl restart headroom\n```",
+            "Verify health endpoint",
+        ]
+
+    def test_detect_format_keeps_short_fenced_notes_in_generic_mode(self):
+        content = "Quick script:\n```bash\n# comment inside fence\necho ok\n```\nDone.\n"
+        assert detect_format(content) == "generic"
 
 
 class TestFormatDetection:

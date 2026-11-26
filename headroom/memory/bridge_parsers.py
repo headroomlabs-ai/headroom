@@ -253,12 +253,14 @@ def detect_format(content: str) -> str:
 
     has_h2_headers = False
     has_bullets = False
+    has_fence = False
     short_line_count = 0
     total_lines = 0
     fence: tuple[str, int] | None = None
 
     for line in lines:
         fence, in_fence = _next_fence_state(line, fence)
+        has_fence = has_fence or in_fence
         stripped = line.strip()
         if not stripped:
             continue
@@ -276,8 +278,8 @@ def detect_format(content: str) -> str:
     if has_h2_headers and has_bullets:
         return "claude_code"
 
-    # ChatGPT: mostly short lines, no headers, looks like flat facts
-    if total_lines > 0 and not has_h2_headers:
+    # ChatGPT: mostly short lines, no headers or fenced code, looks like flat facts
+    if total_lines > 0 and not has_h2_headers and not has_fence:
         short_ratio = short_line_count / total_lines
         if short_ratio > 0.8 and total_lines >= 2:
             return "chatgpt"
@@ -444,9 +446,14 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
 
         facts = []
         fact_fence: tuple[str, int] | None = None
+        fence_buf: list[str] = []
         for line in current_lines:
             fact_fence, in_fence = _next_fence_state(line, fact_fence)
             if in_fence:
+                fence_buf.append(line)
+                if fact_fence is None:
+                    facts.append("\n".join(fence_buf))
+                    fence_buf = []
                 continue
             stripped = line.strip()
             if stripped.startswith("- "):
@@ -456,6 +463,8 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
             elif stripped and not stripped.startswith("#"):
                 # Non-bullet, non-empty lines are also facts in generic mode
                 facts.append(stripped)
+        if fence_buf:
+            facts.append("\n".join(fence_buf))
 
         entities = extract_entities_from_text(section_content) if section_content else []
 
