@@ -465,6 +465,49 @@ def test_parse_markdown_table_keeps_separator_like_body_row() -> None:
     assert rows == [["1", "2"], ["---", "---"]]
 
 
+def test_parse_markdown_table_preserves_pipes_in_inline_code_and_escapes() -> None:
+    md = (
+        "| Name | Type | Notes |\n"
+        "| --- | --- | --- |\n"
+        "| id | `string | number` | ``a | `b` | c`` |\n"
+        "| mask | `a \\| b` | plain \\| pipe |\n"
+        "| trail | path\\\\| exact |\n"
+        "| stray | `unclosed | still_splits |"
+    )
+    headers, rows = parse_markdown_table(md)
+    assert headers == ["Name", "Type", "Notes"]
+    assert rows[0] == ["id", "`string | number`", "``a | `b` | c``"]
+    assert rows[1] == ["mask", "`a | b`", "plain | pipe"]
+    assert rows[2] == ["trail", "path\\\\", "exact"]
+    assert rows[3] == ["stray", "`unclosed", "still_splits"]
+
+
+def test_markdown_table_inline_code_pipes_keep_detection_and_rag_guard_consistent() -> None:
+    # Two-cell row whose inline code contains `|` must NOT pass a 3-col check as 3 cells.
+    ragged = (
+        "| Name | Type | Default |\n"
+        "| --- | --- | --- |\n"
+        + "\n".join(f"| f_{i} | string | none |" for i in range(40))
+        + "\n| x | `string | number` |"
+    )
+    assert detect_content_type(ragged).metadata.get("format") != "markdown"
+    assert parse_tabular(ragged) is None
+
+    # Valid uniform table with inline-code pipes compresses as markdown.
+    valid = "| Field | Type | Notes |\n| --- | --- | --- |\n" + "\n".join(
+        f"| field_{i} | `string | number` | union type |" for i in range(40)
+    )
+    detected = detect_content_type(valid)
+    assert detected.content_type is ContentType.TABULAR
+    assert detected.metadata.get("format") == "markdown"
+    parsed = parse_tabular(valid)
+    assert parsed is not None
+    assert parsed[1][0] == ["field_0", "`string | number`", "union type"]
+    compressed = TabularCompressor().compress(valid)
+    assert compressed.was_modified
+    assert "`string | number`" in compressed.compressed
+
+
 def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
     # Rows with differing cell counts can't be zipped under the headers
     # without misattributing columns (#1652) — must pass through.

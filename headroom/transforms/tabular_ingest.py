@@ -19,7 +19,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from .content_detector import ContentType, detect_content_type
+from .content_detector import ContentType, _split_markdown_row, detect_content_type
 
 # Mirrors content_detector's separator-cell pattern (e.g. ``| --- | :--: |``).
 _MD_SEP_CELL = re.compile(r"^:?-{2,}:?$")
@@ -96,21 +96,18 @@ def parse_csv(content: str, delimiter: str = ",") -> tuple[list[str], list[list[
 def parse_markdown_table(content: str) -> tuple[list[str], list[list[str]]]:
     """Parse a markdown table, dropping the ``|---|`` separator row."""
 
-    def split_row(row: str) -> list[str]:
-        return [c.strip() for c in row.strip().strip("|").split("|")]
-
     def is_separator(row: str) -> bool:
-        cells = [c for c in split_row(row) if c]
+        cells = [c for c in _split_markdown_row(row, unescape=False) if c]
         return len(cells) >= 2 and all(_MD_SEP_CELL.match(c) for c in cells)
 
     lines = [ln for ln in content.split("\n") if ln.strip() and "|" in ln]
     if len(lines) < 2:
         return [], []
-    headers = split_row(lines[0])
+    headers = _split_markdown_row(lines[0])
     body_lines = lines[1:]
     if body_lines and is_separator(body_lines[0]):
         body_lines = body_lines[1:]
-    rows = [split_row(ln) for ln in body_lines]
+    rows = [_split_markdown_row(ln) for ln in body_lines]
     return headers, rows
 
 

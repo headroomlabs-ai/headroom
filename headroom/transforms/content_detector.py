@@ -685,9 +685,83 @@ def _try_detect_log(content: str) -> DetectionResult | None:
     )
 
 
+def _split_markdown_row(row: str, *, unescape: bool = True) -> list[str]:
+    """Split a markdown table row on unescaped ``|`` outside inline code spans."""
+    s = row.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        bs = 0
+        k = len(s) - 2
+        while k >= 0 and s[k] == "\\":
+            bs += 1
+            k -= 1
+        if bs % 2 == 0:
+            s = s[:-1]
+
+    cells: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(s)
+    tick_len = 0
+    while i < n:
+        ch = s[i]
+        if ch == "`":
+            j = i
+            while j < n and s[j] == "`":
+                j += 1
+            run_len = j - i
+            if tick_len == 0:
+                close_marker = "`" * run_len
+                pos = j
+                found_close = False
+                while pos < n:
+                    idx = s.find(close_marker, pos)
+                    if idx == -1:
+                        break
+                    after = idx + run_len
+                    if (idx == 0 or s[idx - 1] != "`") and (after == n or s[after] != "`"):
+                        found_close = True
+                        break
+                    pos = idx + 1
+                if found_close:
+                    tick_len = run_len
+            elif run_len == tick_len:
+                tick_len = 0
+            buf.append(s[i:j])
+            i = j
+            continue
+
+        if ch == "\\":
+            j = i
+            while j < n and s[j] == "\\":
+                j += 1
+            bs = j - i
+            if j < n and s[j] == "|" and bs % 2 == 1:
+                buf.append("\\" * (bs - 1 if unescape else bs))
+                buf.append("|")
+                i = j + 1
+                continue
+            buf.append(s[i:j])
+            i = j
+            continue
+
+        if ch == "|" and tick_len == 0:
+            cells.append("".join(buf).strip())
+            buf.clear()
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    cells.append("".join(buf).strip())
+    return cells
+
+
 def _md_cell_count(row: str) -> int:
     """Count cells in a markdown table row, ignoring the outer pipes."""
-    return len(row.strip().strip("|").split("|"))
+    return len(_split_markdown_row(row, unescape=False))
 
 
 def _is_md_separator(row: str) -> bool:
@@ -801,11 +875,8 @@ def _is_whole_markdown_table(content: str) -> bool:
 
     Every row must also split into exactly the header's cells, the way the
     tabular parser splits it, or the records built from it would truncate or
-    pad the row. The parser does not unescape ``\\|``, so a table that uses it
-    is left alone too.
+    pad the row.
     """
-    if "\\|" in content:
-        return False
     rows = content.strip().split("\n")
     if len(rows) < 3 or not _is_md_separator(rows[1]):
         return False
