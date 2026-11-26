@@ -43,6 +43,7 @@ def _drain_import_threads(timeout: float = 5.0) -> None:
 def _clean_lock(monkeypatch):
     """Guarantee the module lock is free, so a leaked test cannot poison others."""
     monkeypatch.delenv(ENV, raising=False)
+    kc._reset_availability_cache()
     # A cached import result would skip the import stage these tests measure.
     _drain_import_threads()
     if kc._kompress_lock.locked():  # pragma: no cover - defensive
@@ -363,24 +364,105 @@ def caplog_v2():
         logger.removeHandler(handler)
 
 
-def test_auto_loader_deadline_covers_unmocked_availability_probes(monkeypatch):
-    """The probes sit inside the same budget as everything else.
+class _PausedModuleImport:
+    """Pause one module while its import loader is running ``exec_module``."""
 
-    ``_is_onnx_available``/``_is_pytorch_available`` are cached and do a plain
-    inline ``import transformers``; on a cold process with the module paused in
-    ``exec_module`` that inline import waits out the pause before the loader
-    ever sees the budget. The dispatcher bounds the probes first, so a 20 ms
-    budget returns busy while initialisation is still paused.
+    def __init__(self, module_name: str, stall_seconds: float = 0.3) -> None:
+        self.module_name = module_name
+        self.stall_seconds = stall_seconds
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._saved_entry: ModuleType | None = None
+        self._created_entry: ModuleType | None = None
+
+    def find_spec(self, fullname, path=None, target=None):  # noqa: D102 - meta_path hook
+        if fullname != self.module_name:
+            return None
+        return importlib.machinery.ModuleSpec(fullname, self)
+
+    def create_module(self, spec):  # noqa: D102 - meta_path hook
+        return None
+
+    def exec_module(self, module):  # noqa: D102 - meta_path hook
+        self._created_entry = module
+        self.entered.set()
+        self.release.wait(self.stall_seconds)
+
+    def __enter__(self) -> _PausedModuleImport:
+        _drain_import_threads()
+        self._saved_entry = sys.modules.pop(self.module_name, None)
+        sys.meta_path.insert(0, self)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release.set()
+        _drain_import_threads(2.0)
+        if self in sys.meta_path:
+            sys.meta_path.remove(self)
+        sys.modules.pop(self.module_name, None)
+        if self._saved_entry is not None:
+            sys.modules[self.module_name] = self._saved_entry
+
+
+def _prime_module(monkeypatch, name: str, **attrs: object) -> ModuleType:
+    module = ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
+
+
+def _reset_probe_caches() -> None:
+    """Drop cached probe verdicts so a test exercises the real import path."""
+    kc._reset_availability_cache()
+
+
+@pytest.mark.parametrize(
+    ("paused_module", "prime_modules"),
+    [
+        # Auto order: transformers -> onnxruntime -> safetensors/torch.
+        ("onnxruntime", ()),
+        ("safetensors", ()),
+        ("torch", ()),
+    ],
+)
+def test_auto_loader_probe_entry_points_share_the_deadline(
+    monkeypatch, paused_module, prime_modules
+):
+    """A paused backend probe must report busy within the auto-loader budget.
+
+    ``transformers`` is already loaded, so the bounded first-import gate passes
+    and the dispatcher reaches the *availability* probes, which import
+    ``onnxruntime`` / ``safetensors`` / ``torch`` inline. That inline import is
+    the finding: with the module paused in ``exec_module`` the probe must spend
+    the shared deadline and report ``KompressModelBusy``, not wait out the pause
+    before the loader ever sees a budget.
     """
     monkeypatch.setenv(ENV, "0.02")
-    monkeypatch.setattr(kc, "_selected_backend", lambda: "auto")
-    # Deliberately NOT mocking the availability probes: they are the finding.
     monkeypatch.delenv("HEADROOM_KOMPRESS_BACKEND", raising=False)
+    _prime_module(monkeypatch, "transformers", AutoTokenizer=object, AutoModel=object)
+    for module_name in prime_modules:
+        _prime_module(monkeypatch, module_name)
+    # ``sys.modules[name] = None`` is how CPython records a known-absent module:
+    # ``import name`` raises ImportError immediately, no finders consulted.
+    if paused_module != "onnxruntime":
+        monkeypatch.setitem(sys.modules, "onnxruntime", None)
+    # Reaching a real backend loader means a probe claimed the stack was
+    # available inside the budget -- which is exactly what must not happen while
+    # the module is still initialising.
+    monkeypatch.setattr(kc, "_load_kompress_onnx", lambda *a, **k: pytest.fail("reached ONNX"))
+    monkeypatch.setattr(
+        kc, "_load_kompress_pytorch", lambda *a, **k: pytest.fail("reached PyTorch")
+    )
+    _reset_probe_caches()
 
-    with _PausedTransformersImport():
-        started = time.monotonic()
-        with pytest.raises(kc.KompressModelBusy):
-            kc._load_kompress("kompress-probe-budget")
-        elapsed = time.monotonic() - started
-
-    assert elapsed < 0.15, f"waited {elapsed:.3f}s past a 0.02s budget"
+    try:
+        with _PausedModuleImport(paused_module) as paused:
+            started = time.monotonic()
+            with pytest.raises(kc.KompressModelBusy):
+                kc._load_kompress(f"kompress-paused-{paused_module}")
+            elapsed = time.monotonic() - started
+            assert paused.entered.is_set(), f"{paused_module} was never imported"
+        assert elapsed < 0.15, f"{paused_module} probe waited {elapsed:.3f}s"
+    finally:
+        _reset_probe_caches()

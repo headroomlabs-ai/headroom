@@ -240,6 +240,36 @@ def test_disabled_by_env(monkeypatch):
         loop_watchdog._reset_for_test()
 
 
+def test_non_finite_threshold_falls_back_to_a_finite_threshold(monkeypatch):
+    """``HEADROOM_LOOP_WATCHDOG_SECS=nan`` must not arm a nan threshold.
+
+    ``nan`` parses as a float but makes every ``stalled_for >= threshold``
+    comparison false, so the watchdog would arm and never report a stall. The
+    guard falls back to the finite default: it still arms, but with a threshold
+    that actually fires, and ``snapshot()`` stays strict-JSON.
+    """
+    import asyncio
+
+    from headroom.proxy import loop_watchdog
+
+    monkeypatch.setenv("HEADROOM_LOOP_WATCHDOG_SECS", "nan")
+    loop_watchdog._reset_for_test()
+    try:
+
+        async def arm() -> bool:
+            return loop_watchdog.start_loop_watchdog()
+
+        assert loop_watchdog._resolve_secs() == loop_watchdog.DEFAULT_SECS
+        assert asyncio.run(arm()) is True
+        payload = loop_watchdog.snapshot()
+        assert payload["enabled"] is True
+        assert payload["stall_threshold_seconds"] == loop_watchdog.DEFAULT_SECS
+        assert math.isfinite(payload["stall_threshold_seconds"])
+        assert json.dumps(payload, allow_nan=False)
+    finally:
+        loop_watchdog._reset_for_test()
+
+
 def test_blocked_loop_is_reported_and_survives():
     proc = subprocess.run(
         [sys.executable, "-c", _STALLED_LOOP],
