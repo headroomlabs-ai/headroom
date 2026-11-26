@@ -73,25 +73,33 @@ def project(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("edited_global", [False, True])
+@pytest.mark.parametrize("backend", ["enola", "serena"])
 def test_user_scope_reconciliation_checks_the_user_entry_not_its_project_shadow(
-    project, tmp_path, edited_global
+    project, tmp_path, edited_global, backend
 ):
     registrar = ClaudeRegistrar(
         claude_cli=None, home_dir=tmp_path, project_dir=tmp_path, scope=SCOPE_USER
     )
-    old = ServerSpec("enola", "/old/enola")
+
+    def setup():
+        if backend == "enola":
+            return wrap._setup_enola_mcp(registrar)
+        return wrap._setup_serena_mcp(registrar, context="claude-code")
+
+    expected = enola.build_enola_spec() if backend == "enola" else build_serena_spec("claude-code")
+    old = ServerSpec(backend, f"/old/{backend}")
     install_owned(registrar, old)
-    shadow = old if edited_global else ServerSpec("enola", "/project/enola")
+    shadow = old if edited_global else ServerSpec(backend, f"/project/{backend}")
     assert project.register_server(shadow).ok
     if edited_global:
-        customized = ServerSpec("enola", "/user/enola", env={"CUSTOM": "keep"})
+        customized = ServerSpec(backend, f"/user/{backend}", env={"CUSTOM": "keep"})
         assert registrar.register_server(customized, force=True).ok
-        assert not wrap._setup_enola_mcp(registrar)
-        assert registrar.get_server("enola", scope=SCOPE_USER) == customized
+        assert not setup()
+        assert registrar.get_server(backend, scope=SCOPE_USER) == customized
     else:
-        assert wrap._setup_enola_mcp(registrar)
-        assert registrar.get_server("enola", scope=SCOPE_USER) == enola.build_enola_spec()
-    assert project.get_server("enola", scope=SCOPE_LOCAL) == shadow
+        assert setup()
+        assert registrar.get_server(backend, scope=SCOPE_USER) == expected
+    assert project.get_server(backend, scope=SCOPE_LOCAL) == shadow
 
 
 def test_none_preserves_user_managed_enola_guidance(project, monkeypatch):
@@ -347,6 +355,50 @@ def test_invalid_enola_timeout_preserves_serena_until_forced_repair(project, tmp
     assert "timeout" not in json.loads(config.read_text())["mcp"]["enola"]
     wrap._setup_coding_compressor(registrar, serena_context="agent")
     assert registrar.get_server("serena") is None
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_opencode_serena_then_none_preserves_unowned_timeout_mismatch(project, tmp_path, owned):
+    from headroom.mcp_registry import OpencodeRegistrar
+
+    config = tmp_path / ".config/opencode/opencode.json"
+    registrar = OpencodeRegistrar(config_path=config)
+    assert registrar.register_server(build_serena_spec("agent")).ok
+    data = json.loads(config.read_text())
+    data["mcp"]["serena"]["timeout"] = "120000"
+    saved = data["mcp"]["serena"]
+    config.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    if owned:
+        record_install("opencode", registrar.get_server("serena"))
+    runner = CliRunner()
+    for backend in ("serena", "none"):
+        result = runner.invoke(
+            main, ["wrap", "opencode", "--prepare-only", "--no-mcp", "--code-memory", backend]
+        )
+        assert result.exit_code == 0, result.output
+        observed = registrar.get_server("serena")
+        if not owned:
+            assert json.loads(config.read_text())["mcp"]["serena"] == saved
+            assert not headroom_installed_matching("opencode", observed)
+        elif backend == "serena":
+            assert observed == build_serena_spec("agent")
+            assert headroom_installed_matching("opencode", observed)
+        else:
+            assert observed is None
+
+
+def test_explicit_serena_force_can_repair_unowned_timeout(project, tmp_path):
+    from headroom.mcp_registry import OpencodeRegistrar
+
+    config = tmp_path / ".config/opencode/opencode.json"
+    registrar = OpencodeRegistrar(config_path=config)
+    spec = build_serena_spec("agent")
+    assert registrar.register_server(spec).ok
+    data = json.loads(config.read_text())
+    data["mcp"]["serena"]["timeout"] = "120000"
+    config.write_text(json.dumps(data), encoding="utf-8", newline="\n")
+    assert wrap._setup_serena_mcp(registrar, context="agent", force=True)
+    assert registrar.get_server("serena") == spec
 
 
 def install_owned(registrar, spec, *, scope=None):

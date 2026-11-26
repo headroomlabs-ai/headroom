@@ -764,6 +764,7 @@ def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
     _set_test_home(monkeypatch, tmp_path)
     # The eager --code-memory callback writes os.environ; delenv restores it after.
     monkeypatch.delenv("HEADROOM_CODE_MEMORY", raising=False)
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
 
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     if stale_entry:
@@ -778,6 +779,12 @@ def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
                 }
             )
         )
+        # Automatic wrap migration refreshes stale entries only when the ledger
+        # proves Headroom installed them; custom registrations stay untouched.
+        from headroom.mcp_registry import OpencodeRegistrar
+        from headroom.mcp_registry.ledger import record_install
+
+        record_install("opencode", OpencodeRegistrar(config_path=config_file).get_server("serena"))
 
     with (
         patch.object(wrap_mod.shutil, "which", return_value="opencode"),

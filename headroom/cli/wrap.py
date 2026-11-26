@@ -2989,7 +2989,8 @@ def _setup_serena_mcp(
     (and the popup) forever. When the ledger proves the entry currently in the
     config is one Headroom installed, force-update it to the current spec. A
     user-managed Serena (absent from our ledger) is left untouched and the
-    mismatch is reported as before.
+    mismatch is reported as before. ``force`` is reserved for explicit repairs;
+    automatic backend selection relies on the ownership-checked migration.
     """
     from headroom.mcp_registry import build_serena_spec, format_result
     from headroom.mcp_registry.base import RegisterStatus
@@ -3011,11 +3012,14 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+    registration_scope = {"scope": registrar.scope} if hasattr(registrar, "ownership_key") else {}
     owned_drift = (
         result.status == RegisterStatus.MISMATCH
         and not force
         and headroom_installed_matching(
-            registrar.name, registrar.get_server("serena"), ownership_key=ownership_key
+            registrar.name,
+            registrar.get_server("serena", **registration_scope),
+            ownership_key=ownership_key,
         )
     )
 
@@ -3382,7 +3386,6 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
     ``--serena`` / ``--no-serena`` flags map into the selector; user-managed MCP
     entries are always left untouched (ledger).
     """
-    force = bool(kwargs.get("force"))
     verbose = bool(kwargs.get("verbose"))
     selection = _resolve_code_memory(kwargs)
 
@@ -3403,7 +3406,9 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
             _inject_enola_instructions(instruction_file)
         return
 
-    if _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force):
+    # A wrapper's retrieval-refresh flag does not authorize adopting code-memory
+    # entries. Serena setup already force-migrates matching owned installations.
+    if _setup_serena_mcp(registrar, context=serena_context, verbose=verbose):
         _disable_enola_mcp(registrar)
 
 
