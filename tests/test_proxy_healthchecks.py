@@ -349,6 +349,8 @@ def test_readyz_probes_the_configured_primary_upstream(
 
 
 def test_readiness_probe_uses_its_own_diagnostics(monkeypatch, caplog):
+    import asyncio
+
     import httpx
 
     monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
@@ -361,16 +363,21 @@ def test_readiness_probe_uses_its_own_diagnostics(monkeypatch, caplog):
 
     transport = httpx.MockTransport(upstream)
 
+    def ordinary_get():
+        with httpx.Client(transport=transport) as client:
+            client.get("https://llm.example")
+
     async def head(url, **kwargs):
         async with httpx.AsyncClient(transport=transport) as client:
-            return await client.head(url, **kwargs)
+            result = await client.head(url, **kwargs)
+        # The probe is still active while unrelated traffic logs independently.
+        await asyncio.get_running_loop().run_in_executor(None, ordinary_get)
+        return result
 
     with TestClient(create_app(config)) as client:
         with caplog.at_level(logging.INFO, logger="httpx"):
             monkeypatch.setattr(client.app.state.proxy.http_client, "head", head)
             response = client.get("/readyz")
-            with httpx.Client(transport=transport) as other_client:
-                other_client.get("https://llm.example")
 
     assert response.status_code == 200
     assert response.json()["checks"]["upstream"]["ready"] is True
