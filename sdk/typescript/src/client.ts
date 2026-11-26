@@ -324,13 +324,14 @@ export class HeadroomClient implements HeadroomClientInterface {
     return resp.text();
   }
 
-  /** Get historical stats. */
+  /** Get historical stats. Returns CSV text when `format` is "csv", otherwise parsed JSON. */
   async statsHistory(query?: StatsHistoryQuery): Promise<any> {
     const params = new URLSearchParams();
     if (query?.format) params.set("format", query.format);
     if (query?.series) params.set("series", query.series);
     const qs = params.toString();
     const resp = await this._fetch(`/stats-history${qs ? `?${qs}` : ""}`, { method: "GET" });
+    if (query?.format === "csv") return resp.text();
     return resp.json();
   }
 
