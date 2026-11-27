@@ -121,7 +121,7 @@ def _same_origin(a: str, b: str) -> bool:
     def key(url: str) -> tuple[str, str, int | None, str]:
         parts = urlsplit(url)
         scheme = parts.scheme.lower()
-        port = parts.port or {"https": 443, "http": 80}.get(scheme)
+        port = parts.port if parts.port is not None else {"https": 443, "http": 80}.get(scheme)
         return scheme, (parts.hostname or "").lower(), port, parts.path.rstrip("/")
 
     return key(a) == key(b)

@@ -195,3 +195,9 @@ def test_default_anthropic_target_with_explicit_port_still_counts_on_bedrock() -
     )
 
     assert resp.json() == {"input_tokens": 3}
+
+
+def test_explicit_port_zero_is_not_the_default_anthropic_target() -> None:
+    from headroom.providers.proxy_routes import _same_origin
+
+    assert not _same_origin("https://api.anthropic.com:0", "https://api.anthropic.com")
