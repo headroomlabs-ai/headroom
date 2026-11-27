@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://headroom.dev/schemas/release/v1/candidate-manifest.schema.json",
+  "title": "Headroom immutable release candidate manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate_id", "created_at", "source", "artifact", "build", "rollout"],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "candidate_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "sha", "branch"],
+      "properties": {
+        "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$" },
+        "sha": { "$ref": "common.schema.json#/$defs/gitSha" },
+        "branch": { "const": "main" }
+      }
+    },
+    "artifact": { "$ref": "common.schema.json#/$defs/artifactIdentity" },
+    "runtime_payload_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
+    "build": { "$ref": "common.schema.json#/$defs/producerIdentity" },
+    "rollout": { "$ref": "common.schema.json#/$defs/rolloutIdentity" }
+  }
+}

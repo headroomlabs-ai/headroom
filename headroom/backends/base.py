@@ -117,6 +117,15 @@ class Backend(ABC):
         """
         ...
 
+    def bedrock_model_ids(self) -> list[str] | None:
+        """Model names a Bedrock backend can serve; None for other backends.
+
+        The proxy answers ``GET /v1/models`` from this in Bedrock mode, where
+        there is no Anthropic account to ask. Backends that wrap another one
+        should delegate.
+        """
+        return None
+
     async def send_openai_message(
         self,
         body: dict[str, Any],

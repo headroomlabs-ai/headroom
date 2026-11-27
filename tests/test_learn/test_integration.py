@@ -176,6 +176,7 @@ class TestClaudeCodeIntegration:
         sessions_with_events = [s for s in sessions if s.events]
         assert len(sessions_with_events) > 0
 
+    @pytest.mark.live
     @pytest.mark.skipif(not HAS_API_KEY, reason="No ANTHROPIC_API_KEY")
     def test_full_pipeline_produces_output(self):
         """Scan → analyze on real data produces valid output."""

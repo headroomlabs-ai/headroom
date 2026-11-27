@@ -94,6 +94,7 @@ def anthropic_api_key():
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestOpenAIModels:
     """Test OpenAI /v1/models endpoint passthrough."""
 
@@ -137,6 +138,7 @@ class TestOpenAIModels:
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestOpenAIEmbeddings:
     """Test OpenAI /v1/embeddings endpoint passthrough."""
 
@@ -201,6 +203,7 @@ class TestOpenAIEmbeddings:
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestOpenAIModerations:
     """Test OpenAI /v1/moderations endpoint passthrough."""
 
@@ -253,6 +256,7 @@ class TestOpenAIModerations:
 
 
 @pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="GEMINI_API_KEY not set")
+@pytest.mark.live
 class TestGeminiModels:
     """Test Gemini /v1beta/models endpoint passthrough."""
 
@@ -286,6 +290,7 @@ class TestGeminiModels:
     "feature gap, not a regression. Tracked separately."
 )
 @pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="GEMINI_API_KEY not set")
+@pytest.mark.live
 class TestGeminiEmbedContent:
     """Test Gemini /v1beta/models/{model}:embedContent endpoint passthrough."""
 
@@ -325,6 +330,7 @@ class TestGeminiEmbedContent:
     "feature gap, not a regression. Tracked separately."
 )
 @pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="GEMINI_API_KEY not set")
+@pytest.mark.live
 class TestGeminiBatchEmbedContents:
     """Test Gemini /v1beta/models/{model}:batchEmbedContents endpoint passthrough."""
 
@@ -369,6 +375,7 @@ class TestGeminiBatchEmbedContents:
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+@pytest.mark.live
 class TestAnthropicModels:
     """Test Anthropic /v1/models endpoint passthrough."""
 
@@ -431,6 +438,7 @@ class TestAnthropicModels:
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestPassthroughStats:
     """Test that passthrough requests are tracked in proxy stats."""
 
@@ -474,12 +482,14 @@ class TestPassthroughStats:
 class TestPassthroughErrorHandling:
     """Test error handling for passthrough endpoints."""
 
+    @pytest.mark.live
     def test_missing_auth_header_openai(self, openai_client):
         """Missing auth header returns appropriate error."""
         response = openai_client.get("/v1/models")
         # OpenAI requires authentication
         assert response.status_code >= 400
 
+    @pytest.mark.live
     @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
     def test_invalid_json_body(self, openai_client, openai_api_key):
         """Invalid JSON body returns 400 error."""

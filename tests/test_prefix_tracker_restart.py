@@ -53,6 +53,34 @@ def _wire(messages: list[dict[str, Any]]) -> str:
     return json.dumps(_strip(messages))
 
 
+@pytest.mark.parametrize("length", [12, 16, 24, 32, 64])
+@pytest.mark.parametrize("style", ["hash", "ccr"])
+def test_restart_keeps_the_complete_explicit_ccr_hash(tmp_path, monkeypatch, length, style):
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    reset_compression_store()
+    ccr = get_compression_store()
+    key = "abcdef0123456789" * 4
+    key = key[:length]
+    ccr.store("original payload", "compressed", explicit_hash=key, ttl=900)
+    # A truncated reference must not accidentally export a different original.
+    if length > 24:
+        ccr.store("unrelated prefix payload", "other", explicit_hash=key[:24], ttl=900)
+    marker = f"[Retrieve original: hash={key}]" if style == "hash" else f"<<ccr:{key},base64,1KB>>"
+    store = SessionTrackerStore()
+    contextvars.Context().run(_send, store, [{"role": "user", "content": marker}])
+    path = str(tmp_path / "state.json")
+    assert store.save_state(path) == 1
+    saved = json.loads(Path(path).read_text(encoding="utf-8"))
+    reset_compression_store()
+
+    assert SessionTrackerStore().load_state(path) == 1
+    assert [record["hash"] for record in saved["ccr"]] == [key]
+    entry = get_compression_store().retrieve(key)
+    assert entry is not None
+    assert entry.original_content == "original payload"
+    reset_compression_store()
+
+
 def _ccr_hashes(messages: list[dict[str, Any]]) -> set[str]:
     """Retrieval references the model sees, found the way the proxy finds them."""
     return set(CCRToolInjector().scan_for_markers(messages))

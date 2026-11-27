@@ -116,6 +116,7 @@ from headroom.proxy.auth_mode import (
 from headroom.proxy.buffered_ccr_response import (
     DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
     OPENAI_ERROR_FORMAT,
+    OPENAI_RESPONSES_ERROR_FORMAT,
     buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
@@ -4035,6 +4036,11 @@ class OpenAIHandlerMixin:
             "verbosity": body.get("verbosity"),
             "modalities": body.get("modalities"),
         }
+        # Voice and output format shape an audio reply as much as modalities
+        # does; without them a voice/format change replays other audio (#4276).
+        # Only keyed when sent, so requests without audio keep their old keys.
+        if body.get("audio") is not None:
+            cache_key_fields["audio"] = body["audio"]
         # Snapshot the lookup messages too. `messages` is the primary cache
         # key component, but the pre_compress hook below reassigns it, so
         # caching the response under the live `messages` would store it under a
@@ -5556,7 +5562,7 @@ class OpenAIHandlerMixin:
 
                     if tokens_saved > 0:
                         logger.info(
-                            f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                            f"[{request_id}] {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                             f"(saved {tokens_saved:,} tokens) via {request_backend.name}"
                         )
 
@@ -6189,7 +6195,7 @@ class OpenAIHandlerMixin:
 
                 if tokens_saved > 0:
                     logger.info(
-                        f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                        f"[{request_id}] {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                         f"(saved {tokens_saved:,} tokens)"
                     )
 
@@ -7738,7 +7744,7 @@ class OpenAIHandlerMixin:
                     )
 
                     logger.info(
-                        f"[{request_id}] /v1/responses {model}: {total_input_tokens:,} tokens"
+                        f"[{request_id}] /v1/responses {safe_id(model)}: {total_input_tokens:,} tokens"
                     )
 
                     # Capture Codex rate-limit window data from response headers
@@ -7771,18 +7777,15 @@ class OpenAIHandlerMixin:
                                 "handling; failing closed"
                             )
 
-                            async def _residual_ccr_error_sse():
-                                error_event = {
-                                    "type": "error",
-                                    "error": {
-                                        "message": "Unable to safely complete streamed CCR retrieval.",
-                                    },
-                                }
-                                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
-
-                            return StreamingResponse(
-                                _residual_ccr_error_sse(),
-                                media_type="text/event-stream",
+                            # Same split as the Chat twin: a plain JSON error
+                            # works on both sides of the commit. The wrapper
+                            # turns it into the typed stream event if SSE is
+                            # already on the wire.
+                            return Response(
+                                content=OPENAI_RESPONSES_ERROR_FORMAT.json_body(
+                                    "Unable to safely complete streamed CCR retrieval."
+                                ),
+                                media_type="application/json",
                                 headers=sse_headers,
                                 status_code=502,
                             )
@@ -7844,7 +7847,7 @@ class OpenAIHandlerMixin:
                 # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
                 _buffered_call = buffered_ccr_asgi_call(
                     operation=operation,
-                    fmt=OPENAI_ERROR_FORMAT,
+                    fmt=OPENAI_RESPONSES_ERROR_FORMAT,
                     grace_seconds=getattr(
                         self.config,
                         "buffered_ccr_grace_seconds",
@@ -7911,6 +7914,8 @@ class OpenAIHandlerMixin:
         ws_sessions: WebSocketSessionRegistry | None = getattr(self, "ws_sessions", None)
         session_handle: WSSessionHandle | None = None
         termination_cause: TerminationCause = "unknown"
+        client_close_code: int | None = None
+        upstream_close_code: int | None = None
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
@@ -9372,7 +9377,18 @@ class OpenAIHandlerMixin:
                             await upstream.close()
                         return
                 async with upstream:
-                    await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
+
+                    async def _send_upstream(payload: str) -> None:
+                        nonlocal upstream_close_code
+                        try:
+                            await upstream.send(payload)
+                        except Exception as exc:
+                            upstream_close_code = getattr(upstream, "close_code", None) or getattr(
+                                getattr(exc, "rcvd", None), "code", None
+                            )
+                            raise
+
+                    await _send_upstream(_strip_codex_lite_metadata(first_msg_raw))
 
                     # Unit 3: flag the upstream side flips on seeing
                     # ``response.completed`` so the outer cause
@@ -9386,6 +9402,7 @@ class OpenAIHandlerMixin:
                     # even though the halves swallow and log.
                     upstream_relay_error: BaseException | None = None
                     client_relay_error: BaseException | None = None
+                    closing_client_from_upstream = False
 
                     async def _maybe_compress_response_create_frame(
                         raw_msg: str,
@@ -9707,6 +9724,7 @@ class OpenAIHandlerMixin:
                         nonlocal ws_client_frames_total, ws_cancel_frames
                         nonlocal ws_frames_compressed
                         nonlocal ws_last_client_frame_type, ws_client_disconnect_seen
+                        nonlocal client_close_code
                         nonlocal current_response_input
                         nonlocal current_response_template
                         nonlocal termination_cause
@@ -9876,7 +9894,7 @@ class OpenAIHandlerMixin:
                                         "transforms_applied": transforms_applied,
                                     },
                                 )
-                                await upstream.send(_strip_codex_lite_metadata(msg))
+                                await _send_upstream(_strip_codex_lite_metadata(msg))
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
                             # orchestrator — re-raise so
@@ -9896,6 +9914,8 @@ class OpenAIHandlerMixin:
                                 )
                             else:
                                 ws_client_disconnect_seen = True
+                                if not closing_client_from_upstream:
+                                    client_close_code = getattr(relay_err, "code", None)
                                 logger.info(
                                     "[%s] WS client disconnected session_id=%s "
                                     "frames=%d cancels=%d last_type=%s",
@@ -9927,6 +9947,8 @@ class OpenAIHandlerMixin:
                         # over ``upstream_disconnect``.
                         nonlocal response_completed_seen
                         nonlocal upstream_relay_error
+                        nonlocal client_close_code, upstream_close_code
+                        nonlocal closing_client_from_upstream
                         nonlocal ws_memory_response_pending
                         nonlocal ws_input_tokens_total, ws_output_tokens_total
                         nonlocal ws_cache_read_tokens_total, ws_cache_write_tokens_total
@@ -10382,7 +10404,7 @@ class OpenAIHandlerMixin:
                                 }
                                 continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
                                 ws_memory_response_pending = True
-                                await upstream.send(
+                                await _send_upstream(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
                                 logger.info(
@@ -10391,6 +10413,10 @@ class OpenAIHandlerMixin:
                                 )
                                 _reset()
 
+                            # The upstream iterator exits normally on a clean close.
+                            # Ignore the handshake started by the client relay's cleanup.
+                            if not ws_client_disconnect_seen:
+                                upstream_close_code = getattr(upstream, "close_code", None)
                         except asyncio.CancelledError:
                             raise
                         except Exception as relay_err:
@@ -10400,7 +10426,7 @@ class OpenAIHandlerMixin:
                                 # distinguished from a clean
                                 # upstream disconnect.
                                 upstream_relay_error = relay_err
-                                _upstream_close_code = getattr(relay_err, "code", None) or getattr(
+                                upstream_close_code = getattr(relay_err, "code", None) or getattr(
                                     getattr(relay_err, "rcvd", None), "code", None
                                 )
                                 _upstream_close_reason = (
@@ -10412,7 +10438,7 @@ class OpenAIHandlerMixin:
                                     "[%s] WS upstream→client relay ended: %s code=%s reason=%s",
                                     request_id,
                                     type(relay_err).__name__,
-                                    _upstream_close_code,
+                                    upstream_close_code,
                                     _upstream_close_reason,
                                 )
                                 if os.environ.get(
@@ -10424,17 +10450,21 @@ class OpenAIHandlerMixin:
                                     "on",
                                 ):
                                     _client_close_code = (
-                                        int(_upstream_close_code)
-                                        if isinstance(_upstream_close_code, int)
-                                        and 1000 <= int(_upstream_close_code) <= 4999
+                                        int(upstream_close_code)
+                                        if isinstance(upstream_close_code, int)
+                                        and 1000 <= int(upstream_close_code) <= 4999
                                         else 1011
                                     )
+                                    closing_client_from_upstream = True
                                     with contextlib.suppress(Exception):
                                         await websocket.close(
                                             code=_client_close_code,
                                             reason=str(_upstream_close_reason)[:120],
                                         )
+                            else:
+                                client_close_code = getattr(relay_err, "code", None)
                         finally:
+                            closing_client_from_upstream = True
                             with contextlib.suppress(Exception):
                                 await websocket.close()
 
@@ -10778,6 +10808,7 @@ class OpenAIHandlerMixin:
 
         except Exception as e:
             if "WebSocketDisconnect" in type(e).__name__:
+                client_close_code = getattr(e, "code", None)
                 # Unit 3: client dropped the socket before or during
                 # relay. The registry classifier may already have set
                 # ``client_disconnect`` via the relay task exit path;
@@ -10851,12 +10882,14 @@ class OpenAIHandlerMixin:
                     )
             logger.info(
                 "event=proxy_inbound_websocket_closed request_id=%s session_id=%s "
-                "path=%s cause=%s duration_ms=%.2f",
+                "path=%s cause=%s duration_ms=%.2f client_close_code=%s upstream_close_code=%s",
                 request_id,
                 session_id,
                 _ws_path,
                 termination_cause,
                 (time.perf_counter() - session_started_at) * 1000.0,
+                client_close_code,
+                upstream_close_code,
             )
             await emit_stage_timings_log(
                 path="openai_responses_ws",

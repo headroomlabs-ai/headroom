@@ -26,6 +26,22 @@ from headroom.providers.openai import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_developer_models_config(monkeypatch, tmp_path):
+    """Keep the developer's own ``models.json`` out of these tests.
+
+    Both loaders read ``~/.headroom/config/models.json`` (and the legacy
+    ``~/.headroom/models.json``) whenever it exists. The conftest scrub clears
+    ``HEADROOM_*`` but leaves ``Path.home()`` real, so on a machine with that
+    file its rows leaked into every test asserting on the loaded config.
+    Tests that need a config file still patch ``Path.home`` themselves; their
+    patch wins inside the test.
+    """
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: empty_home))
+
+
 class TestGoogleModelFallback:
     """Tests for Google provider model fallback."""
 
