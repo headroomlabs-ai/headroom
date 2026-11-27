@@ -229,6 +229,12 @@ Python proxy trusts loopback callers (no token needed, and access to
   container-alias `Host`), so a remote caller cannot borrow a name the
   Python proxy would trust from the front's loopback connection. Other
   backends can ignore it.
+  The Python proxy enforces it only from the release that adds marker
+  checks; an older one ignores it and still counts a relayed WebSocket
+  handshake (loopback peer, loopback upstream `Host`) as local. The front
+  has already required the token from that caller, but the Python side
+  grants it local treatment, so upgrade the Python proxy first when
+  WebSocket clients reach the front remotely.
 - A non-loopback `--listen` with no token refuses to start. Set
   `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` only when something else
   already restricts who can reach the port.
