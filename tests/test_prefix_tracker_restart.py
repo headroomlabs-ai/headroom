@@ -811,3 +811,57 @@ def test_undo_off_the_main_thread_only_disarms(tmp_path: Path) -> None:
     loop.run_until_complete(asyncio.sleep(0))
     loop.close()
     assert calls == [("app", signal.SIGTERM)]
+
+
+def test_a_locked_ccr_store_at_boot_still_restores_trackers_and_originals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review of #4986: the CCR SQLite file is held BEGIN EXCLUSIVE through boot.
+    The snapshot's tracker and its original still restore (the original is served
+    from memory), and once the lock is released the original is written to disk."""
+    import sqlite3
+
+    from headroom.cache.backends.sqlite import SQLiteBackend
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    reset_compression_store()
+    ccr = get_compression_store()
+    rows = ccr.store(json.dumps(list(range(400))), "[0, 1]", ttl=900)
+    store = SessionTrackerStore()
+    text = f"[400 items compressed to 2. Retrieve more: hash={rows}]"
+    contextvars.Context().run(_send, store, [{"role": "user", "content": text}])
+    path = str(tmp_path / "state.json")
+    assert store.save_state(path) == 1
+    reset_compression_store()
+
+    db = tmp_path / "ccr.db"
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "sqlite")
+    monkeypatch.setenv("HEADROOM_CCR_SQLITE_PATH", str(db))
+    monkeypatch.setattr(SQLiteBackend._open, "__defaults__", (100,))  # fail the first open fast
+    sqlite3.connect(db).close()
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        ccr = get_compression_store()
+        assert ccr._backend._conn is None  # type: ignore[attr-defined]
+        restored = SessionTrackerStore()
+        assert restored.load_state(path) == 1
+        assert restored.active_sessions == 1
+        assert not os.path.exists(path)
+        assert ccr.retrieve(rows).original_content == json.dumps(list(range(400)))  # type: ignore[union-attr]
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    ccr._backend._next_reopen_at = 0.0  # type: ignore[attr-defined]
+    assert ccr.retrieve(rows).original_content == json.dumps(list(range(400)))  # type: ignore[union-attr]
+    assert not ccr._deferred  # type: ignore[attr-defined]
+    check = sqlite3.connect(db)
+    try:
+        assert (
+            check.execute("SELECT count(*) FROM ccr_entries WHERE hash=?", (rows,)).fetchone()[0]
+            == 1
+        )
+    finally:
+        check.close()
+    reset_compression_store()
