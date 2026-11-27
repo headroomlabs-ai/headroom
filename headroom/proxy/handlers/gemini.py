@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
+from headroom.log_safety import safe_id
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.handlers._failure_logging import log_request_failure
@@ -1227,11 +1228,13 @@ class GeminiHandlerMixin:
 
                 if tokens_saved > 0:
                     logger.info(
-                        f"[{request_id}] Gemini {model}: {original_tokens:,} → {optimized_tokens:,} "
+                        f"[{request_id}] Gemini {safe_id(model)}: {original_tokens:,} → {optimized_tokens:,} "
                         f"(saved {tokens_saved:,} tokens)"
                     )
                 else:
-                    logger.info(f"[{request_id}] Gemini {model}: {original_tokens:,} tokens")
+                    logger.info(
+                        f"[{request_id}] Gemini {safe_id(model)}: {original_tokens:,} tokens"
+                    )
 
                 # Remove transport framing headers (the body is re-framed here)
                 # and inject Headroom compression metrics (for SaaS metering).
@@ -1721,12 +1724,12 @@ class GeminiHandlerMixin:
 
             if tokens_saved > 0:
                 logger.info(
-                    f"[{request_id}] Gemini countTokens {model}: {original_tokens:,} → {compressed_tokens:,} "
+                    f"[{request_id}] Gemini countTokens {safe_id(model)}: {original_tokens:,} → {compressed_tokens:,} "
                     f"(saved {tokens_saved:,} tokens, transforms: {transforms_applied})"
                 )
             else:
                 logger.info(
-                    f"[{request_id}] Gemini countTokens {model}: {compressed_tokens:,} tokens"
+                    f"[{request_id}] Gemini countTokens {safe_id(model)}: {compressed_tokens:,} tokens"
                 )
 
             # Remove transport framing headers (the body is re-framed here).

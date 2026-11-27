@@ -253,6 +253,7 @@ QUESTION = (
 EXPECTED = "10"
 
 
+@pytest.mark.live
 @_NEED_OPENAI
 def test_compressed_payload_preserves_answer_openai(repo: Path):
     """Model answers the same question correctly on ast-grep-sliced input."""
@@ -317,6 +318,7 @@ def test_compressed_payload_preserves_answer_openai(repo: Path):
     assert sliced_usage < full_usage, "compressed payload used more tokens than full"
 
 
+@pytest.mark.live
 @_NEED_ANTHROPIC
 def test_compressed_payload_preserves_answer_anthropic(repo: Path):
     import anthropic

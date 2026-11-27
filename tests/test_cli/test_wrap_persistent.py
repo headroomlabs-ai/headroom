@@ -397,6 +397,48 @@ def test_ensure_proxy_restarts_idle_stale_ephemeral_proxy(monkeypatch) -> None:
     assert calls[1][0] == "start"
 
 
+def test_ensure_proxy_stops_an_idle_stale_proxy_once_when_features_also_differ(
+    monkeypatch,
+) -> None:
+    """An older proxy that also lacks --memory is stopped once and replaced once."""
+    calls: list[object] = []
+    health = {
+        "version": "0.0.1",
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": "12345", "memory": False, "learn": True, "code_graph": False},
+    }
+    stopped: list[int] = []
+
+    def kill(pid: int, port: int) -> bool:
+        # Like the real check: once stopped, the PID no longer listens on the port.
+        calls.append(("kill", pid, port))
+        if pid in stopped:
+            return False
+        stopped.append(pid)
+        return True
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: not stopped)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda port, exclude_self: [])
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_kill_proxy_by_pid", kill)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, memory=True)
+
+    assert actual_port == 8787
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 12345, 8787)]
+    starts = [c for c in calls if c[0] == "start"]
+    assert len(starts) == 1
+    assert starts[0][2]["memory"] is True
+    assert starts[0][2]["learn"] is True  # kept from the running proxy
+
+
 def test_proxy_version_restart_ignores_non_release_source_labels(monkeypatch) -> None:
     monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.29.0")
     assert wrap_cli._proxy_needs_version_restart({"version": "source-build+g6266a1d774b5"}) is False

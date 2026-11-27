@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Callable
+from functools import partial
 
 __all__ = [
     "strip_ansi",
@@ -79,6 +81,7 @@ _TIMESTAMP_ROW_RE = re.compile(
     r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
     r"|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2}"  # syslog: Aug 16 11:02
     r"|[IWEF]\d{4}\s+\d{1,2}:\d{2}"  # klog/glog: E0902 14:30
+    r"|[DIWEFA], \[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}"  # Ruby Logger: I, [2026-09-02T14:30
     # Common/combined access log: 10.0.0.7 - - [02/Sep/2026:14:30:00. The
     # fields hold no ':', so a `grep -n` row (`path:12:10.0.0.7 - - [...`) is
     # not claimed. The host takes name/IPv4 characters only, capped at 255
@@ -366,7 +369,7 @@ def search_unheading(text: str) -> str:
 _DIR_DATA_RE = re.compile(r"^(?P<base>[^/\n:]+):(?P<line>\d+):(?P<content>.*)$")
 
 
-def search_dir_heading(text: str) -> str:
+def search_dir_heading(text: str, *, backslash: bool = False) -> str:
     """Fold grep ``path:line:content`` rows by DIRECTORY.
 
     Consecutive rows whose path shares a parent directory collapse to that
@@ -377,7 +380,12 @@ def search_dir_heading(text: str) -> str:
     saves nothing but the shared directory repeats on every row. Rows whose path
     has no ``/`` pass through untouched. Exactly reversed by
     :func:`search_dir_unheading`; ``compact_lossless`` verifies the round-trip.
+
+    With ``backslash=True`` a ``\\`` also ends a directory, as in the paths that
+    Windows tools print (ripgrep, Claude Code's Grep). Pass the same flag to
+    :func:`search_dir_unheading`.
     """
+    separators = "/\\" if backslash else "/"
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
@@ -385,9 +393,9 @@ def search_dir_heading(text: str) -> str:
     current_dir: str | None = None
     for line in lines:
         m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
-        if m and "/" in m.group("path"):
-            path = m.group("path")
-            cut = path.rindex("/") + 1
+        path = m.group("path") if m else ""
+        cut = max(path.rfind(sep) for sep in separators) + 1
+        if m and cut:
             dir_part, base = path[:cut], path[cut:]
             if dir_part != current_dir:
                 out.append(dir_part)
@@ -399,13 +407,15 @@ def search_dir_heading(text: str) -> str:
     return _join(out, had_trailing)
 
 
-def search_dir_unheading(text: str) -> str:
+def search_dir_unheading(text: str, *, backslash: bool = False) -> str:
     """Exact inverse of :func:`search_dir_heading`.
 
     A *header* is a line ending in ``/`` immediately followed by a
     ``base:line:content`` data row; it is consumed and re-prefixed onto each
-    following data row until a non-data line appears.
+    following data row until a non-data line appears. ``backslash`` must match
+    the flag the fold was made with (a header may then also end in ``\\``).
     """
+    header_ends = ("/", "\\") if backslash else ("/",)
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
@@ -420,7 +430,7 @@ def search_dir_unheading(text: str) -> str:
             out.append(f"{current_dir}{line}")
             i += 1
             continue
-        if line.endswith("/") and i + 1 < n and _DIR_DATA_RE.match(lines[i + 1]):
+        if line.endswith(header_ends) and i + 1 < n and _DIR_DATA_RE.match(lines[i + 1]):
             current_dir = line
             i += 1
             continue
@@ -571,11 +581,22 @@ def compact_lossless(content: str, kind: str) -> str:
             # search_heading factors a repeated FILE (many matches in one file);
             # search_dir_heading factors a repeated DIRECTORY (one match each
             # across many files in a dir — the grep -rn case the file fold misses).
-            best = content
-            for candidate, inverse in (
+            folds: list[tuple[str, Callable[[str], str]]] = [
                 (search_heading(content), search_unheading),
                 (search_dir_heading(content), search_dir_unheading),
-            ):
+            ]
+            if "\\" in content:
+                # Windows tools (ripgrep, Claude Code's Grep) separate path parts
+                # with "\". An extra candidate, not a replacement: on mixed
+                # ``a/b\c.py`` rows the "/"-only fold can still be the smaller.
+                folds.append(
+                    (
+                        search_dir_heading(content, backslash=True),
+                        partial(search_dir_unheading, backslash=True),
+                    )
+                )
+            best = content
+            for candidate, inverse in folds:
                 if inverse(candidate) == content and _smaller(candidate, best):
                     best = candidate
             return best

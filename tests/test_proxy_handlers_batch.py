@@ -1133,6 +1133,106 @@ async def test_handle_google_batch_results_processes_completed_results(
 
 
 @pytest.mark.asyncio
+async def test_handle_google_batch_results_accepts_the_route_batch_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /v1beta/batches/{batch_name}` hands the handler only the id.
+
+    The upstream URL and the stored batch context both need the full
+    `batches/<id>` resource name; forwarding `/v1beta/<id>` is a 404 upstream.
+    """
+    looked_up: list[str] = []
+    processed_calls: list[str] = []
+
+    class FakeStore:
+        async def get(self, batch_name):  # noqa: ANN001
+            looked_up.append(batch_name)
+            return SimpleNamespace(batch_name=batch_name)
+
+    class FakeProcessor:
+        def __init__(self, http_client) -> None:  # noqa: ANN001
+            self.http_client = http_client
+
+        async def process_results(self, batch_name, results, provider):  # noqa: ANN001
+            processed_calls.append(batch_name)
+            return []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "headroom.ccr",
+        SimpleNamespace(
+            BatchResultProcessor=FakeProcessor,
+            get_batch_context_store=lambda: FakeStore(),
+        ),
+    )
+
+    handler = DummyBatchHandler()
+    handler.config.ccr_inject_tool = True
+    handler.http_client.get_response = FakeResponse(
+        status_code=200,
+        content=b"{}",
+        json_data={
+            "metadata": {"state": "SUCCEEDED"},
+            "response": {"responses": [{"id": "raw-1"}]},
+        },
+    )
+
+    await handler.handle_google_batch_results(
+        FakeRequest(
+            "{}", headers={"x-goog-api-key": "secret"}, method="GET", path="/v1beta/batches/b1"
+        ),
+        "b1",
+    )
+
+    assert (
+        handler.http_client.gets[-1]["url"] == "https://gemini.example/v1beta/batches/b1?key=secret"
+    )
+    assert looked_up == ["batches/b1"]
+    assert processed_calls == ["batches/b1"]
+
+
+def test_google_batch_get_route_forwards_the_batch_resource_path() -> None:
+    """Through the real router: polling a batch reaches `/v1beta/batches/<id>`.
+
+    This is the request google-genai's `client.batches.get(name="batches/<id>")`
+    sends. Before the fix the proxy forwarded `/v1beta/<id>` and returned 404.
+    """
+    httpx = pytest.importorskip("httpx")
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    upstream_urls: list[str] = []
+    batch = {"name": "batches/b1", "metadata": {"state": "BATCH_STATE_RUNNING"}}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_urls.append(str(request.url))
+        if request.url.path == "/v1beta/batches/b1":
+            return httpx.Response(200, json=batch)
+        return httpx.Response(404, json={"error": {"code": 404, "status": "NOT_FOUND"}})
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    with TestClient(app) as client:
+        client.app.state.proxy.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(upstream)
+        )
+        response = client.get("/v1beta/batches/b1", headers={"x-goog-api-key": "secret"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == batch
+    assert len(upstream_urls) == 1
+    assert upstream_urls[0].endswith("/v1beta/batches/b1?key=secret")
+
+
+@pytest.mark.asyncio
 async def test_google_batch_passthrough_helpers_forward_and_track_metrics() -> None:
     handler = DummyBatchHandler()
     handler.http_client.post_response = FakeResponse(

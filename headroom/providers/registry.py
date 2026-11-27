@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, cast
 from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
 from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
-from headroom.proxy.upstream_guard import is_safe_upstream_url
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
 DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
@@ -93,12 +92,6 @@ class ProxyProviderRuntime:
             return self.api_targets.anthropic
         if headers.get("x-goog-api-key"):
             return self.api_targets.gemini
-        if headers.get("api-key"):
-            azure_base = headers.get("x-headroom-base-url", "")
-            # Same SSRF guard as `proxy_targets.select_passthrough_base_url`;
-            # both resolve a caller-named upstream (CVE-2026-77775).
-            if azure_base and is_safe_upstream_url(azure_base):
-                return azure_base.rstrip("/")
         return self.api_targets.openai
 
 

@@ -128,6 +128,9 @@ pub fn clear_hf_registrations() {
 /// Hub and register it under `prefix`. One-line glue around
 /// [`HfTokenizer::from_pretrained`] + [`register_hf`].
 ///
+/// The download uses the repository's pinned commit ([`crate::hf_pins`]);
+/// use [`try_register_hf_at`] to name a revision explicitly.
+///
 /// Useful for proxy startup code that wants real tokenizers for the major
 /// non-OpenAI families. Each call is independent — failure for one model
 /// (e.g. a gated Llama repo without `HF_TOKEN`) does not affect others.
@@ -138,7 +141,16 @@ pub fn clear_hf_registrations() {
 /// let _ = try_register_hf("mistral-", "mistralai/Mistral-7B-v0.1");
 /// ```
 pub fn try_register_hf(prefix: &str, repo: &str) -> Result<(), HfTokenizerError> {
-    let t = HfTokenizer::from_pretrained(repo)?;
+    try_register_hf_at(prefix, repo, None)
+}
+
+/// [`try_register_hf`] with an explicit revision (`None` = the repo's pin).
+pub fn try_register_hf_at(
+    prefix: &str,
+    repo: &str,
+    revision: Option<&str>,
+) -> Result<(), HfTokenizerError> {
+    let t = HfTokenizer::from_pretrained_at(repo, revision)?;
     register_hf(prefix, t);
     Ok(())
 }

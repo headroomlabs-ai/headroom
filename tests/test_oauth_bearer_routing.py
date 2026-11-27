@@ -179,43 +179,96 @@ class TestCatchAllRouting:
 
 
 # ---------------------------------------------------------------------------
-# Unit test: rate-limit key uses Bearer token when no x-api-key
+# Rate-limit key: OAuth (Bearer-only) callers get their own bucket
 # ---------------------------------------------------------------------------
+
+# Same first 16 characters, different tokens: the old ``api_key[:16]`` key
+# would have put both callers in one bucket.
+_OAUTH_TOKEN_A = "sk-ant-oat01-shared-prefix-AAAA"
+_OAUTH_TOKEN_B = "sk-ant-oat01-shared-prefix-BBBB"
+_API_KEY_A = "sk-ant-api03-shared-prefix-AAAA"
+_API_KEY_B = "sk-ant-api03-shared-prefix-BBBB"
+
+
+def _anthropic_upstream(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
 
 
 class TestRateLimitKey:
-    def test_rate_key_with_x_api_key(self):
-        """x-api-key takes precedence for rate key."""
-        headers = {"x-api-key": "sk-ant-api03-abcdef1234567890"}
-        api_key = headers.get("x-api-key", "")
-        if not api_key:
-            auth = headers.get("authorization", "")
-            if auth.startswith("Bearer "):
-                api_key = auth[7:]
-        client_ip = "127.0.0.1"
-        rate_key = f"{api_key[:16]}:{client_ip}" if api_key else client_ip
-        assert rate_key == "sk-ant-api03-abc:127.0.0.1"
+    """Drive /v1/messages with one request per minute and watch who gets a 429.
 
-    def test_rate_key_with_bearer_only(self):
-        """Bearer token used for rate key when no x-api-key."""
-        headers = {"authorization": "Bearer sk-ant-oat01-mytoken123456"}
-        api_key = headers.get("x-api-key", "")
-        if not api_key:
-            auth = headers.get("authorization", "")
-            if auth.startswith("Bearer "):
-                api_key = auth[7:]
-        client_ip = "127.0.0.1"
-        rate_key = f"{api_key[:16]}:{client_ip}" if api_key else client_ip
-        assert rate_key == "sk-ant-oat01-myt:127.0.0.1"
+    The caller is a direct loopback peer, which ``rate_limit_identity`` trusts,
+    so the provider credential is part of the bucket.
+    """
 
-    def test_rate_key_no_auth(self):
-        """No auth headers → IP-only rate key."""
-        headers = {}
-        api_key = headers.get("x-api-key", "")
-        if not api_key:
-            auth = headers.get("authorization", "")
-            if auth.startswith("Bearer "):
-                api_key = auth[7:]
-        client_ip = "127.0.0.1"
-        rate_key = f"{api_key[:16]}:{client_ip}" if api_key else client_ip
-        assert rate_key == "127.0.0.1"
+    def _client(self, peer: str = "127.0.0.1") -> TestClient:
+        app = create_app(
+            ProxyConfig(
+                optimize=False,
+                cache_enabled=False,
+                rate_limit_enabled=True,
+                rate_limit_requests_per_minute=1,
+                cost_tracking_enabled=False,
+                log_requests=False,
+                ccr_inject_tool=False,
+                ccr_handle_responses=False,
+                ccr_context_tracking=False,
+                image_optimize=False,
+            )
+        )
+        app.state.proxy.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(_anthropic_upstream)
+        )
+        return TestClient(app, base_url="http://127.0.0.1", client=(peer, 50000))
+
+    def _send(self, client: TestClient, headers: dict[str, str]) -> int:
+        # anthropic-version routes even a credential-less request to /v1/messages.
+        response = client.post(
+            "/v1/messages",
+            headers={"anthropic-version": "2023-06-01", **headers},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        return response.status_code
+
+    def test_bearer_tokens_get_separate_buckets(self):
+        """Two OAuth users on one machine do not share a limit."""
+        client = self._client()
+        a = {"authorization": f"Bearer {_OAUTH_TOKEN_A}"}
+        b = {"authorization": f"Bearer {_OAUTH_TOKEN_B}"}
+        assert self._send(client, a) == 200
+        assert self._send(client, a) == 429
+        assert self._send(client, b) == 200
+
+    def test_x_api_keys_get_separate_buckets(self):
+        client = self._client()
+        assert self._send(client, {"x-api-key": _API_KEY_A}) == 200
+        assert self._send(client, {"x-api-key": _API_KEY_A}) == 429
+        assert self._send(client, {"x-api-key": _API_KEY_B}) == 200
+
+    def test_no_credential_gets_the_peer_bucket(self):
+        """A credential-less caller is limited, in a bucket apart from a keyed one."""
+        client = self._client()
+        assert self._send(client, {"authorization": f"Bearer {_OAUTH_TOKEN_A}"}) == 200
+        assert self._send(client, {}) == 200
+        assert self._send(client, {}) == 429
+
+    def test_remote_caller_cannot_rotate_tokens_for_fresh_buckets(self):
+        """Without the proxy token a remote peer is keyed by address only (VAPT 01-F3)."""
+        client = self._client(peer="203.0.113.5")
+        assert self._send(client, {"authorization": f"Bearer {_OAUTH_TOKEN_A}"}) == 200
+        assert self._send(client, {"authorization": f"Bearer {_OAUTH_TOKEN_B}"}) == 429

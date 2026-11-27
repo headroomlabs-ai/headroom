@@ -138,6 +138,7 @@ class TestOpenAIBatchCreate:
         assert "error" in data
         assert "endpoint" in data["error"]["message"].lower()
 
+    @pytest.mark.live
     def test_batch_create_with_compression(self, openai_batch_client, openai_api_key):
         """Full batch creation flow with compression.
 
@@ -236,6 +237,7 @@ class TestOpenAIBatchCreate:
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestOpenAIBatchList:
     """Test OpenAI /v1/batches list endpoint passthrough."""
 
@@ -308,6 +310,7 @@ class TestAnthropicBatchCreate:
         data = response.json()
         assert "error" in data
 
+    @pytest.mark.live
     def test_batch_create_with_compression(self, anthropic_batch_client, anthropic_api_key):
         """Create Anthropic batch with compression.
 
@@ -375,6 +378,7 @@ class TestAnthropicBatchCreate:
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+@pytest.mark.live
 class TestAnthropicBatchList:
     """Test Anthropic /v1/messages/batches list endpoint passthrough."""
 
@@ -416,6 +420,7 @@ class TestAnthropicBatchList:
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestBatchCompressionStats:
     """Test that batch compression stats are properly tracked."""
 
@@ -437,6 +442,7 @@ class TestBatchCompressionStats:
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+@pytest.mark.live
 class TestAnthropicBatchCompressionStats:
     """Test Anthropic batch compression stats tracking."""
 
@@ -469,6 +475,7 @@ class TestAnthropicBatchCompressionStats:
 class TestBatchErrorHandling:
     """Test error handling for batch endpoints."""
 
+    @pytest.mark.live
     @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
     def test_openai_batch_invalid_file_id(self, openai_batch_client, openai_api_key):
         """Invalid file ID returns appropriate error."""
@@ -484,6 +491,7 @@ class TestBatchErrorHandling:
         # Should return error for non-existent file
         assert response.status_code in [400, 404]
 
+    @pytest.mark.live
     def test_openai_batch_missing_auth(self, openai_batch_client):
         """Missing authentication returns error (401 or 404 depending on routing)."""
         response = openai_batch_client.post(

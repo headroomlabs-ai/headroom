@@ -226,6 +226,7 @@ class TestMemoryIntegration:
     # Test 5: End-to-end with real LLM - Standard Mode
     # =========================================================================
 
+    @pytest.mark.live
     def test_e2e_standard_mode_llm_call(self, openai_client, temp_db_path, user_id):
         """Test end-to-end flow with real LLM call in standard mode."""
         from headroom.memory import with_memory_tools
@@ -277,6 +278,7 @@ class TestMemoryIntegration:
     # Test 6: End-to-end with real LLM - Optimized Mode
     # =========================================================================
 
+    @pytest.mark.live
     def test_e2e_optimized_mode_llm_call(self, openai_client, temp_db_path, user_id):
         """Test end-to-end flow with real LLM call in optimized mode."""
         from headroom.memory import with_memory_tools
@@ -504,6 +506,7 @@ class TestMemoryIntegration:
     # Test 10: Full flow - LLM saves, then retrieves via search
     # =========================================================================
 
+    @pytest.mark.live
     def test_full_flow_save_then_search(self, openai_client, temp_db_path, user_id):
         """Test complete flow: LLM saves memory, then searches for it."""
         import json
