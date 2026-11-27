@@ -4799,7 +4799,14 @@ class ContentRouter(Transform):
                             if compressed == content:
                                 from headroom._core import minify_json
 
-                                minified = minify_json(content)
+                                try:
+                                    minified = minify_json(content)
+                                except ValueError as exc:
+                                    # JSON-shaped but unparseable (truncated tool
+                                    # output, trailing text): nothing to minify.
+                                    # The zero-savings fallback below still runs.
+                                    logger.debug("JSON minify skipped: %s", exc)
+                                    minified = None
                                 if minified is not None:
                                     compressed = minified
                                     compressed_tokens = _estimate_tokens(minified)

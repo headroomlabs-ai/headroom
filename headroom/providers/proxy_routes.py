@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from headroom.log_safety import redact_url
+from headroom.providers.bedrock_models import newest_snapshot
 from headroom.providers.cloudcode import (
     cloudcode_passthrough_target,
     normalize_cloudcode_passthrough_path,
@@ -659,9 +661,57 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         )
         return provider_name, base_url
 
+    def _bedrock_model_ids(request: Request, provider_name: str) -> list[str] | None:
+        # In Bedrock mode an Anthropic-format model lookup has no Anthropic
+        # account behind it (Claude Desktop in gateway mode sends a placeholder
+        # key); answer from the Bedrock models the backend discovered. A
+        # caller-named upstream still gets the passthrough.
+        if provider_name != "anthropic" or request.headers.get("x-headroom-base-url", "").strip():
+            return None
+        backend = getattr(proxy, "anthropic_backend", None)
+        return backend.bedrock_model_ids() if backend is not None else None
+
+    def _anthropic_model_entry(model_id: str) -> dict[str, str]:
+        return {
+            "type": "model",
+            "id": model_id,
+            "display_name": model_id,
+            "created_at": "1970-01-01T00:00:00Z",
+        }
+
+    def _anthropic_model_page(ids: list[str], params: Mapping[str, str]) -> dict[str, Any]:
+        # Anthropic's list paging: ``limit`` (default 20, 1-1000), and cursors
+        # ``after_id`` / ``before_id`` naming a model id.
+        try:
+            limit = min(max(int(params.get("limit", "20")), 1), 1000)
+        except ValueError:
+            limit = 20
+        cursors = [params[c] for c in ("after_id", "before_id") if c in params]
+        if any(cursor not in ids for cursor in cursors):
+            # A cursor naming a model no longer listed: an empty page, never a
+            # silent restart from the top.
+            return {"data": [], "has_more": False, "first_id": None, "last_id": None}
+        start, end = 0, len(ids)
+        if params.get("after_id") in ids:
+            start = ids.index(params["after_id"]) + 1
+        if params.get("before_id") in ids:
+            end = ids.index(params["before_id"])
+            start = max(start, end - limit)
+        page = ids[start:end][:limit]
+        return {
+            "data": [_anthropic_model_entry(m) for m in page],
+            # More pages in the direction being paged.
+            "has_more": start > 0 if "before_id" in params else start + len(page) < end,
+            "first_id": page[0] if page else None,
+            "last_id": page[-1] if page else None,
+        }
+
     @app.get("/v1/models")
     async def list_models(request: Request):
         provider_name, base_url = await _model_metadata_route(request)
+        bedrock_ids = _bedrock_model_ids(request, provider_name)
+        if bedrock_ids is not None:
+            return JSONResponse(_anthropic_model_page(bedrock_ids, request.query_params))
         return await handle_model_metadata_endpoint(
             proxy,
             request,
@@ -673,6 +723,26 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
         provider_name, base_url = await _model_metadata_route(request)
+        bedrock_ids = _bedrock_model_ids(request, provider_name)
+        if bedrock_ids is not None:
+            # Same names inference accepts: a "[1m]" context suffix and an
+            # undated alias of a listed snapshot.
+            # Local import: the module pulls in litellm, which proxy startup avoids.
+            from headroom.providers.anthropic import sanitize_anthropic_model_id
+
+            clean_id = sanitize_anthropic_model_id(model_id)
+            if clean_id in bedrock_ids or newest_snapshot(clean_id, bedrock_ids):
+                return JSONResponse(_anthropic_model_entry(model_id))
+            return JSONResponse(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "not_found_error",
+                        "message": f"Model {model_id!r} is not available on this Bedrock backend.",
+                    },
+                },
+                status_code=404,
+            )
         return await handle_model_metadata_endpoint(
             proxy,
             request,
