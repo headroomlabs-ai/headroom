@@ -317,6 +317,29 @@ class TestGenericParser:
             "  ```bash\n\t- inner bullet\n  ```",
         ]
 
+    def test_mixed_indent_fence_closer_keeps_following_list_facts(self):
+        content = "- Example\n\t```bash\n\t- inside code\n  \t```\n  - Remember this\n"
+        claude_parsed = parse_claude_code_memory(content)
+        assert claude_parsed.sections[0].facts == ["Example", "Remember this"]
+
+        generic_parsed = parse_generic_markdown(content)
+        assert generic_parsed.sections[0].facts == [
+            "Example",
+            "\t```bash\n\t- inside code\n  \t```",
+            "Remember this",
+        ]
+
+    def test_empty_and_overpadded_tab_list_markers_keep_nested_headings_in_section(self):
+        empty_tab_item = "# Notes\n-\t\n  ## Nested\n  - Keep this\n"
+        parsed_empty = parse_claude_code_memory(empty_tab_item)
+        assert [s.heading for s in parsed_empty.sections] == ["Notes"]
+        assert parsed_empty.sections[0].facts == ["Keep this"]
+
+        overpadded_tab_item = "# Notes\n-\t\tExample\n   ## Nested\n   - Keep this\n"
+        parsed_overpadded = parse_claude_code_memory(overpadded_tab_item)
+        assert [s.heading for s in parsed_overpadded.sections] == ["Notes"]
+        assert parsed_overpadded.sections[0].facts == ["Keep this"]
+
 
 class TestFormatDetection:
     def test_detect_claude_code(self):
