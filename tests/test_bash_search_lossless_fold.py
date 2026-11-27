@@ -561,7 +561,12 @@ _LISTING_COMMANDS = [
     "rg --regexp pat -l src",
     "rg --glob=*.py -l x",
     "rg 'a # b' -l src",  # a quoted # starts no comment
+    "rg C# -l src",  # nor does one inside a word
     "rg --files  # every file",
+    "rg --files .\\",  # PowerShell: the trailing backslash is part of the path
+    "rg --files .\\headroom\\ | sort",
+    "rg \\\n  --files crates",  # a line continuation before the flag
+    "grep -r \\\n  -l foo .",
     "grep -rl foo .",
     "grep -rL foo .",
     "grep -r --files-with-matches foo .",
@@ -655,6 +660,8 @@ def test_ignores_commands_that_do_not_list_files(command) -> None:
         "fd -e rs | sort",
         ".\\rg.exe --files crates",
         "Resolve-Path -Relative .\\crates\\*\\src\\*\\*.rs",
+        "rg --files .\\crates\\",
+        "rg \\\n  --files crates",
     ],
 )
 def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer) -> None:

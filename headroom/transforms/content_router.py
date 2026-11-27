@@ -1228,9 +1228,14 @@ def _bash_command_lists_files(command: str) -> bool:
     if prog in {"fd", "fdfind"}:
         return not any(re.match(r"--exec|-[A-Za-z]*[xX]", arg) for arg in rest)
     if prog in {"rg", "ripgrep", "grep"}:
+        # _bash_program keeps shell quotes: `rg 'a -l b'` is one pattern. But "\" is
+        # no escape here: a Windows path ends in one (`rg --files .\`), and a line
+        # continuation leaves one between words. A `\"` inside double quotes is the
+        # cost: it closes the quote.
+        lexer = shlex.shlex(" ".join(rest), posix=True)
+        lexer.whitespace_split, lexer.escape, lexer.commenters = True, "", ""
         try:
-            # _bash_program keeps shell quotes: `rg 'a -l b'` is one pattern.
-            args = shlex.split(" ".join(rest))
+            args = list(lexer)
         except ValueError:
             return False
         if prog == "grep":
