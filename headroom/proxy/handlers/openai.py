@@ -147,6 +147,7 @@ from headroom.proxy.project_context import (
 from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_from_usage
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.proxy.upstream_watchdog import gateway_timeout_status, is_watchdog_timeout
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -6282,6 +6283,13 @@ class OpenAIHandlerMixin:
                 provider=openai_chat_outcome_provider,
                 model=model,
             )
+            if is_watchdog_timeout(e):
+                return JSONResponse(
+                    status_code=504,
+                    content=public_errors.openai_error_body(
+                        public_errors.UPSTREAM_TIMEOUT, request_id=str(request_id)
+                    ),
+                )
             # Return sanitized error message to client (don't expose internal details)
             return JSONResponse(
                 status_code=502,
@@ -7866,6 +7874,13 @@ class OpenAIHandlerMixin:
         except Exception as e:
             await self.metrics.record_failed(provider="openai")
             log_request_failure(request_id, "OpenAI responses request", e, model=model)
+            if is_watchdog_timeout(e):
+                return JSONResponse(
+                    status_code=504,
+                    content=public_errors.openai_error_body(
+                        public_errors.UPSTREAM_TIMEOUT, request_id=str(request_id)
+                    ),
+                )
             return JSONResponse(
                 status_code=502,
                 content={
@@ -12656,7 +12671,7 @@ class OpenAIHandlerMixin:
                         hint=tls_hint,
                     )
                 ),
-                status_code=502,
+                status_code=gateway_timeout_status(e, 502),
                 media_type="application/json",
             )
         except httpx.RemoteProtocolError as e:
@@ -12869,7 +12884,7 @@ class OpenAIHandlerMixin:
                             hint=tls_hint,
                         )
                     ),
-                    status_code=502,
+                    status_code=gateway_timeout_status(e, 502),
                     media_type="application/json",
                 )
         else:

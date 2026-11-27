@@ -381,6 +381,7 @@ Coding agents re-read the same files repeatedly; these control how stale reads a
 |---|---|---|
 | `--request-timeout-seconds` / `HEADROOM_REQUEST_TIMEOUT` | `300` | Upstream request timeout (seconds). |
 | `--connect-timeout-seconds` | `10` | Upstream connect timeout (seconds). |
+| `--upstream-watchdog-seconds` / `HEADROOM_UPSTREAM_WATCHDOG_SECONDS` | `60` | Deadline for a request to get onto an upstream connection (pool wait, connect, TLS, HTTP/2 stream slot). On expiry the request fails with `504` and the shared upstream client is replaced; open streams on the old one are left to finish. `0` disables. Waits for response headers and for each body chunk are also capped at the request's own timeouts plus 5s, since httpx does not bound httpcore's internal HTTP/2 waits. |
 | `--retry-max-attempts` | `3` | Upstream retries on transient failure. |
 | `--limit-concurrency` | `1000` | Concurrent connections before returning 503. |
 | `--rpm` / `--tpm` | `60` / unlimited | Requests- and tokens-per-minute rate limits (disable with `--no-rate-limit`). |

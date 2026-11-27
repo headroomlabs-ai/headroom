@@ -324,9 +324,10 @@ class BedrockHandlerMixin:
         except (httpx.ConnectError, httpx.TimeoutException) as err:
             logger.warning("[%s] %s upstream connect failed: %s", request_id, LOG_TAG, err)
             from headroom.proxy import public_errors
+            from headroom.proxy.upstream_watchdog import gateway_timeout_status
 
             return JSONResponse(
-                status_code=502,
+                status_code=gateway_timeout_status(err, 502),
                 content=public_errors.openai_error_body(
                     public_errors.classify_or_internal(err),
                     request_id=str(request_id),

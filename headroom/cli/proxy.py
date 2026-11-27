@@ -723,6 +723,18 @@ def dashboard(port: int | None, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--upstream-watchdog-seconds",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_UPSTREAM_WATCHDOG_SECONDS",
+    help=(
+        "Seconds a request may wait to get onto an upstream connection before "
+        "it fails with 504 and the shared upstream client is replaced "
+        "(default: 60, 0 disables). Catches HTTP/2 connection stalls that the "
+        "other timeouts cannot see. Env: HEADROOM_UPSTREAM_WATCHDOG_SECONDS."
+    ),
+)
+@click.option(
     "--anthropic-buffered-request-timeout-seconds",
     type=click.IntRange(min=1),
     default=None,
@@ -1275,6 +1287,7 @@ def proxy(
     connect_timeout_seconds: int | None,
     write_timeout_seconds: int | None,
     upstream_tcp_keepalive_seconds: int | None,
+    upstream_watchdog_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1644,6 +1657,9 @@ def proxy(
         write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
         upstream_tcp_keepalive_seconds=(
             upstream_tcp_keepalive_seconds if upstream_tcp_keepalive_seconds is not None else 30
+        ),
+        upstream_watchdog_seconds=(
+            upstream_watchdog_seconds if upstream_watchdog_seconds is not None else 60
         ),
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds

@@ -284,6 +284,7 @@ headroom proxy --mode cache
 | `--retry-max-attempts` | runtime default `3` | Maximum upstream retry attempts |
 | `--request-timeout-seconds` | runtime default `300` | Request timeout in seconds |
 | `--connect-timeout-seconds` | runtime default `10` | Upstream connection timeout |
+| `--upstream-watchdog-seconds` | `60` | Deadline for a request to get onto an upstream connection; on expiry it fails with `504` and the shared upstream client is replaced. `0` disables. Env: `HEADROOM_UPSTREAM_WATCHDOG_SECONDS` |
 | `--anthropic-pre-upstream-concurrency` | auto `max(2, min(8, cpu_count))` | Cap simultaneous pre-upstream work on `/v1/messages` (body read, deep copy, first compression stage, memory-context lookup, upstream connect). `0` or negative disables (unbounded); any positive integer is honoured verbatim. Prevents cold-start replay storms from starving `/livez`, `/readyz`, and new Codex WS opens. |
 | `--anthropic-pre-upstream-acquire-timeout-seconds` | `15.0` | Fail fast when the Anthropic pre-upstream queue is saturated. Requests that wait longer return `503` with `Retry-After` instead of parking indefinitely. |
 | `--anthropic-pre-upstream-memory-context-timeout-seconds` | `2.0` | Fail-open timeout for Anthropic memory-context lookup while the request still holds a pre-upstream slot. |

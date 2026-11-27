@@ -49,6 +49,7 @@ from headroom.proxy.memory_tool_stream import (
     MemoryToolStreamOverflowError,
 )
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
+from headroom.proxy.upstream_watchdog import gateway_timeout_status
 from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
@@ -1545,7 +1546,7 @@ class StreamingMixin:
             self._cleanup_mid_turn_stream(session_key)
             return StreamingResponse(
                 _error_gen(),
-                status_code=502,
+                status_code=gateway_timeout_status(e, 502),
                 media_type="text/event-stream",
             )
 

@@ -213,6 +213,13 @@ from headroom.proxy.ssl_context import (
 from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
+from headroom.proxy.upstream_watchdog import (
+    DEFAULT_UPSTREAM_WATCHDOG_SECONDS,
+    UpstreamClientGeneration,
+    UpstreamClientRetirer,
+    close_upstream_client,
+    install_upstream_watchdog,
+)
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.workspace_registry import resolve_registered_cwd
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
@@ -696,6 +703,9 @@ _RUST_CORE_REQUIRED_ENV = "HEADROOM_REQUIRE_RUST_CORE"
 # treat this as a deliberate configuration failure rather than a crash, so
 # they won't restart-loop on a broken deployment.
 _EXIT_CONFIG = 78
+
+# Hard bound on one /readyz upstream probe, waiting for the probe lock included.
+READYZ_UPSTREAM_CHECK_DEADLINE_SECONDS = 10.0
 
 
 def _check_rust_core() -> tuple[str, str | None]:
@@ -1430,6 +1440,11 @@ class HeadroomProxy(
         # HTTP/1.1-only client for ChatGPT passthrough (Cloudflare challenges
         # our HTTP/2 fingerprint on its sensitive account endpoints).
         self.http_client_h1: httpx.AsyncClient | None = None
+        # The clients' generation; the watchdog recycles them once per generation.
+        self._upstream_generation: UpstreamClientGeneration | None = None
+        self._upstream_retirer = UpstreamClientRetirer()
+        self._upstream_http2 = False
+        self._upstream_client_kwargs: dict[str, Any] = {}
         self._shutdown_event: asyncio.Event | None = None
 
         # Shared cold-start warmup registry (populated by startup()).
@@ -2317,19 +2332,9 @@ class HeadroomProxy(
         # network. Operator-configured upstreams have no pin and are untouched,
         # so trust_env, limits, HTTP/2 and connection reuse are unchanged.
         # Keepalive goes on first: pinning hides proxy pools behind a wrapper.
-        _keepalive = self.config.upstream_tcp_keepalive_seconds
-        self.http_client = install_upstream_pinning(
-            install_tcp_keepalive(httpx.AsyncClient(http2=_http2, **_client_kwargs), _keepalive)
-        )
-        # Reuse the primary client when HTTP/2 is already off; otherwise keep a
-        # dedicated HTTP/1.1 client for ChatGPT passthrough.
-        self.http_client_h1 = (
-            self.http_client
-            if not _http2
-            else install_upstream_pinning(
-                install_tcp_keepalive(httpx.AsyncClient(http2=False, **_client_kwargs), _keepalive)
-            )
-        )
+        self._upstream_http2 = _http2
+        self._upstream_client_kwargs = _client_kwargs
+        self._install_upstream_clients()
         logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
         self.config.mode = normalize_proxy_mode(self.config.mode)
@@ -2637,6 +2642,64 @@ class HeadroomProxy(
             },
         )
 
+    def _new_upstream_client(self, *, http2: bool) -> httpx.AsyncClient:
+        """One shared upstream client: keepalive, then pinning (see startup)."""
+        return install_upstream_pinning(
+            install_tcp_keepalive(
+                httpx.AsyncClient(http2=http2, **self._upstream_client_kwargs),
+                self.config.upstream_tcp_keepalive_seconds,
+            )
+        )
+
+    def _install_upstream_clients(self) -> None:
+        """Build a new generation of the shared clients under the watchdog."""
+        previous = self._upstream_generation
+        generation = UpstreamClientGeneration(0 if previous is None else previous.number + 1)
+        deadline = float(getattr(self.config, "upstream_watchdog_seconds", 0) or 0)
+
+        def build(http2: bool) -> httpx.AsyncClient:
+            return install_upstream_watchdog(
+                self._new_upstream_client(http2=http2),
+                send_deadline=deadline,
+                generation=generation,
+                on_send_timeout=self._recycle_upstream_clients,
+            )
+
+        primary = build(self._upstream_http2)
+        # Reuse the primary client when HTTP/2 is already off; otherwise keep a
+        # dedicated HTTP/1.1 client for ChatGPT passthrough.
+        h1 = primary if not self._upstream_http2 else build(False)
+        self._upstream_generation = generation
+        self.http_client = primary
+        self.http_client_h1 = h1
+
+    def _recycle_upstream_clients(self, generation: UpstreamClientGeneration) -> None:
+        """Swap in fresh clients after a send-phase watchdog expiry.
+
+        Runs synchronously on the event loop, so the generation check and the
+        swap are atomic: of many requests timing out together, the first swaps
+        and the rest find their generation already retired. The old clients
+        close in the background once their open streams drain.
+        """
+        if generation is not self._upstream_generation or self.http_client is None:
+            return
+        old_clients = [self.http_client]
+        if self.http_client_h1 is not None and self.http_client_h1 is not self.http_client:
+            old_clients.append(self.http_client_h1)
+        try:
+            self._install_upstream_clients()
+        except Exception:
+            logger.exception("Upstream watchdog: could not build replacement clients")
+            return
+        logger.warning(
+            "Upstream watchdog: replaced upstream clients (generation %d -> %d); "
+            "%d request(s) still open on the old ones",
+            generation.number,
+            generation.number + 1,
+            generation.in_flight,
+        )
+        self._upstream_retirer.retire(old_clients, generation)
+
     async def shutdown(self):
         """Cleanup async resources."""
         self._get_shutdown_event().set()
@@ -2646,11 +2709,12 @@ class HeadroomProxy(
         if self._undo_exit_signal_save is not None:
             self._undo_exit_signal_save()
             self._undo_exit_signal_save = None
+        await self._upstream_retirer.shutdown()
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
-            await self.http_client_h1.aclose()
+            await close_upstream_client(self.http_client_h1)
         self.http_client_h1 = None
         if self.http_client:
-            await self.http_client.aclose()
+            await close_upstream_client(self.http_client)
             self.http_client = None
 
         if self.memory_handler and hasattr(self.memory_handler, "close"):
@@ -2876,13 +2940,16 @@ class HeadroomProxy(
 
         from headroom.proxy.handlers.openai import prefers_http1_passthrough
 
-        req_client = (
-            getattr(self, "http_client_h1", None) or self.http_client
-            if prefers_http1_passthrough(url)
-            else self.http_client
-        )
+        prefers_h1 = prefers_http1_passthrough(url)
 
         for attempt in range(self.config.retry_max_attempts):
+            # Resolved per attempt: a watchdog expiry may have swapped the
+            # clients, and the retry belongs on the fresh one.
+            req_client = (
+                getattr(self, "http_client_h1", None) or self.http_client
+                if prefers_h1
+                else self.http_client
+            )
             request_trace = RequestWriteTrace()
             post_kwargs["extensions"] = {"trace": request_trace}
             try:
@@ -4350,6 +4417,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if now < _upstream_check_cache["expires_at"]:
             return
 
+        # One deadline over the lock wait and the probe: the HEAD's own
+        # timeout does not bound httpcore's internal waits, and a probe stuck
+        # there would otherwise hold the lock and queue every later /readyz.
+        try:
+            async with asyncio.timeout(READYZ_UPSTREAM_CHECK_DEADLINE_SECONDS):
+                await _probe_upstream_locked()
+        except TimeoutError:
+            _upstream_check_cache["ok"] = False
+            _upstream_check_cache["error"] = (
+                f"upstream check did not finish within {READYZ_UPSTREAM_CHECK_DEADLINE_SECONDS:g}s"
+            )
+            _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
+
+    async def _probe_upstream_locked() -> None:
         async with _upstream_check_lock:
             # Re-check inside the lock to handle concurrent waiters.
             if time.monotonic() < _upstream_check_cache["expires_at"]:
@@ -6953,6 +7034,11 @@ def _proxy_config_from_env() -> ProxyConfig:
             30,
             min_value=0,
         ),
+        upstream_watchdog_seconds=_get_env_int(
+            "HEADROOM_UPSTREAM_WATCHDOG_SECONDS",
+            DEFAULT_UPSTREAM_WATCHDOG_SECONDS,
+            min_value=0,
+        ),
         buffered_ccr_grace_seconds=_get_env_float(
             "HEADROOM_BUFFERED_CCR_GRACE_SECONDS",
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
@@ -7831,6 +7917,11 @@ if __name__ == "__main__":
         upstream_tcp_keepalive_seconds=_get_env_int(
             "HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
             30,
+            min_value=0,
+        ),
+        upstream_watchdog_seconds=_get_env_int(
+            "HEADROOM_UPSTREAM_WATCHDOG_SECONDS",
+            DEFAULT_UPSTREAM_WATCHDOG_SECONDS,
             min_value=0,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),

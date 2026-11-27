@@ -90,6 +90,7 @@ from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
+from headroom.proxy.upstream_watchdog import is_watchdog_timeout
 from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
@@ -6079,6 +6080,13 @@ class AnthropicHandlerMixin:
                 log_request_failure(
                     request_id, "Request", e, provider=provider_name, model=locals().get("model")
                 )
+                if is_watchdog_timeout(e):
+                    return JSONResponse(
+                        status_code=504,
+                        content=public_errors.anthropic_error_body(
+                            public_errors.UPSTREAM_TIMEOUT, request_id=str(request_id)
+                        ),
+                    )
 
                 # An untrusted TLS-inspection root is the one failure worth
                 # spelling out: it is environmental, never transient, and the
