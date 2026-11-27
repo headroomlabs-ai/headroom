@@ -648,6 +648,10 @@ _OTHER_COMMANDS = [
     "rg --files .\\| xargs cat",
     "rg --files .\\; Get-Content rules.txt",
     "rg --files .\\&& Get-Content rules.txt",
+    # The same inside bash -c: the script keeps its line breaks.
+    "bash -c 'rg --no-filename --regexp \\\n  -legacy rules.txt'",
+    "bash -c 'rg --files\ncat rules.txt'",
+    'pwsh -Command "rg --files\nGet-Content rules.txt"',
 ]
 
 
@@ -697,6 +701,8 @@ def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer)
         "rg --no-filename foo rules # -l",
         "rg --no-filename --regexp \\\n  -legacy rules",
         'rg --files ".\\rules\\" | ForEach-Object { Get-Content -LiteralPath $_ }',
+        "bash -c 'rg --no-filename --regexp \\\n  -legacy rules'",
+        "bash -c 'rg --files\ncat rules.txt'",
     ],
 )
 def test_router_keeps_regex_rules_whole(command, send, tokenizer) -> None:

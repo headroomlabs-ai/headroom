@@ -1225,10 +1225,10 @@ def _bash_command_lists_files(command: str) -> bool:
     prog, rest = _bash_program(stages[0])
     prog = prog.rsplit("\\", 1)[-1].removesuffix(".exe")  # .\rg.exe -> rg
     if prog in {"sh", "bash", "zsh", "dash", "pwsh", "powershell"}:
-        for j, tok in enumerate(rest):
-            if tok.lower() in {"-c", "-lc", "-lic", "-ic", "-command"} and j + 1 < len(rest):
-                return _bash_command_lists_files(" ".join(rest[j + 1 :]).strip("'\""))
-        return False
+        # The script is the text after -c as written: rejoining its words would drop
+        # its line breaks (`bash -c 'rg --files<newline>cat rules.txt'`).
+        script = re.search(r"(?<!\S)-(?:c|lc|lic|ic|command)\s+(.+)", stages[0], re.I | re.S)
+        return script is not None and _bash_command_lists_files(script[1].strip().strip("'\""))
     if prog in {"get-childitem", "gci"}:
         return relative or any(arg.lower() == "-name" for arg in rest)
     if prog == "resolve-path":
