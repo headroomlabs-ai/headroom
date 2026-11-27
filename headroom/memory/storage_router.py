@@ -173,7 +173,9 @@ class ProjectResolver:
         # Tier 2: client-provided explicit cwd (any client).
         explicit_cwd = self._first_nonempty_header(ctx.headers, "x-headroom-cwd")
         if explicit_cwd:
-            ident = self._identity_from_cwd(explicit_cwd, percent_encoded=True)
+            ident = self._identity_from_cwd(
+                explicit_cwd, percent_encoded=True, reject_relative=True
+            )
             if ident is not None:
                 return ident
 
@@ -188,7 +190,7 @@ class ProjectResolver:
         # Tier 4: parse client working-directory context from the system prompt.
         sys_cwd = self._extract_cwd_from_system_prompt(ctx.system_prompt)
         if sys_cwd:
-            ident = self._identity_from_cwd(sys_cwd)
+            ident = self._identity_from_cwd(sys_cwd, reject_relative=True)
             if ident is not None:
                 return ident
 
@@ -233,6 +235,24 @@ class ProjectResolver:
                     return system_prompt[block_start:block_end].strip() or None
         return None
 
+    @staticmethod
+    def _is_windows_absolute(path: str) -> bool:
+        """True when ``path`` is an absolute Windows path (drive-rooted or UNC).
+
+        Client paths arrive from any OS while the proxy may run on another.
+        ``os.path.isabs`` is host-relative, so on a POSIX proxy a Windows
+        absolute path such as ``C:\\Users\\Client`` or ``\\\\server\\share``
+        would be misread as a relative POSIX filename (and ``realpath`` would
+        glue the proxy's own cwd onto it). This helper recognises the two
+        Windows-absolute shapes explicitly so the resolver can normalise them
+        with Windows semantics regardless of host.
+        """
+        # Drive-rooted: a single ASCII letter, ``:``, then a separator.
+        if len(path) >= 3 and path[1] == ":" and path[0].isalpha():
+            return path[2] in ("\\", "/")
+        # UNC: two leading separators then a server/share component.
+        return path.startswith("\\\\") or path.startswith("//")
+
     @classmethod
     def _identity_from_cwd(
         cls,
@@ -240,6 +260,7 @@ class ProjectResolver:
         *,
         percent_encoded: bool = False,
         preserve_whitespace: bool = False,
+        reject_relative: bool = False,
     ) -> tuple[str, str] | None:
         # ``percent_encoded`` is set only for the ``x-headroom-cwd`` header,
         # which the wrapper percent-encodes so non-ASCII paths stay valid HTTP
@@ -265,17 +286,41 @@ class ProjectResolver:
             cwd = raw_cwd.strip()
         if not cwd:
             return None
+        # A relative client path (``./project``, ``project``) carries no
+        # client base directory, so it cannot identify a remote project:
+        # the proxy would resolve it against *its own* working directory and
+        # mint a key that silently changes when the proxy's cwd changes
+        # (#4170). Only the operator CLI ``project_root_override`` may stay
+        # relative, because there the operator's process cwd is the legitimate
+        # base. ``reject_relative`` is therefore set only on the client header
+        # and system-prompt tiers.
+        windows_absolute = cls._is_windows_absolute(cwd)
+        if reject_relative and not os.path.isabs(cwd) and not windows_absolute:
+            return None
         # Normalise so symlinked / trailing-slash variants collapse to
         # the same key. ``realpath`` falls back to the input when the
         # path doesn't exist on this host, which is the right behaviour
         # for a proxy that may run on a different machine than the
         # client (in that case we still want a stable key per cwd
-        # string).
-        try:
-            normalised = os.path.realpath(cwd)
-        except (OSError, ValueError):
-            normalised = cwd
-        normalised = normalised.rstrip(os.sep) or os.sep
+        # string). Windows-absolute paths are normalised with Windows
+        # semantics instead of POSIX ``realpath``: on a POSIX proxy
+        # ``realpath`` would treat ``C:\\Users\\Client`` as a relative
+        # POSIX filename and fold the proxy cwd into the key (#4169).
+        if windows_absolute:
+            # Collapse backslashes to forward slashes so the same path
+            # yields the same key regardless of host separator style, and
+            # drop trailing separators (but keep the drive root / UNC root).
+            normalised = cwd.replace("\\", "/").rstrip("/")
+            if normalised.endswith(":"):
+                normalised += "/"
+            elif not normalised:
+                normalised = cwd
+        else:
+            try:
+                normalised = os.path.realpath(cwd)
+            except (OSError, ValueError):
+                normalised = cwd
+            normalised = normalised.rstrip(os.sep) or os.sep
         # A path with no UTF-8 form cannot be hashed without a lossy encoding
         # that could merge distinct directories onto one store. It reaches
         # here either from the input (an unpaired surrogate, e.g. a
