@@ -256,6 +256,47 @@ def _next_fence_state(
     return active_fence, True
 
 
+def _leading_indent_columns(line: str) -> int:
+    """Return leading indentation width in columns using 4-column tab stops."""
+    cols = 0
+    for ch in line:
+        if ch == " ":
+            cols += 1
+        elif ch == "\t":
+            cols += 4 - (cols % 4)
+        else:
+            break
+    return cols
+
+
+def _measure_prefix_columns(prefix: str) -> int:
+    """Return column width of a matched line prefix using 4-column tab stops."""
+    cols = 0
+    for ch in prefix:
+        cols += 4 - (cols % 4) if ch == "\t" else 1
+    return cols
+
+
+def _strip_indent_columns(line: str, target_cols: int) -> str:
+    """Strip up to ``target_cols`` columns of leading whitespace for block matching."""
+    if target_cols <= 0:
+        return line
+    cols = 0
+    for i, ch in enumerate(line):
+        if cols >= target_cols:
+            return line[i:]
+        if ch == " ":
+            cols += 1
+        elif ch == "\t":
+            next_cols = cols + 4 - (cols % 4)
+            if next_cols > target_cols:
+                return " " * (next_cols - target_cols) + line[i + 1 :]
+            cols = next_cols
+        else:
+            return line[i:]
+    return ""
+
+
 def _advance_block_state(
     line: str,
     state: _BlockState,
@@ -265,11 +306,13 @@ def _advance_block_state(
     Returns ``(is_verbatim_block, top_level_atx_heading_match)``.
     """
     stripped = line.strip()
-    leading = len(line) - len(line.lstrip(" "))
+    leading = _leading_indent_columns(line)
 
     if state.fence is not None:
-        strip_n = min(leading, state.fence_indent)
-        next_fence, _ = _next_fence_state(line[strip_n:], state.fence)
+        next_fence, _ = _next_fence_state(
+            _strip_indent_columns(line, state.fence_indent),
+            state.fence,
+        )
         if next_fence is None:
             state.fence = None
             state.fence_indent = 0
@@ -301,12 +344,14 @@ def _advance_block_state(
         list_match = _LIST_ITEM_RE.match(line)
         if list_match:
             lead, marker, sep = list_match.group(1), list_match.group(2), list_match.group(3)
-            state.list_indent = len(lead) + len(marker) + (len(sep) if sep else 1)
+            state.list_indent = (
+                _measure_prefix_columns(lead + marker + sep) if sep else len(lead) + len(marker) + 1
+            )
 
     container_indent = (
         state.list_indent if (state.list_indent is not None and leading >= state.list_indent) else 0
     )
-    inner_line = line[container_indent:] if container_indent else line
+    inner_line = _strip_indent_columns(line, container_indent) if container_indent else line
 
     if _PRE_OPEN_RE.match(inner_line):
         state.block_id += 1

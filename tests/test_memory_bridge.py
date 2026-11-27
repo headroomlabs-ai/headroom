@@ -296,6 +296,27 @@ class TestGenericParser:
             "```python\nprint(2)\n```",
         ]
 
+    def test_tab_indented_lines_stay_inside_space_indented_list_pre_and_fence(self):
+        content = "- Example\n  <pre>\n\t- sample output\n  </pre>\n"
+        claude_parsed = parse_claude_code_memory(content)
+        assert claude_parsed.sections[0].facts == ["Example"]
+
+        generic_parsed = parse_generic_markdown(content)
+        assert generic_parsed.sections[0].facts == [
+            "Example",
+            "  <pre>\n\t- sample output\n  </pre>",
+        ]
+
+        fenced_content = "- Example\n  ```bash\n\t- inner bullet\n  ```\n"
+        fenced_claude = parse_claude_code_memory(fenced_content)
+        assert fenced_claude.sections[0].facts == ["Example"]
+
+        fenced_generic = parse_generic_markdown(fenced_content)
+        assert fenced_generic.sections[0].facts == [
+            "Example",
+            "  ```bash\n\t- inner bullet\n  ```",
+        ]
+
 
 class TestFormatDetection:
     def test_detect_claude_code(self):
