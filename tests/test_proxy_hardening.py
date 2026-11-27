@@ -483,6 +483,25 @@ class TestWebSocketAuthMiddleware:
 
         assert downstream.called is True
 
+    async def test_accepts_the_proof_under_a_container_alias_upstream_host(self):
+        # The handshake a containerised front relays keeps its upstream's
+        # Host (the alias) and carries the marker and the proof.
+        from headroom.proxy.server import front_relay_proof
+
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+        headers = [
+            ("host", "host.docker.internal:8788"),
+            ("x-headroom-front-remote", "1"),
+            ("x-headroom-front-proof", front_relay_proof("s3cr3t-token")),
+        ]
+
+        await _drive(
+            mw, {**_ws_scope(client=LOOPBACK, headers=headers), "server": ("127.0.0.1", 8788)}
+        )
+
+        assert downstream.called is True
+
     async def test_rejects_a_wrong_rust_front_relay_proof(self):
         downstream = _SpyApp()
         mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")

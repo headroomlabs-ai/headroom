@@ -294,9 +294,13 @@ answer those names too. They count from a loopback peer because Docker Desktop d
 container callers to the host from 127.0.0.1. The Rust front never forwards an alias a
 remote caller chose, and a front that reaches this proxy as
 `http://host.docker.internal:<port>` must run with `--python-upstream true` so its
-relayed callers arrive as `headroom-remote.invalid`. Every request the front relays for a remote caller also
-carries `X-Headroom-Front-Remote: 1`; a request carrying it is never treated as local here,
-whatever its `Host`. The proof is accepted from any peer, as the token is (a containerised
+relayed HTTP callers arrive as `headroom-remote.invalid`. That relay `Host` is HTTP only: a
+relayed WebSocket handshake keeps the upstream's own `Host` (for example `127.0.0.1:8787` or
+`host.docker.internal:8787`), so on WebSocket the remote marker (and, with
+`--python-upstream`, the proof) is what identifies a remote caller. Every HTTP request and
+WebSocket handshake the front relays for a remote caller carries
+`X-Headroom-Front-Remote: 1`; a request carrying it is never treated as local here, whatever
+its `Host`. The proof is accepted from any peer, as the token is (a containerised
 front on Linux arrives from the bridge gateway), and on WebSocket handshakes as on HTTP. Requests the Rust front (`crates/headroom-proxy`) relays for a
 caller it authenticated carry `X-Headroom-Front-Proof`, derived from
 `HEADROOM_PROXY_TOKEN`; with the same token configured here that proof stands in for the

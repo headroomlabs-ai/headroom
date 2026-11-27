@@ -420,6 +420,37 @@ def test_rust_front_relay_from_a_container_gateway_is_accepted(
     assert FRONT_RELAY_PROOF_HEADER not in {k.lower() for k in transport.requests[0].headers}
 
 
+def test_front_relay_proof_matches_the_rust_front() -> None:
+    # The same vector as relay_proof_matches_python in
+    # crates/headroom-proxy/src/inbound_auth.rs: both processes must agree.
+    assert (
+        front_relay_proof("abc")
+        == "33d9db219abd5b185118a8980948fe91930384fdf1a44fa3a964fcdb670be2e3"
+    )
+
+
+@pytest.mark.parametrize("host", ["host.docker.internal:8787", "host.containers.internal:8787"])
+def test_rust_front_relay_to_a_container_alias_upstream_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    # A containerised front dialling this proxy as a container alias sends
+    # that alias as Host on a WebSocket handshake, with the marker and the
+    # proof (the Rust test relay_identity_for_a_container_alias_upstream).
+    # The marker takes local trust away; the proof authenticates the caller.
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "abc")
+    client, transport = _client()
+    marked = {"Host": host, "X-Headroom-Front-Remote": "1"}
+
+    proved = client.get(
+        _PATH, headers={**marked, FRONT_RELAY_PROOF_HEADER: front_relay_proof("abc")}
+    )
+    unproved = client.get(_PATH, headers=marked)
+
+    assert proved.status_code == 200, proved.text
+    assert unproved.status_code == 403, unproved.text
+    assert len(transport.requests) == 1
+
+
 def test_rust_front_relay_with_its_proof_forwards_without_the_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
