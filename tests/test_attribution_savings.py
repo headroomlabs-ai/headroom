@@ -147,7 +147,7 @@ def test_state_without_dimensions_loads_and_garbage_is_dropped(tmp_path):
     tracker.flush()
     raw = json.loads(path.read_text())
     raw.pop("dimensions", None)
-    path.write_text(json.dumps(raw))
+    path.write_text(json.dumps(raw), newline="\n")
     assert SavingsTracker(path=path).snapshot()["by_dimension"] == {}
 
     raw["dimensions"] = {
@@ -155,7 +155,7 @@ def test_state_without_dimensions_loads_and_garbage_is_dropped(tmp_path):
         "Bad Name": {"a": {}},
         "project": {"shadow": {"requests": 1}},
     }
-    path.write_text(json.dumps(raw))
+    path.write_text(json.dumps(raw), newline="\n")
     by_dim = SavingsTracker(path=path).snapshot()["by_dimension"]
     assert set(by_dim) == {"host", "project"}
     assert by_dim["host"] == {"ok": by_dim["host"]["ok"]}
@@ -510,7 +510,9 @@ def test_a_replaced_resolver_is_not_overridden_by_the_legacy_field(tmp_path, mon
             # The older projects totals still record what the proxy detected.
             assert set(lifetime["projects"]) == {"web"}
             tags = sink.entries[-1].tags
-            assert (tags["client"], tags["project"]) == ("custom-client", "custom-project")
+            # The project tag is the resolver's; the client tag names the
+            # harness in the public agent_usage, so it stays what was detected.
+            assert (tags["client"], tags["project"]) == ("codex", "custom-project")
     finally:
         attribution.unregister_dimension("client")
         attribution.unregister_dimension("project")
@@ -684,6 +686,68 @@ def test_middleware_resolves_labels_from_request(tmp_path, monkeypatch):
         assert captured[-1]["project"] == "aider-proj"
 
 
+def test_literal_percent_project_names_stay_apart_from_request_to_ledger(tmp_path, monkeypatch):
+    """A provider request through the middleware, handler and outcome funnel.
+
+    ``headroom wrap`` percent-encodes the directory name, so ``release%41``
+    goes on the wire as ``release%2541``. It must not share a bucket with
+    ``releaseA``.
+    """
+    pytest.importorskip("fastapi")
+    httpx = pytest.importorskip("httpx")
+    respx = pytest.importorskip("respx")
+    from fastapi.testclient import TestClient
+
+    from headroom.cli.wrap import _project_name_from_cwd
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "events.jsonl"))
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+    )
+    names = ["release%41", "releaseA"]
+    usage = {"input_tokens": 10, "output_tokens": 1}
+    with respx.mock(assert_all_called=False) as upstream:
+        upstream.post("https://api.openai.com/v1/responses").mock(
+            return_value=httpx.Response(200, json={"id": "r", "output": [], "usage": usage})
+        )
+        app = create_app(config)
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as client:
+            for name in names:
+                (tmp_path / name).mkdir()
+                monkeypatch.chdir(tmp_path / name)
+                response = client.post(
+                    "/v1/responses",
+                    json={"model": "gpt-4o", "input": f"hello from {name}"},
+                    headers={
+                        "authorization": "Bearer sk-test",
+                        "X-Headroom-Project": _project_name_from_cwd(),
+                    },
+                )
+                assert response.status_code == 200
+            by_dim = client.get("/stats").json()["savings"]["by_dimension"]
+            assert set(by_dim["project"]) == set(names)
+
+    events = [json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert [event["dims"]["project"] for event in events] == names
+
+    from headroom.cli import savings as savings_cli
+
+    monkeypatch.setattr(savings_cli, "_proxy_routing", lambda: None)
+    new_input = []
+    for name in names:
+        result = CliRunner().invoke(savings_cli.savings, ["--where", f"project={name}", "--json"])
+        assert result.exit_code == 0, result.output
+        new_input.append(json.loads(result.output)["lifetime"]["new_input_tokens"])
+    # Nothing was compressed, so each filter finds its one request's new input.
+    assert new_input[0] == new_input[1] > 0
+
+
 def test_network_callers_do_not_see_labels(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
@@ -709,6 +773,49 @@ def test_network_callers_do_not_see_labels(tmp_path, monkeypatch):
         # Whatever the key, the label itself is nowhere in either response.
         assert "studio" not in stats.text
         assert "studio" not in lifetime.text
+
+
+def test_labels_never_name_an_agent_in_the_public_agent_usage(tmp_path, monkeypatch):
+    """``agent_usage`` groups the request log by its client and stack tags and
+    is shown to network callers, so no label may become one of those tags."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy import attribution
+    from headroom.proxy.request_logger import RequestLogger
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "events.jsonl"))
+    monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "default,stack,labels")
+    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
+    app = create_app(config)
+    try:
+        attribution.register_dimension("client", lambda request: "alice-laptop", replace=True)
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as local:
+            proxy = local.app.state.proxy
+            monkeypatch.setattr(proxy, "logger", RequestLogger(log_file=None), raising=False)
+            # A replaced client resolver and a listed stack resolver ...
+            set_current_attribution({"client": "alice-laptop", "stack": "bob-desktop"})
+            _emit(proxy, client="codex", request_id="req-1")
+            # ... and a stack a client named through labels, with no harness found.
+            monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels")
+            set_current_attribution({"stack": "carol-vm"})
+            _emit(proxy, request_id="req-2")
+            set_current_attribution(None)
+            tags = [entry["tags"] for entry in proxy.logger.get_recent(10)]
+            # Same running app, seen from the network (no second startup).
+            remote = TestClient(app, base_url="http://10.0.0.5", client=("10.0.0.9", 1))
+            stats = remote.get("/stats")
+    finally:
+        attribution.unregister_dimension("client")
+    assert tags[0]["client"] == "codex" and "stack" not in tags[0]
+    assert "client" not in tags[1] and "stack" not in tags[1]
+    assert stats.status_code == 200
+    agents = {row["agent"] for row in stats.json()["agent_usage"]["agents"]}
+    assert "codex" in agents
+    for label in ("alice-laptop", "bob-desktop", "carol-vm"):
+        assert label not in stats.text
 
 
 def test_proxy_token_holders_see_labels_like_recent_requests(tmp_path, monkeypatch):

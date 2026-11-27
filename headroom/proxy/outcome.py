@@ -483,6 +483,30 @@ def _warn_estimated_input(provider: str, model: str) -> None:
     )
 
 
+#: Request-log tags that name the harness in ``/stats``' ``agent_usage``
+#: (``server._classify_agent_from_log``). That section is shown to every
+#: caller, network ones included, so a label never writes these tags: a
+#: replaced ``client`` resolver or a ``stack`` label could name a machine or a
+#: person there. Labels reach ``by_dimension``, which the stats gate hides.
+_AGENT_USAGE_TAGS: frozenset[str] = frozenset({"client", "stack", "headroom-stack"})
+
+
+def _discovered_project(project: str, resolved: str | None) -> bool:
+    """Whether the legacy ``project`` names a project the resolved label does not.
+
+    The legacy value passes through :func:`set_current_project`, which
+    percent-decodes once more than the header resolver does, so a directory
+    named ``release%41`` arrives there as ``releaseA``. That is the same
+    project, already labelled correctly; only a handler that found a different
+    one (Codex project context) should replace the label.
+    """
+    if resolved is None:
+        return True
+    from headroom.proxy.project_name_policy import sanitize_project_name
+
+    return project != resolved and project != sanitize_project_name(resolved)
+
+
 async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """Single funnel for per-request bookkeeping. The contract.
 
@@ -518,6 +542,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.attribution import (
         _builtin_label_applies,
+        booking_attribution,
         dimension_enabled,
         enabled_dimensions,
         get_current_attribution,
@@ -651,10 +676,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         for name, label in normalize_attribution(outcome.attribution).items()
         if dimension_enabled(name)
     }
+    bound_labels = get_current_attribution()
     attribution = merge_attribution(
-        get_current_attribution(),
+        bound_labels,
         handler_labels,
-        {"project": project} if project and _builtin_label_applies("project") else None,
+        {"project": project}
+        if project
+        and _discovered_project(project, bound_labels.get("project"))
+        and _builtin_label_applies("project")
+        else None,
         {"client": outcome.client} if outcome.client and _builtin_label_applies("client") else None,
     )
 
@@ -752,41 +782,43 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if not input_provider_reported and billed_input_tokens > 0:
         _warn_estimated_input(outcome.provider, outcome.model)
 
-    # 1. Prometheus / SavingsTracker.
-    await handler.metrics.record_request(
-        provider=outcome.provider,
-        model=outcome.model,
-        input_tokens=billed_input_tokens,
-        output_tokens=outcome.output_tokens,
-        tokens_saved=novel_tokens_saved,
-        latency_ms=outcome.total_latency_ms,
-        cached=outcome.cache_hit,
-        overhead_ms=outcome.overhead_ms,
-        ttfb_ms=outcome.ttfb_ms,
-        pipeline_timing=pipeline_timing,
-        waste_signals=outcome.waste_signals,
-        cache_read_tokens=outcome.cache_read_tokens,
-        cache_write_tokens=outcome.cache_write_tokens,
-        cache_write_5m_tokens=outcome.cache_write_5m_tokens,
-        cache_write_1h_tokens=outcome.cache_write_1h_tokens,
-        uncached_input_tokens=outcome.uncached_input_tokens,
-        attempted_input_tokens=outcome.attempted_input_tokens,
-        output_tokens_saved=output_tokens_saved_est,
-        output_tokens_saved_high=output_tokens_saved_high_est,
-        project=project,
-        client=outcome.client,
-        attribution=attribution,
-        tool_search_saved=tool_search_saved,
-        local_input_tokens=outcome.optimized_tokens,
-        savings_attribution=savings_breakdown,
-        # Already handed to the cost tracker below; the metrics path needs it
-        # too now that it prices savings cache-aware. An inferred write is the
-        # same tokens as `uncached_input_tokens` and carries no write premium,
-        # so counting it as a write would both double it and apply a premium
-        # OpenAI never charges.
-        cache_inferred=outcome.cache_inferred,
-        input_provider_reported=input_provider_reported,
-    )
+    # 1. Prometheus / SavingsTracker. OpenTelemetry attributes read the labels
+    #    booked here, late discoveries included (see booking_attribution).
+    with booking_attribution(attribution):
+        await handler.metrics.record_request(
+            provider=outcome.provider,
+            model=outcome.model,
+            input_tokens=billed_input_tokens,
+            output_tokens=outcome.output_tokens,
+            tokens_saved=novel_tokens_saved,
+            latency_ms=outcome.total_latency_ms,
+            cached=outcome.cache_hit,
+            overhead_ms=outcome.overhead_ms,
+            ttfb_ms=outcome.ttfb_ms,
+            pipeline_timing=pipeline_timing,
+            waste_signals=outcome.waste_signals,
+            cache_read_tokens=outcome.cache_read_tokens,
+            cache_write_tokens=outcome.cache_write_tokens,
+            cache_write_5m_tokens=outcome.cache_write_5m_tokens,
+            cache_write_1h_tokens=outcome.cache_write_1h_tokens,
+            uncached_input_tokens=outcome.uncached_input_tokens,
+            attempted_input_tokens=outcome.attempted_input_tokens,
+            output_tokens_saved=output_tokens_saved_est,
+            output_tokens_saved_high=output_tokens_saved_high_est,
+            project=project,
+            client=outcome.client,
+            attribution=attribution,
+            tool_search_saved=tool_search_saved,
+            local_input_tokens=outcome.optimized_tokens,
+            savings_attribution=savings_breakdown,
+            # Already handed to the cost tracker below; the metrics path needs it
+            # too now that it prices savings cache-aware. An inferred write is the
+            # same tokens as `uncached_input_tokens` and carries no write premium,
+            # so counting it as a write would both double it and apply a premium
+            # OpenAI never charges.
+            cache_inferred=outcome.cache_inferred,
+            input_provider_reported=input_provider_reported,
+        )
 
     # 2. Cost tracker (optional).
     cost_tracker = getattr(handler, "cost_tracker", None)
@@ -817,12 +849,18 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
         log_tags = public_tags(outcome.tags)
-        # ``client`` / ``project`` tags are what the proxy detected, as they
-        # always were, except for a dimension the operator listed: there the
-        # tag is its resolver's label, so a replaced resolver shows here too.
-        # A label a client merely named through ``labels`` does not.
+        # The ``project`` tag is what the proxy detected, as it always was,
+        # except for a dimension the operator listed: there the tag is its
+        # resolver's label, so a replaced resolver shows here too. A label a
+        # client merely named through ``labels`` does not. The ``client`` tag
+        # is always the harness the proxy detected (see _AGENT_USAGE_TAGS).
         listed = enabled_dimensions()
-        client_tag = (attribution.get("client") if "client" in listed else None) or outcome.client
+        detected_client = (
+            attribution.get("client")
+            if "client" in listed and _builtin_label_applies("client")
+            else None
+        )
+        client_tag = outcome.client or detected_client
         if client_tag:
             log_tags["client"] = client_tag
         project_tag = (attribution.get("project") if "project" in listed else None) or project
@@ -831,7 +869,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         for dimension, label in attribution.items():
             # The stats reader sums these tags as savings, so only the proxy
             # writes them: a label of the same name never reaches them.
-            if dimension in TOOL_SCHEMA_SAVINGS_TAGS:
+            if dimension in TOOL_SCHEMA_SAVINGS_TAGS or dimension in _AGENT_USAGE_TAGS:
                 continue
             # A listed dimension's label is its resolver's, which outranks the
             # ``X-Headroom-<name>`` tag a client sent under the same key,

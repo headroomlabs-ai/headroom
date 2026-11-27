@@ -121,6 +121,17 @@ def test_a_selected_resolver_has_the_last_word_over_open_labels():
     assert resolve_attribution(request, ["client", "tenant", "labels"]) == {"client": "claude-code"}
 
 
+@pytest.mark.parametrize("team_header", ["unknown", "  ", "\x00"])
+def test_a_selected_header_dimension_with_no_usable_label_stays_unattributed(team_header):
+    # ``team`` has no registered resolver; its header fallback gives the
+    # dedicated header precedence, so the combined header cannot refill it.
+    request = _req({"X-Headroom-Team": team_header, "X-Headroom-Labels": "team=infra; region=eu"})
+    assert resolve_attribution(request, ["team", "labels"]) == {"region": "eu"}
+    # Without a dedicated header the fallback reads the combined one.
+    request = _req({"X-Headroom-Labels": "team=infra; region=eu"})
+    assert resolve_attribution(request, ["team", "labels"]) == {"team": "infra", "region": "eu"}
+
+
 def test_open_labels_never_readmit_a_removed_dimension(monkeypatch):
     monkeypatch.setenv(attribution.ATTRIBUTION_DIMENSIONS_ENV_VAR, "labels,-Project")
     request = _req({"X-Headroom-Labels": "project=web; team=infra"})
@@ -424,6 +435,29 @@ def test_otel_provider_exports_selected_dimensions(monkeypatch):
     finally:
         attribution.install_otel_attribution({})
     assert registered == []
+
+
+def test_otel_provider_reads_the_labels_an_outcome_books(monkeypatch):
+    registered = []
+    import headroom.observability.metrics as metrics
+
+    monkeypatch.setattr(
+        metrics, "register_otel_metric_attribute_provider", lambda p: registered.append(p) or p
+    )
+    monkeypatch.setattr(
+        metrics, "unregister_otel_metric_attribute_provider", lambda p: registered.remove(p)
+    )
+    try:
+        attribution.install_otel_attribution({"HEADROOM_OTEL_ATTRIBUTION": "project"})
+        set_current_attribution({"host": "studio"})
+        # A handler found the project after the middleware bound the request.
+        with attribution.booking_attribution({"host": "studio", "project": "late"}):
+            assert registered[0]() == {"headroom.attribution.project": "late"}
+        # The request's own binding is unchanged for whatever follows.
+        assert registered[0]() == {}
+        assert dict(get_current_attribution()) == {"host": "studio"}
+    finally:
+        attribution.install_otel_attribution({})
 
 
 def test_a_header_label_is_percent_decoded_exactly_once(monkeypatch):

@@ -41,7 +41,8 @@ import itertools
 import logging
 import os
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -495,8 +496,10 @@ def resolve_attribution(
     With the open ``labels`` token, ``X-Headroom-Labels`` may name any
     dimension that was not resolved above. That includes a registered one that
     is not selected, provided it is client-settable (the built-ins are; see
-    :func:`register_dimension`). A selected resolver keeps precedence, even
-    when it yields nothing, and a name removed with ``-name`` stays out.
+    :func:`register_dimension`). A selected dimension keeps precedence, even
+    when it yields nothing: so does a selected name without a registered
+    resolver, whose header fallback found ``X-Headroom-<Name>: unknown``. A
+    name removed with ``-name`` stays out.
     """
     _ensure_builtins()
     names = enabled_dimensions() if dimensions is None else tuple(dimensions)
@@ -528,12 +531,15 @@ def resolve_attribution(
         for name, label in _label_pairs(request.header(LABELS_HEADER)).items():
             if len(labels) >= MAX_DIMENSIONS:
                 break
-            if name in labels or name in excluded or _is_credential(name):
+            if name in labels or name in names or name in excluded or _is_credential(name):
+                # A selected name has the last word, registered or not: its
+                # header fallback already read this header and gave way to the
+                # dedicated header, even one that held no usable label.
                 continue
             registration = registry.get(name)
-            if registration is not None and (name in names or not registration.client_settable):
-                # A selected resolver has the last word; an unselected one
-                # that is not client-settable keeps its name reserved.
+            if registration is not None and not registration.client_settable:
+                # An unselected resolver that is not client-settable keeps its
+                # name reserved.
                 continue
             labels[name] = label
     return labels
@@ -569,6 +575,27 @@ def set_current_attribution(labels: Mapping[str, str] | None) -> None:
 def get_current_attribution() -> Mapping[str, str]:
     """Labels bound to the current request context (read-only, maybe empty)."""
     return _current_attribution.get()
+
+
+_booked_attribution: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "headroom_booked_attribution", default=None
+)
+
+
+@contextmanager
+def booking_attribution(labels: Mapping[str, str]) -> Iterator[None]:
+    """Expose the labels an outcome books while its metrics are recorded.
+
+    They can include what a handler found after the request was bound (a
+    Codex WebSocket turn's project), so OpenTelemetry reads these rather than
+    the bound labels. The request's own binding is left alone: the next turn
+    on the same socket still starts from what the middleware resolved.
+    """
+    token = _booked_attribution.set(MappingProxyType(dict(labels)))
+    try:
+        yield
+    finally:
+        _booked_attribution.reset(token)
 
 
 #: Headers that name the client's own conversation, in priority order. Used only
@@ -703,9 +730,11 @@ def install_otel_attribution(environ: Mapping[str, str] | None = None) -> bool:
     allowed = frozenset(selected)
 
     def provider() -> Mapping[str, str]:
+        booked = _booked_attribution.get()
+        labels = get_current_attribution() if booked is None else booked
         return {
             OTEL_ATTRIBUTE_PREFIX + name: label
-            for name, label in get_current_attribution().items()
+            for name, label in labels.items()
             if export_all or name in allowed
         }
 
@@ -731,6 +760,7 @@ __all__ = [
     "CONVERSATION_HEADERS",
     "bind_builtin_label",
     "bind_label",
+    "booking_attribution",
     "conversation_hint",
     "get_current_conversation",
     "set_current_conversation",

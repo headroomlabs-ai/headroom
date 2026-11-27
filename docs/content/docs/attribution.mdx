@@ -56,6 +56,9 @@ percent-decoded once. Only the first 6,702 characters of `X-Headroom-Labels` are
 enough for 16 full-length ASCII labels with every character percent-encoded; a pair cut
 by that limit is dropped, not shortened. A dimension name may not start with `-` or `.`,
 and `unknown` is not a label: it is what the ledger shows for an event with none.
+A selected dimension's own header outranks `X-Headroom-Labels`, even when it holds no
+usable label: `X-Headroom-Team: unknown` leaves `team` unattributed whatever the
+combined header says.
 
 `none` stops labels being resolved and booked. Each ledger event still records the
 harness in its own `client` key, as it did before labels existed.
@@ -135,7 +138,9 @@ proxy detects itself no longer overrides it. In request-log tags its label wins 
 when it finds nothing the tag still shows what the proxy detected. A label never
 writes the savings tags the proxy sets, `tool_search_deferred_tokens` and
 `turn_hook_tools_saved_tokens`, so a dimension that shares one of those names cannot
-change the savings the proxy reports.
+change the savings the proxy reports. Nor does it write the `client` and `stack` tags:
+`/stats` groups requests by those in `agent_usage`, which every caller sees, so they
+always name the harness the proxy detected.
 
 Two older records keep what the proxy detected. The `projects` totals are one. The
 ledger is the other, for `client` only: each event has a single `client` key, which is
