@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
@@ -114,6 +115,18 @@ async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Re
     )
 
 
+def _same_origin(a: str, b: str) -> bool:
+    """True when two URLs name the same scheme, host, port and path (default ports implied)."""
+
+    def key(url: str) -> tuple[str, str, int | None, str]:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        port = parts.port or {"https": 443, "http": 80}.get(scheme)
+        return scheme, (parts.hostname or "").lower(), port, parts.path.rstrip("/")
+
+    return key(a) == key(b)
+
+
 async def _count_tokens_on_backend(proxy: Any, request: Request) -> Response | None:
     """Answer ``/v1/messages/count_tokens`` from the Anthropic backend, or None to pass through.
 
@@ -184,7 +197,7 @@ def _register_provider_passthrough_route(
         if (
             spec.provider_name == "anthropic"
             and spec.sub_path == "count_tokens"
-            and _api_target(proxy, "anthropic").rstrip("/") == DEFAULT_ANTHROPIC_API_URL.rstrip("/")
+            and _same_origin(_api_target(proxy, "anthropic"), DEFAULT_ANTHROPIC_API_URL)
         ):
             counted = await _count_tokens_on_backend(proxy, request)
             if counted is not None:

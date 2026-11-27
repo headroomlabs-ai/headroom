@@ -44,7 +44,7 @@ def _bedrock_backend(runtime: MagicMock) -> LiteLLMBackend:
     return backend
 
 
-def _post(backend, passthrough, headers=_HEADERS, **config):
+def _post(backend, passthrough, headers=_HEADERS, body=_BODY, **config):
     from fastapi.testclient import TestClient
 
     from headroom.proxy.loopback_guard import require_loopback
@@ -55,7 +55,7 @@ def _post(backend, passthrough, headers=_HEADERS, **config):
     with TestClient(app) as client:
         app.state.proxy.anthropic_backend = backend
         with patch.object(app.state.proxy, "handle_passthrough", passthrough):
-            return client.post("/v1/messages/count_tokens", headers=headers, json=_BODY)
+            return client.post("/v1/messages/count_tokens", headers=headers, json=body)
 
 
 def test_bedrock_counts_tokens_without_an_upstream_call() -> None:
@@ -165,3 +165,33 @@ def test_configured_anthropic_gateway_keeps_the_passthrough_in_bedrock_mode() ->
     assert resp.json() == {"input_tokens": 11}
     assert passthrough.call_args.args[1].rstrip("/") == "https://gateway.example.com"
     assert not runtime.count_tokens.called
+
+
+def test_undated_alias_counts_on_the_dated_base_model() -> None:
+    runtime = MagicMock()
+    runtime.count_tokens.return_value = {"inputTokens": 5}
+    body = {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]}
+
+    resp = _post(
+        _bedrock_backend(runtime), MagicMock(side_effect=AssertionError("upstream")), body=body
+    )
+
+    assert resp.json() == {"input_tokens": 5}
+    # Undated name -> newest dated profile -> base model ID (no us./global. prefix).
+    assert (
+        runtime.count_tokens.call_args.kwargs["modelId"]
+        == "anthropic.claude-haiku-4-5-20251001-v1:0"
+    )
+
+
+def test_default_anthropic_target_with_explicit_port_still_counts_on_bedrock() -> None:
+    runtime = MagicMock()
+    runtime.count_tokens.return_value = {"inputTokens": 3}
+
+    resp = _post(
+        _bedrock_backend(runtime),
+        MagicMock(side_effect=AssertionError("upstream")),
+        anthropic_api_url="https://api.anthropic.com:443",
+    )
+
+    assert resp.json() == {"input_tokens": 3}
