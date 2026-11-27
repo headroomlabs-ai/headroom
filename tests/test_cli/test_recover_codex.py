@@ -308,6 +308,8 @@ def test_recovery_refuses_a_target_whose_backup_would_be_incomplete(
     with pytest.raises(RuntimeError, match=r"cannot read .*sessions/locked"):
         recover_codex_home(source=source, target=target)
     assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+    # `target-before` is what a failed merge restores: never leave a partial one.
+    assert not list((tmp_path / codex_recovery._RECOVERY_DIR).glob("*/target-before*"))
 
 
 def test_recovery_offers_no_snapshot_when_the_pinning_copy_fails_midway(

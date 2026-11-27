@@ -921,9 +921,17 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     if target_existed:
         target_modes = _capture_modes(target)
         target_fingerprint = home_fingerprint(target)
-        _copy_home(target, target_backup, report.skipped_runtime)
-        if home_fingerprint(target) != target_fingerprint:
-            raise RuntimeError("target Codex home changed while it was being backed up")
+        # Staged like the pin: `target-before` is what a failed merge restores,
+        # so it gets that name only once complete and verified.
+        target_staging = backup_dir / "target-before.partial"
+        try:
+            _copy_home(target, target_staging, report.skipped_runtime)
+            if home_fingerprint(target) != target_fingerprint:
+                raise RuntimeError("target Codex home changed while it was being backed up")
+        except BaseException:
+            shutil.rmtree(target_staging, ignore_errors=True)
+            raise
+        target_staging.rename(target_backup)
     else:
         target.mkdir(mode=0o700, parents=True)
     try:
