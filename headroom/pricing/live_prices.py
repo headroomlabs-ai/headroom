@@ -142,6 +142,7 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
     """
     from headroom.pricing.litellm_pricing import (
         deepseek_rows,
+        invalidate_litellm_lookup_caches,
         litellm,
         mirrored_rows,
         publish_price_table,
@@ -168,9 +169,7 @@ def merge_litellm_prices(models: dict[str, Any]) -> int:
         # built at import, and caches a lowercase index of the keys; new models
         # need both, or `cost_per_token` cannot place them.
         litellm.add_known_models(changed)
-        invalidate = getattr(litellm.utils, "_invalidate_model_cost_lowercase_map", None)
-        if invalidate is not None:
-            invalidate()
+        invalidate_litellm_lookup_caches()
     finally:
         _clear_price_caches()
     return len(changed)

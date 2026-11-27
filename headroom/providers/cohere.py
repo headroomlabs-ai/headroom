@@ -23,7 +23,11 @@ from typing import Any
 
 from headroom.log_safety import describe_exception, safe_id
 from headroom.offline import pin_litellm_cost_map_local
-from headroom.pricing.litellm_pricing import catalog_key, estimate_cost_from_tokens
+from headroom.pricing.litellm_pricing import (
+    call_litellm,
+    catalog_key,
+    estimate_cost_from_tokens,
+)
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -278,7 +282,9 @@ class CohereProvider(Provider):
         if LITELLM_AVAILABLE:
             for model_variant in [f"cohere/{model}", model]:
                 try:
-                    info = litellm.get_model_info(catalog_key(model_variant) or model_variant)
+                    info = call_litellm(
+                        litellm.get_model_info, catalog_key(model_variant) or model_variant
+                    )
                     if info and "max_input_tokens" in info:
                         result = info["max_input_tokens"]
                         if result is not None:

@@ -11,11 +11,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.price_table_generation import (
+    advance_price_table_generation,
+    price_table_generation,
+)
 from headroom.pricing.deepseek_tiers import (
     LEGACY_MODEL_IDS,
     OFF_PEAK_RATES_PER_1M,
@@ -60,9 +65,10 @@ except ImportError:
     litellm = None  # type: ignore[assignment]
     LITELLM_AVAILABLE = False
 
-# Least-recently-used first. Keyed by the client-supplied model name, so the
+# Least-recently-used first. Keyed by the price-table generation and the
+# client-supplied model name (see headroom.price_table_generation), so the
 # entry count is capped (#4479); an evicted name is simply resolved again.
-_resolved_model_cache: dict[str, str] = {}
+_resolved_model_cache: dict[tuple[int, str], str] = {}
 _RESOLVED_MODEL_CACHE_MAXSIZE = 256
 
 logger = logging.getLogger("headroom.pricing")
@@ -117,16 +123,17 @@ def resolve_litellm_model(model: str) -> str:
     the bare-prefix rules. Shared by the live (cost.py) and persisted
     (savings_tracker) pricing paths so both figures price identically.
     """
-    cached = _resolved_model_cache.get(model)
+    key = (price_table_generation(), model)
+    cached = _resolved_model_cache.get(key)
     if cached is not None:
-        remember_bounded(_resolved_model_cache, model, cached, _RESOLVED_MODEL_CACHE_MAXSIZE)
+        remember_bounded(_resolved_model_cache, key, cached, _RESOLVED_MODEL_CACHE_MAXSIZE)
         return cached
     priced: str | None = None
     alias = _static_alias_map()
     if alias:
         priced = _reduce_to_priced_key(alias.get(model, model))
     resolved = priced if priced is not None else _resolve_litellm_model_uncached(model)
-    remember_bounded(_resolved_model_cache, model, resolved, _RESOLVED_MODEL_CACHE_MAXSIZE)
+    remember_bounded(_resolved_model_cache, key, resolved, _RESOLVED_MODEL_CACHE_MAXSIZE)
     return resolved
 
 
@@ -140,11 +147,42 @@ _catalog_index: tuple[dict[str, Any], int, dict[str, str]] | None = None
 def publish_price_table(table: dict[str, Any]) -> None:
     """Make ``table`` LiteLLM's price table, with Headroom's index of it built first.
 
-    ``table`` must not be changed afterwards: readers may be iterating it.
+    ``table`` must not be changed afterwards: readers may be iterating it. The
+    generation advances after the table is bound, so a lookup that read the
+    new generation can only have read the new table.
     """
     global _catalog_index
     _catalog_index = (table, len(table), {key.lower(): key for key in table})
     litellm.model_cost = table
+    advance_price_table_generation()
+
+
+def invalidate_litellm_lookup_caches() -> None:
+    """Drop LiteLLM's lowercase name index and the model-info caches it clears with it."""
+    invalidate = getattr(
+        getattr(litellm, "utils", None), "_invalidate_model_cost_lowercase_map", None
+    )
+    if invalidate is not None:
+        invalidate()
+
+
+_T = TypeVar("_T")
+
+
+def call_litellm(fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+    """Call a LiteLLM lookup, then drop LiteLLM's caches if a price refresh landed meanwhile.
+
+    LiteLLM memoises model info (rates, limits) in caches a refresh clears. In
+    1.101 they are not keyed on the table, so a lookup that read the old table
+    and returns after that clear stores the old rows again, for every later
+    caller. The lookup that overlapped the refresh clears them on its way out.
+    """
+    generation = price_table_generation()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        if price_table_generation() != generation:
+            invalidate_litellm_lookup_caches()
 
 
 def catalog_key(name: str) -> str | None:
@@ -180,8 +218,11 @@ def _resolve_litellm_model_uncached(model: str) -> str:
 
     def is_known_model(candidate: str) -> bool:
         try:
-            litellm.cost_per_token(
-                model=catalog_key(candidate) or candidate, prompt_tokens=1, completion_tokens=0
+            call_litellm(
+                litellm.cost_per_token,
+                model=catalog_key(candidate) or candidate,
+                prompt_tokens=1,
+                completion_tokens=0,
             )
             return True
         except Exception:
@@ -420,7 +461,8 @@ def estimate_cost_from_tokens(
     if candidate is None:
         return None
     try:
-        prompt_cost, completion_cost = litellm.cost_per_token(
+        prompt_cost, completion_cost = call_litellm(
+            litellm.cost_per_token,
             model=candidate,
             prompt_tokens=input_tokens,
             completion_tokens=output_tokens,

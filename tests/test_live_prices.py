@@ -12,6 +12,7 @@ import copy
 import http.client
 import io
 import json
+import sys
 import threading
 import urllib.request
 
@@ -92,6 +93,16 @@ def test_refresh_prices_a_model_the_bundled_table_lacks(monkeypatch, isolated_ca
     assert live_prices.refresh_litellm_prices() == 0
 
 
+def _add_old_row(row: dict) -> None:
+    """List ``NEW_MODEL`` at ``row``, as a table bundled before a refresh would."""
+    from headroom.pricing.litellm_pricing import invalidate_litellm_lookup_caches
+
+    litellm.model_cost[NEW_MODEL] = row
+    litellm.add_known_models({NEW_MODEL: row})
+    invalidate_litellm_lookup_caches()
+    live_prices._clear_price_caches()
+
+
 def _input_rate(model: str, provider: str) -> object:
     """``model``'s input price from ``litellm.get_model_info``, or the error it raised."""
     try:
@@ -100,47 +111,196 @@ def _input_rate(model: str, provider: str) -> object:
         return exc
 
 
-def test_a_refresh_overlapping_a_lookup_keeps_every_lookup_priced(isolated_catalog):
-    """A refresh landing while a lookup reads the table breaks neither that lookup nor later ones.
+class _Overlap:
+    """Pause one reader thread at a point the test chooses, while a refresh runs.
 
-    litellm resolves a mixed-case name by rebuilding a global lowercase index,
-    which iterates ``litellm.model_cost``. Growing that dict in place, even in
-    one ``dict.update``, failed the running iteration and the model read as
-    unmapped. The overlapped rebuild also stores an index of the replaced
-    table after the refresh invalidated it, so litellm's own mixed-case lookup
-    of a refreshed model misses; Headroom's lookups use their own index,
-    published with the table, and still price it. A key whose ``lower()``
-    blocks pauses the rebuild mid-iteration.
+    Every wait is bounded, the reader is always released, and a reader that
+    never reached the pause point is reported, so no test hangs on it.
+    """
+
+    def __init__(self, read) -> None:
+        self.paused, self._resume = threading.Event(), threading.Event()
+        self.results: list[object] = []
+
+        def run() -> None:
+            try:
+                self.results.append(read())
+            except Exception as exc:  # noqa: BLE001 - reported to the test, which asserts on it
+                self.results.append(exc)
+
+        self.reader = threading.Thread(target=run)
+
+    def pause_here(self) -> None:
+        """Call from the code under test; pauses only the reader thread."""
+        if threading.current_thread() is self.reader:
+            self.paused.set()
+            self._resume.wait(5)
+
+    def refresh_during_read(self, models: dict) -> bool:
+        """Start the read, refresh once it pauses, then let it finish. False if it never paused."""
+        self.reader.start()
+        try:
+            reached = self.paused.wait(5)
+            if reached:
+                live_prices.merge_litellm_prices(models)
+        finally:
+            self._resume.set()
+            self.reader.join(5)
+        assert not self.reader.is_alive()
+        return reached
+
+
+def test_a_resolution_overlapping_a_refresh_is_not_reused_after_it(monkeypatch, isolated_catalog):
+    """A name resolved against the old table is not served once the new one is published.
+
+    The pause sits in Headroom's resolver, after it resolved against the old
+    table and before it caches the answer, so this holds on every supported
+    LiteLLM.
+    """
+    from headroom.pricing import litellm_pricing
+    from headroom.pricing.litellm_pricing import get_model_pricing, resolve_litellm_model
+
+    resolve = litellm_pricing._resolve_litellm_model_uncached
+    overlap = _Overlap(lambda: resolve_litellm_model(NEW_MODEL.upper()))
+
+    def resolve_then_pause(model):
+        resolved = resolve(model)
+        overlap.pause_here()
+        return resolved
+
+    monkeypatch.setattr(litellm_pricing, "_resolve_litellm_model_uncached", resolve_then_pause)
+
+    assert overlap.refresh_during_read({NEW_MODEL: NEW_ROW})
+    assert overlap.results == [NEW_MODEL.upper()]  # the old table lacked it
+    assert resolve_litellm_model(NEW_MODEL.upper()) == NEW_MODEL
+    pricing = get_model_pricing(NEW_MODEL.upper())
+    assert pricing is not None
+    assert pricing.input_cost_per_1m == pytest.approx(NEW_ROW["input_cost_per_token"] * 1e6)
+
+
+def test_rates_read_during_a_refresh_are_not_reused_after_it(monkeypatch, isolated_catalog):
+    """Rates resolved from a row a refresh then replaced are not served afterwards.
+
+    The pause sits in Headroom's rate resolver, after it read the old row and
+    before the result is cached.
+    """
+    from headroom.pricing import counterfactual
+
+    old_rate, new_rate = 9e-06, NEW_ROW["input_cost_per_token"]
+    _add_old_row({**NEW_ROW, "input_cost_per_token": old_rate})
+    read_row = counterfactual._catalog_row
+    overlap = _Overlap(lambda: counterfactual.resolve_rates(NEW_MODEL).uncached)
+
+    def read_then_pause(model):
+        row = read_row(model)
+        overlap.pause_here()
+        return row
+
+    monkeypatch.setattr(counterfactual, "_catalog_row", read_then_pause)
+
+    assert overlap.refresh_during_read({NEW_MODEL: NEW_ROW})
+    assert overlap.results == [pytest.approx(old_rate)]
+    assert counterfactual.resolve_rates(NEW_MODEL).uncached == pytest.approx(new_rate)
+
+
+def _inside(function_name: str) -> bool:
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_name == function_name:
+            return True
+        frame = frame.f_back
+    return False
+
+
+class _PausingRow(dict):
+    """A catalog row that records, or pauses on, LiteLLM's reads while it memoises model info.
+
+    LiteLLM fetches the row afresh several times while building the info it
+    memoises, so only a pause after its last read leaves the build holding the
+    old row. A dry run of the same lookup counts the reads.
+    """
+
+    overlap: _Overlap | None = None
+    pause_at: int | None = None
+    reads = 0
+
+    def _read(self, key) -> None:
+        if not _inside("_cached_get_model_info"):
+            return
+        self.reads += 1
+        if self.reads == self.pause_at and self.overlap is not None:
+            self.overlap.pause_here()
+
+    def __getitem__(self, key):
+        self._read(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._read(key)
+        return super().get(key, default)
+
+
+def test_a_budget_estimate_after_an_overlapping_lookup_uses_the_refreshed_rate(isolated_catalog):
+    """LiteLLM's model-info cache cannot keep a rate a refresh replaced.
+
+    LiteLLM 1.101 memoises model info (``_cached_get_model_info``) without
+    keying it on the table, so a lookup that read the old row and finished
+    after the refresh cleared that cache stored the old rate again, and budget
+    estimates kept charging it. The pause sits inside that memoised build,
+    after its last read of the row; a LiteLLM without that cache has nothing
+    to go stale.
+    """
+    from headroom.pricing.litellm_pricing import invalidate_litellm_lookup_caches
+    from headroom.proxy.cost import CostTracker
+
+    old_rate, new_rate = 9e-06, NEW_ROW["input_cost_per_token"]
+    old_row = _PausingRow({**NEW_ROW, "input_cost_per_token": old_rate})
+    _add_old_row(old_row)
+
+    def estimate() -> float | None:
+        return CostTracker().estimate_cost(NEW_MODEL, input_tokens=1_000_000, output_tokens=0)
+
+    estimate()  # dry run: how many reads does the memoised build make?
+    if not old_row.reads:
+        pytest.skip("this LiteLLM has no _cached_get_model_info to go stale")
+    old_row.pause_at, old_row.reads = old_row.reads, 0
+    invalidate_litellm_lookup_caches()
+    live_prices._clear_price_caches()
+    overlap = _Overlap(estimate)
+    old_row.overlap = overlap
+
+    assert overlap.refresh_during_read({NEW_MODEL: NEW_ROW})
+    old_row.overlap = None
+    assert estimate() == pytest.approx(new_rate * 1_000_000)
+
+
+def test_a_refresh_does_not_break_a_lookup_iterating_the_table(isolated_catalog):
+    """A refresh landing while LiteLLM iterates the table leaves that lookup priced.
+
+    LiteLLM 1.101 resolves a mixed-case name by rebuilding a lowercase index
+    that iterates ``litellm.model_cost``; growing that dict in place, even in
+    one ``dict.update``, failed the iteration and the model read as unmapped.
+    The rebuild then stores an index of the replaced table, which Headroom's
+    lookups do not use. A key whose ``lower()`` blocks pauses the rebuild;
+    LiteLLM versions that index the table natively never call it, and have no
+    such overlap.
     """
     from headroom.pricing.litellm_pricing import get_model_pricing, resolve_litellm_model
 
-    started, resume = threading.Event(), threading.Event()
+    overlap = _Overlap(lambda: _input_rate("GPT-4O", "openai"))
 
     class PausingKey(str):
         def lower(self) -> str:
-            # Only the lookup's rebuild pauses, not the refresh's own indexing.
-            if threading.current_thread() is reader:
-                started.set()
-                resume.wait(5)
+            overlap.pause_here()
             return str(self).lower()
 
     litellm.model_cost[PausingKey("headroom-test-pause")] = {"input_cost_per_token": 0.0}
     litellm.utils._invalidate_model_cost_lowercase_map()
-    during: list[object] = []
-    reader = threading.Thread(target=lambda: during.append(_input_rate("GPT-4O", "openai")))
-    reader.start()
-    try:
-        assert started.wait(5)
-        live_prices.merge_litellm_prices({NEW_MODEL: NEW_ROW})
-    finally:
-        resume.set()
-        reader.join(5)
-    assert not reader.is_alive()
 
-    assert during == [pytest.approx(2.5e-06)]
-    # The overlapped rebuild left litellm a stale index of the replaced table.
-    assert isinstance(_input_rate(NEW_MODEL.upper(), "anthropic"), Exception)
-    # Headroom's lookups never consult it.
+    if not overlap.refresh_during_read({NEW_MODEL: NEW_ROW}):
+        assert not isinstance(overlap.results[0], Exception), overlap.results
+        pytest.skip("this LiteLLM does not rebuild its name index from the table in Python")
+    assert overlap.results == [pytest.approx(2.5e-06)]
     assert resolve_litellm_model(NEW_MODEL.upper()) == NEW_MODEL
     pricing = get_model_pricing(NEW_MODEL.upper())
     assert pricing is not None

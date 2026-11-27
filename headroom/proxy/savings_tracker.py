@@ -18,7 +18,6 @@ import time
 from collections.abc import Mapping
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,7 @@ from typing import Any
 from headroom import paths as _paths
 from headroom.log_safety import WarnOnce, describe_exception, safe_id
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.price_table_generation import generation_cached
 from headroom.proxy import project_name_policy
 from headroom.proxy.persistent_metrics import (
     MAX_LABEL_LENGTH,
@@ -334,7 +334,7 @@ def _normalize_model(value: Any) -> str:
 _MODEL_RESOLUTION_CACHE_MAXSIZE = 256
 
 
-@lru_cache(maxsize=_MODEL_RESOLUTION_CACHE_MAXSIZE)
+@generation_cached(maxsize=_MODEL_RESOLUTION_CACHE_MAXSIZE)
 def _resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes.
 
@@ -345,7 +345,7 @@ def _resolve_litellm_model(model: str) -> str:
     only when it maps to a priced model_cost key; otherwise falls through to the
     bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
 
-    Bounded LRU cache, keyed by model name — see
+    Bounded LRU cache, keyed by model name and price-table generation — see
     ``_MODEL_RESOLUTION_CACHE_MAXSIZE`` above. Tests that mock the LiteLLM
     module across calls with the same model name must call
     ``_resolve_litellm_model.cache_clear()`` between cases, or results from
@@ -354,10 +354,9 @@ def _resolve_litellm_model(model: str) -> str:
     litellm = _get_litellm_module()
     if litellm is None:
         return model
+    from headroom.pricing.litellm_pricing import call_litellm, resolve_litellm_model
 
     try:
-        from headroom.pricing.litellm_pricing import resolve_litellm_model
-
         resolved = resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved)
         if info and info.get("input_cost_per_token") is not None:
@@ -371,9 +370,9 @@ def _resolve_litellm_model(model: str) -> str:
 
     # litellm raises a bare Exception for a model it has not mapped, so this is
     # the narrowest catch that works. A miss means "not this spelling, try the
-    # provider prefixes next". Runs once per model (lru_cache above).
+    # provider prefixes next". Runs once per model and table (cache above).
     try:
-        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
+        call_litellm(litellm.cost_per_token, model=model, prompt_tokens=1, completion_tokens=0)
         return model
     except Exception as exc:
         logger.debug(
@@ -392,7 +391,8 @@ def _resolve_litellm_model(model: str) -> str:
         if model.startswith(pattern):
             candidate = f"{prefix}{model}"
             try:
-                litellm.cost_per_token(
+                call_litellm(
+                    litellm.cost_per_token,
                     model=candidate,
                     prompt_tokens=1,
                     completion_tokens=0,

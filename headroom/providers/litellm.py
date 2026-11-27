@@ -26,7 +26,11 @@ import os
 from typing import Any
 
 from headroom.offline import pin_litellm_cost_map_local
-from headroom.pricing.litellm_pricing import catalog_key, estimate_cost_from_tokens
+from headroom.pricing.litellm_pricing import (
+    call_litellm,
+    catalog_key,
+    estimate_cost_from_tokens,
+)
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -197,7 +201,7 @@ class LiteLLMProvider(Provider):
         """Get context limit using LiteLLM's model info."""
         try:
             if litellm_get_model_info is not None:
-                info = litellm_get_model_info(catalog_key(model) or model)
+                info = call_litellm(litellm_get_model_info, catalog_key(model) or model)
                 if info and "max_input_tokens" in info:
                     result = info["max_input_tokens"]
                     return result if result is not None else 128000
@@ -214,7 +218,7 @@ class LiteLLMProvider(Provider):
         """Get recommended output buffer."""
         try:
             if litellm_get_model_info is not None:
-                info = litellm_get_model_info(catalog_key(model) or model)
+                info = call_litellm(litellm_get_model_info, catalog_key(model) or model)
                 if info and "max_output_tokens" in info:
                     max_output = info["max_output_tokens"]
                     if max_output is not None:
