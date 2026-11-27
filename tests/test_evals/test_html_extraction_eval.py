@@ -194,6 +194,7 @@ class TestHTMLExtractionQuality:
                     )
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
 class TestHTMLExtractionWithLLM:
     """Tests that use actual LLM calls for evaluation.
@@ -260,6 +261,7 @@ class TestHTMLExtractionWithLLM:
         )
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
 class TestHTMLvsBaseline:
     """Tests comparing HTMLExtractor vs Kompress baseline."""

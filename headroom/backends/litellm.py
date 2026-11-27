@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.providers.bedrock_models import newest_snapshot
 from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
@@ -970,6 +971,23 @@ class LiteLLMBackend(Backend):
             if normalized and normalized in self._model_map:
                 return self._model_map[normalized]
 
+            # Undated alias ("claude-haiku-4-5") for a model Bedrock only lists
+            # dated ("claude-haiku-4-5-20251001"): use the newest snapshot.
+            # Without this the fallback below builds an ID Bedrock rejects.
+            # Operator overrides count as listed snapshots too (discovery lists
+            # them), and an override wins exactly as it does for its own name.
+            snapshot = (
+                newest_snapshot(normalized, {*self._model_map, *self._model_overrides})
+                if normalized
+                else None
+            )
+            if snapshot:
+                return (
+                    self.map_model_id(snapshot)
+                    if snapshot in self._model_overrides
+                    else self._model_map[snapshot]
+                )
+
             # Bedrock fallback: construct a valid region-prefixed model ID.
             # Without this, bare model names like "claude-sonnet-4-20250514"
             # would become "bedrock/claude-sonnet-4-20250514" which is not a
@@ -992,6 +1010,17 @@ class LiteLLMBackend(Backend):
 
         # Fallback: construct provider/model format
         return f"{self.provider}/{anthropic_model}"
+
+    def bedrock_model_ids(self) -> list[str] | None:
+        """Model names this Bedrock backend can serve, or None for other providers.
+
+        Clients that discover models from the gateway (Claude Desktop in
+        gateway mode asks ``GET /v1/models``) need this answered locally: in
+        Bedrock mode there is no Anthropic account to ask.
+        """
+        if self.provider != "bedrock":
+            return None
+        return sorted(set(self._model_map) | set(self._model_overrides))
 
     def supports_model(self, model: str) -> bool:
         """Check if model is supported."""

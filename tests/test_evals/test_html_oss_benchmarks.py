@@ -162,6 +162,7 @@ class TestMetrics:
         assert compute_exact_match("hello", "hello world") is False
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
 class TestQAAccuracyPreservation:
     """Tests that verify QA accuracy is preserved after extraction.
@@ -237,6 +238,7 @@ Answer:"""
         print(f"  Delta:         {result.accuracy_extracted - result.accuracy_original_html:+.3f}")
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
 class TestFullBenchmarkSuite:
     """Full benchmark suite combining extraction quality and QA accuracy."""

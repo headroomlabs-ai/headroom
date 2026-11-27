@@ -476,3 +476,91 @@ def test_search_file_fold_still_wins_for_many_matches_one_file() -> None:
     out = compact_lossless(grep, "search")
     assert len(out) < len(grep)
     assert search_unheading(out) == grep
+
+
+# --- Windows separators: ripgrep and Claude Code's Grep print "\" in paths ---
+_DEEP_ROWS = "".join(
+    f"crates/headroom-core/src/{folder}/{name}.rs:{line}:use std::collections::HashMap;\n"
+    for folder, names in (
+        ("transforms", ("anchor", "content", "diff", "log", "search", "smart")),
+        ("ccr", ("store", "marker", "resolve", "batch")),
+        ("signals", ("keyword", "tokens", "budget", "error")),
+    )
+    for line, name in enumerate(names, start=3)
+)
+
+
+def _windows(rows: str) -> str:
+    """The same grep rows as a Windows tool prints them: backslashes in each path."""
+    out = []
+    for row in rows.splitlines(keepends=True):
+        path, rest = row.split(":", 1)
+        out.append(path.replace("/", chr(92)) + ":" + rest)
+    return "".join(out)
+
+
+def test_search_dir_fold_handles_windows_backslash_paths() -> None:
+    windows = _windows(_DEEP_ROWS)
+    folded = compact_lossless(windows, "search")
+    assert len(folded) == len(compact_lossless(_DEEP_ROWS, "search")) < len(windows)
+    assert folded.split("\n")[0] == chr(92).join(
+        ["crates", "headroom-core", "src", "transforms", ""]
+    )
+    assert search_dir_unheading(folded, backslash=True) == windows
+
+
+def test_windows_rows_whose_content_ends_in_a_backslash_round_trip() -> None:
+    # A shell line continuation in the matched text must not read as a header.
+    posix = "".join(
+        f"docs/guides/page_{i}.md:{i + 1}:headroom proxy --port 8787 {chr(92)}\n" for i in range(12)
+    )
+    windows = _windows(posix)
+    folded = compact_lossless(windows, "search")
+    assert len(folded) < len(windows)
+    assert search_dir_unheading(folded, backslash=True) == windows
+
+
+def test_slash_fold_keeps_a_line_ending_in_a_backslash_as_text() -> None:
+    # Without backslash=True a "\" never ends a header, so a text line ending in
+    # one stays text even when a grep row with no folder follows it.
+    text = f"src/app/a.py:1:x\nsrc/app/b.py:2:y\nrun it with {chr(92)}\nREADME.md:3:z\n"
+    assert search_dir_unheading(search_dir_heading(text)) == text
+
+
+def test_mixed_separators_keep_the_slash_fold_when_it_is_smaller() -> None:
+    # `rg pat headroom/cli headroom/proxy` on Windows prints headroom/cli\x.py.
+    # With the two folders interleaved, factoring headroom/ beats a header per
+    # folder, so the "/" fold must stay available alongside the backslash one.
+    mixed = "".join(
+        f"headroom/{folder}{chr(92)}mod_{i}.py:{i + 1}:import json\n"
+        for i in range(12)
+        for folder in ("cli", "proxy")
+    )
+    assert compact_lossless(mixed, "search") == search_dir_heading(mixed)
+
+
+@pytest.mark.parametrize(
+    ("name", "tool_input", "label"),
+    [
+        ("Grep", {"pattern": "HashMap", "path": "crates"}, "router:excluded:lossless_search"),
+        ("bash", {"command": "rg -n HashMap crates"}, "router:bash:lossless_search"),
+    ],
+)
+def test_windows_search_output_takes_the_lossless_dir_fold(name, tool_input, label, tokenizer):
+    windows = _windows(_DEEP_ROWS)
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": name, "input": tool_input}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": windows}],
+        },
+    ]
+    result = ContentRouter(ContentRouterConfig()).apply(
+        messages, tokenizer, compress_user_messages=True
+    )
+    out = result.messages[1]["content"][0]["content"]
+    assert label in result.transforms_applied
+    assert search_dir_unheading(out, backslash=True) == windows

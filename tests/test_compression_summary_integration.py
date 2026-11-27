@@ -20,10 +20,13 @@ _env_overrides = load_env_overrides()
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY") or _env_overrides.get("ANTHROPIC_API_KEY", "")
 apply_dotenv = autouse_apply_env(_env_overrides)
 
-pytestmark = pytest.mark.skipif(
-    not ANTHROPIC_KEY,
-    reason="ANTHROPIC_API_KEY not set — skipping integration tests",
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not ANTHROPIC_KEY,
+        reason="ANTHROPIC_API_KEY not set — skipping integration tests",
+    ),
+]
 
 
 def _call_claude(messages: list[dict], max_tokens: int = 200) -> dict:
