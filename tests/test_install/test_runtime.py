@@ -1232,6 +1232,22 @@ def test_start_detached_agent_skips_scope_when_no_manager_is_reachable(
     ]
 
 
+def test_user_bus_reachable_reads_runtime_dir_bus(monkeypatch, tmp_path: Path) -> None:
+    """The user manager is only assumed present when its bus socket is."""
+    from headroom.install.runtime import _user_bus_reachable
+
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    assert _user_bus_reachable() is False
+
+    (tmp_path / "bus").write_text("", encoding="utf-8")
+    assert _user_bus_reachable() is True
+
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    assert _user_bus_reachable() is True
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell shim")
 def test_start_detached_agent_really_runs_runner_through_scope_launcher(
     monkeypatch, tmp_path: Path
