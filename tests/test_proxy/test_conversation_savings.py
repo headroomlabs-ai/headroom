@@ -559,11 +559,19 @@ def _expansion_outcome(
     import httpx
     from fastapi.testclient import TestClient
 
-    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+    from headroom.cache.compression_store import (
+        detach_compression_store,
+        get_compression_store,
+        reset_compression_store,
+    )
     from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
     from headroom.proxy.server import ProxyConfig, create_app
 
-    reset_compression_store()
+    # A private in-memory CCR store. The default is the developer's SQLite file,
+    # and reset_compression_store() deletes every row in the store it resets, so
+    # detach any store an earlier test left behind instead of resetting it.
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    detach_compression_store()
     app = create_app(
         ProxyConfig(
             optimize=optimize,
