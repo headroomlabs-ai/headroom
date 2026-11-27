@@ -4123,10 +4123,13 @@ class AnthropicHandlerMixin:
                 # the debt too would drop them twice) and proactive expansion
                 # text (sent this turn only; the tracker strips it, so a lower
                 # baseline would let the next turn re-book the same removal).
+                # Signed, then clamped: adding the expansion back to the
+                # already-clamped ``tokens_saved`` would book it as a removal
+                # on a turn that compressed nothing.
                 conversation_tokens_saved = max(
                     0,
-                    tokens_saved
-                    + _replay_debt
+                    original_tokens
+                    - optimized_tokens
                     + self._proactive_expansion_tokens(optimized_messages, tokenizer.count_text),
                 )
             except Exception:

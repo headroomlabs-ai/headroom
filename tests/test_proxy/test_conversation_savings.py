@@ -10,6 +10,7 @@ frozen prefix in the compressed form forwarded last turn, so its
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -538,31 +539,162 @@ async def test_the_snapshot_says_whose_request_it_was() -> None:
     assert dict(seen[1].attribution) == {}
 
 
-def test_proactive_expansion_does_not_lower_the_anthropic_running_total() -> None:
-    """Expansion text is sent on one turn only; the replayed prefix keeps the
-    removal. The ledger is fed the wire saving with the expansion added back,
-    so expand-then-not does not re-book the same removal (#5069 follow-up)."""
-    from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin, _ProxyExpansionBlock
+_LOG_OUTPUT = "\n".join(
+    f"2026-11-27T07:{i % 60:02d}:00 INFO worker-{i % 7} step {i} completed ok" for i in range(600)
+)
+_EXPANDED_OUTPUT = "\n".join(
+    f"src/auth/middleware_{i}.py session token login handler" for i in range(40)
+)
+_EXPANDED_SAMPLE = "\n".join(_EXPANDED_OUTPUT.splitlines()[:4])
+_EXPANSION_QUERY = "list the auth middleware files"
 
-    def count(text: str) -> int:
-        return len(text.split())
 
-    expanded = AnthropicHandlerMixin._append_proactive_expansion_after_cached_prefix(
-        [{"role": "user", "content": [{"type": "text", "text": "what failed?"}]}],
-        "word " * 500,
+def _expansion_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, *, optimize: bool
+) -> tuple[Any, int]:
+    """Drive one real ``/v1/messages`` turn whose query proactively expands a
+    tracked compression; return the outcome the handler hands the funnel and
+    the expansion size it counted."""
+    pytest.importorskip("fastapi")
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+    from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    reset_compression_store()
+    app = create_app(
+        ProxyConfig(
+            optimize=optimize,
+            mode="token",
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=True,
+            ccr_proactive_expansion=True,
+            image_optimize=False,
+        )
     )
-    assert any(isinstance(b, _ProxyExpansionBlock) for m in expanded for b in m["content"]), (
-        "setup: no expansion block appended"
-    )
-    expansion = AnthropicHandlerMixin._proactive_expansion_tokens(expanded, count)
-    assert expansion == 500
-    assert AnthropicHandlerMixin._proactive_expansion_tokens([{"role": "user"}], count) == 0
+    outcomes: list[Any] = []
 
-    # Request savings 2,000 / 1,500 (500 expanded back) / 2,000: one removal.
-    ledger = ConversationSavings()
-    booked = [
-        ledger.novel("anthropic:lineage", 2_000),
-        ledger.novel("anthropic:lineage", 1_500 + expansion),
-        ledger.novel("anthropic:lineage", 2_000),
-    ]
-    assert booked == [2_000, 0, 0]
+    async def _spy(_self: Any, outcome: Any, *a: Any, **kw: Any) -> None:
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(type(app.state.proxy), "_record_request_outcome", _spy, raising=True)
+    counted: list[int] = []
+    real_count = AnthropicHandlerMixin._proactive_expansion_tokens.__func__
+
+    def _counting(cls: Any, messages: Any, count_text: Any) -> int:
+        n = real_count(cls, messages, count_text)
+        counted.append(n)
+        return n
+
+    monkeypatch.setattr(
+        AnthropicHandlerMixin, "_proactive_expansion_tokens", classmethod(_counting)
+    )
+
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_expansion",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+            },
+        )
+
+    def tool_turn(tid: str, command: str, content: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": command}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": tid, "content": content}],
+            },
+        ]
+
+    cwd = str(tmp_path)
+    try:
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            hash_key = get_compression_store().store(
+                _EXPANDED_OUTPUT,
+                _EXPANDED_SAMPLE,
+                original_item_count=40,
+                compressed_item_count=4,
+                tool_name="Bash",
+                query_context=_EXPANSION_QUERY,
+            )
+            workspace_key, _ = proxy._resolve_ccr_workspace(
+                SimpleNamespace(headers={"x-headroom-cwd": cwd}), {}
+            )
+            proxy.ccr_context_tracker.track_compression(
+                hash_key=hash_key,
+                turn_number=1,
+                tool_name="Bash",
+                original_count=40,
+                compressed_count=4,
+                workspace_key=workspace_key,
+                query_context=_EXPANSION_QUERY,
+                sample_content=_EXPANDED_SAMPLE,
+            )
+            proxy._retry_request = _fake_retry
+
+            messages: list[dict[str, Any]] = [{"role": "user", "content": "run the worker"}]
+            messages += tool_turn("t0", "./worker", _LOG_OUTPUT)
+            messages += tool_turn(
+                "t1", "ls", f"[40 items compressed to 4. Retrieve more: hash={hash_key}]"
+            )
+            messages += [
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": _EXPANSION_QUERY},
+            ]
+            response = client.post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": "test-key",
+                    "anthropic-version": "2023-06-01",
+                    "x-headroom-cwd": cwd,
+                },
+                json={"model": "claude-sonnet-4-6", "max_tokens": 16, "messages": messages},
+            )
+            assert response.status_code == 200, response.text
+    finally:
+        reset_compression_store()
+    (outcome,) = outcomes
+    assert counted and counted[-1] > 0, "setup: the turn did not proactively expand"
+    return outcome, counted[-1]
+
+
+def test_proactive_expansion_is_added_back_to_the_anthropic_running_total(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Expansion text is sent on one turn only and the tracker strips it, so the
+    replayed prefix keeps the removal. The handler must feed the ledger the
+    wire saving with the expansion added back; otherwise expand-then-not
+    re-books the same removal on the next turn (#5069 follow-up). Asserted on
+    the outcome the real handler hands the funnel."""
+    outcome, expansion = _expansion_outcome(monkeypatch, tmp_path, optimize=True)
+    assert outcome.tokens_saved > 0, "setup: nothing was compressed"
+    assert outcome.conversation_key and outcome.conversation_key.startswith("anthropic:")
+    assert outcome.conversation_tokens_saved == outcome.tokens_saved + expansion
+
+
+def test_proactive_expansion_alone_books_nothing_on_the_anthropic_ledger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A turn that only expands removes nothing. Adding the expansion back to
+    the clamped per-request saving would book the expansion's own size as a
+    removal; the running total has to come from the signed wire saving."""
+    outcome, _ = _expansion_outcome(monkeypatch, tmp_path, optimize=False)
+    assert outcome.tokens_saved == 0
+    assert outcome.conversation_tokens_saved == 0
