@@ -20,6 +20,8 @@ It checks for a matching durable `headroom init` deployment and starts it if nee
 | `SessionStart` | `startup\|resume` | deployment is ready before the first turn |
 | `PreToolUse` | `Bash\|PowerShell` | shell tools always hit a live proxy |
 
+When the helper has to spawn a runner and it is itself running inside a systemd unit (a timer that calls `ensure`, for example), it launches the runner in its own transient scope via `systemd-run --user --scope`. Without that, the calling unit's default `KillMode=control-group` would kill the new runner the moment the unit exits.
+
 ## Install
 
 - **Claude Code**: the plugin ships a `.claude-plugin/plugin.json` manifest — install it as a Claude Code plugin from the headroom repository.

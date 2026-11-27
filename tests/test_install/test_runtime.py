@@ -1116,6 +1116,61 @@ def test_start_detached_agent_closes_parent_log_fd(monkeypatch, tmp_path: Path) 
     assert log_handle.closed is True
 
 
+def test_start_detached_agent_escapes_caller_systemd_cgroup(monkeypatch, tmp_path: Path) -> None:
+    """Under a systemd unit, spawn through ``systemd-run --user --scope``.
+
+    ``start_new_session`` does not leave the caller's cgroup, so a oneshot
+    caller's ``KillMode=control-group`` teardown kills the freshly started
+    runner. A transient scope unit is outside that cgroup.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+
+    commands: list[list[str]] = []
+
+    class FakeProc:
+        pid = 999
+
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda command, **kwargs: commands.append(command) or FakeProc(),
+    )
+
+    monkeypatch.setenv("INVOCATION_ID", "abc123")
+    monkeypatch.setattr(
+        "headroom.install.runtime.shutil.which", lambda name: "/usr/bin/systemd-run"
+    )
+    start_detached_agent("demo")
+    assert commands[0] == [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--",
+        "headroom",
+        "install",
+        "agent",
+        "run",
+        "--profile",
+        "demo",
+    ]
+
+    # No systemd-run binary: plain spawn (detached as before).
+    monkeypatch.setattr("headroom.install.runtime.shutil.which", lambda name: None)
+    start_detached_agent("demo")
+    assert commands[1] == ["headroom", "install", "agent", "run", "--profile", "demo"]
+
+    # Not invoked by a systemd unit: nothing to escape.
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.shutil.which", lambda name: "/usr/bin/systemd-run"
+    )
+    start_detached_agent("demo")
+    assert commands[2] == ["headroom", "install", "agent", "run", "--profile", "demo"]
+
+
 def test_start_detached_agent_closes_log_fd_when_popen_raises(monkeypatch, tmp_path: Path) -> None:
     """A Popen failure must not leak the just-opened log file handle."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

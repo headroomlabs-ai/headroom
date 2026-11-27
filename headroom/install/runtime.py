@@ -512,10 +512,33 @@ def run_foreground(manifest: DeploymentManifest) -> int:
             _clear_pid(manifest.profile, expected_pid=proc.pid)
 
 
+def _escape_caller_cgroup(command: list[str]) -> list[str]:
+    """Wrap ``command`` so it runs in a systemd scope of its own.
+
+    ``start_new_session`` leaves the session but not the caller's cgroup, so
+    when the caller is a systemd unit (e.g. ``Type=oneshot`` with the default
+    ``KillMode=control-group``) the child is killed the moment that unit
+    stops. ``systemd-run --user --scope`` puts it in a transient scope unit,
+    which the caller's teardown does not reach. Environment is inherited in
+    scope mode, unlike a transient service.
+
+    No-op outside systemd (``INVOCATION_ID``) and where ``systemd-run`` is
+    missing.
+    """
+    if _is_windows() or not os.environ.get("INVOCATION_ID"):
+        return command
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        return command
+    return [systemd_run, "--user", "--scope", "--collect", "--quiet", "--", *command]
+
+
 def start_detached_agent(profile: str) -> subprocess.Popen[str]:
     """Start `headroom install agent run` detached for the given profile."""
 
-    command = [*resolve_headroom_command(), "install", "agent", "run", "--profile", profile]
+    command = _escape_caller_cgroup(
+        [*resolve_headroom_command(), "install", "agent", "run", "--profile", profile]
+    )
     log_file_path = log_path(profile)
     log_file_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(log_file_path, "a", encoding="utf-8", errors="replace")  # noqa: SIM115
