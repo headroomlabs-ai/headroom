@@ -21,6 +21,7 @@ from headroom.transforms.content_router import (
     ContentRouter,
     ContentRouterConfig,
     _bash_command_is_search,
+    _bash_command_lists_files,
     _bash_program,
 )
 from headroom.transforms.lossless_compaction import search_unheading
@@ -449,7 +450,7 @@ _DEEP_FILES = "".join(
 def test_path_fold_handles_windows_backslash_paths(root) -> None:
     posix = "".join(root + row for row in _DEEP_FILES.splitlines(keepends=True))
     windows = posix.replace("/", chr(92))
-    folded = compact_lossless(windows, "paths")
+    folded = compact_lossless(windows, "paths", listing=True)
     assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
     first_header = f"{root}crates/headroom-core/src/transforms/".replace("/", chr(92))
     assert folded.split("\n")[0] == first_header
@@ -461,129 +462,46 @@ def test_mixed_separator_listing_takes_the_smaller_fold() -> None:
     grouped = "".join(
         f"headroom/{folder}{chr(92)}mod_{i}.py\n" for folder in ("cli", "proxy") for i in range(12)
     )
-    assert compact_lossless(grouped, "paths") == _ph(grouped, backslash=True)
+    assert compact_lossless(grouped, "paths", listing=True) == _ph(grouped, backslash=True)
+    assert compact_lossless(grouped, "paths") == _ph(grouped)
     # Interleaved folders: factoring headroom/ beats a header per row, so the
     # "/" fold has to stay a candidate, and its bases may hold a "\".
     interleaved = "".join(
         f"headroom/{folder}{chr(92)}mod_{i}.py\n" for i in range(12) for folder in ("cli", "proxy")
     )
-    assert compact_lossless(interleaved, "paths") == _ph(interleaved)
+    assert compact_lossless(interleaved, "paths", listing=True) == _ph(interleaved)
+
+
+_REGEX_LISTS = {
+    "anchored": ["^invoice@A@d$", "^invoice@A@w$"],
+    "star": ["^invoice@A@d*$", "^invoice@A@w*$"],
+    "quantified": ["invoice@A@d{2}@A@tvalue", "invoice@A@d{2}@A@tstatus"],
+    "bracket": ["invoice@A@d[0-9].pdf", "invoice@A@d[0-9].csv"],
+    "tab-and-extension": ["foo@A@tday.txt", "foo@A@tnight.txt"],
+    "escaped-dots": ["ads@A@.example@A@.com", "ads@A@.example@A@.net"],
+    "looks-like-a-listing": ["src@A@services@A@service_1.py", "src@A@services@A@service_2.py"],
+}
+
+
+@pytest.mark.parametrize("rows", _REGEX_LISTS.values(), ids=_REGEX_LISTS)
+def test_backslash_rows_stay_whole_unless_known_to_be_a_listing(rows) -> None:
+    text = "".join(row.replace("@A@", chr(92)) + "\n" for row in rows)
+    assert compact_lossless(text, "paths") == text
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        # Regex lists: every row reads as a path, so nothing names a file.
-        f"{chr(92)}w+{chr(92)}s{chr(92)}w+\n{chr(92)}d+{chr(92)}s{chr(92)}d+\n",
-        f"^invoice{chr(92)}d*$\n^invoice{chr(92)}w*$\n",
-        f"^invoice{chr(92)}d+$\n^invoice{chr(92)}w+$\n",
-        "".join(f"^invoice{chr(92)}{c}$\n" for c in "dDsSwWbB"),
-        "".join(f"id{chr(92)}{c}\n" for c in "dDsSwWbB"),
-        f"invoice{chr(92)}d{{2}}{chr(92)}tvalue\ninvoice{chr(92)}d{{2}}{chr(92)}tstatus\n",
-        f"name{chr(92)}p{{L}}x\nname{chr(92)}p{{L}}y\n",
-        f"ads{chr(92)}.example{chr(92)}.com\nads{chr(92)}.example{chr(92)}.net\n",
-        f"ads{chr(92)}.example.com\nads{chr(92)}.example.net\n",
-        f"read{chr(92)}_file\nread{chr(92)}_line\n",
-        "".join(f"img{chr(92)}{c}.png\n" for c in "dDsSwWbB"),
-        "".join(f"img{chr(92)}{c}+.png\n" for c in "dDsSwWbB"),
-        "".join(f"img{chr(92)}{c}{{2}}.png\n" for c in "dDsSwWbB"),
-        f"^log{chr(92)}tday.txt\n^log{chr(92)}tnight.txt\n",
-        f"app{chr(92)}core{chr(92)}a.py\napp{chr(92)}core{chr(92)}make\napp{chr(92)}core{chr(92)}license\n",
         # A lone leading "\" is not a path root.
         f"{chr(92)}home{chr(92)}a.py\n{chr(92)}home{chr(92)}b.py\n",
         # The "/" fold's markup rule holds with "\" as a separator too.
         f"{{{{/if}}}}{chr(92)}x.py\n{{{{/if}}}}{chr(92)}y.py\n",
+        f"app{chr(92)}a.py\nnot a path\napp{chr(92)}b.py\n",
     ],
-    ids=[
-        "word-classes",
-        "star",
-        "plus",
-        "anchored",
-        "unanchored",
-        "tab-escape",
-        "property-escape",
-        "escaped-dots",
-        "half-escaped-dots",
-        "markdown-escapes",
-        "class-then-dot",
-        "class-plus-dot",
-        "class-count-dot",
-        "anchored-with-extension",
-        "mostly-no-extension",
-        "lone-root",
-        "template-closers",
-    ],
+    ids=["lone-root", "template-closers", "not-pure"],
 )
-def test_backslash_path_fold_skips_non_listings(text) -> None:
+def test_backslash_path_fold_skips_rows_that_are_not_paths(text) -> None:
     assert _ph(text, backslash=True) == text
-    assert compact_lossless(text, "paths") == text
-
-
-@pytest.mark.parametrize("tail", ["", "+", "{2}", "[0-9]", "(a)"])
-@pytest.mark.parametrize("letter", "dDsSwWbB")
-def test_class_letter_on_its_own_is_not_a_file_name(letter, tail) -> None:
-    text = f"img{chr(92)}{letter}{tail}.png\nimg{chr(92)}{letter}{tail}.jpg\n"
-    assert compact_lossless(text, "paths") == text
-
-
-def test_slash_listing_needs_no_extensions() -> None:
-    text = "src/app/main\nsrc/app/lib\n"
-    assert compact_lossless(text, "paths") == "src/app/\nmain\nlib\n"
-
-
-@pytest.mark.parametrize("char", ["*", "?", '"', "|"])
-@pytest.mark.parametrize(
-    "row", ["src/core/a{0}b/{1}.py", "src/core/{1}{0}.py"], ids=["dir", "base"]
-)
-def test_backslash_path_fold_rejects_names_windows_cannot_hold(row, char) -> None:
-    text = "".join(row.format(char, n) + "\n" for n in "xyz").replace("/", chr(92))
-    assert _ph(text, backslash=True) == text
-
-
-def test_backslash_path_fold_keeps_names_that_only_look_like_regexes() -> None:
-    names = (
-        "C++",
-        "[slug]",
-        "(auth)",
-        "{{cookiecutter.name}}",
-        "$out",
-        "d",
-        "w2",
-        "s-3",
-        "w{draft}",
-    )
-    posix = "".join(
-        f"app/{name}/{base}\n"
-        for name in names
-        for base in ("+page.ts", "Foo$1.kt", "w{draft}.txt")
-    )
-    windows = posix.replace("/", chr(92))
-    folded = compact_lossless(windows, "paths")
-    assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
-    assert _puh(folded, backslash=True) == windows
-
-
-@pytest.mark.parametrize(
-    "rows",
-    [
-        [f"src/services/service_{i:03}.py" for i in range(100)],  # every "\" is followed by "s"
-        [f"routes/blog/+page{i}.svelte" for i in range(3)],
-        [f"pages/blog/[slug{i}].tsx" for i in range(3)],
-        [
-            "app/core/a.py",
-            "app/core/c.py",
-            "app/core/Makefile",
-            "app/core/LICENSE",
-        ],  # half is enough
-    ],
-    ids=["escape-initials", "plus-name", "bracket-name", "half-extensionless"],
-)
-def test_backslash_path_fold_recognizes_listings(rows) -> None:
-    posix = "\n".join(rows) + "\n"
-    windows = posix.replace("/", chr(92))
-    folded = compact_lossless(windows, "paths")
-    assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
-    assert _puh(folded, backslash=True) == windows
 
 
 @pytest.mark.parametrize("sep", ["/", chr(92)], ids=["slash", "backslash"])
@@ -593,7 +511,7 @@ def test_paths_fold_does_not_decode_text_that_is_not_a_listing(sep) -> None:
     text = "h" * 5000 + sep + "\n" + "".join(f"f{i}.py\n" for i in range(500))
     tracemalloc.start()
     try:
-        assert compact_lossless(text, "paths") == text
+        assert compact_lossless(text, "paths", listing=True) == text
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
@@ -627,14 +545,128 @@ def test_paths_fold_bounds_its_verification(monkeypatch) -> None:
     assert peak < 20 * len(content)
 
 
-def test_windows_listing_takes_the_lossless_paths_fold(tokenizer) -> None:
-    # Over the 2000-char floor below which a shell result stays verbatim (#3590).
+_LISTING_COMMANDS = [
+    "rg --files",
+    "rg --files src tests",
+    "rg -l HashMap crates",
+    "rg -il 'import re' headroom",
+    "rg -g '*.py' -l x",
+    "rg -tpy -l x",
+    "rg -e pat -l src",
+    "rg --files-with-matches x",
+    "rg --files-without-match x",
+    "rg.exe --files",
+    "grep -rl foo .",
+    "grep -rL foo .",
+    "grep -r --files-with-matches foo .",
+    "fd",
+    "fd -e py",
+    "fdfind -H rs crates",
+    "cd repo && rg --files",
+    "sudo rg --files",
+    "rg --files 2>/dev/null",
+    "rg --files | sort",
+    "rg -l 'a|b' src | sort | uniq | head -n 40",
+    "rg --files | tail -20",
+    'bash -lc "rg --files | head -20"',
+    "bash -c 'rg --files' | sort",
+    "pwsh -Command 'rg --files'",
+    "powershell.exe -c 'Get-ChildItem -Recurse -Name'",
+    "Get-ChildItem -Recurse -File -Name headroom",
+    "gci -r -name",
+    "Get-ChildItem -Recurse -File headroom | Resolve-Path -Relative",
+    "Get-ChildItem -Recurse -Name | Sort-Object | Select-Object -First 50",
+]
+_OTHER_COMMANDS = [
+    "",
+    "cat rules.txt",
+    "type rules.txt",
+    "rg -n foo src",
+    "rg -INtlua foo",  # -t takes "lua": the l is not -l
+    "rg -e -l src",  # -e takes "-l": the pattern
+    "rg -A l foo",
+    "rg -- --files rules.txt",
+    "rg -L foo src",  # follow symlinks, not a listing
+    "rg --no-filename foo rules",
+    "grep -h foo rules.txt",
+    "grep -e -l rules.txt",
+    "grep -f l rules.txt",
+    "fd -x cat",
+    "fd --exec-batch cat",
+    "fd -HX cat",
+    "rg --files | xargs cat",
+    "rg --files | xargs -n1 head -5",
+    "rg --files | head rules.txt",
+    "rg --files | sed 's/a/b/'",
+    "rg --files | wc -l",
+    "rg --files | cut -c1-20",
+    "bash -c 'rg --files' | xargs cat",
+    "rg --files | grep -o x",
+    "rg --files; cat rules.txt",
+    "rg --files && cat rules.txt",
+    "rg --files || cat rules.txt",
+    "cat rules.txt | sort",
+    "cat files.txt | xargs rg -l x",
+    'bash -lc "cat rules.txt"',
+    "bash list_files.sh",
+    "Get-ChildItem -Recurse",
+    "Get-ChildItem | Resolve-Path",
+    "Get-Content rules.txt | Resolve-Path -Relative",
+    "git show HEAD:rules.txt",
+    "rg --files\ncat rules.txt",
+]
+
+
+@pytest.mark.parametrize("command", _LISTING_COMMANDS)
+def test_detects_commands_that_list_files(command) -> None:
+    assert _bash_command_lists_files(command)
+
+
+@pytest.mark.parametrize("command", _OTHER_COMMANDS)
+def test_ignores_commands_that_do_not_list_files(command) -> None:
+    assert not _bash_command_lists_files(command)
+
+
+@pytest.mark.parametrize("send", [_openai, _anthropic], ids=["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "command", ["rg --files crates", "rg -l HashMap crates", "fd -e rs | sort"]
+)
+def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer) -> None:
     posix = "".join(
         f"crates/headroom-core/src/{folder}/module_{i:02}.rs\n"
         for folder in ("transforms", "ccr", "signals")
         for i in range(20)
     )
     windows = posix.replace("/", chr(92))
-    out, transforms = _anthropic("rg --files crates", windows, tokenizer)
-    assert "router:tool_result:lossless_paths" in transforms
+    out, transforms = send(command, windows, tokenizer)
+    assert "router:bash:lossless_paths" in transforms
+    assert out == _ph(windows, backslash=True)
     assert _puh(out, backslash=True) == windows
+
+
+@pytest.mark.parametrize("send", [_openai, _anthropic], ids=["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "command", ["cat rules.txt", "rg --no-filename foo rules", "rg --files | xargs cat"]
+)
+def test_router_keeps_regex_rules_whole(command, send, tokenizer) -> None:
+    # Every rule is also a valid Windows path; only the command tells them apart.
+    rules = "".join(f"foo{chr(92)}tday_{i:03}.txt\n" for i in range(120))
+    out, transforms = send(command, rules, tokenizer)
+    assert "router:bash:lossless_paths" not in transforms
+    assert "router:tool_result:lossless_paths" not in transforms
+    assert "foo" + chr(92) not in out.split("\n")
+
+
+def test_windows_listing_that_does_not_fold_takes_the_general_path(tokenizer) -> None:
+    # One folder per file: a header per row would only add bytes.
+    listing = "".join(f"crate_{i:03}{chr(92)}lib.rs\n" for i in range(120))
+    out, transforms = _anthropic("rg --files", listing, tokenizer)
+    assert "router:bash:lossless_paths" not in transforms
+
+
+def test_posix_listing_is_left_to_the_general_path(tokenizer) -> None:
+    posix = "".join(f"crates/core/src/module_{i:03}.rs\n" for i in range(120))
+    out, transforms = _anthropic("rg --files crates", posix, tokenizer)
+    assert "router:bash:lossless_paths" not in transforms
+    assert "router:tool_result:lossless_paths" in transforms
+    assert _puh(out) == posix

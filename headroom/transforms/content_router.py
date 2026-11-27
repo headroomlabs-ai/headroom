@@ -1147,6 +1147,78 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     return prog in search_commands
 
 
+# Short options that take a value, so a letter after them is not a flag.
+_VALUE_FLAGS = {"rg": "ABCEMdefgjmrtT", "grep": "ABCDdefm"}
+# Pipeline stages that pass rows through as they are.
+_ROW_FILTERS = frozenset({"sort", "head", "tail", "uniq", "sort-object", "select-object"})
+
+
+def _bash_command_lists_files(command: str) -> bool:
+    """True when ``command`` prints file paths, one per row: ``rg --files``,
+    ``rg -l``/``grep -l``, ``fd``, PowerShell's ``Get-ChildItem -Name`` or
+    ``... | Resolve-Path -Relative``. One command, piped at most through stages
+    that only pick or order rows, so what it prints is the listing.
+    """
+    command = _strip_cd_prefix(command)
+    segments = _command_segments(command)
+    if len(segments) != 1:
+        return False
+    masked = _mask_quoted(segments[0])
+    if "\n" in masked:
+        return False
+    ends = [i for i, char in enumerate(masked) if char == "|"] + [len(masked)]
+    starts = [0] + [i + 1 for i in ends[:-1]]
+    stages = [segments[0][start:end] for start, end in zip(starts, ends)]
+    relative = False
+    for stage in stages[1:]:
+        # Judged by its own first word: `| xargs head` runs head on the files.
+        prog, *args = stage.split() or [""]
+        prog = prog.lower()
+        if prog == "resolve-path":
+            relative = any(arg.lower() == "-relative" for arg in args)
+        elif prog not in _ROW_FILTERS or not all(a.startswith("-") or a.isdigit() for a in args):
+            return False
+    prog, rest = _bash_program(stages[0])
+    prog = prog.removesuffix(".exe")
+    if prog in {"sh", "bash", "zsh", "dash", "pwsh", "powershell"}:
+        for j, tok in enumerate(rest):
+            if tok.lower() in {"-c", "-lc", "-lic", "-ic", "-command"} and j + 1 < len(rest):
+                return _bash_command_lists_files(" ".join(rest[j + 1 :]).strip("'\""))
+        return False
+    if prog in {"get-childitem", "gci"}:
+        return relative or any(arg.lower() == "-name" for arg in rest)
+    if prog in {"fd", "fdfind"}:
+        return not any(re.match(r"--exec|-[A-Za-z]*[xX]", arg) for arg in rest)
+    if prog in {"rg", "ripgrep"}:
+        return _has_flag(
+            rest, "rg", "l", {"--files", "--files-with-matches", "--files-without-match"}
+        )
+    if prog == "grep":
+        return _has_flag(rest, "grep", "lL", {"--files-with-matches", "--files-without-match"})
+    return False
+
+
+def _has_flag(args: list[str], tool: str, letters: str, names: set[str]) -> bool:
+    """True when ``args`` hold one of the short ``letters`` or long ``names``."""
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg == "--":
+            return False
+        if arg in names:
+            return True
+        if arg.startswith("-") and not arg.startswith("--"):
+            for pos, char in enumerate(arg[1:], 1):
+                if char in letters:
+                    return True
+                if char in _VALUE_FLAGS[tool]:
+                    skip = pos == len(arg) - 1
+                    break
+    return False
+
+
 def _router_debug_enabled() -> bool:
     """Router debug events carry the tool output being routed, so DEBUG alone is
     not enough: they also need the explicit content opt-in."""
@@ -7021,13 +7093,14 @@ class ContentRouter(Transform):
                 # output. Fold it instead of the lossy strategy path.
                 bash_folded = self._bash_search_fold(tool_name, tool_call_id, content)
                 if bash_folded is not None:
-                    result_slots[i] = {**message, "content": bash_folded}
-                    transforms_applied.append("router:bash:lossless_search")
-                    route_counts["bash_lossless_search"] = (
-                        route_counts.get("bash_lossless_search", 0) + 1
+                    folded, kind = bash_folded
+                    result_slots[i] = {**message, "content": folded}
+                    transforms_applied.append(f"router:bash:lossless_{kind}")
+                    route_counts[f"bash_lossless_{kind}"] = (
+                        route_counts.get(f"bash_lossless_{kind}", 0) + 1
                     )
                     if collect_diagnostics:
-                        _diag[i] = "compressed:bash_lossless_search"
+                        _diag[i] = f"compressed:bash_lossless_{kind}"
                     continue
 
                 # Small shell results stay verbatim (#3590). A short `ls`,
@@ -7768,7 +7841,9 @@ class ContentRouter(Transform):
         minified = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
         return minified if len(minified) < len(content) else None
 
-    def _bash_search_fold(self, tool_name: str, tool_id: str, content: Any) -> str | None:
+    def _bash_search_fold(
+        self, tool_name: str, tool_id: str, content: Any
+    ) -> tuple[str, str] | None:
         """Byte-lossless fold for a read-only search run through a shell tool.
 
         ``bash`` is not excluded, so its output normally takes the lossy strategy
@@ -7780,22 +7855,33 @@ class ContentRouter(Transform):
         gated command (``grep -l`` path-lists, ``grep -c`` counts) simply falls
         through to the normal path with no accuracy risk.
 
-        Returns the folded text (smaller, recoverable) or ``None`` to fall through.
+        A file listing with Windows paths is folded here too, because only the
+        command tells it from other text with backslashes (a list of regexes).
+
+        Returns the folded text (smaller, recoverable) and the kind of fold, or
+        ``None`` to fall through.
         """
         if not isinstance(content, str) or len(content) < 200:
             return None
         if tool_name.lower() not in self.config.bash_tool_names:
             return None
         command = self._tool_call_commands.get(tool_id, "")
-        if not command or not _bash_command_is_search(command, self.config.bash_search_commands):
+        if not command:
             return None
         try:
             from .lossless_compaction import compact_lossless
 
-            folded = compact_lossless(content, "search")
+            if _bash_command_is_search(command, self.config.bash_search_commands):
+                folded = compact_lossless(content, "search")
+                if len(folded) < len(content):
+                    return folded, "search"
+            if "\\" in content and _bash_command_lists_files(command):
+                folded = compact_lossless(content, "paths", listing=True)
+                if len(folded) < len(content):
+                    return folded, "paths"
         except Exception:  # noqa: BLE001
             return None
-        return folded if len(folded) < len(content) else None
+        return None
 
     def _content_cache_key(
         self, content: str, *, gated: bool = False, bias: float = 1.0, context: str = ""
@@ -8326,20 +8412,19 @@ class ContentRouter(Transform):
                 # instead of taking the lossy strategy path.
                 bash_folded = self._bash_search_fold(tool_name, tool_use_id, tool_text)
                 if bash_folded is not None:
+                    folded, kind = bash_folded
                     new_blocks.append(
                         {
                             **block,
                             "content": (
-                                [{"type": "text", "text": bash_folded}]
-                                if _tr_list_form
-                                else bash_folded
+                                [{"type": "text", "text": folded}] if _tr_list_form else folded
                             ),
                         }
                     )
-                    transforms_applied.append("router:bash:lossless_search")
+                    transforms_applied.append(f"router:bash:lossless_{kind}")
                     if route_counts is not None:
-                        route_counts["bash_lossless_search"] = (
-                            route_counts.get("bash_lossless_search", 0) + 1
+                        route_counts[f"bash_lossless_{kind}"] = (
+                            route_counts.get(f"bash_lossless_{kind}", 0) + 1
                         )
                     any_compressed = True
                     continue

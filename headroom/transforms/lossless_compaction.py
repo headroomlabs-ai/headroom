@@ -461,19 +461,12 @@ _PATH_ROW_RE = re.compile(
     r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
 )
 # The same with ``\`` also a separator, for the paths Windows tools print
-# (ripgrep, PowerShell). The root may be ``.\`` or ``..\`` but not a lone
-# ``\``, a Windows name cannot hold ``* ? " |`` (``\x22`` is the quote), and a row
-# anchored like a regex (``^id\d``) is not a path.
+# (ripgrep, PowerShell). Only for text known to be a listing: row by row a list of
+# regexes (``id\d``, ``foo\tday.txt``) looks the same.
 _PATH_ROW_BACKSLASH_RE = re.compile(
-    r"^(?!\^)(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?"
-    r"(?:(?=[^/\\]*\w)[^/\\\s:<>;*?\x22|]+[/\\])+)"
-    r"(?P<base>[^/\\\s:<>;*?\x22|]+)$"
+    r"^(?P<dir>(?:\.{0,2}/|\.{1,2}\\)?(?:(?=[^/\\]*\w)[^/\\\s:<>;]+[/\\])+)"
+    r"(?P<base>[^/\\\s:<>;]+)$"
 )
-# Row by row a list of regexes (``id\d``, ``row\tname``) looks like Windows paths, so a
-# listing needs its own evidence: files have extensions. A regex escapes its dot
-# (``\.``), so its last piece is not ``name.ext``, and a class letter on its own
-# (``img\d.png``, ``img\d+.png``, ``img\d[0-9].png``) is no evidence either.
-_FILE_NAME_RE = re.compile(r"(?![dDsSwWbB]\W)[\w+\[].*\.\w+$")
 
 
 def path_heading(text: str, *, backslash: bool = False) -> str:
@@ -501,10 +494,7 @@ def path_heading(text: str, *, backslash: bool = False) -> str:
         if ln and not m:  # not a pure listing; stop at the first such line
             return text
         matches.append(m)
-    rows = [m for m in matches if m]
-    if len(rows) < 2:
-        return text
-    if backslash and 2 * sum(1 for m in rows if _FILE_NAME_RE.match(m["base"])) < len(rows):
+    if sum(1 for m in matches if m) < 2:
         return text
     out: list[str] = []
     current: str | None = None
@@ -576,7 +566,7 @@ def _lossless_compaction_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-def compact_lossless(content: str, kind: str) -> str:
+def compact_lossless(content: str, kind: str, *, listing: bool = False) -> str:
     """Dispatch format-native lossless compaction by ``kind``.
 
     ``kind`` in {'log', 'search', 'diff', 'text', 'config'}. For reversible kinds the
@@ -584,6 +574,9 @@ def compact_lossless(content: str, kind: str) -> str:
     non-semantic bits, e.g. ANSI color for logs); if verification fails or the
     result is not smaller, the original content is returned unchanged. Never
     raises; unknown kinds pass through.
+
+    ``listing=True`` says the content is known to be a file listing (the command
+    printed one), which lets the ``paths`` fold read ``\\`` as a separator.
 
     Set ``HEADROOM_LOSSLESS_COMPACTION=0`` to disable every fold here while
     leaving the rest of the pipeline (Kompress, SmartCrusher, CCR) active. The
@@ -634,7 +627,7 @@ def compact_lossless(content: str, kind: str) -> str:
             # As in "search", the "\" fold for Windows paths is an extra
             # candidate and the smallest exact round-trip wins.
             best = content
-            for backslash in (False, True) if "\\" in content else (False,):
+            for backslash in (False, True) if listing and "\\" in content else (False,):
                 candidate = path_heading(content, backslash=backslash)
                 # Size first: text that is not a pure listing comes back
                 # unchanged, and decoding it would copy a line that ends in a
