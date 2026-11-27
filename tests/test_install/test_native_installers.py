@@ -907,6 +907,48 @@ def test_powershell_installer_writes_only_the_chosen_profile(
     os.name != "nt" or _powershell_executable() is None,
     reason="Windows PowerShell coverage runs on Windows hosts only",
 )
+def test_powershell_installer_accepts_bare_filename_profile_override(tmp_path: Path) -> None:
+    """A filename-only override (``profile.ps1``) has an empty parent and must still work.
+
+    ``Split-Path -Parent`` returns an empty string for it, which ``New-Item`` rejects; the
+    profile belongs in the current directory.
+    """
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+    env["HEADROOM_INSTALL_PROFILE_PATH"] = "profile.ps1"
+
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=workdir,
+        )
+    finally:
+        _cleanup_fake_docker(env)
+
+    profile = workdir / "profile.ps1"
+    assert profile.exists(), "installer did not write profile.ps1 in the current directory"
+    assert profile.read_bytes().count(b"# >>> headroom docker-native >>>") == 1
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
 def test_powershell_mcp_wrapper_keeps_stdin_attached_for_redirected_stdio(
     tmp_path: Path,
 ) -> None:

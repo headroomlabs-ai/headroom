@@ -101,7 +101,9 @@ $markerEnd
 
     $profileDir = Split-Path -Parent $profilePath
     # -LiteralPath: a profile name may hold [ ], which -Path treats as wildcards.
-    if (-not (Test-Path -LiteralPath $profileDir)) {
+    # A bare filename (profile.ps1) has an empty parent: it lives in the current
+    # directory, which already exists, and New-Item rejects an empty -Path.
+    if ($profileDir -and -not (Test-Path -LiteralPath $profileDir)) {
         New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
     }
     if (-not (Test-Path -LiteralPath $profilePath)) {
