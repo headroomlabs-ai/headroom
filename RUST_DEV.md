@@ -109,7 +109,7 @@ curl -si -H "X-Headroom-Proxy-Token: $HEADROOM_PROXY_TOKEN" \
 | `--max-body-bytes` |  | `100MB` | for buffered cases; streams bypass |
 | `--log-level` |  | `info` | `RUST_LOG`-style filter |
 | `--rewrite-host` / `--no-rewrite-host` | | rewrite | rewrite Host to upstream (default) |
-| `--python-upstream` | `HEADROOM_PROXY_PYTHON_UPSTREAM` | `false` | the upstream is the Headroom Python proxy: relay non-local callers under `headroom-remote.invalid` and send the relay proof (below); leave off for any other backend |
+| `--python-upstream` | `HEADROOM_PROXY_PYTHON_UPSTREAM` | `false` | the upstream is the Headroom Python proxy: relay non-local callers under `headroom-remote.invalid` over HTTP (WebSocket handshakes keep the upstream's `Host` and rely on the remote marker) and send the relay proof on both (below); leave off for any other backend |
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
 | `--stats` | `HEADROOM_PROXY_STATS` | `true` | native savings stats + `/dashboard` (below) |
 | `--stats-path` | `HEADROOM_PROXY_STATS_PATH` | `~/.headroom/native_stats.json` | ledger persistence (honours `HEADROOM_WORKSPACE_DIR`) |
@@ -150,7 +150,7 @@ Python proxy trusts loopback callers (no token needed, and access to
   `X-Headroom-Front-Proof` a client sends, and never sends one without
   `--python-upstream`.
 - A caller that is not local here (a non-loopback peer, or a loopback
-  peer whose `Host` is not a loopback name) is never forwarded with a
+  peer whose `Host` is not a loopback name) is never forwarded over HTTP with a
   `Host` that may name loopback (including scoped IPv6 such as
   `[::1%lo]`), whatever `--rewrite-host` is and whatever the upstream
   name resolves to: that `Host` is replaced with
@@ -159,7 +159,11 @@ Python proxy trusts loopback callers (no token needed, and access to
   without a token. With `--python-upstream` the relayed `Host` is always
   `headroom-remote.invalid`, even under `--no-rewrite-host`; without it a
   public `Host` kept by `--no-rewrite-host` reaches the backend as sent,
-  so a same-host gateway can still route on it.
+  so a same-host gateway can still route on it. This `Host` rule is
+  HTTP only: a relayed WebSocket handshake always carries the upstream's
+  own `Host` (the WebSocket client sets it, e.g. `127.0.0.1:8788`), and
+  relies on the remote marker below (plus the relay proof with
+  `--python-upstream`) to keep a remote caller from counting as local.
 - `GET /healthz`, `/healthz/upstream`, `/health`, `/livez` and `/readyz`
   stay reachable without the token, and also from a loopback peer under
   a public `Host` when no token is configured (a monitor behind a
@@ -217,8 +221,9 @@ Python proxy trusts loopback callers (no token needed, and access to
   front on a non-loopback address. The front logs
   `event=proxy_loopback_listen_with_token` at startup as a reminder when
   it listens on loopback with a token configured.
-- Every request relayed for a caller that is not local here carries
-  `X-Headroom-Front-Remote: 1`, in every mode and whatever `Host` is sent;
+- Every request and WebSocket handshake relayed for a caller that is not
+  local here carries `X-Headroom-Front-Remote: 1`, in every mode and
+  whatever `Host` is sent;
   the front drops any value a client sends. It is not a secret: the Python
   proxy never treats a request carrying it as local (loopback or
   container-alias `Host`), so a remote caller cannot borrow a name the
