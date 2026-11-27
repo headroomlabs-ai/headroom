@@ -7,6 +7,8 @@ the two-tier ConfigCompressor, and the router wiring.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from headroom.parser import CCR_RETRIEVAL_MARKER_RE
@@ -140,6 +142,42 @@ def test_detects_structured_config(content: str, flavor: str) -> None:
     assert result.content_type is ContentType.STRUCTURED_CONFIG
     assert result.metadata["flavor"] == flavor
     assert result.confidence >= 0.7
+
+
+def test_ini_assign_regex_is_linear_on_space_runs() -> None:
+    """The INI assignment regex was cubic on a run of spaces (space sits in both
+    the whitespace class and the key class): 1,000 spaces ~4 s, 2,000 ~33 s.
+    Fixed it is ~1 ms; the bound is generous (>500x headroom)."""
+    from headroom.transforms.content_detector import _INI_ASSIGN_RE
+
+    for attack in (" " * 2000 + "!", " \t" * 1000 + "!", "a " * 1000 + "!"):
+        start = time.perf_counter()
+        assert _INI_ASSIGN_RE.match(attack) is None
+        assert time.perf_counter() - start < 1.0
+
+
+def test_ini_assign_regex_keeps_matching_real_assignments() -> None:
+    from headroom.transforms.content_detector import _INI_ASSIGN_RE
+
+    for line in (
+        "key = value",
+        "  key name = value",
+        "a:b",
+        "\t  x=1",
+        "a \t = 1",
+        " = x",
+        "@x.y-z: 1",
+    ):
+        assert _INI_ASSIGN_RE.match(line), line
+    for line in ("no assignment here", "a\tb = 1", "", "   ", "!x = 1"):
+        assert _INI_ASSIGN_RE.match(line) is None, line
+
+
+def test_detect_ini_with_long_space_lines_is_fast() -> None:
+    text = "[s]\na = 1\nb = 2\n" + (" " * 1500 + "!\n") * 3
+    start = time.perf_counter()
+    detect_content_type(text)
+    assert time.perf_counter() - start < 2.0
 
 
 @pytest.mark.parametrize(

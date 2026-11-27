@@ -1,6 +1,7 @@
 """Tests for CCR tool injection and MCP integration."""
 
 import json
+import time
 
 from headroom.ccr import (
     CCR_TOOL_NAME,
@@ -821,3 +822,32 @@ class TestVerifyOwnership:
         result = injector.verify_ownership()
 
         assert result == []
+
+
+class TestGenericMarkerPatternIsLinear:
+    """The generic `[.. compressed .. hash=..]` fallback was cubic on a line of
+    repeated "[compressed " with no hash: 2,400 chars ~0.4 s, 12,000 chars ~50 s,
+    run synchronously on every request's message text. Bounds below are
+    generous (fixed code is ~1 ms, >1000x under them)."""
+
+    def test_repeated_open_bracket_compressed_is_fast(self):
+        injector = CCRToolInjector()
+        for attack in ("[compressed " * 1000, "[" + "compressed " * 1100, "[x compressed " * 1000):
+            messages = [{"role": "user", "content": [{"type": "tool_result", "content": attack}]}]
+            start = time.perf_counter()
+            assert injector.scan_for_markers(messages) == []
+            assert time.perf_counter() - start < 2.0
+
+    def test_generic_marker_still_detected_after_long_prefix(self):
+        h = "0123456789abcdef01234567"
+        injector = CCRToolInjector()
+        text = "x" * 6000 + f"\n[Content COMPRESSED by custom tool, ref hash={h}]"
+        assert injector.scan_for_markers([{"role": "tool", "content": text}]) == [h]
+
+    def test_diff_compressor_marker_is_detected(self):
+        """The diff compressor's retrieval marker reaches only the generic fallback."""
+        h = "0123456789abcdef01234567"
+        diff = "diff --git a/x.py b/x.py\n@@ -1,3 +1,3 @@\n-a\n+b\n"
+        text = f"{diff}[412 lines compressed to 37. Retrieve full diff: hash={h}]"
+        messages = [{"role": "user", "content": [{"type": "tool_result", "content": text}]}]
+        assert CCRToolInjector().scan_for_markers(messages) == [h]

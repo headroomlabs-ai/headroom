@@ -17,6 +17,15 @@ function sseResponse(chunks: string[]): Response {
 }
 
 describe("parseSSE", () => {
+  it("accepts JSON data fields and the completion sentinel without a space", async () => {
+    const events = await collectStream(
+      parseSSE(
+        sseResponse(['data:{"a":1}\n\n', 'data: {"b":2}\n\n', 'data:[DONE]\n\n', 'data: {"c":3}\n\n']),
+      ),
+    );
+    expect(events).toEqual([{ a: 1 }, { b: 2 }]);
+  });
+
   it("yields the final event when the stream has no trailing newline", async () => {
     // Regression: the last `data:` line was held back in the buffer and dropped
     // when the read loop exited on `done`.

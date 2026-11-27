@@ -19,10 +19,13 @@ import os
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("GCP_ACCESS_TOKEN") or not os.environ.get("GCP_PROJECT_ID"),
-    reason="GCP_ACCESS_TOKEN or GCP_PROJECT_ID not set",
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not os.environ.get("GCP_ACCESS_TOKEN") or not os.environ.get("GCP_PROJECT_ID"),
+        reason="GCP_ACCESS_TOKEN or GCP_PROJECT_ID not set",
+    ),
+]
 
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
