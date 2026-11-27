@@ -673,10 +673,6 @@ pub(crate) async fn forward_http(
         .get::<crate::inbound_auth::NonLocalCaller>()
         .is_some()
     {
-        outgoing_headers.insert(
-            crate::inbound_auth::FRONT_REMOTE_HEADER,
-            http::HeaderValue::from_static("1"),
-        );
         if let Some(host) = crate::inbound_auth::host_override_for_non_local(
             outgoing_headers.get(http::header::HOST),
             &state.config.upstream,
@@ -684,17 +680,13 @@ pub(crate) async fn forward_http(
         ) {
             outgoing_headers.insert(http::header::HOST, host);
         }
-        // Stands in for the token this front stripped, so the Python proxy
-        // behind it can tell a caller authenticated here from a relayed
-        // page whose hostname was pointed at 127.0.0.1.
-        if let Some(proof) = req.extensions().get::<crate::inbound_auth::RelayProof>() {
-            if state.config.python_upstream
-                && crate::inbound_auth::upstream_takes_relay_proof(&state.config.upstream)
-            {
-                outgoing_headers.insert(crate::inbound_auth::RELAY_PROOF_HEADER, proof.0.clone());
-            }
-        }
     }
+    crate::inbound_auth::insert_relay_identity(
+        &mut outgoing_headers,
+        req.extensions(),
+        &state.config.upstream,
+        state.config.python_upstream,
+    );
 
     // ─── COMPRESSION GATE ──────────────────────────────────────────────
     //

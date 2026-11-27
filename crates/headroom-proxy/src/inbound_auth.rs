@@ -191,6 +191,28 @@ pub struct RelayProof(pub HeaderValue);
 /// loopback forms this one does not.
 pub const NON_LOCAL_HOST: &str = "headroom-remote.invalid";
 
+/// What the front tells its upstream about a caller it relays, on HTTP and
+/// WebSocket alike: the remote marker for a [`NonLocalCaller`], and, when
+/// that caller presented the token and the upstream is a `--python-upstream`
+/// address that may take it, the relay proof standing in for the stripped
+/// token. A local caller's request is left as it is.
+pub(crate) fn insert_relay_identity(
+    headers: &mut HeaderMap,
+    extensions: &axum::http::Extensions,
+    upstream: &url::Url,
+    python_upstream: bool,
+) {
+    if extensions.get::<NonLocalCaller>().is_none() {
+        return;
+    }
+    headers.insert(FRONT_REMOTE_HEADER, HeaderValue::from_static("1"));
+    if let Some(proof) = extensions.get::<RelayProof>() {
+        if python_upstream && upstream_takes_relay_proof(upstream) {
+            headers.insert(RELAY_PROOF_HEADER, proof.0.clone());
+        }
+    }
+}
+
 /// Whether a `--python-upstream` upstream may receive the relay proof: the
 /// Python proxy on this machine, addressed as a loopback IP literal,
 /// `localhost`, or (from a container) a container host alias.
@@ -434,6 +456,57 @@ mod tests {
         ] {
             assert!(!upstream_takes_relay_proof(&no.parse().unwrap()), "{no}");
         }
+    }
+
+    #[test]
+    fn relay_identity_for_a_container_alias_upstream() {
+        // CI has no container DNS, so the alias upstream is checked here: a
+        // front in a container dialling the Python proxy as
+        // host.docker.internal sends the marker and the proof Python derives
+        // from the same token (see `relay_proof_matches_python`).
+        let token = ProxyToken::new("abc").unwrap();
+        let proof = HeaderValue::from_str(&token.relay_proof()).unwrap();
+        let identity = |upstream: &str, python: bool, remote: bool, proved: bool| {
+            let mut ext = axum::http::Extensions::new();
+            if remote {
+                ext.insert(NonLocalCaller);
+            }
+            if proved {
+                ext.insert(RelayProof(proof.clone()));
+            }
+            let mut headers = HeaderMap::new();
+            insert_relay_identity(&mut headers, &ext, &upstream.parse().unwrap(), python);
+            (
+                headers.get(FRONT_REMOTE_HEADER).cloned(),
+                headers.get(RELAY_PROOF_HEADER).cloned(),
+            )
+        };
+        let marker = Some(HeaderValue::from_static("1"));
+        for upstream in [
+            "http://host.docker.internal:8788",
+            "http://host.containers.internal:8788",
+        ] {
+            assert_eq!(
+                identity(upstream, true, true, true),
+                (marker.clone(), Some(proof.clone()))
+            );
+            // Without --python-upstream the marker still goes, the proof never.
+            assert_eq!(
+                identity(upstream, false, true, true),
+                (marker.clone(), None)
+            );
+            // A remote caller that did not present the token: marker only.
+            assert_eq!(
+                identity(upstream, true, true, false),
+                (marker.clone(), None)
+            );
+            // A local caller: nothing.
+            assert_eq!(identity(upstream, true, false, false), (None, None));
+        }
+        assert_eq!(
+            identity("http://proxy.internal.example:8788", true, true, true),
+            (marker, None)
+        );
     }
 
     #[test]

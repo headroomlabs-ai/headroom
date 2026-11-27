@@ -63,26 +63,15 @@ pub async fn ws_handler(
         &request_id,
         strip_internal_ws,
     );
-    // Same relay identity as the HTTP path (`forward_http`): tungstenite
-    // sets the upstream's own Host, so the marker is what tells the Python
-    // proxy this caller is not local, and the proof stands in for the token.
-    if req
-        .extensions()
-        .get::<crate::inbound_auth::NonLocalCaller>()
-        .is_some()
-    {
-        forward_headers.insert(
-            crate::inbound_auth::FRONT_REMOTE_HEADER,
-            HeaderValue::from_static("1"),
-        );
-        if let Some(proof) = req.extensions().get::<crate::inbound_auth::RelayProof>() {
-            if state.config.python_upstream
-                && crate::inbound_auth::upstream_takes_relay_proof(&state.config.upstream)
-            {
-                forward_headers.insert(crate::inbound_auth::RELAY_PROOF_HEADER, proof.0.clone());
-            }
-        }
-    }
+    // Same relay identity as the HTTP path, but not the reserved relay Host:
+    // tungstenite sets the upstream's own Host, so the marker is what tells
+    // the Python proxy this caller is not local.
+    crate::inbound_auth::insert_relay_identity(
+        &mut forward_headers,
+        req.extensions(),
+        &state.config.upstream,
+        state.config.python_upstream,
+    );
     // Sec-WebSocket-Protocol must be propagated for subprotocol negotiation.
     let subprotocols: Option<String> = req
         .headers()
