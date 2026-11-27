@@ -556,6 +556,12 @@ _LISTING_COMMANDS = [
     "rg --files-with-matches x",
     "rg --files-without-match x",
     "rg.exe --files",
+    ".\\rg.exe --files tests",
+    "C:\\tools\\rg.exe -l x",
+    "rg --regexp pat -l src",
+    "rg --glob=*.py -l x",
+    "rg 'a # b' -l src",  # a quoted # starts no comment
+    "rg --files  # every file",
     "grep -rl foo .",
     "grep -rL foo .",
     "grep -r --files-with-matches foo .",
@@ -576,6 +582,8 @@ _LISTING_COMMANDS = [
     "gci -r -name",
     "Get-ChildItem -Recurse -File headroom | Resolve-Path -Relative",
     "Get-ChildItem -Recurse -Name | Sort-Object | Select-Object -First 50",
+    "Resolve-Path -Relative .\\headroom\\proxy\\*.py",
+    "Resolve-Path -Relative .\\src\\*.rs | Sort-Object",
 ]
 _OTHER_COMMANDS = [
     "",
@@ -584,6 +592,15 @@ _OTHER_COMMANDS = [
     "rg -n foo src",
     "rg -INtlua foo",  # -t takes "lua": the l is not -l
     "rg -e -l src",  # -e takes "-l": the pattern
+    "rg --no-filename --regexp -legacy rules.txt",  # so does --regexp
+    "rg --replace -l foo rules.txt",
+    "rg --context-separator -l -C1 foo rules.txt",
+    "grep --regexp -l rules.txt",
+    "grep --label -l foo",
+    "rg --no-filename legacy rules.txt # -l",  # a comment is not an argument
+    "rg -n foo src  # --files",
+    "rg 'a -l b' rules.txt",  # a quoted pattern is one argument
+    "rg -l 'unclosed",
     "rg -A l foo",
     "rg -- --files rules.txt",
     "rg -L foo src",  # follow symlinks, not a listing
@@ -612,6 +629,8 @@ _OTHER_COMMANDS = [
     "Get-ChildItem -Recurse",
     "Get-ChildItem | Resolve-Path",
     "Get-Content rules.txt | Resolve-Path -Relative",
+    "Resolve-Path .\\src\\*.rs",  # absolute paths in a table
+    "Resolve-Path -Relative x | Get-Content",
     "git show HEAD:rules.txt",
     "rg --files\ncat rules.txt",
 ]
@@ -629,7 +648,14 @@ def test_ignores_commands_that_do_not_list_files(command) -> None:
 
 @pytest.mark.parametrize("send", [_openai, _anthropic], ids=["openai", "anthropic"])
 @pytest.mark.parametrize(
-    "command", ["rg --files crates", "rg -l HashMap crates", "fd -e rs | sort"]
+    "command",
+    [
+        "rg --files crates",
+        "rg -l HashMap crates",
+        "fd -e rs | sort",
+        ".\\rg.exe --files crates",
+        "Resolve-Path -Relative .\\crates\\*\\src\\*\\*.rs",
+    ],
 )
 def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer) -> None:
     posix = "".join(
@@ -646,7 +672,14 @@ def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer)
 
 @pytest.mark.parametrize("send", [_openai, _anthropic], ids=["openai", "anthropic"])
 @pytest.mark.parametrize(
-    "command", ["cat rules.txt", "rg --no-filename foo rules", "rg --files | xargs cat"]
+    "command",
+    [
+        "cat rules.txt",
+        "rg --no-filename foo rules",
+        "rg --files | xargs cat",
+        "rg --no-filename --regexp -legacy rules",
+        "rg --no-filename foo rules # -l",
+    ],
 )
 def test_router_keeps_regex_rules_whole(command, send, tokenizer) -> None:
     # Every rule is also a valid Windows path; only the command tells them apart.

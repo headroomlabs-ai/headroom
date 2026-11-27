@@ -1147,8 +1147,41 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     return prog in search_commands
 
 
-# Short options that take a value, so a letter after them is not a flag.
-_VALUE_FLAGS = {"rg": "ABCEMdefgjmrtT", "grep": "ABCDdefm"}
+# Options that take a value, so what follows them is not a flag: every short one,
+# and the long ones whose value may start with "-" (a pattern, glob, file name,
+# separator or command; a number, enum or type name cannot).
+_VALUE_FLAGS = {
+    "rg": (
+        "ABCEMdefgjmrtT",
+        {
+            "--regexp",
+            "--file",
+            "--replace",
+            "--glob",
+            "--iglob",
+            "--ignore-file",
+            "--pre",
+            "--pre-glob",
+            "--context-separator",
+            "--field-context-separator",
+            "--field-match-separator",
+            "--path-separator",
+        },
+    ),
+    "grep": (
+        "ABCDdefm",
+        {
+            "--regexp",
+            "--file",
+            "--label",
+            "--group-separator",
+            "--include",
+            "--exclude",
+            "--exclude-dir",
+            "--exclude-from",
+        },
+    ),
+}
 # Pipeline stages that pass rows through as they are.
 _ROW_FILTERS = frozenset({"sort", "head", "tail", "uniq", "sort-object", "select-object"})
 
@@ -1156,8 +1189,9 @@ _ROW_FILTERS = frozenset({"sort", "head", "tail", "uniq", "sort-object", "select
 def _bash_command_lists_files(command: str) -> bool:
     """True when ``command`` prints file paths, one per row: ``rg --files``,
     ``rg -l``/``grep -l``, ``fd``, PowerShell's ``Get-ChildItem -Name`` or
-    ``... | Resolve-Path -Relative``. One command, piped at most through stages
-    that only pick or order rows, so what it prints is the listing.
+    ``Resolve-Path -Relative`` (on its own or after a pipe). One command, piped at
+    most through stages that only pick or order rows, so what it prints is the
+    listing.
     """
     command = _strip_cd_prefix(command)
     segments = _command_segments(command)
@@ -1166,9 +1200,11 @@ def _bash_command_lists_files(command: str) -> bool:
     masked = _mask_quoted(segments[0])
     if "\n" in masked:
         return False
+    # A comment is no argument: `rg foo # -l` is not a listing.
+    segment = _strip_shell_comment(segments[0])
     ends = [i for i, char in enumerate(masked) if char == "|"] + [len(masked)]
     starts = [0] + [i + 1 for i in ends[:-1]]
-    stages = [segments[0][start:end] for start, end in zip(starts, ends)]
+    stages = [segment[start:end] for start, end in zip(starts, ends)]
     relative = False
     for stage in stages[1:]:
         # Judged by its own first word: `| xargs head` runs head on the files.
@@ -1179,7 +1215,7 @@ def _bash_command_lists_files(command: str) -> bool:
         elif prog not in _ROW_FILTERS or not all(a.startswith("-") or a.isdigit() for a in args):
             return False
     prog, rest = _bash_program(stages[0])
-    prog = prog.removesuffix(".exe")
+    prog = prog.rsplit("\\", 1)[-1].removesuffix(".exe")  # .\rg.exe -> rg
     if prog in {"sh", "bash", "zsh", "dash", "pwsh", "powershell"}:
         for j, tok in enumerate(rest):
             if tok.lower() in {"-c", "-lc", "-lic", "-ic", "-command"} and j + 1 < len(rest):
@@ -1187,19 +1223,27 @@ def _bash_command_lists_files(command: str) -> bool:
         return False
     if prog in {"get-childitem", "gci"}:
         return relative or any(arg.lower() == "-name" for arg in rest)
+    if prog == "resolve-path":
+        return any(arg.lower() == "-relative" for arg in rest)
     if prog in {"fd", "fdfind"}:
         return not any(re.match(r"--exec|-[A-Za-z]*[xX]", arg) for arg in rest)
-    if prog in {"rg", "ripgrep"}:
+    if prog in {"rg", "ripgrep", "grep"}:
+        try:
+            # _bash_program keeps shell quotes: `rg 'a -l b'` is one pattern.
+            args = shlex.split(" ".join(rest))
+        except ValueError:
+            return False
+        if prog == "grep":
+            return _has_flag(args, "grep", "lL", {"--files-with-matches", "--files-without-match"})
         return _has_flag(
-            rest, "rg", "l", {"--files", "--files-with-matches", "--files-without-match"}
+            args, "rg", "l", {"--files", "--files-with-matches", "--files-without-match"}
         )
-    if prog == "grep":
-        return _has_flag(rest, "grep", "lL", {"--files-with-matches", "--files-without-match"})
     return False
 
 
 def _has_flag(args: list[str], tool: str, letters: str, names: set[str]) -> bool:
     """True when ``args`` hold one of the short ``letters`` or long ``names``."""
+    short_values, long_values = _VALUE_FLAGS[tool]
     skip = False
     for arg in args:
         if skip:
@@ -1209,11 +1253,13 @@ def _has_flag(args: list[str], tool: str, letters: str, names: set[str]) -> bool
             return False
         if arg in names:
             return True
-        if arg.startswith("-") and not arg.startswith("--"):
+        if arg in long_values:
+            skip = True
+        elif arg.startswith("-") and not arg.startswith("--"):
             for pos, char in enumerate(arg[1:], 1):
                 if char in letters:
                     return True
-                if char in _VALUE_FLAGS[tool]:
+                if char in short_values:
                     skip = pos == len(arg) - 1
                     break
     return False
