@@ -16,7 +16,7 @@ from headroom.learn.models import ProjectInfo
 from headroom.learn.plugins.claude import ClaudeCodePlugin
 
 
-def _write_session(path: Path, out: str = "x" * 400) -> None:
+def _write_session(path: Path, out: str | list = "x" * 400) -> None:
     """Write a minimal Claude Code session: one tool_use paired with a result."""
     lines = [
         {
@@ -80,6 +80,21 @@ def test_scan_survives_null_message_line(tmp_path: Path) -> None:
     assert session is not None
     assert len(session.tool_calls) == 1
     assert session.total_input_tokens == 100
+
+
+def test_list_tool_result_content_is_read_as_its_text(tmp_path: Path) -> None:
+    # MCP, Agent and image Read results are stored as a list of blocks. The
+    # output is their text, not the list's repr with an image's base64 in it.
+    path = tmp_path / "main-uuid.jsonl"
+    image = {"type": "image", "source": {"type": "base64", "data": "A" * 4000}}
+    _write_session(path, out=[{"type": "text", "text": "Error: not found"}, image])
+
+    session = ClaudeCodePlugin()._scan_session(path)
+
+    assert session is not None
+    (call,) = session.tool_calls
+    assert call.output == "Error: not found"
+    assert call.output_bytes == len("Error: not found")
 
 
 def test_scan_project_discovers_subagent_and_workflow_transcripts(tmp_path: Path) -> None:

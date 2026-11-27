@@ -37,7 +37,8 @@ mod tiktoken_impl;
 pub use estimator::EstimatingCounter;
 pub use hf_impl::{HfTokenizer, HfTokenizerError};
 pub use registry::{
-    clear_hf_registrations, detect_backend, get_tokenizer, register_hf, try_register_hf, Backend,
+    clear_hf_registrations, detect_backend, get_tokenizer, register_hf, try_register_hf,
+    try_register_hf_at, Backend,
 };
 pub use tiktoken_impl::{TiktokenCounter, TiktokenError};
 

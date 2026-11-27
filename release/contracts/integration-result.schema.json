@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://headroom.dev/schemas/release/v1/integration-result.schema.json",
+  "title": "Headroom release integration result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "result_id",
+    "created_at",
+    "integration",
+    "provider",
+    "execution_depth",
+    "candidate_sha",
+    "artifact",
+    "rollout",
+    "environment",
+    "checks",
+    "status",
+    "reasons",
+    "producer"
+  ],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "result_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "integration": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+    "provider": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+    "execution_depth": { "type": "string", "enum": ["pr", "scheduled", "rc"] },
+    "candidate_sha": { "$ref": "common.schema.json#/$defs/gitSha" },
+    "artifact": { "$ref": "common.schema.json#/$defs/artifactIdentity" },
+    "rollout": { "$ref": "common.schema.json#/$defs/rolloutIdentity" },
+    "environment": { "$ref": "common.schema.json#/$defs/environmentIdentity" },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "install",
+        "configuration",
+        "route_reached",
+        "realistic_tool_task",
+        "streaming",
+        "tool_calls_and_results",
+        "compression_telemetry",
+        "passthrough_and_failure"
+      ],
+      "properties": {
+        "install": { "$ref": "common.schema.json#/$defs/status" },
+        "configuration": { "$ref": "common.schema.json#/$defs/status" },
+        "route_reached": { "$ref": "common.schema.json#/$defs/status" },
+        "realistic_tool_task": { "$ref": "common.schema.json#/$defs/status" },
+        "streaming": { "$ref": "common.schema.json#/$defs/status" },
+        "tool_calls_and_results": { "$ref": "common.schema.json#/$defs/status" },
+        "compression_telemetry": { "$ref": "common.schema.json#/$defs/status" },
+        "passthrough_and_failure": { "$ref": "common.schema.json#/$defs/status" }
+      }
+    },
+    "status": { "$ref": "common.schema.json#/$defs/status" },
+    "reasons": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+      "uniqueItems": true
+    },
+    "producer": { "$ref": "common.schema.json#/$defs/producerIdentity" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+      "then": { "properties": { "reasons": { "maxItems": 0 } } },
+      "else": { "properties": { "reasons": { "minItems": 1 } } }
+    }
+  ]
+}

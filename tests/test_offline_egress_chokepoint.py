@@ -3505,7 +3505,6 @@ class TestRustEgressChokepointCoverage:
         sites = _rust_egress_sites()
         for relpath in (
             "headroom-core/src/hf_cache.rs",
-            "headroom-core/src/transforms/kompress.rs",
             "headroom-core/src/relevance/embedding.rs",
         ):
             assert relpath in sites, f"{relpath} has no detected egress site at all"
@@ -3518,6 +3517,32 @@ class TestRustEgressChokepointCoverage:
             assert len(unguarded) == _RUST_ALLOWLIST.get(relpath, (0, ""))[0], (
                 f"{relpath} has an egress site the Rust sweep does not see as guarded"
             )
+
+    def test_loaders_that_delegate_egress_name_the_chokepoint(self) -> None:
+        """A loader with no client of its own must route through `hf_cache::hub_api`.
+
+        `transforms/kompress.rs` builds no Hub client any more: it calls the
+        shared chokepoint, which `hf_cache.rs` guards before constructing
+        anything. So it has no egress site for the sweep above to check — and
+        the sweep cannot tell "delegates to a guarded helper" apart from "lost
+        its only network call by accident".
+
+        This pins the delegation by name, so removing it (or reverting to a
+        bare `Api::new()`, which honours neither `HF_ENDPOINT` nor Python's
+        cache dir) fails here even though the sweep stays quiet.
+        """
+        sites = _rust_egress_sites()
+        kompress = (REPO_ROOT / "crates" / "headroom-core/src/transforms/kompress.rs").read_text(
+            encoding="utf-8"
+        )
+        assert "headroom-core/src/transforms/kompress.rs" not in sites, (
+            "kompress.rs builds its own Hub client again; the egress sweep must "
+            "see it, so add it back to the guarded-paths list above"
+        )
+        assert "hf_cache::hub_api(" in kompress, (
+            "kompress.rs neither builds a client nor routes through the guarded "
+            "hf_cache::hub_api chokepoint"
+        )
 
     def test_rust_allowlist_has_no_stale_entries(self) -> None:
         unguarded = {
