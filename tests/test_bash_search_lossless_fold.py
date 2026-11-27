@@ -169,23 +169,8 @@ def test_go_log_keeps_its_timestamps(command, tokenizer):
     assert "2026/09/02 14" not in out.split("\n")
 
 
-_PREFIXED_CLOCKS = {
-    "git-blame": "c75ebdee6 (Dev One  2026-07-02 {} -0700) value = ",
-    "java-util-logging": "Nov 24, 2026 {} AM com.example.Order.",
-    "bracket": "worker[{}] heartbeat ",
-    "logfmt-clock": "ts={} level=info msg=handled ",
-    "logfmt-iso": 'time="2026-09-02T{}Z" level=info msg=handled ',
-}
-
-
-@pytest.mark.parametrize("ccr", [True, False], ids=["ccr", "no-ccr"])
-@pytest.mark.parametrize("command", ["grep record app.log", "cat app.log"])
-@pytest.mark.parametrize("row", _PREFIXED_CLOCKS.values(), ids=_PREFIXED_CLOCKS)
-def test_prefixed_clock_records_survive_the_lossy_router(row, command, ccr, tokenizer):
-    # No relevance context and a lossy router: only the fold keeps these rows out of
-    # the search and log compressors, so a fold that refused them would drop records.
-    clocks = [f"{10 + i // 60}:{i % 60:02d}:10" for i in range(240)]
-    text = "".join(f"{row.format(clock)}record_{i:03}\n" for i, clock in enumerate(clocks))
+def _route(command, text, ccr, tokenizer):
+    """The default lossy router with no relevance context."""
     config = ContentRouterConfig()
     config.ccr_enabled = config.ccr_inject_marker = ccr
     messages = [
@@ -201,10 +186,43 @@ def test_prefixed_clock_records_survive_the_lossy_router(row, command, ccr, toke
         },
     ]
     result = ContentRouter(config).apply(messages, tokenizer, compress_user_messages=True)
-    out = result.messages[1]["content"][0]["content"]
-    assert any(t.endswith(":lossless_search") for t in result.transforms_applied)
-    assert search_unheading(out) == text
+    return result.messages[1]["content"][0]["content"], result.transforms_applied
+
+
+_PREFIXED_CLOCKS = {
+    "git-blame": "c75ebdee6 (Dev One  2026-07-02 {} -0700) value = ",
+    "java-util-logging": "Nov 24, 2026 {} AM com.example.Order.",
+    "bracket": "worker[{}] heartbeat ",
+    "logfmt-clock": "ts={} level=info msg=handled ",
+    "logfmt-iso": 'time="2026-09-02T{}Z" level=info msg=handled ',
+}
+
+
+@pytest.mark.parametrize("ccr", [True, False], ids=["ccr", "no-ccr"])
+@pytest.mark.parametrize("command", ["grep record app.log", "cat app.log"])
+@pytest.mark.parametrize("row", _PREFIXED_CLOCKS.values(), ids=_PREFIXED_CLOCKS)
+def test_prefixed_clock_records_survive_the_lossy_router(row, command, ccr, tokenizer):
+    # Only the fold keeps these rows out of the search and log compressors, so a
+    # fold that refused them would drop records.
+    clocks = [f"{10 + i // 60}:{i % 60:02d}:10" for i in range(240)]
+    text = "".join(f"{row.format(clock)}record_{i:03}\n" for i, clock in enumerate(clocks))
+    out, transforms = _route(command, text, ccr, tokenizer)
+    assert any(t.endswith(":lossless_search") for t in transforms)
+    assert search_unheading(out, clocks=True) == text
     assert [c for c in clocks if c not in out] == []
+
+
+@pytest.mark.parametrize("ccr", [True, False], ids=["ccr", "no-ccr"])
+@pytest.mark.parametrize("path", ["results,14", "my notes 14", "ts=14", "x[14"])
+def test_mixed_matches_of_a_file_named_like_a_clock_survive_the_lossy_router(path, ccr, tokenizer):
+    # Every other match looks like the rest of a clock (`ts=14:30:10 items`).
+    text = "".join(
+        f"{path}:{10 + i % 50}:{'normal text' if i % 2 else '10 items'} record_{i:03}\n"
+        for i in range(240)
+    )
+    out, transforms = _route("grep -n record .", text, ccr, tokenizer)
+    assert "router:bash:lossless_search" in transforms
+    assert search_unheading(out) == text
 
 
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----

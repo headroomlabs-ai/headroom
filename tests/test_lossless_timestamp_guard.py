@@ -8,7 +8,6 @@ byte-reversible, so compact_lossless's inverse-check cannot catch it.
 """
 
 import os
-import re
 
 import pytest
 
@@ -155,12 +154,7 @@ _CLOCK_PREFIXES = {
     "logfmt-iso": 'time="2026-09-02T',
     "logfmt-clock": "ts=",
     "quoted-clock": 'time="',
-    "single-quoted-clock": "t='",
     "bracket": "worker[",
-    "paren": "svc (",
-    "comma": "a,b,",
-    "pipe": "web|",
-    "tab": "pod\t",
 }
 
 
@@ -174,21 +168,24 @@ def _prefixed_log(prefix: str, hours: int = 3) -> list[str]:
 def test_clock_behind_a_prefix_is_not_split(prefix: str) -> None:
     lines = _prefixed_log(prefix)
     text = "\n".join(lines)
-    out = compact_lossless(text, "search").split("\n")
+    out = compact_lossless(text, "search")
     # One heading for all three hours, and every row starts with its whole clock.
-    assert out == [prefix] + [line[len(prefix) :] for line in lines]
-    assert search_unheading("\n".join(out)) == text
+    assert out.split("\n") == [prefix] + [line[len(prefix) :] for line in lines]
+    assert search_unheading(out, clocks=True) == text
 
 
-def test_a_line_that_shares_its_prefix_with_neither_neighbour_stays_whole() -> None:
+def test_a_clock_row_that_shares_its_prefix_with_neither_neighbour_stays_whole() -> None:
     a, b = _prefixed_log("worker[", 1), _prefixed_log("db[", 1)
     text = "\n".join(line for pair in zip(a, b) for line in pair)
-    assert search_heading(text) == text
+    assert search_heading(text, clocks=True) == text
+    # Cut at the first colon instead, each line gets a heading of its own: no smaller.
+    assert len(search_heading(text)) == len(text)
+    assert compact_lossless(text, "search") == text
     text = "\n".join([b[0], *a[:3], b[1], *a[3:6]])
-    out = search_heading(text)
+    out = search_heading(text, clocks=True)
     group = [["worker[", *(line[7:] for line in lines)] for lines in (a[:3], a[3:6])]
     assert out.split("\n") == [b[0], *group[0], b[1], *group[1]]
-    assert search_unheading(out) == text
+    assert search_unheading(out, clocks=True) == text
 
 
 def test_clock_headings_and_grep_headings_mix() -> None:
@@ -196,59 +193,85 @@ def test_clock_headings_and_grep_headings_mix() -> None:
     text = "\n".join(
         [*_prefixed_log("ts=", 1)[:3], *grep, *_prefixed_log("worker[", 1)[:3], "plain"]
     )
-    out = search_heading(text)
+    out = search_heading(text, clocks=True)
     assert out.split("\n")[4:8] == ["src/app.py", *(line.split(":", 1)[1] for line in grep)]
+    assert search_unheading(out, clocks=True) == text
+
+
+def test_search_heading_without_clocks_is_unchanged() -> None:
+    text = "\n".join(_prefixed_log("worker[", 1)[:3])
+    out = search_heading(text)
+    assert out == "worker[9\n00:10 record 9-0\n01:10 record 9-1\n02:10 record 9-2"
     assert search_unheading(out) == text
+    # Only clocks=True reads a row under a clock heading as a clock.
+    assert search_unheading("notes=\n14:30:10 x") == "notes=:14:30:10 x"
+    assert search_unheading("notes=\n14:30:10 x", clocks=True) == "notes=14:30:10 x"
+    assert search_unheading("notes=\n14:x", clocks=True) == "notes=:14:x"
+    assert search_unheading("notes\n14:30:10 x", clocks=True) == "notes:14:30:10 x"
 
 
-@pytest.mark.parametrize("path", ["notes[", "a b T1T", "x="])
-def test_grep_row_that_would_decode_as_a_clock_stays_whole(path: str) -> None:
-    # Joined back without its ":", this row would read `notes[14:30:10`.
-    text = "\n".join([f"{path}:14:30:10 text"] * 3 + _prefixed_log("worker[", 1))
-    out = compact_lossless(text, "search")
-    assert len(out) < len(text)
-    assert search_unheading(out) == text
+_CLOCK_LIKE_FILES = [
+    "results,14",
+    "my notes 14",
+    "ts=14",
+    "x[14",
+    'say "14',
+    "run 2026-11-24 14",
+    "app-2026-09-02T14",
+    "a, 2026 9",
+]
 
 
-@pytest.mark.parametrize("path", ["notes[", "a b T1T", "x="])
-def test_grep_rows_under_a_path_that_ends_like_a_clock_heading_still_fold(path: str) -> None:
-    grep = "\n".join(f"{path}:{n}:plain text" for n in range(1, 41))
+@pytest.mark.parametrize("path", _CLOCK_LIKE_FILES)
+@pytest.mark.parametrize("block", [1, 2, 5], ids=["alternating", "pairs", "blocks"])
+def test_mixed_rows_of_a_file_named_like_a_clock_fold_by_file(path: str, block: int) -> None:
+    """One row that is no clock shows the path is a file, so it folds as it always did."""
+    rows = ["10 items" if (i // block) % 2 == 0 else "normal text" for i in range(50)]
+    grep = "\n".join(f"{path}:{10 + i}:{row} {i}" for i, row in enumerate(rows))
     out = compact_lossless(grep, "search")
+    assert out == search_heading(grep)
     assert out.split("\n")[0] == path
+    assert len(out) < len(grep)
     assert search_unheading(out) == grep
 
 
 @pytest.mark.parametrize(
     ("path", "content", "lines"),
     [
-        ("logs/2026/11/24", "30 items", range(15, 55)),  # "24" follows a "/"
-        ("chunk12", "30 files", range(15, 55)),  # "12" is part of a name
+        ("logs/2026/11/24", "30 items", range(15, 55)),
+        ("chunk12", "30 files", range(15, 55)),
         ("part-7", "45 rows", range(15, 55)),
-        ("v2.10", "15 entries", range(15, 55)),
-        ("deploy 14", "75 items", range(15, 55)),  # 75 is not a second
-        ("deploy 14", "105 items", range(15, 55)),
-        ("deploy 14", "10 items", range(1, 10)),  # a one-digit minute is not a clock
-        ("tasks 3", "30 items", range(60, 100)),  # 60 and up is not a minute
-        ("deploy 141", "30 items", range(15, 55)),  # three digits are not an hour
+        ("my notes 14", "30 items", range(15, 55)),  # a bare space opens no clock
+        ("results,14", "30 items", range(15, 55)),
+        ("at 2026-11-24 14", "75 items", range(15, 55)),  # 75 is not a second
+        ("at 2026-11-24 14", "105 items", range(15, 55)),
+        ("at 2026-11-24 14", "10 items", range(1, 10)),  # a one-digit minute is not a clock
+        ("at 2026-11-24 3", "30 items", range(60, 100)),  # 60 and up is not a minute
+        ("at 2026-11-24 141", "30 items", range(15, 55)),  # three digits are not an hour
+        ("at 26-11-24 14", "30 items", range(15, 55)),  # not an ISO date
+        ("v1.2026 14", "30 items", range(15, 55)),  # a year follows ", "
+        ("REPORT14", "30 items", range(15, 55)),  # a T opens a clock only after a date
     ],
 )
 def test_grep_rows_that_only_resemble_a_clock_fold_by_path(path, content, lines) -> None:
     grep = "\n".join(f"{path}:{lines[i % len(lines)]}:{content}" for i in range(40))
-    out = search_heading(grep)
+    out = search_heading(grep, clocks=True)
+    assert out == search_heading(grep)
     assert out.split("\n")[0] == path
-    assert search_unheading(out) == grep
+    assert compact_lossless(grep, "search") == out
 
 
-def test_prefixed_logs_never_lose_the_fold_to_a_split_clock() -> None:
-    """Two prefixes, changing every few lines: still smaller, still exact, clocks whole."""
-    lines = [
-        f"{'worker[' if (i // 3) % 2 else 'db-1 ['}{10 + i // 60}:{i % 60:02d}:10] r{i}"
-        for i in range(180)
-    ]
-    text = "\n".join(lines)
+@pytest.mark.parametrize("prefix", ["web-1  | ", "svc (", "a,b,"])
+def test_other_prefixes_fold_as_before(prefix: str) -> None:
+    text = "\n".join(_prefixed_log(prefix))
+    assert compact_lossless(text, "search") == search_heading(text)
+
+
+def test_when_only_a_split_clock_folds_it_is_still_taken() -> None:
+    # Joined back without its ":", the last row would read `notes=14:30:10`, so the
+    # whole-clock fold is not exact here. Not folding at all would be worse: the rows
+    # would go on to the lossy compressors.
+    text = "\n".join([*_prefixed_log("worker[", 1), "notes=:14:30:10 x"])
     out = compact_lossless(text, "search")
+    assert out == search_heading(text)
     assert len(out) < len(text)
-    assert search_unheading(out) == text
-    rows = [row for row in out.split("\n") if re.match(r"\d", row)]
-    assert len(rows) == len(lines)
-    assert all(re.match(r"\d{1,2}:\d{2}:\d{2}] r\d+$", row) for row in rows)

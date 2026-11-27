@@ -1823,7 +1823,8 @@ def content_cache_key(
 # version and config, so the disk tier starts a fresh namespace instead of
 # replaying it. "code-never-kompress": before #4214, code could reach Kompress
 # and lose keywords; a cache made then must not be served after the fix.
-_ROUTING_POLICY_REVISION = "code-never-kompress"
+# "whole-clocks": the search fold stopped cutting a clock behind a prefix in two.
+_ROUTING_POLICY_REVISION = "code-never-kompress,whole-clocks"
 
 
 def _config_namespace(config: Any) -> str:
