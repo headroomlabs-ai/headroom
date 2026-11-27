@@ -115,6 +115,81 @@ def test_resolver_tier3_cli_override() -> None:
     assert display == "project-c"
 
 
+def test_resolver_operator_root_preserves_leading_space(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``project`` and `` project`` stay on different memory stores.
+
+    The operator override is a native path. Stripping it before ``realpath``
+    folded a leading space out of a relative root, so both directories shared
+    one project key, display name, and database.
+    """
+    (tmp_path / "project").mkdir()
+    (tmp_path / " project").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    r = ProjectResolver()
+    plain = r.resolve(_ctx(project_root_override="project"))
+    spaced = r.resolve(_ctx(project_root_override=" project"))
+
+    assert plain is not None and spaced is not None
+    assert plain[0] != spaced[0]
+    assert plain[1] == "project"
+    assert spaced[1] == " project"
+
+    router = _make_router(tmp_path, MemoryStorageMode.PROJECT, monkeypatch)
+    scope_plain = router.scope_for(_ctx(project_root_override="project"))
+    scope_spaced = router.scope_for(_ctx(project_root_override=" project"))
+    assert scope_plain.db_path != scope_spaced.db_path
+
+
+def test_resolver_operator_root_preserves_trailing_space(tmp_path: Path) -> None:
+    plain_dir = tmp_path / "project"
+    spaced_dir = tmp_path / "project "
+    plain_dir.mkdir()
+    spaced_dir.mkdir()
+
+    r = ProjectResolver()
+    plain = r.resolve(_ctx(project_root_override=str(plain_dir)))
+    spaced = r.resolve(_ctx(project_root_override=str(spaced_dir)))
+
+    assert plain is not None and spaced is not None
+    assert plain[0] != spaced[0]
+    assert plain[1] == "project"
+    assert spaced[1] == "project "
+
+
+def test_resolver_whitespace_only_operator_root_stays_on_tier3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / " ").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    r = ProjectResolver()
+    prompt = "Primary working directory: /work/prompt-project\n"
+    out = r.resolve(_ctx(project_root_override=" ", system_prompt=prompt))
+    prompt_only = r.resolve(_ctx(system_prompt=prompt))
+
+    assert out is not None and prompt_only is not None
+    assert out[1] == " "
+    assert out[0] != prompt_only[0]
+
+
+def test_resolver_cwd_header_still_strips_surrounding_whitespace() -> None:
+    r = ProjectResolver()
+    padded = r.resolve(_ctx(headers={"x-headroom-cwd": " /work/proj "}))
+    plain = r.resolve(_ctx(headers={"x-headroom-cwd": "/work/proj"}))
+
+    assert padded is not None and plain is not None
+    assert padded == plain
+    assert padded[1] == "proj"
+    assert (
+        ProjectResolver._identity_from_cwd(" /work/proj ", percent_encoded=True)
+        == ProjectResolver._identity_from_cwd("/work/proj", percent_encoded=True)
+        == plain
+    )
+
+
 def test_resolver_tier4_env_block_primary_working_directory() -> None:
     r = ProjectResolver()
     prompt = (

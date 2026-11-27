@@ -25,10 +25,13 @@ from headroom.compression.universal import (
 )
 
 # Skip all tests if no API key
-pytestmark = pytest.mark.skipif(
-    not os.getenv("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY not set - skipping LLM eval tests",
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not os.getenv("OPENAI_API_KEY"),
+        reason="OPENAI_API_KEY not set - skipping LLM eval tests",
+    ),
+]
 
 
 # =============================================================================
