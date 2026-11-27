@@ -1184,6 +1184,8 @@ _VALUE_FLAGS = {
 }
 # Pipeline stages that pass rows through as they are.
 _ROW_FILTERS = frozenset({"sort", "head", "tail", "uniq", "sort-object", "select-object"})
+# Everything in a masked command but the characters that split it into commands.
+_NOT_SHELL_SYNTAX_RE = re.compile(r"[^|&;\n]")
 
 
 def _bash_command_lists_files(command: str) -> bool:
@@ -1199,6 +1201,12 @@ def _bash_command_lists_files(command: str) -> bool:
         return False
     masked = _mask_quoted(segments[0])
     if "\n" in masked:
+        return False
+    # The shell is not known. Bash reads "\" as an escape (`\"`, `\|`, a line
+    # continuation) and PowerShell as a character, so judge the command only where
+    # both readings find the same pipes, separators and line breaks.
+    as_character = _mask_quoted(segments[0].replace("\\", "/"))
+    if _NOT_SHELL_SYNTAX_RE.sub("_", masked) != _NOT_SHELL_SYNTAX_RE.sub("_", as_character):
         return False
     # A comment is no argument: `rg foo # -l` is not a listing.
     segment = _strip_shell_comment(segments[0])
@@ -1228,10 +1236,9 @@ def _bash_command_lists_files(command: str) -> bool:
     if prog in {"fd", "fdfind"}:
         return not any(re.match(r"--exec|-[A-Za-z]*[xX]", arg) for arg in rest)
     if prog in {"rg", "ripgrep", "grep"}:
-        # _bash_program keeps shell quotes: `rg 'a -l b'` is one pattern. But "\" is
-        # no escape here: a Windows path ends in one (`rg --files .\`), and a line
-        # continuation leaves one between words. A `\"` inside double quotes is the
-        # cost: it closes the quote.
+        # _bash_program keeps shell quotes: `rg 'a -l b'` is one pattern. "\" is no
+        # escape here (both readings agree, checked above), so a Windows path may
+        # end in one: `rg --files .\`.
         lexer = shlex.shlex(" ".join(rest), posix=True)
         lexer.whitespace_split, lexer.escape, lexer.commenters = True, "", ""
         try:

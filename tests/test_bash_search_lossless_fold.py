@@ -565,8 +565,9 @@ _LISTING_COMMANDS = [
     "rg --files  # every file",
     "rg --files .\\",  # PowerShell: the trailing backslash is part of the path
     "rg --files .\\headroom\\ | sort",
-    "rg \\\n  --files crates",  # a line continuation before the flag
-    "grep -r \\\n  -l foo .",
+    "rg --files 'C:\\src\\'",  # single quotes: "\" is a character in both shells
+    "grep -rl 'foo\\|bar' .",
+    'grep -rl "foo\\|bar" .',
     "grep -rl foo .",
     "grep -rL foo .",
     "grep -r --files-with-matches foo .",
@@ -638,6 +639,15 @@ _OTHER_COMMANDS = [
     "Resolve-Path -Relative x | Get-Content",
     "git show HEAD:rules.txt",
     "rg --files\ncat rules.txt",
+    # Bash reads "\" as an escape, PowerShell as a character; where that moves a
+    # pipe or line break the shell decides, and it is not known.
+    "rg --no-filename --regexp \\\n  -legacy rules.txt",  # Bash: -legacy is the pattern
+    "rg \\\n  --files crates",  # PowerShell: two commands
+    "rg --files .\\\nGet-Content rules.txt",
+    'rg --files ".\\crates\\" | ForEach-Object { Get-Content -LiteralPath $_ }',
+    "rg --files .\\| xargs cat",
+    "rg --files .\\; Get-Content rules.txt",
+    "rg --files .\\&& Get-Content rules.txt",
 ]
 
 
@@ -661,7 +671,6 @@ def test_ignores_commands_that_do_not_list_files(command) -> None:
         ".\\rg.exe --files crates",
         "Resolve-Path -Relative .\\crates\\*\\src\\*\\*.rs",
         "rg --files .\\crates\\",
-        "rg \\\n  --files crates",
     ],
 )
 def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer) -> None:
@@ -686,6 +695,8 @@ def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer)
         "rg --files | xargs cat",
         "rg --no-filename --regexp -legacy rules",
         "rg --no-filename foo rules # -l",
+        "rg --no-filename --regexp \\\n  -legacy rules",
+        'rg --files ".\\rules\\" | ForEach-Object { Get-Content -LiteralPath $_ }',
     ],
 )
 def test_router_keeps_regex_rules_whole(command, send, tokenizer) -> None:
