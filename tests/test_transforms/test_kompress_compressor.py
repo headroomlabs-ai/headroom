@@ -59,6 +59,7 @@ class TestLazyImports:
         "kompress unavailable".
         """
         import builtins
+        import importlib.util
 
         from headroom.transforms import kompress_compressor as kmod
 
@@ -66,11 +67,10 @@ class TestLazyImports:
         kmod._is_pytorch_available.cache_clear()
 
         real_import = builtins.__import__
+        real_find_spec = importlib.util.find_spec
         attempts = {"torch": 0}
 
         def fake_import(name: str, *args: object, **kwargs: object) -> object:
-            if name in ("onnxruntime", "optimum"):
-                raise ImportError(f"No module named {name!r}")
             if name == "torch":
                 attempts["torch"] += 1
                 raise OSError(
@@ -79,7 +79,18 @@ class TestLazyImports:
                 )
             return real_import(name, *args, **kwargs)
 
-        with patch.object(builtins, "__import__", fake_import):
+        def fake_find_spec(name: str, *args: object, **kwargs: object):
+            # The ONNX probe checks presence with find_spec (it must not import
+            # transformers, which pulls in torch — GH #4719), so "not
+            # installed" is modelled as "not findable", not as a raising import.
+            if name in ("onnxruntime", "transformers"):
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        with (
+            patch.object(builtins, "__import__", fake_import),
+            patch.object(importlib.util, "find_spec", fake_find_spec),
+        ):
             # Must degrade, not raise.
             assert kmod._is_pytorch_available() is False
             assert kmod.is_kompress_available() is False

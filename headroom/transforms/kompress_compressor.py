@@ -651,15 +651,21 @@ def _kompress_content_signature(content: str) -> Any:
 
 @lru_cache(maxsize=1)
 def _is_onnx_available() -> bool:
-    """Check if ONNX Runtime is available (lightweight, no torch needed)."""
-    try:
-        import onnxruntime  # noqa: F401
-        import transformers  # noqa: F401
+    """Check if ONNX Runtime is available (lightweight, no torch needed).
 
-        return True
-    except (ImportError, OSError):
-        # OSError: the package is installed but its native library will not
-        # load. See _is_pytorch_available for the full case.
+    Uses ``importlib.util.find_spec`` rather than importing the packages:
+    importing ``transformers`` pulls in ``torch`` when torch is installed
+    (~520 MB RSS on its own), which defeats the point of a lightweight probe
+    (GH #4719). A package that is present but unloadable surfaces later as an
+    import error on the actual load path, which callers treat as
+    "Kompress unavailable".
+    """
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("onnxruntime") is not None and find_spec("transformers") is not None
+    except (ImportError, OSError, ValueError):
+        # ValueError: a module already in sys.modules with __spec__ = None.
         return False
 
 
