@@ -24,6 +24,15 @@ def _multi_hour_log() -> str:
     return "\n".join(lines)
 
 
+def _ruby_logger_log() -> str:
+    """Ruby's default ``Logger::Formatter`` at every severity (UNKNOWN prints as ANY)."""
+    return "\n".join(
+        f"{sev[0]}, [2026-09-02T14:{m:02d}:10.{m:06d} #4321] {sev:>5} -- : request {m} handled"
+        for sev in ("DEBUG", "INFO", "WARN", "ERROR", "FATAL", "ANY")
+        for m in range(10)
+    )
+
+
 _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maximum
 
 
@@ -54,6 +63,7 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
             f'{_LONGEST_HOST} - - [02/Sep/2026:14:{m:02d}:10 +0000] "GET /" 200 5'
             for m in range(60)
         ),
+        _ruby_logger_log(),
     ],
     ids=[
         "iso-datetime",
@@ -65,6 +75,7 @@ _LONGEST_HOST = ".".join(["h" * 63] * 3 + ["h" * 61])  # 253 chars, the DNS maxi
         "klog",
         "access-log",
         "access-log-longest-host",
+        "ruby-logger",
     ],
 )
 def test_timestamped_logs_are_never_folded(sample: str) -> None:
@@ -78,8 +89,9 @@ def test_timestamped_logs_are_never_folded(sample: str) -> None:
         ("logs/nginx/error.log", "2026/09/02 14:30:{s:02d} [error] 31#31: connect() failed"),
         ("logs/controller.log", "E0902 14:30:{s:02d}.000000       1 reflector.go:100] list failed"),
         ("/var/log/nginx/access.log", '10.0.0.7 - - [02/Sep/2026:14:30:{s:02d} +0000] "GET /" 500'),
+        ("log/production.log", "I, [2026-09-02T14:30:{s:02d}.000000 #1]  INFO -- : 200 OK"),
     ],
-    ids=["go-log", "nginx-error", "klog", "access-log"],
+    ids=["go-log", "nginx-error", "klog", "access-log", "ruby-logger"],
 )
 def test_grep_rows_over_those_logs_still_fold(path: str, row: str) -> None:
     """``grep -n`` output starts with the file path, so it is not a log row."""

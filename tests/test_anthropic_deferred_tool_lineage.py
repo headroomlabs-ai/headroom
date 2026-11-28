@@ -258,11 +258,9 @@ def _isolated_state(monkeypatch, tmp_path):  # noqa: ANN001, ANN202
     # Each proxied request appends to the savings ledger, by default the
     # developer's real ~/.headroom/savings_events.jsonl.
     monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "savings_events.jsonl"))
-    # Headroom does not recognize Claude Code's client-side ToolSearch as a
-    # search tool by default, so a request with deferred tools logs
-    # tool_search_deferred_orphan. Naming it is the documented remedy and
-    # changes nothing on the lineage path.
-    monkeypatch.setenv("HEADROOM_CLIENT_TOOL_SEARCH_NAMES", "ToolSearch")
+    # The test asserts no tool_search_deferred_orphan line: Claude Code's
+    # ToolSearch resolves its deferred tools without any configuration.
+    monkeypatch.delenv("HEADROOM_CLIENT_TOOL_SEARCH_NAMES", raising=False)
     reset_deferred_orphan_warn_state()
     reset_compression_store()
 

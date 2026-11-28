@@ -127,7 +127,7 @@ blake3 = "1"
 # a system libsqlite3 — matters for Lambda / container builds where the
 # host image may lag behind. WAL is enabled at connection-open time (see
 # `ccr/backends/sqlite.rs`).
-rusqlite = { version = "0.41", features = ["bundled"], optional = true }
+rusqlite = { version = "0.43", features = ["bundled"], optional = true }
 # `redis` for the optional multi-worker CCR backend. Cfg-gated behind
 # the `redis` feature so deploys that don't need it pay no compile
 # cost. Default features include the sync `Connection` API used in
@@ -195,8 +195,8 @@ ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, fea
 #   `UnsupportedBackend` for `CcrBackendConfig::Sqlite`; the in-memory store
 #   is always available.
 # - `code`: the tree-sitter AST code compressor (pulls `tree-sitter`, which
-#   declares `links = "tree-sitter"`). Without it, source-code blocks fall
-#   through to the Kompress/no-op arm.
+#   declares `links = "tree-sitter"`). Without it, source-code blocks are
+#   passed through untouched with a deterministic NoOp (never handed to Kompress).
 # - `arbitrary-precision`: serde_json's `arbitrary_precision`, required by
 #   the byte-parity paths but global to the graph (serde-rs/serde#2748).
 default = ["ml", "sqlite", "code", "arbitrary-precision"]

@@ -353,6 +353,7 @@ class TestCCRIntegration:
         print(f"Total tracked memory: {report.total_tracked_mb:.4f} MB")
 
 
+@pytest.mark.live
 @pytest.mark.skipif(
     not os.environ.get("ANTHROPIC_API_KEY"),
     reason="ANTHROPIC_API_KEY not set in environment",
