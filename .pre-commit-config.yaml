@@ -42,3 +42,8 @@ repos:
         exclude: ^experiments/
         pass_filenames: false
         entry: mypy headroom
+        # The hook runs in its own virtualenv. Without httpx there,
+        # --ignore-missing-imports types it as Any and mypy reports
+        # no-any-return where CI (which has httpx installed) does not.
+        # Pinned to the uv.lock version.
+        additional_dependencies: [httpx==0.28.1]
