@@ -481,6 +481,7 @@ def _run_memory_eval(
     # Create answer function based on provider
     answer_fn = None
     if answer_model:
+        from headroom.evals.anthropic_compat import litellm_model_kwargs
         from headroom.offline import guard_egress
 
         guard_egress(f"{answer_model} API for the memory eval answers")
@@ -514,10 +515,9 @@ def _run_memory_eval(
 ## Answer (be concise - just the facts):"""
 
                 response = litellm.completion(
-                    model=answer_model,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
                     max_tokens=150,
+                    **litellm_model_kwargs(answer_model),
                 )
                 return response.choices[0].message.content or ""
 

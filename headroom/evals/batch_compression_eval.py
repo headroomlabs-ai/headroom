@@ -40,7 +40,12 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from headroom.evals.anthropic_compat import anthropic_response_text, anthropic_thinking_kwargs
+from headroom.evals.anthropic_compat import (
+    anthropic_response_text,
+    anthropic_thinking_kwargs,
+    anthropic_thinking_params,
+    is_sonnet_5_5,
+)
 from headroom.evals.metrics import (
     compute_exact_match,
     compute_f1,
@@ -85,10 +90,10 @@ class BatchRequest:
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": self.messages,
-            **anthropic_thinking_kwargs(self.model),
+            **anthropic_thinking_params(self.model),
         }
         # Claude Sonnet 5.5 rejects sampling parameters.
-        if not self.model.startswith("claude-sonnet-5-5"):
+        if not is_sonnet_5_5(self.model):
             params["temperature"] = self.temperature
         return {"custom_id": self.custom_id, "params": params}
 

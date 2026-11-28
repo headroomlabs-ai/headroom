@@ -17,7 +17,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from headroom.evals.anthropic_compat import anthropic_response_text, anthropic_thinking_kwargs
+from headroom.evals.anthropic_compat import (
+    anthropic_response_text,
+    anthropic_thinking_kwargs,
+    is_sonnet_5_5,
+)
 from headroom.evals.core import (
     EvalCase,
     EvalMode,
@@ -161,7 +165,7 @@ Answer:"""
         # Claude Sonnet 5.5 rejects sampling parameters.
         sampling: dict[str, Any] = (
             {}
-            if self.llm_config.model.startswith("claude-sonnet-5-5")
+            if is_sonnet_5_5(self.llm_config.model)
             else {"temperature": self.llm_config.temperature}
         )
         response = self._proxy_client.chat.completions.create(
@@ -169,6 +173,8 @@ Answer:"""
             max_tokens=self.llm_config.max_tokens,
             messages=[{"role": "user", "content": prompt}],
             **sampling,
+            # Same thinking setting as the direct arm.
+            **anthropic_thinking_kwargs(self.llm_config.model),
         )
         content = response.choices[0].message.content
         return str(content) if content else ""
