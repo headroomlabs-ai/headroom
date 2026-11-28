@@ -3,6 +3,7 @@
 import io
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -895,6 +896,128 @@ class TestCallCliLlm:
             "--settings",
             '{"disableAllHooks":true}',
         ]
+
+    _ENTERPRISE_REFUSAL = (
+        "You cannot use --strict-mcp-config when an enterprise MCP config is present\n"
+    )
+
+    def test_claude_cli_enterprise_mcp_refusal_fails_closed_without_the_opt_in(self, monkeypatch):
+        monkeypatch.delenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", raising=False)
+        popen = _fake_claude_popen(
+            stdout_lines=[], stderr_lines=[self._ENTERPRISE_REFUSAL], returncode=1
+        )
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            with pytest.raises(RuntimeError, match="HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP=1"):
+                _call_cli_llm("test digest", "claude-cli")
+        assert popen.call_count == 1
+
+    def test_claude_cli_retries_without_strict_mcp_config_and_with_mcp_denied_on_opt_in(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", "1")
+        refused = _fake_claude_popen(
+            stdout_lines=[], stderr_lines=[self._ENTERPRISE_REFUSAL], returncode=1
+        )
+        ok = _fake_claude_popen(
+            stdout_lines=[_result_event('{"context_file_rules": [], "memory_file_rules": []}')]
+        )
+        procs = iter([refused, ok])
+        popen = MagicMock(side_effect=lambda *a, **k: next(procs)(*a, **k))
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            result = _call_cli_llm("test digest", "claude-cli")
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        assert "--strict-mcp-config" in popen.call_args_list[0][0][0]
+        retry = popen.call_args_list[1][0][0]
+        assert "--strict-mcp-config" not in retry
+        assert retry[retry.index("--tools") + 1] == ""
+        assert retry[retry.index("--disallowedTools") + 1] == "mcp__*"
+
+    def test_claude_cli_refusal_text_outside_stderr_does_not_trigger_the_retry(self, monkeypatch):
+        # Model output can echo session text, so only stderr counts.
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", "1")
+        popen = _fake_claude_popen(
+            stdout_lines=[
+                _stream_event("assistant", message={"content": self._ENTERPRISE_REFUSAL}),
+                _result_event(self._ENTERPRISE_REFUSAL),
+            ],
+            returncode=1,
+        )
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            with pytest.raises(RuntimeError, match="failed.*exit 1"):
+                _call_cli_llm("test digest", "claude-cli")
+        assert popen.call_count == 1
+
+    # A real process standing in for `claude`: under --strict-mcp-config it prints
+    # the refusal and exits without reading stdin; otherwise it answers.
+    _REFUSING_CLAUDE = (
+        "import json, sys\n"
+        "if '--strict-mcp-config' in sys.argv:\n"
+        f"    sys.stderr.write({_ENTERPRISE_REFUSAL!r})\n"
+        "    sys.exit(1)\n"
+        "sys.stdin.read()\n"
+        "rules = json.dumps({'context_file_rules': [], 'memory_file_rules': []})\n"
+        "print(json.dumps({'type': 'result', 'result': rules}))\n"
+    )
+    # Larger than any pipe buffer (64 KB on Linux and macOS), so the stdin write
+    # itself always hits the closed pipe, whether the stub exits before or during it.
+    _LARGE_DIGEST = "x" * 180_000
+
+    def _refusing_claude_popen(self, tmp_path: Path) -> tuple[MagicMock, list[list[str]]]:
+        stub = tmp_path / "claude_stub.py"
+        stub.write_text(self._REFUSING_CLAUDE)
+        argvs: list[list[str]] = []
+        real_popen = subprocess.Popen
+
+        def _popen(cmd, **kwargs):
+            argvs.append(cmd)
+            return real_popen([sys.executable, str(stub), *cmd[1:]], **kwargs)
+
+        return MagicMock(side_effect=_popen), argvs
+
+    def test_claude_cli_refusal_before_stdin_is_read_fails_closed_without_the_opt_in(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", raising=False)
+        popen, argvs = self._refusing_claude_popen(tmp_path)
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            with pytest.raises(RuntimeError, match="HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP=1"):
+                _call_cli_llm(self._LARGE_DIGEST, "claude-cli")
+        assert len(argvs) == 1
+
+    def test_claude_cli_refusal_before_stdin_is_read_retries_once_with_mcp_denied_on_opt_in(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", "1")
+        popen, argvs = self._refusing_claude_popen(tmp_path)
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            result = _call_cli_llm(self._LARGE_DIGEST, "claude-cli")
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        assert len(argvs) == 2
+        assert "--strict-mcp-config" in argvs[0]
+        assert "--strict-mcp-config" not in argvs[1]
+        assert argvs[1][argvs[1].index("--disallowedTools") + 1] == "mcp__*"
+
+    def test_claude_cli_success_without_reading_the_whole_digest_is_rejected(
+        self, monkeypatch, tmp_path
+    ):
+        # A real process that closes stdin unread, prints a valid result and exits 0:
+        # that result was not produced from the digest, so it must not count.
+        stub = tmp_path / "claude_stub.py"
+        stub.write_text(
+            "import json, os\n"
+            "os.close(0)\n"
+            "rules = json.dumps({'context_file_rules': [], 'memory_file_rules': []})\n"
+            "print(json.dumps({'type': 'result', 'result': rules}))\n"
+        )
+        monkeypatch.delenv("HEADROOM_LEARN_ALLOW_UNSAFE_ENTERPRISE_MCP", raising=False)
+        real_popen = subprocess.Popen
+        popen = MagicMock(
+            side_effect=lambda cmd, **kw: real_popen([sys.executable, str(stub), *cmd[1:]], **kw)
+        )
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            with pytest.raises(RuntimeError, match="closed its input before reading the whole"):
+                _call_cli_llm(self._LARGE_DIGEST, "claude-cli")
+        assert popen.call_count == 1
 
     def test_claude_cli_progress_callback_is_throttled(self):
         stdout = [
