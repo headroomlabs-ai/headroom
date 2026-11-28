@@ -130,7 +130,7 @@ it.
 | `OPENCODE_CONFIG_CONTENT` | JSON payload with provider, plugin, and optional local MCP config injected by `wrap` |
 | `HEADROOM_PROXY_URL` | Proxy URL passed to Headroom MCP when a non-default port is used, and to the native plugin when configured |
 | `OPENAI_TARGET_API_URL` | Upstream for OpenAI-compatible traffic when `--openai-api-url` is not passed; defaults to `https://api.openai.com/v1` |
-| `HEADROOM_OPENCODE_EXTRA_MODELS` | Comma-separated `--extra-model` specs added to the `headroom` provider on every wrap |
+| `HEADROOM_OPENCODE_EXTRA_MODELS` | Comma-separated `--extra-model` specs added to the `headroom` provider on every wrap, or on every persistent install apply and restart when passed with `install apply --env` |
 | `HEADROOM_OPENCODE_EXCLUDE_HOSTS` | Comma-separated hosts (and their subdomains) the native plugin sends straight upstream instead of through the proxy, for example `opencode.ai,.corp.internal` |
 
 ## Failure Learning
@@ -154,6 +154,29 @@ headroom install apply --preset persistent-service --scope provider --providers 
 This writes the Headroom provider into `~/.config/opencode/opencode.json` and keeps the proxy running on port 8787.
 
 The default user scope only writes shell environment configuration. For OpenCode, direct provider config requires `--scope provider`.
+
+Re-running `install apply`, `install restart`, and the health check's automatic
+restart all rewrite the `headroom` provider, so model ids you add to it by hand
+are lost. Pass extra models with `--env HEADROOM_OPENCODE_EXTRA_MODELS=...`
+instead. It takes the same specs as `--extra-model`, comma-separated:
+
+```bash
+headroom install apply --preset persistent-service --scope provider --providers manual --target opencode \
+  --env OPENAI_TARGET_API_URL=https://api.deepseek.com/v1 \
+  --env "HEADROOM_OPENCODE_EXTRA_MODELS=deepseek-chat=DeepSeek Chat=65536,deepseek-reasoner"
+```
+
+The value is stored with the deployment, so restarts keep it. Like any other
+`--env` value, pass it again each time you run `install apply`.
+
+The `apiKey` in `options` is yours, and it is kept: when the deployment names
+an upstream with `OPENAI_TARGET_API_URL` (or `--openai-api-url`), the install
+leaves the key in `options` and rewrites only what Headroom owns (`npm`,
+`name`, `baseURL`, `models`). The key is stored with the deployment, because
+the rewrite drops the whole provider entry and a key you add to the config by
+hand would not survive the next `install apply` or `install restart`. Without
+a named upstream the proxy forwards to OpenAI, so the install leaves no
+third-party key behind.
 
 ## Native OpenCode Plugin
 
