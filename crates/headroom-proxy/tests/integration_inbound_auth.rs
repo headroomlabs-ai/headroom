@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use headroom_proxy::inbound_auth::ProxyToken;
+use headroom_proxy::inbound_auth::{ProxyToken, FRONT_REMOTE_HEADER, RELAY_PROOF_HEADER};
 use headroom_proxy::{build_app, AppState, Config};
 use tower::util::ServiceExt;
 use wiremock::matchers::any;
@@ -41,10 +41,29 @@ async fn send(
     path: &str,
     headers: &[(&str, &str)],
 ) -> StatusCode {
+    send_to(upstream, false, token, peer, method, path, headers).await
+}
+
+/// [`send`], with `python` choosing `--python-upstream`.
+async fn send_to(
+    upstream: &MockServer,
+    python: bool,
+    token: Option<&str>,
+    peer: Option<&str>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> StatusCode {
     let mut config = Config::for_test(upstream.uri().parse().unwrap());
     config.proxy_token = token.and_then(ProxyToken::new);
+    config.python_upstream = python;
     let app = build_app(AppState::new(config).unwrap());
     let mut builder = Request::builder().method(method).uri(path);
+    // What a client on this machine sends; a test that names its own Host
+    // replaces it.
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        builder = builder.header("host", "127.0.0.1:8787");
+    }
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
@@ -260,17 +279,118 @@ async fn local_caller_keeps_the_rewritten_upstream_host() {
 }
 
 #[tokio::test]
-async fn loopback_peer_with_a_foreign_host_is_not_relayed_as_local() {
+async fn loopback_peer_with_a_foreign_host_is_refused_without_a_token() {
     // A browser reaching the port through a name that resolves to
-    // 127.0.0.1: loopback peer, foreign Host.
-    let host = upstream_host(
+    // 127.0.0.1: loopback peer, foreign Host. Relaying it would hand the
+    // upstream a caller it cannot tell from a remote token holder.
+    let up = upstream().await;
+    let status = send(
+        &up,
         None,
-        LOCAL,
-        "/admin/upstream",
+        Some(LOCAL),
+        "GET",
+        "/v1/messages/batches",
         &[("host", "evil.example:8787")],
     )
     .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(up.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn loopback_peer_with_a_foreign_host_needs_the_token() {
+    let up = upstream().await;
+    let refused = send(
+        &up,
+        Some(TOKEN),
+        Some(LOCAL),
+        "GET",
+        "/v1/messages/batches",
+        &[("host", "evil.example:8787")],
+    )
+    .await;
+    assert_eq!(refused, StatusCode::UNAUTHORIZED);
+    assert!(up.received_requests().await.unwrap().is_empty());
+
+    let host = upstream_host(
+        Some(TOKEN),
+        LOCAL,
+        "/v1/messages/batches",
+        &[
+            ("host", "evil.example:8787"),
+            ("x-headroom-proxy-token", TOKEN),
+        ],
+    )
+    .await;
     assert_eq!(host, "headroom-remote.invalid");
+}
+
+/// The relay-proof header a `--python-upstream` upstream received for one request.
+async fn upstream_proof(
+    token: Option<&str>,
+    peer: &str,
+    headers: &[(&str, &str)],
+) -> Option<String> {
+    let up = upstream().await;
+    let status = send_to(&up, true, token, Some(peer), "GET", "/v1/models", headers).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    seen[0]
+        .headers
+        .get(RELAY_PROOF_HEADER)
+        .map(|v| v.to_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn loopback_peer_without_a_host_is_relayed_as_local() {
+    // A raw HTTP/1.0 client on this machine: no Host, which a browser never
+    // omits. It needs no token and reaches the upstream under its loopback
+    // authority, with no relay proof.
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.proxy_token = ProxyToken::new(TOKEN);
+    let app = build_app(AppState::new(config).unwrap());
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .body(Body::empty())
+        .unwrap();
+    let peer: SocketAddr = LOCAL.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    let host = seen[0].headers.get("host").unwrap().to_str().unwrap();
+    assert!(is_loopback_name(host), "{host}");
+    assert!(seen[0].headers.get(RELAY_PROOF_HEADER).is_none());
+}
+
+#[tokio::test]
+async fn authenticated_remote_caller_is_relayed_with_the_proof_not_the_token() {
+    let expected = ProxyToken::new(TOKEN).unwrap().relay_proof();
+    let proof = upstream_proof(
+        Some(TOKEN),
+        REMOTE,
+        &[
+            ("x-headroom-proxy-token", TOKEN),
+            (RELAY_PROOF_HEADER, "forged"),
+        ],
+    )
+    .await;
+    assert_eq!(proof.as_deref(), Some(expected.as_str()));
+}
+
+#[tokio::test]
+async fn proof_is_never_relayed_for_a_caller_the_token_did_not_authenticate() {
+    // A local caller, and a remote one on a token-less (acknowledged open)
+    // bind: neither proved anything, and a forged proof is dropped.
+    assert_eq!(
+        upstream_proof(Some(TOKEN), LOCAL, &[(RELAY_PROOF_HEADER, "forged")]).await,
+        None
+    );
+    assert_eq!(
+        upstream_proof(None, REMOTE, &[(RELAY_PROOF_HEADER, "forged")]).await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -286,5 +406,237 @@ async fn remote_token_holder_is_not_relayed_as_local() {
         )
         .await;
         assert_eq!(host, "headroom-remote.invalid", "{client_host}");
+    }
+}
+
+/// Headers a `--python-upstream` upstream received for one POST with a JSON body.
+async fn upstream_post_headers(
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> wiremock::http::HeaderMap {
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.proxy_token = ProxyToken::new(TOKEN);
+    config.python_upstream = true;
+    let app = build_app(AppState::new(config).unwrap());
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let mut req = builder.body(Body::from(body.to_owned())).unwrap();
+    let peer: SocketAddr = REMOTE.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    assert_eq!(seen.len(), 1, "{path}");
+    seen[0].headers.clone()
+}
+
+#[tokio::test]
+async fn buffered_openai_routes_keep_the_callers_relay_identity() {
+    // These two routes buffer the body and rebuild the request; the
+    // rebuilt request must still carry what the inbound gate recorded.
+    let expected = ProxyToken::new(TOKEN).unwrap().relay_proof();
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/v1/responses", r#"{"model":"gpt-4o","input":"hi"}"#),
+    ] {
+        let seen = upstream_post_headers(
+            path,
+            body,
+            &[
+                ("x-headroom-proxy-token", TOKEN),
+                ("host", "proxy.example:8787"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen.get(RELAY_PROOF_HEADER).map(|v| v.to_str().unwrap()),
+            Some(expected.as_str()),
+            "{path}"
+        );
+        assert_eq!(
+            seen.get("host").unwrap().to_str().unwrap(),
+            "headroom-remote.invalid",
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn front_health_probe_answers_a_loopback_peer_under_a_public_host() {
+    // A monitor behind a same-host reverse proxy that keeps the public
+    // Host, with no token configured.
+    let up = upstream().await;
+    let status = send(
+        &up,
+        None,
+        Some(LOCAL),
+        "GET",
+        "/healthz",
+        &[("host", "proxy.example")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// What a loopback upstream saw for a remote `GET /v1/models` under
+/// `--no-rewrite-host` and `Host: proxy.example:8787`: (Host, proof?).
+async fn no_rewrite_remote_request(python: bool, token: Option<&str>) -> (String, bool) {
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.rewrite_host = false;
+    config.python_upstream = python;
+    config.proxy_token = token.and_then(ProxyToken::new);
+    let app = build_app(AppState::new(config).unwrap());
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("host", "proxy.example:8787");
+    if let Some(token) = token {
+        builder = builder.header("x-headroom-proxy-token", token);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    let peer: SocketAddr = REMOTE.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    let host = seen[0]
+        .headers
+        .get("host")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    (host, seen[0].headers.get(RELAY_PROOF_HEADER).is_some())
+}
+
+#[tokio::test]
+async fn generic_loopback_upstream_keeps_the_callers_public_host() {
+    // A same-host gateway that routes by Host: it must see the caller's
+    // Host, and never the relay proof meant for the Python proxy.
+    for token in [None, Some(TOKEN)] {
+        assert_eq!(
+            no_rewrite_remote_request(false, token).await,
+            ("proxy.example:8787".to_owned(), false),
+            "{token:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn container_alias_host_is_never_relayed_for_a_remote_caller() {
+    // The Python proxy trusts these names from a loopback peer (Docker
+    // Desktop delivers container callers from 127.0.0.1), so a tokenless,
+    // Host-preserving front must not relay a remote caller under them.
+    for host in ["host.docker.internal:8787", "host.containers.internal"] {
+        let up = upstream().await;
+        let mut config = Config::for_test(up.uri().parse().unwrap());
+        config.rewrite_host = false;
+        let app = build_app(AppState::new(config).unwrap());
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap();
+        let peer: SocketAddr = REMOTE.parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let seen = up.received_requests().await.unwrap();
+        assert_eq!(
+            seen[0].headers.get("host").unwrap(),
+            "headroom-remote.invalid",
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn python_upstream_gets_the_relay_host_under_no_rewrite_host() {
+    // The Python proxy tells relayed callers apart by the reserved name.
+    assert_eq!(
+        no_rewrite_remote_request(true, None).await,
+        ("headroom-remote.invalid".to_owned(), false)
+    );
+    assert_eq!(
+        no_rewrite_remote_request(true, Some(TOKEN)).await,
+        ("headroom-remote.invalid".to_owned(), true)
+    );
+}
+
+/// The remote marker one upstream request carried, for a caller at `peer`
+/// that sends `headers`, with `--python-upstream` on or off.
+async fn upstream_remote_marker(
+    python: bool,
+    rewrite_host: bool,
+    peer: &str,
+    headers: &[(&str, &str)],
+) -> Option<String> {
+    let up = upstream().await;
+    let mut config = Config::for_test(up.uri().parse().unwrap());
+    config.python_upstream = python;
+    config.rewrite_host = rewrite_host;
+    let app = build_app(AppState::new(config).unwrap());
+    let mut builder = Request::builder().method("GET").uri("/v1/models");
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        builder = builder.header("host", "127.0.0.1:8787");
+    }
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    let addr: SocketAddr = peer.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let seen = up.received_requests().await.unwrap();
+    seen[0]
+        .headers
+        .get(FRONT_REMOTE_HEADER)
+        .map(|v| v.to_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn every_relayed_remote_caller_carries_the_remote_marker() {
+    // Whatever Host reaches the upstream (a preserved container alias, a
+    // public name, the relay name), the Python proxy is told the caller is
+    // not local; a client-sent value is replaced.
+    for python in [false, true] {
+        for rewrite_host in [true, false] {
+            for host in ["host.docker.internal:8787", "proxy.example:8787"] {
+                assert_eq!(
+                    upstream_remote_marker(
+                        python,
+                        rewrite_host,
+                        REMOTE,
+                        &[("host", host), (FRONT_REMOTE_HEADER, "0")],
+                    )
+                    .await
+                    .as_deref(),
+                    Some("1"),
+                    "python={python} rewrite_host={rewrite_host} host={host}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_caller_never_carries_the_remote_marker() {
+    // Nobody but this process sets it: a value a local client sends is
+    // dropped, so the upstream sees no marker at all.
+    for python in [false, true] {
+        assert_eq!(
+            upstream_remote_marker(python, true, LOCAL, &[(FRONT_REMOTE_HEADER, "1")]).await,
+            None,
+            "python={python}"
+        );
     }
 }
