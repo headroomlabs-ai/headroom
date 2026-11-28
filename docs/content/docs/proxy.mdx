@@ -570,7 +570,8 @@ The proxy also accepts:
 
 ### Antigravity IDE
 
-Google's Antigravity IDE can route its model traffic through the proxy:
+Headroom exposes MCP tools for the Antigravity IDE and a native Cloud Code
+endpoint for compatible clients:
 
 ```bash
 headroom wrap antigravity          # Start proxy + print Antigravity setup instructions
@@ -589,9 +590,13 @@ at the proxy. What the proxy does offer Antigravity users:
   [`POST /v1internal:streamGenerateContent`](#post-v1internalstreamgeneratecontent)
   and routed upstream like any other Cloud Code request.
 
-The Antigravity CLI (`agy`), unlike the IDE, accepts a custom endpoint
-via its `GOOGLE_GEMINI_BASE_URL` setting — the one Antigravity surface
-where a custom model endpoint is supported.
+### Antigravity CLI
+
+To point `agy` at the proxy's Gemini-compatible endpoint, select Gemini API key
+authentication. Set `modelProvider` to `gemini` in the CLI settings, export
+`GEMINI_API_KEY`, and set `GOOGLE_GEMINI_BASE_URL` to the proxy's base URL
+(for example, `http://127.0.0.1:8787`). See
+[Google's Antigravity CLI authentication guide](https://antigravity.google/docs/cli/install/).
 
 ### `POST /v1/compress`
 
