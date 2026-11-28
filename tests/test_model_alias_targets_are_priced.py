@@ -3,8 +3,8 @@
 `MODEL_ALIASES` exists so a retired model id still prices at its own tier.
 Every target pointed at `claude-sonnet-4-20250514` until litellm pruned it on
 2026-09-23; all three aliases then resolved to nothing and those models fell
-through to the unknown-model default -- the GPT-4o tier -- which silently
-misprices them. Nothing failed, because no test asserted the targets were live.
+through to the unknown-model default, which silently misprices them. Nothing
+failed, because no test asserted the targets were live.
 """
 
 from __future__ import annotations
@@ -46,9 +46,11 @@ def test_a_retired_id_prices_at_its_alias_rate(retired: str, target: str) -> Non
 def test_retired_sonnets_are_not_priced_at_the_unknown_default() -> None:
     """Regression for the failure mode this whole file is about.
 
-    The unknown-model fallback is the GPT-4o tier. A Sonnet-tier model landing
-    there is wrong in both directions and is exactly what happened when the
-    alias targets went stale.
+    The unknown-model fallback is a single shared default. A Sonnet-tier
+    model landing there is wrong in both directions and is exactly what
+    happened when the alias targets went stale. The gpt-4o rate below is the
+    wrong-tier sentinel: a retired Sonnet id must never price at a
+    cheaper model's rate.
     """
     gpt4o = get_model_pricing("gpt-4o")
     assert gpt4o is not None

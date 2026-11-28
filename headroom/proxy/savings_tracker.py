@@ -661,6 +661,30 @@ def estimate_request_savings_usd(
     }
 
 
+def _fallback_unknown_input_cost_usd(
+    cache_read: int,
+    cache_write: int,
+    uncached: int,
+    total_input_tokens: int,
+    use_breakdown: bool,
+) -> float:
+    """Input spend for a model no price source knows, at the shared fallback.
+
+    Cache reads bill at half the shared unknown-model input rate -- the same
+    effective convention the ledger uses (``_fallback_cost_usd`` in
+    ``proxy/cost.py``, #3825) -- so the savings tracker's input bill, the
+    history rollup's read cost (which derives from this function), and the
+    ledger all price an unknown model's cached tokens from one number:
+    $1.50 per 1M cached tokens, not $3.00 in the rollup against $1.50 in the
+    ledger. Without a breakdown there is nothing to discount, so the whole
+    prompt bills at the fallback input rate.
+    """
+    fallback = float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+    if use_breakdown:
+        return float(cache_read) * 0.5 * fallback + float(cache_write + uncached) * fallback
+    return float(total_input_tokens) * fallback
+
+
 def _estimate_input_cost_usd(
     model: str,
     input_tokens: int,
@@ -695,7 +719,9 @@ def _estimate_input_cost_usd(
     # `litellm` can be present but lack an entry for the resolved model,
     # in which case we fall back to a blended rate instead of zeroing usage.
     if litellm is None:
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        return _fallback_unknown_input_cost_usd(
+            cache_read, cache_write, uncached, total_input_tokens, use_breakdown
+        )
 
     try:
         resolved = _resolve_litellm_model(model)
@@ -705,7 +731,9 @@ def _estimate_input_cost_usd(
         # A present 0.0 means the model is free and must cost $0, not the fallback.
         if input_cost_per_token is None:
             _log_unpriced_model_once(model, "input_cost_per_token")
-            return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+            return _fallback_unknown_input_cost_usd(
+                cache_read, cache_write, uncached, total_input_tokens, use_breakdown
+            )
 
         if use_breakdown:
             cache_read_cost = info.get(
@@ -729,7 +757,9 @@ def _estimate_input_cost_usd(
             safe_id(model),
             describe_exception(exc),
         )
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        return _fallback_unknown_input_cost_usd(
+            cache_read, cache_write, uncached, total_input_tokens, use_breakdown
+        )
 
 
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:

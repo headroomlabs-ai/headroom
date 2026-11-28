@@ -26,12 +26,15 @@ from headroom.proxy.budget_basis_policy import (
     COST_BASIS_MEASURED,
     DEFAULT_POLICY,
     ENV_VAR,
+    PRICE_BASIS_ESTIMATED,
+    PRICE_BASIS_MEASURED,
     resolve_estimated_basis_policy,
 )
 from headroom.proxy.modes import PROXY_MODE_CACHE
 from headroom.proxy.persistent_metrics import (
     MAX_TRACKED_MODELS,
     OTHER_MODEL,
+    OTHER_PASSTHROUGH_MODEL,
     bounded_model_key,
 )
 
@@ -62,6 +65,41 @@ def _get_litellm_module() -> Any | None:
 
 
 logger = logging.getLogger("headroom.proxy")
+
+# Unknown-model default pricing, USD per 1M tokens. Last resort ONLY: used
+# when LiteLLM can't price a model and the caller supplied no
+# provider-resolved pricing (#3732). This is the shared unknown-input
+# fallback: the $3.00/M input basis matches the existing savings fallback
+# (``headroom/proxy/savings_tracker.py`` prices unknown-model tokens at
+# ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN``), so the ledger, the cost card,
+# and savings all price an unknown model from one number. Mirrors
+# ``OpenAIProvider._UNKNOWN_OPENAI_DEFAULT["pricing"]``; every entry booked
+# at this price is stamped PRICE_BASIS_ESTIMATED, never as a real lookup.
+_UNKNOWN_MODEL_DEFAULT_PRICING_PER_1M = (3.00, 10.00)
+
+
+def _fallback_cost_usd(
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    pricing_per_1m: tuple[float, float],
+) -> float:
+    """Cost from per-1M (input, output) prices when LiteLLM can't price a model.
+
+    Mirrors the OpenAI cache convention the default pricing belongs to: cache
+    reads at a 50% discount, cache writes at list (an inferred write is
+    already zeroed by the caller via ``cache_write_tokens``). A guess, but a
+    recorded-and-labelled one (#3825) beats silently booking $0, which left
+    the budget unable to trip on unpriced models.
+    """
+    input_per_1m, output_per_1m = pricing_per_1m
+    read = max(0, cache_read_tokens)
+    write = max(0, cache_write_tokens)
+    uncached = max(0, input_tokens - read - write)
+    prompt_cost = ((uncached + write) + 0.5 * read) * input_per_1m / 1_000_000
+    return prompt_cost + max(0, output_tokens) * output_per_1m / 1_000_000
+
 
 # Pricing-lookup warnings are emitted on the per-request cost path, so an
 # unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
@@ -119,11 +157,21 @@ class CostEntry(NamedTuple):
     when it didn't and Headroom's own ``tokens_sent`` stood in for the input
     count. Budget enforcement is a hard control, so the two must stay separable
     in the ledger rather than collapsing into an undifferentiated dollar figure.
+
+    ``price_basis`` is the independent second dimension (#3732): whether the
+    *price* the cost was computed at came from a real lookup
+    (:data:`~headroom.proxy.budget_basis_policy.PRICE_BASIS_MEASURED`) or from
+    the unknown-model default guess
+    (:data:`~headroom.proxy.budget_basis_policy.PRICE_BASIS_ESTIMATED`). A
+    record may carry provider-reported usage priced at a guessed default; the
+    two provenances are reported separately and a record is non-authoritative
+    for budget purposes when either one is estimated.
     """
 
     timestamp: datetime
     cost_usd: float
     basis: str
+    price_basis: str = PRICE_BASIS_MEASURED
 
 
 # Provider-specific cache discount multipliers (what fraction of input price).
@@ -336,7 +384,9 @@ def build_prefix_cache_stats(
                 _blended_write = (_w_cost / _w_all) if _w_all > 0 else _cw5_price
                 if cache_prices.write_is_catalog:
                     write_mult = _blended_write / _uncached_price
-                if cache_prices.read_is_catalog and (cache_prices.write_is_catalog or not _w_all):
+                if model_name in getattr(cost_tracker, "_fixed_pricing_by_model", {}):
+                    pricing_source = "provider_resolved"
+                elif cache_prices.read_is_catalog and (cache_prices.write_is_catalog or not _w_all):
                     pricing_source = "catalog"
                 elif cache_prices.read_is_catalog or cache_prices.write_is_catalog:
                     pricing_source = "mixed"
@@ -939,9 +989,23 @@ class CostTracker:
         self._budget_measured_usd = 0.0
         self._budget_estimated_usd = 0.0
         self._budget_estimated_records = 0
+        # Price provenance is the second, independent ledger dimension (#3732):
+        # spend booked at a guessed (unknown-model default) price. Tracked
+        # apart from the usage-estimated bucket above so ``estimated_pct``
+        # keeps its "input count was estimated" meaning.
+        self._budget_price_estimated_usd = 0.0
+        self._budget_price_estimated_records = 0
+        # Union of the two for the enforcement policy: a record is
+        # non-authoritative when EITHER its input count OR its price was
+        # estimated. Tracked as its own aggregate (rather than summing the two
+        # buckets) so a record estimated on both dimensions counts once.
+        self._budget_non_authoritative_usd = 0.0
 
         # Token savings per model (exact, no dollar estimation)
         self._tokens_saved_by_model: dict[str, int] = {}
+        self._fixed_pricing_by_model: dict[str, tuple[float, float]] = {}
+        self._input_spend_by_model: dict[str, float] = {}
+        self._output_spend_by_model: dict[str, float] = {}
         # Cache-aware counterfactual buckets for compressed-away message tokens,
         # the same treatment the deferred tool schemas get below. Floats: shares
         # of a request's removed tokens, not whole tokens. Keyed by
@@ -1015,7 +1079,13 @@ class CostTracker:
         self._budget_measured_usd = 0.0
         self._budget_estimated_usd = 0.0
         self._budget_estimated_records = 0
+        self._budget_price_estimated_usd = 0.0
+        self._budget_price_estimated_records = 0
+        self._budget_non_authoritative_usd = 0.0
         self._tokens_saved_by_model.clear()
+        self._fixed_pricing_by_model.clear()
+        self._input_spend_by_model.clear()
+        self._output_spend_by_model.clear()
         self._saved_write_5m_by_tier.clear()
         self._saved_write_1h_by_tier.clear()
         self._saved_list_by_tier.clear()
@@ -1087,7 +1157,12 @@ class CostTracker:
             )
 
             total_cost = input_cost + output_cost
-            return float(total_cost) if total_cost > 0 else None
+            # A found-but-zero price is a price, not a missing one: a model
+            # LiteLLM prices at $0 is genuinely free, and returning None
+            # here would let the record path invent fallback charges for it
+            # (#3825). Only a negative total -- which cost_per_token cannot
+            # produce for a well-formed call -- still reads as unpriced.
+            return float(total_cost) if total_cost >= 0 else None
 
         except Exception as e:
             _warn_pricing_once("estimate", "Failed to get pricing", model, e)
@@ -1126,6 +1201,9 @@ class CostTracker:
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
         provider_reported: bool = False,
+        price_basis: str = PRICE_BASIS_MEASURED,
+        pricing: tuple[float, float] | None = None,
+        pricing_override: bool = False,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -1153,6 +1231,23 @@ class CostTracker:
                 counted both.
             provider_reported: True when ``tokens_sent`` is the provider's own
                 billed input (uncached + cache read + cache write).
+            price_basis: Provenance of the price the cost was computed at
+                (:data:`~headroom.proxy.budget_basis_policy.PRICE_BASIS_MEASURED`
+                or ``PRICE_BASIS_ESTIMATED``). Independent of the usage basis:
+                a record may carry provider-reported usage priced at the
+                unknown-model default guess (#3732). An unrecognized value
+                degrades to measured rather than silently changing enforcement.
+            pricing: Provider-resolved per-1M (input, output) USD for this
+                model, from the provider's own per-lookup resolution (explicit
+                config -> LiteLLM -> built-in table -> unknown default,
+                #3732). Used when ``estimate_cost`` (LiteLLM) can't price
+                the model, so the request books a labelled fallback entry
+                instead of silently recording $0. When None, the generic
+                unknown-model default ($3.00/$10 per 1M) stands in and the
+                entry is stamped PRICE_BASIS_ESTIMATED.
+            pricing_override: Treat supplied rates as the operator-selected fixed price,
+                ahead of LiteLLM. Uses the provider's 50% cache-read convention;
+                catalog pricing otherwise retains native cache/context tiers.
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1277,21 +1372,13 @@ class CostTracker:
             self._api_cache_write_1h_by_model.get(key, 0) + write_1h_eff
         )
         self._api_uncached_by_model[key] = self._api_uncached_by_model.get(key, 0) + uncached_tokens
-        if key == OTHER_MODEL and model != OTHER_MODEL:
-            self._book_folded_usd(
-                model,
-                long_context=long_context,
-                tokens_saved=tokens_saved,
-                tokens_sent=tokens_sent,
-                cache_read=cache_read_tokens,
-                write=write_eff,
-                write_5m=write_5m_eff,
-                write_1h=write_1h_eff,
-                uncached=uncached_tokens,
-                output=output_tokens,
-                tool_schema_saved=tool_schema_saved,
-            )
-
+        # Resolve the selected price BEFORE folded accounting, so the ledger
+        # entry and a folded ``other`` label book the same dollars once.
+        # Previously the folded path ran first and re-resolved the catalog,
+        # so an override-priced request booked $20.20 in the ledger but
+        # $0.51 on the card, and an unknown model's cache reads booked $1.50
+        # in the ledger but $0.00 in totals() (#3825).
+        #
         # Populate _costs so check_budget() has real data to enforce against.
         # When the call site had no API usage breakdown (all cache/uncached
         # fields are 0), fall back to tokens_sent so input cost isn't
@@ -1326,18 +1413,149 @@ class CostTracker:
             input_tokens = tokens_sent
             basis = COST_BASIS_ESTIMATED
             _warn_estimated_basis_once(key)
-        cost = self.estimate_cost(
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=effective_cache_write,
-        )
+        cost: float | None
+        fixed_pricing: tuple[float, float] | None = None
+        if pricing_override and pricing is not None:
+            # Operator-selected fixed rates beat a successful catalog lookup.
+            # Use the provider's existing 50% cache-read convention for overrides;
+            # ordinary catalog pricing retains native cache and context tiers.
+            cost = _fallback_cost_usd(
+                input_tokens, output_tokens, cache_read_tokens, effective_cache_write, pricing
+            )
+            fixed_pricing = pricing
+        else:
+            cost = self.estimate_cost(
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=effective_cache_write,
+            )
+        entry_price_basis = price_basis
+        if cost is None and not model.startswith("passthrough:"):
+            # LiteLLM can't price this model (unknown to the catalog, or
+            # LiteLLM absent). Book the provider's per-lookup fallback price
+            # instead of recording nothing: an unpriced model previously
+            # contributed $0 to the ledger and the budget could never trip on
+            # it (#3825 review). ``passthrough:`` models genuinely have no
+            # price and keep the old no-entry behaviour.
+            #
+            # The fallback fires only for a model no price source knows.
+            # When the caller supplied no pricing but the catalog DOES price
+            # the model (``_get_cache_prices`` resolves it even though
+            # ``litellm.cost_per_token`` could not -- a valid $0 row, or a
+            # cache-only catalog entry), booking the fallback would invent
+            # charges for valid pricing (#3825): a free catalog model keeps
+            # booking $0, and a cache-sliced model keeps its catalog rates.
+            catalog_prices = (
+                None
+                if pricing is not None
+                else self._get_cache_prices(model, long_context=long_context, include_fixed=False)
+            )
+            if catalog_prices is None:
+                fallback = pricing if pricing is not None else _UNKNOWN_MODEL_DEFAULT_PRICING_PER_1M
+                fixed_pricing = fallback
+                if pricing is None:
+                    # Generic path: LiteLLM already failed, so this is the
+                    # unknown-model default guess, not a lookup.
+                    entry_price_basis = PRICE_BASIS_ESTIMATED
+                computed = _fallback_cost_usd(
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    effective_cache_write,
+                    fallback,
+                )
+                cost = computed if computed > 0 else None
         if cost is not None:
-            entry = CostEntry(datetime.now(), cost, basis)
+            entry = CostEntry(
+                datetime.now(),
+                cost,
+                basis,
+                entry_price_basis
+                if entry_price_basis == PRICE_BASIS_ESTIMATED
+                else PRICE_BASIS_MEASURED,
+            )
             self._costs.append(entry)
             self._record_budget_cost(entry)
             self._prune_old_costs()
+
+        if key == OTHER_MODEL and model != OTHER_MODEL:
+            self._book_folded_usd(
+                model,
+                long_context=long_context,
+                tokens_saved=tokens_saved,
+                tokens_sent=tokens_sent,
+                cache_read=cache_read_tokens,
+                write=write_eff,
+                write_5m=write_5m_eff,
+                write_1h=write_1h_eff,
+                uncached=uncached_tokens,
+                output=output_tokens,
+                tool_schema_saved=tool_schema_saved,
+                selected_pricing=fixed_pricing,
+            )
+
+        # The selected price and ledger entry are resolved above, before
+        # folded accounting, so a folded label books the same dollars the
+        # ledger just booked instead of re-resolving the catalog (#3825).
+
+        # Capture spend at request time so catalog/override changes cannot
+        # reprice historical traffic. Keyed by the BOUNDED label (``key``),
+        # never the raw client-supplied name, so these maps stay within the
+        # same 201-entry cap as every other per-model map (#3825: 250
+        # supplied names created 250 entries). A request whose label folded
+        # into ``other`` is skipped here: its dollars are priced once by
+        # ``_book_folded_usd`` above, and capturing them again would
+        # double-count them. A request literally NAMED ``other`` is not
+        # folded -- it is a selected request, and its spend is captured here
+        # (#3825 re-review): the folded path above never ran for it, so
+        # skipping it left its dollars in the ledger but $0.00 in totals().
+        # Its price is resolved from the already-selected ``fixed_pricing``
+        # directly and is NOT stored in ``_fixed_pricing_by_model``: that map
+        # is consulted for folded models too, and an ``other`` entry there
+        # would misprice folded traffic -- and double-count folded savings
+        # in stats() -- at this request's rate.
+        if (key != OTHER_MODEL and key != OTHER_PASSTHROUGH_MODEL) or model == OTHER_MODEL:
+            if key != OTHER_MODEL:
+                if fixed_pricing is not None:
+                    self._fixed_pricing_by_model[key] = fixed_pricing
+                else:
+                    self._fixed_pricing_by_model.pop(key, None)
+            if model == OTHER_MODEL and fixed_pricing is not None:
+                input_price = fixed_pricing[0] / 1_000_000
+                rates: tuple[float, float, float, float] | None = (
+                    0.5 * input_price,
+                    input_price,
+                    input_price,
+                    input_price,
+                )
+            else:
+                rates = self._get_cache_prices(model, long_context=long_context)
+            if rates is not None:
+                read_price, write_5m_price, write_1h_price, input_price = rates
+                if cache_read_tokens or write_eff or uncached_tokens:
+                    billed_write_1h = min(write_1h_eff, write_eff)
+                    billed_write_5m = write_eff - billed_write_1h
+                    input_spend = (
+                        max(0, cache_read_tokens) * read_price
+                        + billed_write_5m * write_5m_price
+                        + billed_write_1h * write_1h_price
+                        + max(0, uncached_tokens) * input_price
+                    )
+                else:
+                    input_spend = max(0, tokens_sent) * input_price
+                self._input_spend_by_model[key] = (
+                    self._input_spend_by_model.get(key, 0.0) + input_spend
+                )
+            if model == OTHER_MODEL and fixed_pricing is not None:
+                output_price: float | None = fixed_pricing[1] / 1_000_000
+            else:
+                output_price = self._get_output_price(model, long_context=long_context)
+            if output_price is not None:
+                self._output_spend_by_model[key] = (
+                    self._output_spend_by_model.get(key, 0.0) + max(0, output_tokens) * output_price
+                )
 
     def _period_cutoff(self, now: datetime | None = None) -> datetime:
         """Start of the current budget period."""
@@ -1356,6 +1574,21 @@ class CostTracker:
             self._budget_estimated_records -= 1
         else:
             self._budget_measured_usd -= entry.cost_usd
+        if entry.price_basis == PRICE_BASIS_ESTIMATED:
+            self._budget_price_estimated_usd -= entry.cost_usd
+            self._budget_price_estimated_records -= 1
+        if self._is_non_authoritative(entry):
+            self._budget_non_authoritative_usd -= entry.cost_usd
+
+    @staticmethod
+    def _is_non_authoritative(entry: CostEntry) -> bool:
+        """True when the record is a guess on either provenance dimension.
+
+        Usage-estimated (no provider breakdown) OR price-estimated
+        (unknown-model default price, #3732): both make a budget decision
+        against the record non-authoritative under the estimated-basis policy.
+        """
+        return entry.basis == COST_BASIS_ESTIMATED or entry.price_basis == PRICE_BASIS_ESTIMATED
 
     def _refresh_budget_window(self, now: datetime | None = None) -> None:
         """Evict expired current-period entries, each exactly once."""
@@ -1368,6 +1601,9 @@ class CostTracker:
         self._budget_measured_usd = max(0.0, self._budget_measured_usd)
         self._budget_estimated_usd = max(0.0, self._budget_estimated_usd)
         self._budget_estimated_records = max(0, self._budget_estimated_records)
+        self._budget_price_estimated_usd = max(0.0, self._budget_price_estimated_usd)
+        self._budget_price_estimated_records = max(0, self._budget_price_estimated_records)
+        self._budget_non_authoritative_usd = max(0.0, self._budget_non_authoritative_usd)
 
     def _record_budget_cost(self, entry: CostEntry) -> None:
         """Add one entry to the current-period aggregate in amortized O(1)."""
@@ -1378,6 +1614,11 @@ class CostTracker:
             self._budget_estimated_records += 1
         else:
             self._budget_measured_usd += entry.cost_usd
+        if entry.price_basis == PRICE_BASIS_ESTIMATED:
+            self._budget_price_estimated_usd += entry.cost_usd
+            self._budget_price_estimated_records += 1
+        if self._is_non_authoritative(entry):
+            self._budget_non_authoritative_usd += entry.cost_usd
 
     def get_period_cost(self, basis: str | None = None) -> float:
         """Get cost for current budget period.
@@ -1402,12 +1643,21 @@ class CostTracker:
         own estimate because the provider returned no usage breakdown. Keeping
         it separable is the point: a budget refusal driven by a guess should be
         distinguishable from one driven by provider-reported usage (#2713).
+
+        ``price_estimated_usd`` is the independent second dimension (#3732):
+        spend computed at a guessed (unknown-model default) price. It is
+        reported apart so ``estimated_pct`` keeps its "input count was
+        estimated" meaning; ``non_authoritative_usd`` is the union the
+        enforcement policy acts on.
         """
         self._refresh_budget_window()
         measured_usd = self._budget_measured_usd
         estimated_usd = self._budget_estimated_usd
         records = len(self._budget_costs)
         estimated_records = self._budget_estimated_records
+        price_estimated_usd = self._budget_price_estimated_usd
+        price_estimated_records = self._budget_price_estimated_records
+        non_authoritative_usd = self._budget_non_authoritative_usd
 
         total_usd = measured_usd + estimated_usd
         return {
@@ -1419,27 +1669,39 @@ class CostTracker:
             "estimated_pct": round(estimated_usd / total_usd * 100, 1) if total_usd > 0 else 0.0,
             "records": records,
             "estimated_records": estimated_records,
+            "price_estimated_usd": price_estimated_usd,
+            "price_estimated_records": price_estimated_records,
+            "non_authoritative_usd": non_authoritative_usd,
         }
 
     def check_budget(self) -> tuple[bool, float]:
         """Check if within budget. Returns (allowed, remaining).
 
-        How estimated-basis spend participates is governed by
+        How non-authoritative spend participates is governed by
         ``estimated_basis_policy``: ``count`` (default) enforces against total
-        spend exactly as before, ``ignore`` enforces against provider-measured
+        spend exactly as before, ``ignore`` enforces against authoritative
         spend only, and ``block`` refuses outright once the period holds any
-        estimated spend rather than enforcing a hard limit against a guess.
+        non-authoritative spend rather than enforcing a hard limit against a
+        guess.
+
+        A record is non-authoritative when EITHER its input count was estimated
+        (no provider usage breakdown, #2713) OR its price was the
+        unknown-model default guess (#3732) — the two provenance dimensions
+        stay separable in reporting, but the policy treats both as guesses.
         """
         if self.budget_limit_usd is None:
             return True, float("inf")
 
         breakdown = self.period_cost_breakdown()
 
-        if self.estimated_basis_policy == BUDGET_BASIS_BLOCK and breakdown["estimated_usd"] > 0:
+        if (
+            self.estimated_basis_policy == BUDGET_BASIS_BLOCK
+            and breakdown["non_authoritative_usd"] > 0
+        ):
             return False, 0.0
 
         if self.estimated_basis_policy == BUDGET_BASIS_IGNORE:
-            period_cost = breakdown["measured_usd"]
+            period_cost = breakdown["total_usd"] - breakdown["non_authoritative_usd"]
         else:
             period_cost = breakdown["total_usd"]
 
@@ -1451,30 +1713,52 @@ class CostTracker:
 
         Built here rather than in the handler so the message can name what the
         ledger actually knows — specifically how much of the period's spend was
-        booked from Headroom's own token estimate.
+        booked from Headroom's own token estimate, and how much was priced at
+        the unknown-model default guess.
         """
         breakdown = self.period_cost_breakdown()
         estimated_usd = breakdown["estimated_usd"]
+        price_estimated_usd = breakdown["price_estimated_usd"]
 
-        if self.estimated_basis_policy == BUDGET_BASIS_BLOCK and estimated_usd > 0:
+        if (
+            self.estimated_basis_policy == BUDGET_BASIS_BLOCK
+            and breakdown["non_authoritative_usd"] > 0
+        ):
+            reasons = []
+            if estimated_usd > 0:
+                reasons.append(
+                    f"${estimated_usd:.4f} was booked from Headroom's own token "
+                    "estimate because the provider returned no usage breakdown"
+                )
+            if price_estimated_usd > 0:
+                reasons.append(
+                    f"${price_estimated_usd:.4f} was priced at the unknown-model default guess"
+                )
             return (
                 f"Budget enforcement blocked for {self.budget_period} period: "
-                f"${estimated_usd:.4f} of ${breakdown['total_usd']:.4f} was booked from "
-                "Headroom's own token estimate because the provider returned no usage "
-                f"breakdown, and {ENV_VAR}=block refuses to enforce a budget on an "
-                "estimate. Set it to 'count' or 'ignore' to serve these requests."
+                f"{' and '.join(reasons)} (of ${breakdown['total_usd']:.4f} total), "
+                f"and {ENV_VAR}=block refuses to enforce a budget on an estimate. "
+                "Set it to 'count' or 'ignore' to serve these requests."
             )
 
         detail = f"Budget exceeded for {self.budget_period} period"
+        notes = []
         if estimated_usd > 0:
-            detail += (
-                f" (${estimated_usd:.4f} of ${breakdown['total_usd']:.4f} booked from "
-                f"Headroom token estimates, not provider-reported usage)"
+            notes.append(
+                f"${estimated_usd:.4f} booked from Headroom token estimates, "
+                "not provider-reported usage"
             )
+        if price_estimated_usd > 0:
+            notes.append(f"${price_estimated_usd:.4f} priced at the unknown-model default guess")
+        if notes:
+            detail += f" ({'; '.join(notes)})"
         return detail
 
     def _get_list_price(self, model: str) -> float | None:
         """Get list input price per 1M tokens for a model."""
+        fixed_key = bounded_model_key(model, self._requests_by_model)
+        if fixed_key in self._fixed_pricing_by_model:
+            return self._fixed_pricing_by_model[fixed_key][0]
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -1496,6 +1780,9 @@ class CostTracker:
         long-context tier where it publishes one (Sonnet 4.5 above 200K: 1.5x;
         Haiku 5.5 above 100K: 5x).
         """
+        fixed_key = bounded_model_key(model, self._requests_by_model)
+        if fixed_key in self._fixed_pricing_by_model:
+            return self._fixed_pricing_by_model[fixed_key][1] / 1_000_000
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -1549,9 +1836,28 @@ class CostTracker:
         uncached: int,
         output: int,
         tool_schema_saved: int,
+        selected_pricing: tuple[float, float] | None = None,
     ) -> None:
-        """Price one request whose label was folded, with the read-time formulas."""
-        prices = self._get_cache_prices(model)
+        """Price one request whose label was folded, with the read-time formulas.
+
+        ``selected_pricing`` is the per-1M (input, output) price the ledger
+        just booked for this request (operator override or unknown-model
+        fallback). When set, the folded dollars use it -- the provider's 50%
+        cache-read convention, writes at list -- instead of re-resolving the
+        catalog, so the card and the ledger cannot disagree about a folded
+        label (#3825). When None the request priced from the catalog and the
+        existing catalog lookups below still apply.
+        """
+        prices: tuple[float, float, float, float] | None
+        out_price: float | None
+        if selected_pricing is not None:
+            input_per_1m, output_per_1m = selected_pricing
+            input_price = input_per_1m / 1_000_000
+            prices = (0.5 * input_price, input_price, input_price, input_price)
+            out_price = output_per_1m / 1_000_000
+        else:
+            prices = self._get_cache_prices(model)
+            out_price = self._get_output_price(model, long_context=long_context)
         if prices:
             cr_price, w5_price, w1h_price, uncached_price = prices
             if cache_read + write + uncached > 0:
@@ -1565,7 +1871,6 @@ class CostTracker:
             else:
                 self._folded_input_usd += tokens_sent * uncached_price
             self._folded_savings_usd += tokens_saved * uncached_price
-        out_price = self._get_output_price(model, long_context=long_context)
         if out_price:
             self._folded_output_usd += max(0, output) * out_price
         # Cache-aware compression and tool-schema savings: same buckets and
@@ -1580,7 +1885,11 @@ class CostTracker:
                 uncached_tokens=uncached,
                 region="live_zone",
             )
-            ca = self._get_cache_prices(model, long_context=long_context, for_billing=False)
+            ca = (
+                prices
+                if selected_pricing is not None
+                else self._get_cache_prices(model, long_context=long_context, for_billing=False)
+            )
             if ca:
                 self._folded_cache_aware_savings_usd += c5 * ca[1] + c1 * ca[2] + cl * ca[3]
         if tool_schema_saved > 0:
@@ -1593,12 +1902,21 @@ class CostTracker:
                 uncached_tokens=uncached,
                 region="prefix",
             )
-            tp = self._get_cache_prices(model, for_billing=False)
+            tp = (
+                prices
+                if selected_pricing is not None
+                else self._get_cache_prices(model, for_billing=False)
+            )
             if tp:
                 self._folded_tool_savings_usd += rd * tp[0] + t5 * tp[1] + t1 * tp[2] + tl * tp[3]
 
     def _get_cache_prices(
-        self, model: str, *, long_context: bool = False, for_billing: bool = True
+        self,
+        model: str,
+        *,
+        long_context: bool = False,
+        for_billing: bool = True,
+        include_fixed: bool = True,
     ) -> tuple[float, float, float, float] | None:
         """Per-token prices for (cache read, 5m write, 1h write, uncached input).
 
@@ -1611,6 +1929,12 @@ class CostTracker:
         ``for_billing`` resolves missing cache catalog rates through LiteLLM's
         billing calculator. Savings consumers opt out to keep the resolver's
         counterfactual estimates.
+
+        ``include_fixed`` (default True) lets a provider-resolved or fallback
+        price recorded for the model stand in for the catalog. Pass False to
+        ask the catalog alone -- the fallback gate in ``record_tokens`` needs
+        that, so a price recorded for an earlier request cannot make a
+        still-unpriced model look catalog-priced.
 
         The 1h write rate is new: LiteLLM publishes it per model as
         ``cache_creation_input_token_cost_above_1hr`` (Sonnet: 2.00x base), and
@@ -1625,6 +1949,11 @@ class CostTracker:
         Imported at call time: ``headroom.pricing`` eagerly imports litellm
         (~4s) and this module is on the proxy's startup path.
         """
+        fixed_key = bounded_model_key(model, self._requests_by_model)
+        if include_fixed and fixed_key in self._fixed_pricing_by_model:
+            input_price = self._fixed_pricing_by_model[fixed_key][0] / 1_000_000
+            return (0.5 * input_price, input_price, input_price, input_price)
+
         try:
             from headroom.pricing.counterfactual import resolve_rates
 
@@ -1632,7 +1961,12 @@ class CostTracker:
         except Exception as e:
             _warn_pricing_once("cache_rates", "Failed to resolve cache rates", model, e)
             return None
-        if rates is None or not rates.uncached:
+        # ``None`` means the catalog has no row for the model at all. A row
+        # whose input price is legitimately 0.0 (a free model) resolves to
+        # all-zero rates, not None -- collapsing those to None here would
+        # make a free model look unpriced and let the record path invent
+        # fallback charges for it (#3825).
+        if rates is None:
             return None
         return (rates.read, rates.write_5m, rates.write_1h, rates.uncached)
 
@@ -1659,6 +1993,10 @@ class CostTracker:
             cw = self._api_cache_write_by_model.get(model, 0)
             uncached = self._api_uncached_by_model.get(model, 0)
             total_input_tokens += sent
+
+            if model in self._input_spend_by_model:
+                cost_with_headroom += self._input_spend_by_model[model]
+                continue
 
             prices = self._get_cache_prices(model)
             if prices:
@@ -1729,6 +2067,11 @@ class CostTracker:
             uncached = self._api_uncached_by_model.get(model, 0)
             total_input_tokens += sent
 
+            if model in self._input_spend_by_model:
+                cost_with_headroom += self._input_spend_by_model[model]
+                total_billed_input_tokens += cr + cw + uncached or sent
+                continue
+
             prices = self._get_cache_prices(model)
             if prices:
                 cr_price, cw5_price, cw1h_price, uncached_price = prices
@@ -1771,9 +2114,16 @@ class CostTracker:
         # tokens the model emitted, or the spend it shows isn't the bill.
         output_cost_usd = self._folded_output_usd
         for (model, long_context), out_tokens in self._output_tokens_by_tier.items():
+            if model in self._output_spend_by_model:
+                continue
             price = self._get_output_price(model, long_context=long_context)
             if price:
                 output_cost_usd += out_tokens * price
+        # Spend captured at record time (fixed/override/catalog rates) is added
+        # once per model: the tier loop above skips those models, so without
+        # this their completion dollars never reached the card (#3825: the
+        # completion test showed $0 instead of $0.30).
+        output_cost_usd += sum(self._output_spend_by_model.values())
 
         # Compression savings priced at the rate the removed tokens would have
         # been billed at: live-zone content, so the provider's cache-write rate
