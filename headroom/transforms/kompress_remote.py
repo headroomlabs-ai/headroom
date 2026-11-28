@@ -326,11 +326,11 @@ class RemoteKompressCompressor:
             # Same resolution order as KompressCompressor.compress.
             ccr_source = ccr_original if ccr_original is not None else content
             # The endpoint's ``original_tokens`` describes ``content``, so it does
-            # not describe a different ``ccr_source``; count that one locally.
-            # Unchanged on the common path where no override was passed.
-            ccr_source_tokens = (
-                len(ccr_source.split()) if ccr_original is not None else result.original_tokens
-            )
+            # not describe a different ``ccr_source`` — and in either case the
+            # local CCR bookkeeping measures the source locally so the stored
+            # count is one consistent unit (payload_tokens, tiktoken) rather
+            # than the endpoint's own measure.
+            ccr_source_tokens = payload_tokens(ccr_source)
             gate: dict[str, bool] = {} if record_toin else {"record_toin": False}
             cache_key = store_kompress_in_ccr(ccr_source, compressed, ccr_source_tokens, **gate)
             if cache_key:
