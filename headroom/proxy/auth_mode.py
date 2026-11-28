@@ -162,6 +162,22 @@ def should_stamp_codex_client(path: str, headers: Mapping[str, Any] | Any) -> bo
     return should_stamp_codex_client_signals(path, _auth_signals(headers))
 
 
+def is_identified_codex_client(headers: Mapping[str, Any] | Any, *, stamped: bool) -> bool:
+    """Whether the caller identifies itself as Codex, beyond the path stamp.
+
+    :func:`should_stamp_codex_client` labels every unidentified Responses
+    caller ``codex``, generic OpenAI SDKs included, so ``client == "codex"``
+    alone does not mean Codex. Every Codex surface sends an ``originator``
+    header naming itself (``codex-tui``, ``codex_exec``, ``codex_vscode``,
+    ``Codex Desktop`` on Codex 0.167.0) and generic SDKs send none. Without
+    one, only an explicit ``X-Client: codex`` or a known Codex User-Agent
+    counts, which a stamped request (``stamped``) lacked by definition.
+    """
+    if _header_get(headers, "originator").strip().lower().startswith("codex"):
+        return True
+    return not stamped and classify_client(headers) == "codex"
+
+
 # Client harnesses that can consume Headroom's mid-turn message-coalescing
 # protocol: the 202 ``headroom_queued`` reply and the synthetic
 # ``headroom_pending_messages`` SSE event. This is a custom protocol only Claude
@@ -191,6 +207,7 @@ __all__ = [
     "SUBSCRIPTION_UA_PREFIXES",
     "classify_auth_mode",
     "classify_client",
+    "is_identified_codex_client",
     "should_stamp_codex_client",
     "supports_mid_turn_coalescing",
 ]
