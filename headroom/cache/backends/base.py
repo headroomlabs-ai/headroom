@@ -89,6 +89,35 @@ class CompressionStoreBackend(Protocol):
         """
         ...
 
+    # --- Optional hooks -------------------------------------------------
+    # Not part of the protocol: ``isinstance(backend, CompressionStoreBackend)``
+    # must not start requiring them of existing and third-party backends.
+    # ``CompressionStore`` feature-detects each one.
+    #
+    # def available(self) -> bool:
+    #     """Whether reads can reach the store right now.
+    #
+    #     ``get``/``exists`` are expected to absorb backend errors into "not
+    #     found", which makes an outage indistinguishable from an eviction.
+    #     A backend that can be unavailable (Redis, SQLite) implements this so
+    #     ``CompressionStore.all_live`` can report "could not ask" instead of
+    #     "gone"; a caller that would discard its own data on a miss needs the
+    #     difference.
+    #     """
+    #
+    # def live(self, hash_key: str) -> bool | None:
+    #     """Whether the entry is present and unexpired, without loading it.
+    #
+    #     ``None`` when the probe could not run (failed or skipped): a missing
+    #     entry and an unreachable store must not read the same, or a caller
+    #     that discards data on a miss would evict on an outage.
+    #
+    #     ``CompressionStore.all_live`` falls back to ``get`` + ``is_expired``,
+    #     which deserializes the whole original (megabytes for a large tool
+    #     output). A backend whose TTL is a column (SQLite) or is enforced by
+    #     the store itself (Redis) answers from the key.
+    #     """
+
     def clear(self) -> None:
         """Remove all entries from storage."""
         ...

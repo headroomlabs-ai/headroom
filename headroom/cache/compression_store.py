@@ -39,6 +39,8 @@ import re
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -659,6 +661,52 @@ class CompressionStore:
                 return False
             return True
 
+    def all_live(self, hash_keys: Iterable[str]) -> bool | None:
+        """Whether every one of ``hash_keys`` is present and unexpired.
+
+        ``None`` when the backend could not answer. That case has to be told
+        apart from a miss by a caller that would otherwise discard its own
+        data: a Redis or SQLite read failure degrades to "entry not found", so
+        an outage is indistinguishable from an eviction by the return value
+        alone. A key-only ``live`` probe reports that itself; the
+        ``get`` fallback asks ``available`` after the lookups, so its state
+        reflects whether they actually reached the store.
+        """
+        with self._lock:
+            for hash_key in hash_keys:
+                # ``live`` is the key-only probe: the entry's original can be
+                # megabytes, and only its presence and TTL matter here. The
+                # probe answers ``None`` when it could not run, which is
+                # carried out as-is: a failed probe must not read as a miss.
+                probe = getattr(self._backend, "live", None)
+                if probe is not None:
+                    try:
+                        live = probe(hash_key)
+                    except Exception as exc:  # noqa: BLE001 - a broken probe is no answer
+                        logger.debug(
+                            "CCR liveness probe raised (%s); treating as unknown",
+                            describe_exception(exc),
+                        )
+                        return None
+                    if live is None:
+                        return None
+                    if not live:
+                        # The probe succeeded, so this is a definite miss even
+                        # if some other call (a write) is failing.
+                        return False
+                    continue
+                entry = self._backend.get(hash_key)
+                if entry is None or entry.is_expired():
+                    break
+            else:
+                return True
+        # Only the ``get`` fallback is ambiguous: both backends report a failed
+        # read as "not found", so ask whether the backend could answer at all.
+        available = getattr(self._backend, "available", None)
+        if available is not None and available() is False:
+            return None
+        return False
+
     def get_entry_status(
         self,
         hash_key: str,
@@ -1234,6 +1282,22 @@ def set_request_compression_store(store: CompressionStore | None) -> None:
 def clear_request_compression_store() -> None:
     """Clear the request-scoped compression store."""
     _request_ccr_store.set(None)
+
+
+@contextmanager
+def request_compression_store(store: CompressionStore | None) -> Iterator[None]:
+    """Bind ``store`` as this context's CCR store, restoring the previous one.
+
+    For code that receives the request's store as an argument while the
+    helpers it calls resolve it through :func:`get_compression_store`: binding
+    it for the duration keeps reads and writes on the same store, and the
+    restore keeps it out of whatever runs next on the same context.
+    """
+    token = _request_ccr_store.set(store)
+    try:
+        yield
+    finally:
+        _request_ccr_store.reset(token)
 
 
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:

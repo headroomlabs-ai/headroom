@@ -164,6 +164,49 @@ def _is_already_compressed(text: str) -> bool:
     return any(marker in text for marker in _ALREADY_COMPRESSED_MARKERS)
 
 
+# The hash inside a retrieval marker, in every shape listed above. The lower
+# bound is 12 hex chars: the Rust row-drop path emits SHA-256[:12].
+_CCR_MARKER_HASH_RE = re.compile(
+    r"(?:Retrieve (?:more|original): hash=|<<ccr:)([0-9a-fA-F]{12,64})(?![0-9a-fA-F])"
+)
+
+
+def _ccr_marker_hashes(text: str) -> set[str]:
+    """Lowercased hashes referenced by the retrieval markers in ``text``."""
+    return {match.group(1).lower() for match in _CCR_MARKER_HASH_RE.finditer(text)}
+
+
+def _ccr_markers_live(text: str, store: Any = None) -> bool:
+    """Whether every retrieval marker in ``text`` still resolves.
+
+    ``store`` must be the store the markers were written to: a request may be
+    served by an explicit ``compression_store`` while the process default is
+    empty, and checking the default would then evict a valid result. ``None``
+    resolves the request-scoped store as before.
+
+    A marker is a pointer, so it is only as good as the CCR entry behind it.
+    Nothing to check (no marker) is live by definition. A store that is absent
+    or failing keeps the previous behaviour (serve the text): a liveness check
+    that cannot run must not turn cached output into a miss, and a miss only
+    costs a recompression anyway — the marker it would produce is no better.
+    """
+    hashes = _ccr_marker_hashes(text)
+    if not hashes:
+        return True
+    try:
+        if store is None:
+            from ..cache.compression_store import get_compression_store
+
+            store = get_compression_store()
+        # ``None`` means the store could not answer: an outage is not an
+        # eviction, and dropping the result would throw away data that is
+        # still retrievable once the store comes back.
+        return store.all_live(hashes) is not False
+    except Exception:  # noqa: BLE001 - never break a request over a cache check
+        logger.debug("CCR marker liveness check failed", exc_info=True)
+        return True
+
+
 def _estimate_tokens(text: str) -> int:
     """Size-proportional token estimate for section ratio decisions.
 
@@ -1943,13 +1986,17 @@ class CompressionCache:
         # new. Order: _disk_read_lock, then _lock, then the store's lock.
         self._disk_read_lock = threading.Lock()
 
-    def get(self, key: str) -> tuple[str, float, str] | None:
+    def get(self, key: str, compression_store: Any = None) -> tuple[str, float, str] | None:
         """Get cached compression result.  Thread-safe.
 
         Returns (compressed_text, ratio, strategy) or None if not found/expired.
         Use is_skipped() first to check if content is known non-compressible.
+
+        ``compression_store`` is the effective store for this request: markers
+        are checked against it, not against the process default.
         """
         t0 = time.perf_counter_ns()
+        self._drop_if_a_marker_died(key, compression_store)
         with self._lock:
             hit = self._memory_hit_locked(key, t0)
             if hit is not None:
@@ -1989,6 +2036,33 @@ class CompressionCache:
                 self._misses += 1
             self._record_lookup(t0)
         return found
+
+    def _drop_if_a_marker_died(self, key: str, compression_store: Any = None) -> None:
+        """Forget a result whose CCR originals are gone (#4796).
+
+        The CCR entry behind a marker can disappear long before this result
+        does: the store evicts by capacity and expires by its own TTL, while a
+        re-compression of the same content hashes to the SAME key. So the
+        marker it hands back can never point at a live entry again, and only a
+        miss here restores that original. Serving it would answer the model
+        with a pointer that 404s on retrieve.
+
+        Runs outside ``_lock`` on purpose: the store can be remote (Redis).
+        Losing the race is harmless — the entry is re-read under the lock and a
+        stale one would have been expired by its marker ttl anyway.
+        """
+        with self._lock:
+            probed_entry = self._results.get(key)
+            if probed_entry is None or not probed_entry[5]:
+                return
+            compressed = probed_entry[0]
+        if _ccr_markers_live(compressed, compression_store):
+            return
+        with self._lock:
+            if self._results.get(key) is not probed_entry:
+                return  # replaced meanwhile, even if the text is identical
+            self._drop_locked(key)
+            self._evictions += 1
 
     def _memory_hit_locked(self, key: str, t0: int) -> tuple[str, float, str] | None:
         """Serve ``key`` from memory if present and unexpired; drop it if expired.
@@ -6414,6 +6488,28 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
+        # Bind the request's effective CCR store for the whole call (#4796):
+        # the writers below resolve the store through get_compression_store()
+        # (dense elision, external-compressor mirroring, the Rust log/search/
+        # diff persist), and each must land in the same store this request's
+        # reads check — an explicit ``compression_store`` kwarg otherwise
+        # recompresses into the process default, leaving the request's own
+        # marker unredeemable. The helper restores the previous value, so the
+        # binding never outlives this call on a reused thread.
+        explicit_store = kwargs.get("compression_store")
+        if explicit_store is not None:
+            from ..cache.compression_store import request_compression_store
+
+            with request_compression_store(explicit_store):
+                return self._apply(messages, tokenizer, **kwargs)
+        return self._apply(messages, tokenizer, **kwargs)
+
+    def _apply(
+        self,
+        messages: list[dict[str, Any]],
+        tokenizer: Tokenizer,
+        **kwargs: Any,
+    ) -> TransformResult:
         # #3486: bind a brand-new, request-exclusive `_PerRequestRuntimeState`
         # as this call's ContextVar value BEFORE anything else runs. This
         # `ContentRouter` is a shared singleton dispatched onto a
@@ -7223,7 +7319,7 @@ class ContentRouter(Transform):
                 continue
 
             # Tier 2: result cache — reuse compressed output
-            cached = self._cache.get(content_key)
+            cached = self._cache.get(content_key, kwargs.get("compression_store"))
             if cached is not None and not self._cached_markers_retrievable(
                 content_key,
                 compression_store=kwargs.get("compression_store"),
@@ -8027,7 +8123,14 @@ class ContentRouter(Transform):
         if not marker_hashes:
             return True
         store = cls._resolve_ccr_store(compression_store)
-        exists_fn = getattr(store, "exists", None) if store is not None else None
+        if store is None:
+            return True
+        all_live = getattr(store, "all_live", None)
+        if all_live is not None:
+            # Unknown means the store could not answer; preserve the cached
+            # result just as CompressionCache.get() does.
+            return all_live(marker_hashes) is not False
+        exists_fn = getattr(store, "exists", None)
         if exists_fn is None:
             return True
         return all(bool(exists_fn(hash_key)) for hash_key in marker_hashes)
@@ -8610,7 +8713,7 @@ class ContentRouter(Transform):
             return None, False
 
         # Tier 2: result cache — reuse compressed output
-        cached = self._cache.get(content_key)
+        cached = self._cache.get(content_key, compression_store)
         if cached is not None and not self._cached_markers_retrievable(
             content_key,
             compression_store=compression_store,

@@ -633,7 +633,11 @@ def test_router_invalidates_cached_marker_when_store_cleared():
         min_tokens_to_compress=10,
     )
     assert second.transforms_applied
-    assert router._cache.get(cache_key) is not None
+    # Recompression restored the original in the store the request used, so
+    # that is the store the cached result must be probed with: with no store
+    # named, the check falls back to the empty process default and the result
+    # is dropped as stale by design (#4796).
+    assert router._cache.get(cache_key, compression_store=custom_store) is not None
 
 
 def test_compress_over_capacity_batch_then_repeat_evicted_original():
