@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 import threading
 from typing import Any
 
@@ -243,8 +244,11 @@ class TestTOINBackendWiring:
         )
         toin.save()
 
-        # Verify file was written
-        with open(tmp_toin_path) as f:
+        # Verify this layout's file was written, next to the configured path
+        written = pathlib.Path(tmp_toin_path).with_name(
+            f"{pathlib.Path(tmp_toin_path).stem}.v3{pathlib.Path(tmp_toin_path).suffix}"
+        )
+        with open(written) as f:
             data = json.load(f)
         assert "patterns" in data
         assert len(data["patterns"]) == 1

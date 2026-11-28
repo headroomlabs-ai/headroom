@@ -110,6 +110,20 @@ MAX_QUERY_PATTERN_LENGTH: Final[int] = 512
 # name with no `|`; sig_hash is hex).
 _AGG_KEY_SEPARATOR: Final[str] = "|"
 
+# Storage layout version. ``2.0`` keyed every pool by the tenant key as it
+# arrived, so a legal id could own a key that the digested form of a
+# *different* id later produces (``tnt-<prefix>-<digest>``). ``3.0`` adds the
+# upgrade purge in :meth:`ToolIntelligenceNetwork.import_patterns`: pools
+# living in the digested sub-space of an older file are dropped instead of
+# being handed to whichever tenant now maps there. The filesystem backend
+# writes ``3.0`` to a version-suffixed sibling (``toin.v3.json``) and keeps
+# the unversioned file read-only as the pre-upgrade store, so a rolled-back
+# release reads its own layout instead of re-resolving v3 keys. A custom
+# backend (``HEADROOM_TOIN_BACKEND``) must provide the same isolation,
+# e.g. a versioned key name, for its own store.
+_TOIN_STORE_VERSION: Final[str] = "3.0"
+_LAST_VERSION_WITHOUT_DIGEST_SUBSPACE: Final[str] = "2.0"
+
 # ── Tenant-key default (PR-F3) ──────────────────────────────────────────
 # When callers haven't plumbed real tenant-id detection (CLI / batch
 # jobs / unauthenticated dev) we land in the literal `"global"` slice.
@@ -186,6 +200,11 @@ def get_default_toin_storage_path() -> str:
     Falls back to ``${HEADROOM_WORKSPACE_DIR}/toin.json`` (which defaults
     to ``~/.headroom/toin.json``) when unset.
 
+    This is the configured path, not the file this release writes: the
+    filesystem backend appends the layout version (``toin.v3.json``) and
+    keeps the configured file read-only as the pre-upgrade store, so a
+    rolled-back release reads its own layout.
+
     Returns:
         The path string for TOIN storage.
     """
@@ -205,6 +224,21 @@ def get_default_toin_storage_path() -> str:
 # LOW FIX #22: Define callback types for metrics/monitoring hooks
 # These allow users to plug in their own metrics collection (Prometheus, StatsD, etc.)
 MetricsCallback = Callable[[str, dict[str, Any]], None]  # (event_name, event_data) -> None
+
+
+def _in_digested_tenant_subspace(tenant_key: str) -> bool:
+    """True when ``tenant_key`` is a shape only a digested tenant id produces.
+
+    Imported lazily for the same reason as
+    :func:`_get_current_tenant_key_or_default`: TOIN ships where the proxy
+    package does not exist. There, digested keys cannot be generated either,
+    so an unimportable module means "not a digested key".
+    """
+    try:
+        from headroom.proxy.tenant_key import _in_digested_subspace as _in_subspace
+    except ImportError:
+        return False
+    return _in_subspace(tenant_key)
 
 
 def _get_current_tenant_key_or_default() -> str:
@@ -485,7 +519,8 @@ class TOINConfig:
     enabled: bool = True
 
     # Storage
-    # Default path is ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var)
+    # Configured path: ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var).
+    # The backend writes it version-suffixed; see get_default_toin_storage_path.
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
     max_patterns: int = DEFAULT_MAX_PATTERNS
@@ -543,12 +578,17 @@ class ToolIntelligenceNetwork:
                      Pass a custom backend for Redis, PostgreSQL, etc.
         """
         from .backends import FileSystemTOINBackend
+        from .backends.base import TOINBackend
 
         self._config = config or TOINConfig()
         self._lock = threading.RLock()  # RLock for reentrant locking (save calls export_patterns)
 
         # Storage backend
-        if backend is not None:
+        self._backend: TOINBackend | None
+        if isinstance(backend, FileSystemTOINBackend):
+            backend.configure_version(_TOIN_STORE_VERSION)
+            self._backend = backend
+        elif backend is not None:
             self._backend = backend
         elif toin_backend_disabled():
             # HEADROOM_TOIN_BACKEND=none means in-memory-only, so it has to win
@@ -561,6 +601,7 @@ class ToolIntelligenceNetwork:
             self._backend = FileSystemTOINBackend(
                 self._config.storage_path,
                 max_load_bytes=self._config.max_storage_bytes,
+                store_version=_TOIN_STORE_VERSION,
             )
         else:
             self._backend = None
@@ -1404,7 +1445,7 @@ class ToolIntelligenceNetwork:
         """
         with self._lock:
             return {
-                "version": "2.0",  # PR-B5: tuple aggregation key
+                "version": _TOIN_STORE_VERSION,
                 "export_timestamp": time.time(),
                 "instance_id": self._instance_id,
                 "patterns": {
@@ -1430,6 +1471,17 @@ class ToolIntelligenceNetwork:
 
         See ``_deserialize_pattern_key`` for the parsing tiers.
 
+        Upgrade isolation: a file written at or before
+        :data:`_LAST_VERSION_WITHOUT_DIGEST_SUBSPACE` stored the tenant
+        key exactly as it arrived, so a legal id could own a key that
+        :func:`headroom.proxy.tenant_key._sanitize_tenant_key` now derives
+        for a *different* id (``acme.corp`` and the literal id
+        ``tnt-acmecorp-80a1d5cc623b165f`` share one key). Loading that pool
+        would hand it to whichever tenant maps there now, so pools sitting
+        in the digested sub-space are dropped at the upgrade instead of
+        being reattributed. Everything else is imported unchanged, and the
+        purge runs once because the next save stamps the new version.
+
         Args:
             data: Exported pattern data.
         """
@@ -1443,8 +1495,13 @@ class ToolIntelligenceNetwork:
         sanitized = False
         patterns_data = data.get("patterns", {})
         source_instance = data.get("instance_id", "unknown")
+        pre_digest_store = data.get("version", "1.0") in (
+            "1.0",
+            _LAST_VERSION_WITHOUT_DIGEST_SUBSPACE,
+        )
 
         skipped = 0
+        purged = 0
         first_error: Exception | None = None
         with self._lock:
             for serialized_key, pattern_dict in patterns_data.items():
@@ -1454,6 +1511,12 @@ class ToolIntelligenceNetwork:
                 # the whole file) or leave a half-merged pattern behind.
                 try:
                     key = _deserialize_pattern_key(serialized_key)
+                    if pre_digest_store and _in_digested_tenant_subspace(key[0]):
+                        # Written before digested keys existed, so this pool
+                        # belongs to a literal id, not to the tenant whose
+                        # digest now produces that key.
+                        purged += 1
+                        continue
                     imported = ToolPattern.from_dict(pattern_dict)
                     sanitized = self._sanitize_loaded_pattern(imported) or sanitized
                     # Make sure dataclass fields agree with the dict key — pre-F3
@@ -1497,11 +1560,20 @@ class ToolIntelligenceNetwork:
                 extra={
                     "event": "toin_import_skipped",
                     "skipped": skipped,
-                    "imported": len(patterns_data) - skipped,
+                    "imported": len(patterns_data) - skipped - purged,
                     "error_type": type(first_error).__name__,
                     "error": str(first_error),
                 },
             )
+        if purged:
+            logger.info(
+                "TOIN dropped pre-upgrade pools that now collide with digested tenant keys",
+                extra={
+                    "event": "toin_tenant_key_upgrade_purge",
+                    "purged": purged,
+                },
+            )
+
         return sanitized
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
@@ -1699,6 +1771,9 @@ class ToolIntelligenceNetwork:
         # Step 1: Serialize under lock (fast in-memory operation)
         with self._lock:
             data = self.export_patterns()
+            owner_token = getattr(self._backend, "_owner_token", None)
+            if owner_token is not None:
+                data["owner"] = owner_token()
 
         # Step 2: Write outside lock (slow I/O operation)
         try:
@@ -1733,7 +1808,8 @@ class ToolIntelligenceNetwork:
         try:
             data = self._backend.load()
             if data:
-                changed = self._import_patterns(data)
+                sanitized_pre_upgrade = self._sanitize_pre_upgrade_store(data)
+                changed = self._import_patterns(data) or sanitized_pre_upgrade
                 with self._lock:
                     before = len(self._patterns)
                     self._prune_patterns_locked()
@@ -1753,6 +1829,62 @@ class ToolIntelligenceNetwork:
             # Rewrite at once: a dropped legacy query key can hold a credential,
             # and waiting for the next observation would leave it on disk.
             self.save()
+
+    def _sanitize_pre_upgrade_store(self, data: dict[str, Any]) -> bool:
+        """Remove raw query keys from the pre-upgrade file, on disk.
+
+        A store written before the digesting tenant resolver stays on disk
+        read-only as the rollback view, but it can still hold a raw query
+        string in a pool this version purges before sanitizing. Leaving it
+        there would keep a credential at rest after it was removed from
+        every pattern this version keeps, so the same sanitizing pass is
+        applied to the file itself.
+
+        Sanitizing the in-memory data and rewriting the rollback file are
+        separate concerns: if the rollback rewrite fails (e.g. the legacy
+        file is mounted read-only), the sanitized import still lands and a
+        warning is surfaced so an operator can redact the rollback copy
+        externally. Never aborting the whole import on a rollback rewrite
+        failure avoids stranding the legacy history on the next load.
+        """
+        pre_upgrade_path = getattr(self._backend, "pre_upgrade_path", None)
+        if pre_upgrade_path is None or not getattr(self._backend, "loaded_pre_upgrade", False):
+            return False
+        patterns_data = data.get("patterns", {})
+        if not isinstance(patterns_data, dict):
+            return False
+
+        rewritten = False
+        for serialized_key, pattern_dict in list(patterns_data.items()):
+            if not isinstance(pattern_dict, dict):
+                continue
+            try:
+                pattern = ToolPattern.from_dict(pattern_dict)
+                changed = self._sanitize_loaded_pattern(pattern)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if changed:
+                patterns_data[serialized_key] = pattern.to_dict()
+                rewritten = True
+
+        if rewritten:
+            try:
+                from .backends import FileSystemTOINBackend
+
+                FileSystemTOINBackend(str(pre_upgrade_path)).save(data)
+            except OSError as e:
+                logger.warning(
+                    "TOIN rollback file could not be rewritten; sanitized "
+                    "patterns are still imported, but %s still holds raw "
+                    "query text. Redact it externally before rollback.",
+                    pre_upgrade_path,
+                    extra={
+                        "event": "toin_rollback_rewrite_failed",
+                        "path": str(pre_upgrade_path),
+                        "error": str(e),
+                    },
+                )
+        return rewritten
 
     def _maybe_auto_save(self) -> None:
         """Auto-save if enough time has passed.

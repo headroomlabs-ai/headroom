@@ -21,7 +21,8 @@ from headroom.telemetry.toin import (
 
 def _network(tmp_path, name: str = "toin.json") -> tuple[ToolIntelligenceNetwork, object]:
     path = tmp_path / name
-    return ToolIntelligenceNetwork(TOINConfig(storage_path=str(path))), path
+    written = path.with_name(f"{path.stem}.v3{path.suffix}")
+    return ToolIntelligenceNetwork(TOINConfig(storage_path=str(path))), written
 
 
 def test_backend_none_keeps_toin_in_memory(tmp_path, monkeypatch):
@@ -84,7 +85,7 @@ def test_unset_backend_still_persists(tmp_path, monkeypatch):
     assert toin._backend is not None
     toin.save()
     assert path.exists()
-    assert json.loads(path.read_text())["version"] == "2.0"
+    assert json.loads(path.read_text())["version"] == "3.0"
 
 
 def test_filesystem_backend_still_persists(tmp_path, monkeypatch):

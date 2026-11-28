@@ -267,6 +267,12 @@ def toin_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     TOIN is classified as workspace state because it is actively written by
     the running proxy (it's a compression feedback loop). The default stays
     ``~/.headroom/toin.json`` to preserve byte-for-byte backward compat.
+
+    This is the *configured* path, not the file the current release writes.
+    ``FileSystemTOINBackend`` appends the layout version (``toin.v3.json``)
+    and keeps this path read-only as the pre-upgrade store, so a rolled-back
+    release still reads its own layout. Read the versioned write path from
+    the backend (``backend.path``) rather than re-deriving it here.
     """
 
     return _resolve(

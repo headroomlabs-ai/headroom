@@ -44,7 +44,7 @@ Examples:
 | Resource | Default path | Legacy env var |
 |---|---|---|
 | Proxy savings ledger | `${WORKSPACE_DIR}/proxy_savings.json` | `HEADROOM_SAVINGS_PATH` |
-| TOIN telemetry JSON | `${WORKSPACE_DIR}/toin.json` | `HEADROOM_TOIN_PATH` |
+| TOIN telemetry JSON | `${WORKSPACE_DIR}/toin.v3.json` (reads `${WORKSPACE_DIR}/toin.json` once to upgrade) | `HEADROOM_TOIN_PATH` |
 | Subscription tracker state | `${WORKSPACE_DIR}/subscription_state.json` | `HEADROOM_SUBSCRIPTION_STATE_PATH` |
 | Memory SQLite | `${WORKSPACE_DIR}/memory.db` | CLI `--memory-db-path` |
 | Native memory directory | `${WORKSPACE_DIR}/memories/` | `MemoryConfig.native_memory_dir` |
@@ -56,6 +56,55 @@ Examples:
 | HTTP 400 debug dumps | `${WORKSPACE_DIR}/logs/debug_400/` | — |
 | Deployment profiles | `${WORKSPACE_DIR}/deploy/` | — |
 | Beacon lock file | `${WORKSPACE_DIR}/.beacon_lock_<port>` | — |
+
+The TOIN store is version-suffixed because its tenant keys are resolved
+by a digesting resolver: a release that predates the digest maps a tenant
+that sends a derived key literally onto that pool. Keeping the v3 layout
+in its own file means a rollback reads `toin.json` (the last pre-upgrade
+layout) instead of reinterpreting v3 keys, and that file is never written
+by the newer release. On upgrade the pre-upgrade file is left in place as
+the rollback view, with any raw query string it still held removed first
+(then it stops being updated). Rolling back therefore loses learning
+recorded after the upgrade; to keep it, back up the v3 file before
+rolling back and restore that backup after re-upgrading, or start from a
+fresh store.
+
+## Rollback procedure
+
+### Filesystem store (default)
+
+Rollback to a release that predates the digesting resolver means pointing
+the store at `toin.json` again — the pre-upgrade file — and never opening
+`toin.v3.json` under the old resolver. The newer release never writes
+`toin.json`, so it remains the last pre-upgrade layout.
+
+Procedure:
+
+1. Back up `toin.v3.json` if you want to preserve post-upgrade learning.
+2. Roll back the release. The old reader opens `toin.json` and sees its own
+   layout; it never parses the version-suffixed sibling.
+3. After re-upgrading, restore the `toin.v3.json` backup to recover
+   post-upgrade patterns, or start with a fresh store. Do not copy the v3
+   file back over `toin.json`.
+
+### Custom (non-filesystem) backends
+
+When you supply an explicit backend (e.g. Redis, Postgres), rollback is
+your responsibility:
+
+1. Before upgrading, snapshot the backend's store (`save()` to a file or
+   `export_patterns()` to memory). The newer release stamps its own layout
+   version and cannot be read by the previous resolver.
+2. Upgrade, then roll back if needed: restore the snapshot into the old
+   backend before the previous release reads it.
+3. After re-upgrading, re-import the v3 snapshot with `import_patterns()`;
+   pools already written at v3 keep their digested keys and are never
+   purged by the upgrade path.
+4. Do not point the previous release at a store this version has already
+   rewritten — keep two physically separate stores across the upgrade
+   boundary, exactly as the filesystem layout does with `toin.json` and
+   `toin.v3.json`.
+
 
 ### Config bucket (`HEADROOM_CONFIG_DIR`)
 
