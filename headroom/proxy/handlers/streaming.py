@@ -21,6 +21,7 @@ from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     RequestWriteTrace,
     _path_for_log,
+    apply_openai_api_key_fallback,
     jitter_delay_ms,
     overload_retry_is_futile,
     parse_sse_events_from_byte_buffer,
@@ -1268,6 +1269,13 @@ class StreamingMixin:
         # Before the guard: its learned-limit lookup is keyed on the credential
         # actually sent, the same one the 400 learning below keys on.
         headers = await apply_copilot_api_auth(headers, url=url)
+        if provider == "openai":
+            headers = apply_openai_api_key_fallback(
+                headers,
+                upstream_url=url,
+                config=self.config,
+                request_id=request_id,
+            )
 
         # Context-limit guard (see headroom/proxy/context_guard.py): rewrites
         # only the client-bound message_start bytes when the forwarded request
