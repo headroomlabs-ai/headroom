@@ -92,6 +92,43 @@ _TIMESTAMP_ROW_RE = re.compile(
     r")"
 )
 
+# A clock behind a prefix has the grep-row shape as well: ``git blame``
+# (``c75ebdee6 (Dev One  2026-07-02 19:04:14 -0700  3) ...``), Java's default log
+# (``Nov 24, 2026 10:46:15 AM ...``), ``worker[14:10:10] ...``, ``ts=14:10:10 ...``.
+# Cut at its first colon, the heading ends in the hour and the rows start at the
+# minute. ``clocks=True`` cuts before the hour, which follows an ISO date, a year
+# or an opener (``\x22`` is the quote).
+_CLOCK_HEADING_RE = re.compile(r"(?:\d{4}-\d{2}-\d{2}[ T]|, \d{4} |[\[=\x22])$")
+_CLOCK_ROW_RE = re.compile(r"\d{1,2}:[0-5]\d:[0-5]\d(?!\d)")
+_CLOCK_LINE_RE = re.compile(
+    r"^(?P<heading>[^\n:]*(?:\d{4}-\d{2}-\d{2}[ T]|, \d{4} |[\[=\x22]))(?P<row>\d{1,2}:[0-5]\d:[0-5]\d(?!\d).*)$"
+)
+
+
+def _heading_splits(lines: list[str], clocks: bool) -> list[tuple[str, str] | None]:
+    """``(heading, row)`` for each line :func:`search_heading` can fold, else ``None``."""
+    splits: list[tuple[str, str] | None] = []
+    for line in lines:
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
+        splits.append((m["path"], line[m.start("line") :]) if m else None)
+    if not clocks:
+        return splits
+    found: dict[int, re.Match[str]] = {}
+    for i, split in enumerate(splits):
+        if split and split[0][-1].isdigit():  # most paths end in a letter
+            clock = _CLOCK_LINE_RE.match(lines[i])
+            if clock:
+                found[i] = clock
+    if found:
+        # A path that also has a row that is no clock is a file (``notes=14``).
+        files = {split[0] for i, split in enumerate(splits) if split and i not in found}
+        for i, clock in found.items():
+            split = splits[i]
+            if split and split[0] not in files:
+                splits[i] = clock["heading"], clock["row"]
+    return splits
+
+
 # unified-diff ``index <sha>..<sha> <mode>`` line. The diff still applies
 # without it (git only uses it for rename/blob bookkeeping).
 _DIFF_INDEX_RE = re.compile(r"^index [0-9a-fA-F]+\.\.[0-9a-fA-F]+( [0-7]+)?$")
@@ -298,7 +335,7 @@ def unfold_repeated_blocks(text: str, max_chars: int | None = None) -> str:
     return _join(out, had_trailing)
 
 
-def search_heading(text: str) -> str:
+def search_heading(text: str, *, clocks: bool = False) -> str:
     """Convert grep ``path:line:content`` rows into ripgrep --heading form.
 
     Consecutive rows sharing a path collapse to the path once on its own line
@@ -307,47 +344,61 @@ def search_heading(text: str) -> str:
     blank separators are inserted (they would be ambiguous with passthrough
     content), keeping the transform exactly reversible via
     :func:`search_unheading`.
+
+    With ``clocks=True`` a clock behind a prefix stays whole on its row (see
+    ``_CLOCK_LINE_RE``), under a heading only if the next line shares it. Pass
+    the same flag to :func:`search_unheading`.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
+    splits = _heading_splits(lines, clocks)
     out: list[str] = []
-    current_path: str | None = None
-    for line in lines:
-        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
-        if m:
-            path = m.group("path")
-            if path != current_path:
-                out.append(path)
-                current_path = path
-            out.append(f"{m.group('line')}:{m.group('content')}")
-        else:
+    current: str | None = None
+    for i, line in enumerate(lines):
+        split = splits[i]
+        if split is None:
             # Any non-grep-row line ends the current file grouping.
             out.append(line)
-            current_path = None
+            current = None
+            continue
+        heading, row = split
+        if heading != current:
+            after = splits[i + 1] if i + 1 < len(lines) else None
+            is_clock = len(heading) + len(row) == len(line)
+            if is_clock and (after is None or after[0] != heading):
+                out.append(line)
+                current = None
+                continue
+            out.append(heading)
+            current = heading
+        out.append(row)
     return _join(out, had_trailing)
 
 
-def search_unheading(text: str) -> str:
+def search_unheading(text: str, *, clocks: bool = False) -> str:
     """Exact inverse of :func:`search_heading`.
 
     A *header* line is any line that is not itself a ``line:content`` data row
     and is immediately followed by at least one ``line:content`` data row; it
     is consumed (not re-emitted) and its text becomes the ``path`` prefix for
-    the data rows that follow, until a non-data line appears.
+    the data rows that follow, until a non-data line appears. With ``clocks=True``
+    a clock heading joins its clock rows without a ``:``.
     """
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
     out: list[str] = []
     current_path: str | None = None
+    clock = False
     n = len(lines)
     i = 0
     while i < n:
         line = lines[i]
         data = _HEADING_ROW_RE.match(line)
         if current_path is not None and data:
-            out.append(f"{current_path}:{data.group('line')}:{data.group('content')}")
+            joint = "" if clock and _CLOCK_ROW_RE.match(line) else ":"
+            out.append(f"{current_path}{joint}{line}")
             i += 1
             continue
         # Not a data row under an active header. Decide if THIS line is a new
@@ -355,6 +406,7 @@ def search_unheading(text: str) -> str:
         # data row. If so, consume it as the path prefix (do not emit).
         if not data and i + 1 < n and _HEADING_ROW_RE.match(lines[i + 1]):
             current_path = line
+            clock = clocks and _CLOCK_HEADING_RE.search(line) is not None
             i += 1
             continue
         # Plain passthrough line (or a stray data row with no header): emit it
@@ -582,7 +634,7 @@ def compact_lossless(content: str, kind: str) -> str:
             # search_dir_heading factors a repeated DIRECTORY (one match each
             # across many files in a dir — the grep -rn case the file fold misses).
             folds: list[tuple[str, Callable[[str], str]]] = [
-                (search_heading(content), search_unheading),
+                (search_heading(content, clocks=True), partial(search_unheading, clocks=True)),
                 (search_dir_heading(content), search_dir_unheading),
             ]
             if "\\" in content:
@@ -598,6 +650,12 @@ def compact_lossless(content: str, kind: str) -> str:
             best = content
             for candidate, inverse in folds:
                 if inverse(candidate) == content and _smaller(candidate, best):
+                    best = candidate
+            if best == content and _CLOCK_ROW_RE.search(content):
+                # A split clock is better than no fold: these rows would go on to
+                # the lossy search and log compressors, which drop records.
+                candidate = search_heading(content)
+                if search_unheading(candidate) == content and _smaller(candidate, best):
                     best = candidate
             return best
 
