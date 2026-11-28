@@ -63,6 +63,7 @@ CORE = [
     "glob",
     "grep",
     "task",
+    "agent",
     "todowrite",
     "todoread",
     "webfetch",

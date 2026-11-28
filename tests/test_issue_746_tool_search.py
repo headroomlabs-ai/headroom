@@ -343,6 +343,15 @@ def test_client_tool_search_tool_is_never_deferred() -> None:
     assert by_name["ToolSearch"].get("defer_loading") is None
 
 
+def test_renamed_subagent_tool_stays_resident_issue_4992() -> None:
+    # The subagent tool the default set keeps resident as ``task`` is now named
+    # ``Agent``; deferring it costs a search round trip on every delegation.
+    tools = _claude_code_tools() + [{"name": "Agent", "description": "Agent", "input_schema": {}}]
+    out = inject_tool_search_deferral(tools)
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    assert by_name["Agent"].get("defer_loading") is None
+
+
 def test_resident_real_tool_survives_pascal_case_surface() -> None:
     # The injected search tool is typed and does not satisfy the invariant on its
     # own; Anthropic 400s when every real tool is deferred.
