@@ -125,6 +125,22 @@ Two configs ship for VS Code / Codespaces:
 
 Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
 
+For code-memory/MCP changes, a focused container suite includes the pinned
+Enola executable and exercises its real stdio MCP server. The test image pins
+its Python base by digest and verifies dependency artifact hashes from `uv.lock`.
+The uv bootstrap wheels also have explicit hashes.
+The integration tests wrap isolated Claude, Codex, Grok, and OpenCode homes,
+then launch Enola from each saved MCP configuration and query a fixture repo.
+Native agent launches and live provider requests are not exercised:
+
+```bash
+docker build -f docker/Dockerfile.code-memory-test -t headroom-code-memory-test .
+docker run --rm --network none -v "$PWD:/workspace:ro" headroom-code-memory-test
+```
+
+This dependency-only image runs against the mounted Python source. Use the main
+Dockerfile for proxy/native-extension validation.
+
 ## Optional automated review
 
 This repository includes `.github/copilot-instructions.md` so maintainers can opt into GitHub Copilot code review without adding workflow billing noise to every PR.

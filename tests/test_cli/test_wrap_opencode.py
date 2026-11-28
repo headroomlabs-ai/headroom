@@ -752,18 +752,44 @@ def test_wrap_opencode_extra_model_invalid_spec_errors(
     assert "non-integer context window" in result.output
 
 
+@pytest.mark.parametrize("stale_entry", [False, True])
 def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    stale_entry: bool,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
     # The eager --code-memory callback writes os.environ; delenv restores it after.
     monkeypatch.delenv("HEADROOM_CODE_MEMORY", raising=False)
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
 
-    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    if stale_entry:
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "serena": {"type": "local", "command": ["stale-serena"]},
+                        "custom": {"type": "local", "command": ["custom-mcp"]},
+                    }
+                }
+            )
+        )
+        # Automatic wrap migration refreshes stale entries only when the ledger
+        # proves Headroom installed them; custom registrations stay untouched.
+        from headroom.mcp_registry import OpencodeRegistrar
+        from headroom.mcp_registry.ledger import record_install
+
+        record_install("opencode", OpencodeRegistrar(config_path=config_file).get_server("serena"))
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(wrap_mod, "_index_serena_project"),
+    ):
         result = runner.invoke(
             main, ["wrap", "opencode", "--prepare-only", "--code-memory", "serena"]
         )
@@ -773,6 +799,8 @@ def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
     config = json.loads(config_file.read_text())
     serena_command = config["mcp"]["serena"]["command"]
     assert serena_command[serena_command.index("--context") + 1] == "agent"
+    if stale_entry:
+        assert config["mcp"]["custom"]["command"] == ["custom-mcp"]
 
 
 def test_wrap_opencode_no_mcp_skips_mcp_injection(

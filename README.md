@@ -173,6 +173,22 @@ Use `headroom install apply` when you need to choose a specific persistent
 service, scheduled task, Docker runtime, scope, or provider target; see the
 [persistent installs guide](https://docs.headroomlabs.ai/docs/persistent-installs).
 
+To use **[Enola](https://github.com/enola-labs/enola)** instead, install the
+pinned optional dependency and select it when wrapping:
+
+```bash
+pip install 'headroom-ai[proxy,enola]'
+headroom wrap claude --code-memory enola
+```
+
+The selector also works with Codex, Grok, and OpenCode, or through
+`HEADROOM_CODE_MEMORY=enola`. Enola provides symbol reads, dependency traversal,
+impact analysis, and architecture deltas over MCP. It is installed with the
+extra; Headroom does not download it at agent startup. Switching backends and
+unwrapping remove only MCP entries Headroom owns. Add `--code-memory-instructions`
+to opt into project guidance. Enola snapshots need refreshing after edits;
+the agent's normal editing tools still make source changes.
+
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import
 (`import { compress } from 'headroom-ai'`) — and provides no `headroom` command.

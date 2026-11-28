@@ -37,7 +37,7 @@ def test_default_is_none() -> None:
 
 
 def test_selector_env_wins() -> None:
-    for val in (wrap._CODE_MEMORY_SERENA, wrap._CODE_MEMORY_NONE):
+    for val in (wrap._CODE_MEMORY_SERENA, wrap._CODE_MEMORY_ENOLA, wrap._CODE_MEMORY_NONE):
         with patch.dict(os.environ, {"HEADROOM_CODE_MEMORY": val}):
             # selector beats any legacy flag
             assert wrap._resolve_code_memory({"serena": True, "no_serena": True}) == val
@@ -544,6 +544,7 @@ def _dispatch_calls(selection: str, extra: dict | None = None) -> list[str]:
             wrap, "_disable_tokensave_mcp", lambda *a, **k: calls.append("disable_tokensave")
         ),
         patch.object(wrap, "_disable_serena_mcp", lambda *a, **k: calls.append("disable_serena")),
+        patch.object(wrap, "_disable_enola_mcp", lambda *a, **k: calls.append("disable_enola")),
     ):
         wrap._setup_coding_compressor(object(), serena_context="claude-code", **(extra or {}))
     return calls
@@ -552,7 +553,11 @@ def _dispatch_calls(selection: str, extra: dict | None = None) -> list[str]:
 def test_orchestrator_dispatch() -> None:
     # A legacy tokensave entry is always retired first, then the selection applies.
     assert _dispatch_calls(wrap._CODE_MEMORY_SERENA) == ["disable_tokensave", "serena"]
-    assert set(_dispatch_calls(wrap._CODE_MEMORY_NONE)) == {"disable_tokensave", "disable_serena"}
+    assert set(_dispatch_calls(wrap._CODE_MEMORY_NONE)) == {
+        "disable_tokensave",
+        "disable_serena",
+        "disable_enola",
+    }
 
 
 def test_code_memory_option_present_only_on_code_memory_agents() -> None:

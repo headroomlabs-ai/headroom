@@ -76,6 +76,7 @@ from mcp.client.stdio import stdio_client  # noqa: E402
 from strands.tools.mcp import MCPClient  # noqa: E402
 
 from headroom import HeadroomConfig
+from headroom.mcp_registry.enola import build_enola_spec
 from headroom.mcp_registry.install import (
     DEFAULT_PROXY_URL,
     build_headroom_spec,
@@ -127,6 +128,9 @@ class HeadroomBundle:
         config: Optional :class:`HeadroomConfig` passed to
             :class:`HeadroomHookProvider`. Default uses framework
             defaults.
+        code_memory: Explicit backend: ``"serena"``, ``"enola"``, or ``"none"``.
+            When omitted, respects ``enable_serena_mcp`` for compatibility.
+            Enola requires ``headroom-ai[enola]`` and uses no runtime download.
 
     The bundle is **stateless** w.r.t. subprocess management — Strands'
     ``Agent`` owns the MCP subprocess lifecycle once you pass
@@ -149,19 +153,28 @@ class HeadroomBundle:
     # cross-host deploys.
     enable_hooks: bool = False
     config: HeadroomConfig | None = None
+    code_memory: str | None = None
 
     _headroom_mcp: MCPClient | None = field(default=None, init=False, repr=False, compare=False)
     _serena_mcp: MCPClient | None = field(default=None, init=False, repr=False, compare=False)
+    _enola_mcp: MCPClient | None = field(default=None, init=False, repr=False, compare=False)
     _hook: HeadroomHookProvider | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        selection = self.code_memory
+        if selection is None:
+            selection = "serena" if self.enable_serena_mcp else "none"
+        if selection not in {"serena", "enola", "none"}:
+            raise ValueError("code_memory must be 'serena', 'enola', or 'none'")
         if self.enable_headroom_mcp:
             self._headroom_mcp = _make_headroom_client(self.proxy_url)
             logger.info(
                 "HeadroomBundle: Headroom MCP client constructed (proxy_url=%s)",
                 self.proxy_url,
             )
-        if self.enable_serena_mcp:
+        if selection == "enola":
+            self._enola_mcp = _client_for(build_enola_spec())
+        elif selection == "serena":
             self._serena_mcp = _make_serena_client(self.serena_context)
             logger.info(
                 "HeadroomBundle: Serena MCP client constructed (code memory, context=%s)",
@@ -183,6 +196,8 @@ class HeadroomBundle:
             out.append(self._headroom_mcp)
         if self._serena_mcp is not None:
             out.append(self._serena_mcp)
+        if self._enola_mcp is not None:
+            out.append(self._enola_mcp)
         return out
 
     @property
@@ -199,3 +214,8 @@ class HeadroomBundle:
     def serena_mcp(self) -> MCPClient | None:
         """Direct handle to the Serena MCPClient (for advanced callers)."""
         return self._serena_mcp
+
+    @property
+    def enola_mcp(self) -> MCPClient | None:
+        """Direct handle to the selected Enola MCPClient."""
+        return self._enola_mcp

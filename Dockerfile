@@ -63,6 +63,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     python -c "exec('try: import tomllib\\nexcept ImportError: from pip._vendor import tomli as tomllib'); print('\\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['uv']['override-dependencies']))" > /tmp/overrides.txt && \
     uv pip install --system --overrides /tmp/overrides.txt ".[${HEADROOM_EXTRAS}]"
 
+# Optional enola-cli installs a native executable in the scripts directory,
+# outside site-packages. Stage it separately so choosing the enola extra also
+# makes the MCP server available in both runtime images. The default extra
+# set leaves this directory empty.
+RUN mkdir -p /opt/headroom-enola-bin && \
+    if command -v enola >/dev/null 2>&1; then \
+      cp /usr/local/bin/enola /opt/headroom-enola-bin/enola; \
+    fi
+
 RUN --mount=type=bind,source=.,target=/context,readonly \
     HEADROOM_BUILD_VERSION="${HEADROOM_BUILD_VERSION}" PYTHON_SITE_PACKAGES="${PYTHON_SITE_PACKAGES}" python - <<'PY'
 import hashlib
@@ -176,6 +185,7 @@ RUN apt-get update && \
 
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
+COPY --from=builder /opt/headroom-enola-bin/ /usr/local/bin/
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
 
@@ -227,6 +237,7 @@ ARG RUNTIME_HOME=/home/nonroot
 ARG PYTHON_SITE_PACKAGES
 
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
+COPY --from=builder /opt/headroom-enola-bin/ /usr/local/bin/
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
 # Owned by the runtime user so the volume below is writable (user and group

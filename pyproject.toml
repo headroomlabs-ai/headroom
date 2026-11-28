@@ -99,6 +99,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Opt-in code navigation and architecture MCP. Validated release, installed
+# with Headroom rather than downloaded when a wrapped agent starts.
+enola = ["enola-cli==0.5.1"]
 # Proxy server (most common install: pip install headroom-ai[proxy])
 proxy = [
     "fastapi>=0.100.0",

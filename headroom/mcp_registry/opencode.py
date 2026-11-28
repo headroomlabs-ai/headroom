@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ def _parse_json_loose(raw: str) -> dict[str, Any] | None:
     of ``//`` and ``/* */`` comments and trailing commas, so this accepts the
     same files ``headroom wrap``/``install`` already edit.
     """
+    raw = raw.lstrip("\ufeff")
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -127,18 +129,41 @@ def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     env: dict[str, str] = {}
     if isinstance(env_value, dict):
         env = {str(k): str(v) for k, v in env_value.items()}
-    return ServerSpec(name=name, command=command, args=args, env=env)
+    extra = {
+        key: value
+        for key, value in entry.items()
+        if key not in {"type", "command", "environment", "env", "enabled"}
+    }
+    return ServerSpec(
+        name=name,
+        command=command,
+        args=args,
+        env=env,
+        enabled=entry.get("enabled") is not False,
+        extra=extra,
+    )
 
 
 def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     entry: dict[str, Any] = {
+        **spec.extra,
         "type": "local",
         "command": [spec.command, *spec.args],
-        "enabled": True,
+        "enabled": spec.enabled,
     }
     if spec.env:
         entry["environment"] = dict(spec.env)
     return entry
+
+
+def _valid_timeout(value: Any) -> bool:
+    """Match OpenCode's positive, JSON-safe integer timeout constraint."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 < value <= 2**53 - 1
+        and (isinstance(value, int) or value.is_integer())
+    )
 
 
 class OpencodeRegistrar(MCPRegistrar):
@@ -166,9 +191,26 @@ class OpencodeRegistrar(MCPRegistrar):
         return _entry_to_spec(server_name, entry)
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
+        if "timeout" in spec.extra and not _valid_timeout(spec.extra["timeout"]):
+            return RegisterResult(
+                RegisterStatus.FAILED,
+                "timeout must be a positive integer no greater than 9007199254740991",
+            )
         existing = self.get_server(spec.name)
 
-        if existing is not None and _specs_equivalent(existing, spec):
+        # An unspecified timeout does not change how the requested server is
+        # launched. Accept it without writing or adopting the user's options;
+        # the complete spec still participates in ownership fingerprints.
+        comparable = existing
+        if (
+            existing is not None
+            and "timeout" not in spec.extra
+            and _valid_timeout(existing.extra.get("timeout"))
+        ):
+            comparable = replace(
+                existing, extra={k: v for k, v in existing.extra.items() if k != "timeout"}
+            )
+        if comparable is not None and _specs_equivalent(comparable, spec):
             return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
 
         if existing is not None and not force:
@@ -182,6 +224,22 @@ class OpencodeRegistrar(MCPRegistrar):
             self.unregister_server(spec.name)
 
         return self._write_entry(spec)
+
+    def prepare_refresh(self, spec: ServerSpec) -> ServerSpec:
+        """Keep local options when refreshing a local stdio server.
+
+        Remote URL, headers and OAuth settings are invalid on local entries.
+        Preserve only options supported by the destination transport.
+        """
+        existing = self.get_server(spec.name)
+        extra = dict(spec.extra)
+        if existing is not None:
+            for key in ("timeout", "cwd"):
+                if key in existing.extra:
+                    if key == "timeout" and not _valid_timeout(existing.extra[key]):
+                        continue
+                    extra.setdefault(key, existing.extra[key])
+        return replace(spec, extra=extra)
 
     def unregister_server(self, server_name: str) -> bool:
         data = _read_json(self._config_path)

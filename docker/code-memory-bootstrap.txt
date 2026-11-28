@@ -1,0 +1,5 @@
+# uv 0.11.18 Linux arm64/amd64 wheels from its PyPI release metadata.
+uv==0.11.18 \
+    --hash=sha256:5df2b2a59f1ee4392066df24ef9904b3bbdc226e8ab9bdff8e290127fcddc3a3 \
+    --hash=sha256:9a4ee93dd0cc86046eb234ff8f3a5090c6cbb1466a825c5201aaf4ee4b45158d \
+    --hash=sha256:57f4e2dea12cac7749628bc87eb66d3aaa5c3ed27420598899d6d82aee4d1b0d

@@ -1,0 +1,67 @@
+# Dependency-only image for MCP/wrap tests, including the real pinned Enola.
+# Mount the checkout at /workspace when running; no host Python is needed.
+# This image does not build the Rust compression extension or run the proxy.
+FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY docker/code-memory-bootstrap.txt /tmp/bootstrap.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/bootstrap.txt
+WORKDIR /tmp/locked
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
+# Export the reviewed lock as constraints, including the locked test tools.
+# Only the lightweight MCP/test subset below is installed; ML extras are not.
+RUN uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes --no-annotate --output-file /tmp/constraints.txt
+RUN python - <<'PY'
+import importlib.metadata
+import re
+import subprocess
+import tomllib
+from pathlib import Path
+
+with open('pyproject.toml', 'rb') as stream:
+    project = tomllib.load(stream)['project']
+with open('uv.lock', 'rb') as stream:
+    locked = tomllib.load(stream)['package']
+requirements = project['dependencies'] + project['optional-dependencies']['enola']
+requirements += project['optional-dependencies']['strands']
+requirements += project['optional-dependencies']['mcp']
+for name in ['pytest', 'pytest-asyncio', 'ruff']:
+    versions = {p['version'] for p in locked if p['name'] == name}
+    assert len(versions) == 1, f'{name} needs an explicit platform selection'
+    requirements.append(f'{name}=={versions.pop()}')
+Path('/tmp/requirements.in').write_text('\n'.join(requirements) + '\n')
+# Resolve only the lightweight subset, constrained to reviewed versions. Every
+# selected artifact must then pass hash verification against the lock itself.
+# Wheel-only resolution prevents source build hooks before hash verification.
+subprocess.check_call(['uv', '--no-config', 'pip', 'compile', '--only-binary', ':all:', '--no-header', '--no-annotate', '--constraint', '/tmp/constraints.txt', '/tmp/requirements.in', '--output-file', '/tmp/selected.txt'])
+normalize = lambda name: re.sub(r'[-_.]+', '-', name).lower()
+artifacts = {}
+for package in locked:
+    hashes = {a['hash'] for a in package.get('wheels', [])}
+    if package.get('sdist'):
+        hashes.add(package['sdist']['hash'])
+    artifacts.setdefault((normalize(package['name']), package['version']), set()).update(hashes)
+hashed = []
+for line in Path('/tmp/selected.txt').read_text().splitlines():
+    if not line.strip() or line.startswith('#'):
+        continue
+    match = re.match(r'([A-Za-z0-9_.-]+)(?:\[[^]]+\])?==([^\s;]+)', line)
+    assert match, f'Unpinned requirement: {line}'
+    hashes = artifacts.get((normalize(match[1]), match[2]))
+    assert hashes, f'No reviewed artifact hashes: {line}'
+    hashed.append(line + ''.join(' \\\n    --hash=' + digest for digest in sorted(hashes)))
+Path('/tmp/verified-requirements.txt').write_text('\n'.join(hashed) + '\n')
+subprocess.check_call(['uv', '--no-config', 'pip', 'install', '--system', '--require-hashes', '--no-deps', '--only-binary', ':all:', '-r', '/tmp/verified-requirements.txt'])
+# Also audit the complete installed closure against the reviewed versions.
+reviewed = {(normalize(p['name']), p['version']) for p in locked}
+for dist in importlib.metadata.distributions():
+    name = normalize(dist.metadata['Name'])
+    if name not in {'pip', 'uv'}:
+        assert (name, dist.version) in reviewed, f'Unreviewed dependency: {name}=={dist.version}'
+entry = Path('/usr/local/bin/headroom')
+entry.write_text('#!/usr/local/bin/python\nfrom headroom.cli import main\nmain()\n')
+entry.chmod(0o755)
+PY
+
+WORKDIR /workspace
+CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_enola_code_memory.py", "tests/test_enola_mcp_integration.py", "tests/test_wrap_code_memory.py"]
