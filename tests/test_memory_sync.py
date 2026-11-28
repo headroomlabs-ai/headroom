@@ -648,6 +648,28 @@ class TestCodexAdapter:
         assert mems == []
 
     @pytest.mark.asyncio
+    async def test_multiline_facts_with_the_same_first_line_round_trip(self, agents_md):
+        agents_md.write_text(
+            "# Existing instructions\n\n"
+            "<!-- headroom:memory:start -->\n"
+            "## Headroom Shared Memory\n\n"
+            "- Legacy one-line fact\n"
+            "<!-- headroom:memory:end -->\n",
+            encoding="utf-8",
+        )
+        adapter = CodexAdapter(agents_md)
+        first = "Deployment checklist\nUse the blue pool.\n\n- Verify the health endpoint."
+        second = "Deployment checklist\nKeep the green pool ready for rollback."
+        assert await adapter.write_memories([{"content": first}, {"content": second}]) == 2
+        assert [m.content for m in await adapter.read_memories()] == [
+            "Legacy one-line fact",
+            first,
+            second,
+        ]
+        assert await adapter.write_memories([{"content": first}]) == 0
+        assert agents_md.read_text(encoding="utf-8").startswith("# Existing instructions\n")
+
+    @pytest.mark.asyncio
     async def test_read_nonexistent_file(self, tmp_path):
         adapter = CodexAdapter(tmp_path / "nonexistent.md")
         mems = await adapter.read_memories()
