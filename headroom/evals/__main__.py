@@ -410,7 +410,7 @@ Install dependencies:
     quick_parser = subparsers.add_parser("quick", help="Run quick sanity check")
     quick_parser.add_argument("-n", type=int, default=5, help="Number of samples")
     quick_parser.add_argument("--provider", default="anthropic", help="LLM provider")
-    quick_parser.add_argument("--model", default="claude-sonnet-4-20250514", help="Model to use")
+    quick_parser.add_argument("--model", default="claude-sonnet-5-5", help="Model to use")
     quick_parser.add_argument("-o", "--output", help="Output file for results (JSON)")
     quick_parser.set_defaults(func=cmd_quick)
 
@@ -427,7 +427,7 @@ Install dependencies:
         help="Dataset name, category (rag, tool_use, code, long_context), 'quick', or 'all'",
     )
     bench_parser.add_argument("--provider", default="anthropic", help="LLM provider")
-    bench_parser.add_argument("--model", default="claude-sonnet-4-20250514", help="Model to use")
+    bench_parser.add_argument("--model", default="claude-sonnet-5-5", help="Model to use")
     bench_parser.add_argument("--semantic", action="store_true", help="Enable semantic similarity")
     bench_parser.add_argument("-o", "--output", help="Output file for results (JSON)")
     bench_parser.set_defaults(func=cmd_benchmark)

@@ -85,7 +85,7 @@ def evals() -> None:
 )
 @click.option(
     "--answer-model",
-    help="LLM model for generating answers (e.g., gpt-4o, claude-sonnet-4-20250514)",
+    help="LLM model for generating answers (e.g., gpt-4o, claude-sonnet-5-5)",
 )
 @click.option(
     "--llm-judge",
