@@ -115,25 +115,6 @@ class TestArmAssignment:
         }
         assert conversation_key_from_body(a) != conversation_key_from_body(b)
 
-    def test_conversation_key_does_not_use_responses_delta_text(self):
-        user_turn = {
-            "model": "gpt-5",
-            "instructions": "same session instructions",
-            "input": "task A",
-        }
-        tool_turn = {
-            "model": "gpt-5",
-            "instructions": "same session instructions",
-            "input": [
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_1",
-                    "output": "ok",
-                }
-            ],
-        }
-        assert conversation_key_from_body(user_turn) == conversation_key_from_body(tool_turn)
-
     def test_conversation_key_unwraps_ws_response_create(self):
         http_body = {"model": "gpt-5", "input": "build a cache"}
         ws_body = {

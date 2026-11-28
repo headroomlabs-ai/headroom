@@ -384,6 +384,51 @@ def test_create_hook_steering_and_core_agree_on_the_arm(
         assert ("output_shaper:verbosity:L3" in labels) is (arm == "treatment"), labels
 
 
+_SHARED_INSTRUCTIONS = "You are a coding assistant."
+
+
+def _shared_instructions_body(i: int) -> dict:
+    return {
+        "model": "gpt-5.5",
+        "instructions": _SHARED_INSTRUCTIONS,
+        "input": _user(f"task {i}"),
+        "stream": False,
+    }
+
+
+def test_conversations_sharing_instructions_keep_their_own_holdout_keys() -> None:
+    """The key used ``instructions`` as a conversation id, so every conversation
+    of a client that sends one system prompt shared one key, and one arm."""
+    from headroom.proxy.output_arm_key import output_arm_key
+    from headroom.proxy.output_savings import assign_arm
+
+    keys = [output_arm_key(_shared_instructions_body(i), {}) for i in range(200)]
+
+    assert len(set(keys)) == 200
+    assert {assign_arm(key, 0.3) for key in keys} == {"control", "treatment"}
+
+
+def test_create_hook_and_core_agree_when_conversations_share_instructions(monkeypatch) -> None:
+    """Same model, same instructions: the hook and core must still split the
+    conversations across both arms and agree on each one."""
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.3")
+    hook = _KiroLikeSteering()
+    register_turn_hook(hook)
+    bodies = [_shared_instructions_body(i) for i in range(30)]
+    expected = [_body_arm(body) for body in bodies]
+    assert set(expected) == {"control", "treatment"}
+
+    outcomes = _post_turns(bodies)
+
+    assert hook.steered == [arm == "treatment" for arm in expected]
+    assert [_arms(o) for o in outcomes] == [{arm} for arm in expected]
+    for arm, outcome in zip(expected, outcomes, strict=True):
+        labels = list(outcome.transforms_applied)
+        assert ("output_shaper:verbosity:L3" in labels) is (arm == "treatment"), labels
+
+
 def test_responses_conversations_without_an_id_get_their_own_holdout_keys() -> None:
     """Without a response id the key used a constant, so every Responses
     conversation of a model shared one holdout arm."""

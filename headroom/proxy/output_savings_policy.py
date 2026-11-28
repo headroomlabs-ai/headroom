@@ -136,9 +136,8 @@ def _stable_response_identifier(body: dict[str, Any]) -> str:
             if value and value.lower() != "auto":
                 return f"{container_key}.{key}:{value}"
 
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions:
-        return f"instructions:{instructions[:512]}"
+    # ``instructions`` is not an identifier: a client sends one system prompt
+    # with every conversation, so keying on it put them all in one arm.
     return ""
 
 
