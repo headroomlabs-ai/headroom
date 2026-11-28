@@ -1875,6 +1875,11 @@ class LiteLLMBackend(Backend):
                     kwargs[param] = body[param]
 
             extra_body = _build_openai_extra_body(body)
+            # Anthropic's native thinking config is a litellm kwarg for
+            # Anthropic-family targets; left in `extra_body` it does not reach
+            # the Messages request as the top-level `thinking` field.
+            if "thinking" in extra_body and _is_anthropic_family_model(litellm_model):
+                kwargs["thinking"] = extra_body.pop("thinking")
             if extra_body:
                 kwargs["extra_body"] = extra_body
 
@@ -2085,6 +2090,11 @@ class LiteLLMBackend(Backend):
                 kwargs["stream_options"] = body["stream_options"]
 
             extra_body = _build_openai_extra_body(body)
+            # Anthropic's native thinking config is a litellm kwarg for
+            # Anthropic-family targets; left in `extra_body` it does not reach
+            # the Messages request as the top-level `thinking` field.
+            if "thinking" in extra_body and _is_anthropic_family_model(litellm_model):
+                kwargs["thinking"] = extra_body.pop("thinking")
             if extra_body:
                 kwargs["extra_body"] = extra_body
 

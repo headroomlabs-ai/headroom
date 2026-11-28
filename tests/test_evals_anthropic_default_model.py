@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +14,7 @@ from click.testing import CliRunner
 from headroom.cli.evals import evals
 from headroom.evals.batch_compression_eval import BatchCompressionEvaluator, BatchRequest
 from headroom.evals.runners.before_after import BeforeAfterRunner, LLMConfig
+from tests._dotenv import importorskip_no_env_leak
 
 
 class _Messages:
@@ -83,6 +88,85 @@ def test_proxy_arm_sends_the_same_thinking_setting_as_the_direct_arm():
 
     assert proxy.kwargs["extra_body"] == runner._llm_client.messages.kwargs["extra_body"]
     assert "temperature" not in proxy.kwargs
+
+
+@pytest.fixture
+def upstream(monkeypatch):
+    """Local stand-in for the Anthropic API that records each request."""
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            requests.append((self.path, body))
+            reply = {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"],
+                "content": [{"type": "text", "text": "42"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+            payload = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    monkeypatch.setenv("ANTHROPIC_API_BASE", url)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    yield SimpleNamespace(url=url, requests=requests)
+    server.shutdown()
+    server.server_close()
+
+
+def test_proxy_arm_upstream_request_has_the_direct_arm_thinking_field(upstream):
+    """Both arms reach Anthropic with the same top-level ``thinking`` field.
+
+    Real SDK clients on both sides; the proxy arm goes through the LiteLLM
+    Anthropic backend, as it does behind ``/v1/chat/completions``.
+    """
+    anthropic = pytest.importorskip("anthropic")
+    httpx = pytest.importorskip("httpx")
+    openai = pytest.importorskip("openai")
+    importorskip_no_env_leak("litellm")
+    from headroom.backends.litellm import LiteLLMBackend
+
+    backend = LiteLLMBackend(provider="anthropic")
+
+    def proxy(request):
+        result = asyncio.run(
+            backend.send_openai_message(json.loads(request.content), dict(request.headers))
+        )
+        return httpx.Response(result.status_code, json=result.body)
+
+    runner = BeforeAfterRunner.__new__(BeforeAfterRunner)
+    runner.llm_config = LLMConfig()
+    runner._llm_client = anthropic.Anthropic(base_url=upstream.url, api_key="test-key")
+    runner._proxy_client = openai.OpenAI(
+        base_url="http://proxy.invalid/v1",
+        api_key="test-key",
+        http_client=httpx.Client(transport=httpx.MockTransport(proxy)),
+    )
+
+    assert runner._call_llm("context", "question") == "42"
+    assert runner._call_llm_via_proxy("context", "question") == "42"
+
+    (direct_path, direct_body), (proxy_path, proxy_body) = upstream.requests
+    assert direct_path == proxy_path == "/v1/messages"
+    assert direct_body["thinking"] == {"type": "between_tools"}
+    assert proxy_body["thinking"] == direct_body["thinking"]
+    assert "extra_body" not in proxy_body
+    assert "temperature" not in proxy_body
 
 
 @pytest.mark.parametrize(
