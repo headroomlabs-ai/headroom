@@ -16,7 +16,11 @@ from typing import Any, Literal, cast
 
 import tomllib
 
-from headroom.memory.storage_router import ProjectResolver, RequestContext
+from headroom.memory.storage_router import (
+    ProjectKeyStrategy,
+    ProjectResolver,
+    RequestContext,
+)
 from headroom.providers.codex.config_toml import loads_codex_config
 from headroom.providers.codex.threads import _codex_state_db_paths
 
@@ -60,6 +64,7 @@ class CodexProjectContextResolver:
         body: Mapping[str, Any],
         pinned_cwd: Path | None = None,
         project_root_override: str | None = None,
+        key_strategy: ProjectKeyStrategy | None = None,
     ) -> CodexResolvedProject:
         explicit_project_id = self._header(headers, "x-headroom-project-id")
         if explicit_project_id:
@@ -69,6 +74,7 @@ class CodexProjectContextResolver:
                     system_prompt="",
                     base_user_id="",
                     project_root_override=project_root_override,
+                    key_strategy=key_strategy,
                 )
             )
             return CodexResolvedProject(
@@ -85,6 +91,7 @@ class CodexProjectContextResolver:
                 headers=headers,
                 source="x-headroom-cwd",
                 pinned_cwd=pinned_cwd,
+                key_strategy=key_strategy,
             )
 
         if project_root_override:
@@ -93,6 +100,7 @@ class CodexProjectContextResolver:
                 headers=headers,
                 source="configured-project-root",
                 pinned_cwd=pinned_cwd,
+                key_strategy=key_strategy,
             )
 
         identity, source, metadata_reason = self._turn_identity(headers, body)
@@ -104,6 +112,7 @@ class CodexProjectContextResolver:
                     headers,
                     pinned_cwd,
                     "turn_id_missing",
+                    key_strategy,
                 )
             cwd, reason = self._cwd_from_state(thread_id, turn_id)
             if cwd is not None:
@@ -112,6 +121,7 @@ class CodexProjectContextResolver:
                     headers,
                     cast(Literal["codex-turn-metadata", "codex-client-metadata"], source),
                     pinned_cwd,
+                    key_strategy,
                 )
             return self._skip(reason)
 
@@ -120,6 +130,7 @@ class CodexProjectContextResolver:
             headers,
             pinned_cwd,
             metadata_reason,
+            key_strategy,
         )
 
     async def resolve_async(
@@ -129,6 +140,7 @@ class CodexProjectContextResolver:
         body: Mapping[str, Any],
         pinned_cwd: Path | None = None,
         project_root_override: str | None = None,
+        key_strategy: ProjectKeyStrategy | None = None,
     ) -> CodexResolvedProject:
         """Resolve optional project context without blocking async model traffic."""
         try:
@@ -138,6 +150,7 @@ class CodexProjectContextResolver:
                 body=body,
                 pinned_cwd=pinned_cwd,
                 project_root_override=project_root_override,
+                key_strategy=key_strategy,
             )
         except Exception:
             logger.warning("event=codex_project_resolution_failed", exc_info=True)
@@ -203,6 +216,7 @@ class CodexProjectContextResolver:
         headers: Mapping[str, str],
         pinned_cwd: Path | None,
         reason: str,
+        key_strategy: ProjectKeyStrategy | None = None,
     ) -> CodexResolvedProject:
         for container in self._body_containers(body):
             metadata = container.get("client_metadata")
@@ -219,6 +233,7 @@ class CodexProjectContextResolver:
                             headers,
                             "responses-body-cwd",
                             pinned_cwd,
+                            key_strategy,
                         )
         return self._skip(reason)
 
@@ -229,6 +244,7 @@ class CodexProjectContextResolver:
         headers: Mapping[str, str],
         source: Literal["x-headroom-cwd", "configured-project-root"],
         pinned_cwd: Path | None,
+        key_strategy: ProjectKeyStrategy | None = None,
     ) -> CodexResolvedProject:
         cwd = self._canonical_cwd(raw_cwd)
         if cwd is None:
@@ -240,6 +256,7 @@ class CodexProjectContextResolver:
                     system_prompt="",
                     base_user_id="",
                     project_root_override=raw_cwd if source == "configured-project-root" else None,
+                    key_strategy=key_strategy,
                 )
             )
             return CodexResolvedProject(
@@ -248,7 +265,7 @@ class CodexProjectContextResolver:
                 source=source,
                 reason="explicit_override",
             )
-        return self._cwd_result(cwd, headers, source, pinned_cwd)
+        return self._cwd_result(cwd, headers, source, pinned_cwd, key_strategy)
 
     def _cwd_result(
         self,
@@ -262,6 +279,7 @@ class CodexProjectContextResolver:
             "responses-body-cwd",
         ],
         pinned_cwd: Path | None,
+        key_strategy: ProjectKeyStrategy | None = None,
     ) -> CodexResolvedProject:
         if pinned_cwd is not None and cwd != pinned_cwd:
             return self._skip("project_mismatch")
@@ -271,6 +289,7 @@ class CodexProjectContextResolver:
                 system_prompt="",
                 base_user_id="",
                 project_root_override=str(cwd),
+                key_strategy=key_strategy,
             )
         )
         return CodexResolvedProject(

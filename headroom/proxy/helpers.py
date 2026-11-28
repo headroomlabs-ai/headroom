@@ -32,6 +32,7 @@ from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 from headroom.cache.compression_cache import _is_tool_result_message
 from headroom.log_safety import LOG_FORMAT, SingleLineFormatter
+from headroom.memory.storage_router import ProjectKeyStrategy
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -272,6 +273,22 @@ def get_memory_injection_mode() -> MemoryInjectionMode:
     return memory_injection_mode_policy.resolve_memory_injection_mode(
         os.environ.get(_MEMORY_INJECTION_MODE_ENV)
     )
+
+
+def project_key_strategy_from_config(config: Any) -> ProjectKeyStrategy | None:
+    """Read the memory project-key strategy off a ``ProxyConfig``-like.
+
+    GH #4712: ``--memory-project-key=git`` keys a project on its git
+    repository instead of its directory. Returns ``None`` (meaning the
+    resolver default, ``cwd``) when unset or the config object predates
+    the field — handlers pass this to ``RequestContext`` so CCR scoping,
+    Codex resolution, and the memory router agree on one key.
+    """
+    raw = getattr(config, "memory_project_key_strategy", "") or ""
+    raw = str(raw).strip().lower()
+    if not raw or raw == "cwd":
+        return None
+    return ProjectKeyStrategy(mode=raw)
 
 
 def hash_query_for_log(query: str) -> str:
