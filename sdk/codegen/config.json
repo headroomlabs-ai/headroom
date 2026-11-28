@@ -1,0 +1,11 @@
+{
+  "sources": [
+    "headroom/proxy/sdk_contracts.py",
+    "headroom/proxy/server.py"
+  ],
+  "fixture_sources": [
+    "headroom/proxy/sdk_contracts.py",
+    "tests/sdkgen/fixtures/retrieval_routes.py"
+  ],
+  "output": "sdk/generated-pilot"
+}
