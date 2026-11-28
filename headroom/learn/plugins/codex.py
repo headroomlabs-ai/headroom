@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from .._shared import classify_error, is_error_content, normalize_tool_name
@@ -20,6 +21,9 @@ from ..models import (
 from ..writer import CodexWriter, ContextWriter
 
 logger = logging.getLogger(__name__)
+_CODEX_EXEC_EXIT = re.compile(
+    r"Chunk ID:[^\n]*\nWall time:[^\n]*\nProcess exited with code (-?[0-9]+)[ \t]*\r?(?:\n|\Z)"
+)
 
 
 class CodexPlugin(LearnPlugin, ConversationScanner):
@@ -250,7 +254,9 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
 
                     name, inp = func_calls[call_id]
                     result_content = _parse_codex_output(payload.get("output", ""))
-                    is_err = is_error_content(result_content)
+                    # The exec wrapper's status is independent of the command's stdout.
+                    status = _CODEX_EXEC_EXIT.match(result_content) if name == "Bash" else None
+                    is_err = bool(status and int(status[1])) or is_error_content(result_content)
                     error_cat = classify_error(result_content) if is_err else ErrorCategory.UNKNOWN
 
                     tool_calls.append(
