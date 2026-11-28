@@ -383,6 +383,16 @@ def test_start_proxy_injects_explicit_agent_savings_profile(monkeypatch, tmp_pat
     assert captured_env["HEADROOM_TARGET_RATIO"] == "0.10"
 
 
+def test_proxy_pipeline_kwargs_does_not_defer_waste_signals() -> None:
+    """proxy_pipeline_kwargs feeds ALL provider handlers, but only the
+    Anthropic messages route compensates for deferral (background task +
+    outcome collection) — so the shared kwargs must NOT defer, or the other
+    routes silently lose waste-signal telemetry. The Anthropic handler passes
+    defer_waste_signals=True explicitly at its covered call sites."""
+    assert "defer_waste_signals" not in proxy_pipeline_kwargs(ProxyConfig())
+
+
+
 def test_agent_90_profile_applies_to_proxy_config_runtime_kwargs() -> None:
     config = ProxyConfig(savings_profile="agent-90")
 

@@ -218,6 +218,14 @@ class RequestOutcome:
     #     here so the ledger sees one observation. None = use output_tokens.
     shaped_output_tokens: int | None = None
     waste_signals: dict[str, int] | None = None
+    # Deferred waste-signal detection: an asyncio.Task resolving to the same
+    # ``to_dict()`` form as ``waste_signals``, started by the Anthropic handler
+    # right after the pipeline ran (overlapping the upstream call).
+    # ``emit_request_outcome`` collects it opportunistically (done-only, never
+    # waits) so the metrics and request-log funnels record the signals the
+    # inline path would have produced without adding response latency.
+    # Ignored when ``waste_signals`` is already populated.
+    waste_signals_task: Any | None = None
     num_messages: int = 0
     turn_id: str | None = None
     request_messages: list[dict[str, Any]] | None = None
@@ -589,6 +597,23 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             await handler.metrics.record_failed(provider=outcome.provider)
         return
 
+    # Deferred waste-signal collection: the task was started right after the
+    # pipeline ran, so by the time the upstream response arrives it has
+    # usually long finished. Collection is strictly opportunistic — this
+    # funnel is awaited BEFORE the response is returned on the non-streaming
+    # path, so it must never wait on the single-worker background executor
+    # (which can be busy for seconds with a deferred compression job). If the
+    # task isn't done yet, only this request's per-row attribution is lost
+    # (telemetry-only, fail open); the task keeps running and still records
+    # its OTel counter.
+    waste_signals = outcome.waste_signals
+    task = outcome.waste_signals_task
+    if waste_signals is None and task is not None and task.done():
+        try:
+            waste_signals = task.result()
+        except Exception:
+            waste_signals = None
+
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
     # observed output tokens to the recorder so it can produce an honest
@@ -738,7 +763,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         overhead_ms=outcome.overhead_ms,
         ttfb_ms=outcome.ttfb_ms,
         pipeline_timing=pipeline_timing,
-        waste_signals=outcome.waste_signals,
+        waste_signals=waste_signals,
+
         cache_read_tokens=outcome.cache_read_tokens,
         cache_write_tokens=outcome.cache_write_tokens,
         cache_write_5m_tokens=outcome.cache_write_5m_tokens,
@@ -818,7 +844,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 provider_input_tokens=outcome.provider_input_tokens,
                 transforms_applied=list(outcome.transforms_applied),
                 savings_breakdown=savings_breakdown,
-                waste_signals=outcome.waste_signals,
+                waste_signals=waste_signals,
                 request_messages=outcome.request_messages,
                 compressed_messages=outcome.compressed_messages,
                 turn_id=outcome.turn_id,

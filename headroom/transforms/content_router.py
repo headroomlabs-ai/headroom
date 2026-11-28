@@ -6535,7 +6535,14 @@ class ContentRouter(Transform):
         # today's behavior.
         dedup_pointers_recoverable = bool(kwargs.get("cross_turn_dedup_recoverable", True))
 
-        tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+        # perf review F3: avoid str()-ing Anthropic content-block lists (repr
+        # punctuation inflated context_pressure). Reuse the pipeline's
+        # already-correct count when available (tokens_before_hint, plumbed
+        # in pipeline.py); only recount here for direct SDK callers that skip
+        # the pipeline.
+        tokens_before = kwargs.get("tokens_before_hint")
+        if tokens_before is None:
+            tokens_before = tokenizer.count_messages(messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
         # Per-message veto from a compression hook (``CompressionHooks.
@@ -7571,9 +7578,10 @@ class ContentRouter(Transform):
                 transformed_messages, frozen_message_count, transforms_applied, route_counts
             )
 
-        tokens_after = sum(
-            tokenizer.count_text(str(m.get("content", ""))) for m in transformed_messages
-        )
+        # perf review F3 (twin of the tokens_before fix above): same repr-based
+        # str() bug inflated tokens_after, which would understate reported
+        # savings relative to the now-accurate tokens_before.
+        tokens_after = tokenizer.count_messages(transformed_messages)
 
         # Log routing summary
         parts = []

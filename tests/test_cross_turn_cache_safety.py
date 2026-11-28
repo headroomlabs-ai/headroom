@@ -19,6 +19,7 @@ turn; WITH it the prefix stays stable.
 from headroom.cache.prefix_tracker import (
     PrefixCacheTracker,
     PrefixFreezeConfig,
+    normalize_message_cache_control,
     overlay_cached_prefix,
 )
 
@@ -138,6 +139,61 @@ def test_cache_create_stays_bounded_to_the_delta_with_overlay():
     # with conversation length. Assert the last turn creates no more than the
     # first (which had no cache to reuse).
     assert creates[-1] <= creates[0] + 1
+
+
+def test_recorded_state_not_mutated_by_downstream_consumers():
+    """Guard for the ref-return contract (perf review F1): get_last_original/
+    forwarded_messages() now return the tracker's actual recorded lists, not
+    deep copies. overlay_cached_prefix splices those refs directly into its
+    output, so normalize_message_cache_control and memory injection may both
+    receive dicts that ARE the recorded state. None of them may mutate in
+    place — a future turn's replay depends on the recorded bytes staying
+    exactly what was recorded at update_from_response time.
+    """
+    import copy
+
+    from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+
+    tracker = PrefixCacheTracker("anthropic", PrefixFreezeConfig(min_cached_tokens=0))
+
+    # Turn 1: a message carrying cache_control (normalize has something to
+    # strip) so the recorded state exercises that mutation path too.
+    turn1 = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}],
+        }
+    ]
+    counts = [_toklen(m) for m in turn1]
+    tracker.update_from_response(
+        0, sum(counts), turn1, message_token_counts=counts, original_messages=turn1
+    )
+
+    # Independent snapshot of turn 1's recorded state — the ground truth.
+    snapshot_original = copy.deepcopy(tracker.get_last_original_messages())
+    snapshot_forwarded = copy.deepcopy(tracker.get_last_forwarded_messages())
+
+    # Turn 2: append-only extension driven through overlay + normalize +
+    # memory injection — the three consumers the mutation audit covers.
+    turn2_original = turn1 + [{"role": "user", "content": "turn 2"}]
+    frozen = tracker.get_frozen_message_count()
+    forwarded = overlay_cached_prefix(
+        turn2_original,
+        turn2_original,
+        tracker.get_last_original_messages(),
+        tracker.get_last_forwarded_messages(),
+    )
+    forwarded = normalize_message_cache_control(forwarded)
+    forwarded = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
+        forwarded, "injected memory", frozen_message_count=frozen
+    )
+
+    assert tracker.get_last_original_messages() == snapshot_original, (
+        "turn 1's recorded original messages were mutated by a downstream consumer"
+    )
+    assert tracker.get_last_forwarded_messages() == snapshot_forwarded, (
+        "turn 1's recorded forwarded messages were mutated by a downstream consumer"
+    )
 
 
 def test_background_improvement_never_busts_warm_cache_and_lands_on_cold():

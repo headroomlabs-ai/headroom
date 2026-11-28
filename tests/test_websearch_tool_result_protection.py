@@ -6,6 +6,7 @@ import pytest
 
 from headroom.config import DEFAULT_EXCLUDE_TOOLS
 from headroom.proxy.server import HeadroomProxy, ProxyConfig
+from headroom.tokenizers.base import BaseTokenizer
 from headroom.transforms.content_detector import ContentType
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -15,7 +16,7 @@ from headroom.transforms.content_router import (
 )
 
 
-class _Tokenizer:
+class _Tokenizer(BaseTokenizer):
     def count_text(self, text: str) -> int:
         return max(1, len(text) // 4)
 

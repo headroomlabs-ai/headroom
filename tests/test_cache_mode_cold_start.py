@@ -159,6 +159,12 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.captured_body = body
         return _ResponseStub()
 
+    def _get_token_count_memo(self, session_id):
+        from headroom.cache.token_count_memo import TokenCountMemo
+
+        self._memo = getattr(self, "_memo", TokenCountMemo())
+        return self._memo
+
 
 def _build_request(body: dict) -> Request:
     payload = json.dumps(body).encode("utf-8")

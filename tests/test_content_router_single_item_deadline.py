@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 import headroom.transforms.kompress_compressor as kc
+from headroom.tokenizers.base import BaseTokenizer
 from headroom.transforms.content_detector import ContentType
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -14,7 +15,7 @@ from headroom.transforms.content_router import (
 from headroom.transforms.kompress_compressor import KompressCompressor, KompressConfig
 
 
-class _Tokenizer:
+class _Tokenizer(BaseTokenizer):
     def count_text(self, content: str) -> int:
         return len(content.split())
 
@@ -137,6 +138,9 @@ def test_single_cache_miss_deadline_starts_before_kompress_load(monkeypatch, cap
     class _Tokenizer:
         def count_text(self, content: str) -> int:
             return len(content.split())
+
+        def count_messages(self, messages: list[dict[str, str]]) -> int:
+            return sum(self.count_text(message.get("content", "")) for message in messages)
 
         def __call__(self, words, **_kwargs):
             rows = words if words and isinstance(words[0], list) else [words]

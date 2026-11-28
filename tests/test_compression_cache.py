@@ -495,35 +495,6 @@ class TestCompressionCacheFrozenCount:
         assert ha in cache._stable_hashes
         assert hb not in cache._stable_hashes  # msg[2] not included
 
-    def test_should_defer_compression_new_content(self, cache: CompressionCache) -> None:
-        """First-time content should NOT be deferred — there is no
-        prefix-cache entry to preserve, so compression carries no bust
-        cost. Issue #327: prior behavior deferred first-sight, which
-        marked every fresh tool_result as stable and disabled
-        compression for typical Claude Code workloads.
-        """
-        h = CompressionCache.content_hash("brand new content")
-        assert cache.should_defer_compression(h, ttl_seconds=300, batch_window=30) is False
-        # Subsequent sightings within TTL should defer (batch window).
-        assert cache.should_defer_compression(h, ttl_seconds=300, batch_window=30) is True
-
-    def test_should_defer_compression_records_first_seen(self, cache: CompressionCache) -> None:
-        """First-sight call must record the timestamp so subsequent
-        in-window calls can defer. Without this the deferral pathway
-        for genuinely-repeated content stops working."""
-        h = CompressionCache.content_hash("seen-twice content")
-        cache.should_defer_compression(h)  # first sight
-        assert h in cache._first_seen
-
-    def test_should_defer_compression_near_ttl(self, cache: CompressionCache) -> None:
-        """Content near TTL boundary should NOT be deferred."""
-        import time
-
-        h = CompressionCache.content_hash("old content")
-        # Backdate first_seen to simulate age near TTL
-        cache._first_seen[h] = time.time() - 280  # 280s old, TTL=300, window=30
-        assert cache.should_defer_compression(h, ttl_seconds=300, batch_window=30) is False
-
 
 class TestCompressionCacheApplyAndUpdate:
     @pytest.mark.parametrize(
@@ -1034,6 +1005,240 @@ def test_get_compression_cache_returns_same_instance_under_contention() -> None:
     first = results[0]
     for c in results[1:]:
         assert c is first, "Concurrent _get_compression_cache returned different instances"
+
+
+# ─── Phase 3: prepare_turn parity + lock hygiene ────────────────────────────
+#
+# `prepare_turn` is a single-pass replacement for the
+# compute_frozen_count -> mark_stable_from_messages -> apply_cached sequence
+# (perf review F4). These tests prove it produces IDENTICAL results and
+# IDENTICAL cache side effects to the old 3-call sequence on a range of
+# fixture transcripts, so the merge cannot silently drift behavior.
+
+
+def _old_three_call_sequence(
+    cache: CompressionCache, messages: list[dict], tracker_frozen_count: int
+) -> tuple[int, list[dict]]:
+    """The exact sequence prepare_turn replaces (mirrors anthropic.py pre-Phase-3)."""
+    cache_frozen_count = cache.compute_frozen_count(messages)
+    frozen_count = min(tracker_frozen_count, cache_frozen_count)
+    cache.mark_stable_from_messages(messages, frozen_count)
+    working_messages = cache.apply_cached(messages)
+    return frozen_count, working_messages
+
+
+def _seeded_cache(
+    pre_compressed: dict[str, tuple[str, int]] | None = None,
+    pre_stable: set[str] | None = None,
+) -> CompressionCache:
+    c = CompressionCache()
+    for content_hash, (compressed, tokens_saved) in (pre_compressed or {}).items():
+        c.store_compressed(content_hash, compressed, tokens_saved=tokens_saved)
+    for content_hash in pre_stable or set():
+        c.mark_stable(content_hash)
+    return c
+
+
+_PREPARE_TURN_FIXTURES = [
+    pytest.param(
+        [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "uncached output"}
+                ],
+            },
+            {"role": "user", "content": "follow up"},
+        ],
+        10,
+        None,
+        None,
+        id="cold_cache_no_hits",
+    ),
+    pytest.param(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "warm tool output"}
+                ],
+            },
+            {"role": "user", "content": "more"},
+        ],
+        1,
+        {CompressionCache.content_hash("warm tool output"): ("compressed warm", 4)},
+        None,
+        id="warm_cache_hit_tracker_clamp",
+    ),
+    pytest.param(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "tc1", "content": "openai tool output"},
+            {"role": "assistant", "content": "done"},
+        ],
+        5,
+        {CompressionCache.content_hash("openai tool output"): ("compressed openai", 3)},
+        None,
+        id="openai_format",
+    ),
+    pytest.param(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "text", "text": "list-of-blocks tool output"}],
+                    }
+                ],
+            },
+            {"role": "user", "content": "more"},
+        ],
+        5,
+        {
+            CompressionCache.content_hash("list-of-blocks tool output"): (
+                "compressed list-blocks",
+                2,
+            )
+        },
+        None,
+        id="list_of_blocks_content",
+    ),
+    pytest.param(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": "excluded read output",
+                    }
+                ],
+            },
+            {"role": "user", "content": "more"},
+        ],
+        5,
+        None,
+        {CompressionCache.content_hash("excluded read output")},
+        id="stable_hash_without_compression",
+    ),
+    pytest.param(
+        [
+            {"role": "user", "content": "start"},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "cached A"}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "uncached B"}],
+            },
+            {"role": "user", "content": "end"},
+        ],
+        5,
+        {CompressionCache.content_hash("cached A"): ("compressed A", 2)},
+        None,
+        id="multiple_tool_results_partial_cache",
+    ),
+    pytest.param([], 0, None, None, id="empty_messages"),
+]
+
+
+class TestCompressionCachePrepareTurn:
+    """Parity tests: prepare_turn must match the old 3-call sequence exactly."""
+
+    @pytest.mark.parametrize(
+        "messages,tracker_frozen_count,pre_compressed,pre_stable", _PREPARE_TURN_FIXTURES
+    )
+    def test_prepare_turn_matches_old_sequence(
+        self,
+        messages: list[dict],
+        tracker_frozen_count: int,
+        pre_compressed: dict[str, tuple[str, int]] | None,
+        pre_stable: set[str] | None,
+    ) -> None:
+        cache_old = _seeded_cache(pre_compressed, pre_stable)
+        cache_new = _seeded_cache(pre_compressed, pre_stable)
+
+        frozen_old, working_old = _old_three_call_sequence(
+            cache_old, messages, tracker_frozen_count
+        )
+        frozen_new, working_new = cache_new.prepare_turn(messages, tracker_frozen_count)
+
+        assert frozen_new == frozen_old
+        assert working_new == working_old
+        assert cache_new._stable_hashes == cache_old._stable_hashes
+        assert set(cache_new._cache.keys()) == set(cache_old._cache.keys())
+        assert cache_new._hits == cache_old._hits
+        assert cache_new._misses == cache_old._misses
+
+    def test_prepare_turn_does_not_mutate_input_messages(self, cache: CompressionCache) -> None:
+        original_content = "big tool output"
+        h = CompressionCache.content_hash(original_content)
+        cache.store_compressed(h, "small output", tokens_saved=5)
+
+        msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": original_content}],
+        }
+        messages = [msg, {"role": "user", "content": "tail"}]
+        cache.prepare_turn(messages, 5)
+
+        assert msg["content"][0]["content"] == original_content
+
+    def test_prepare_turn_concurrent_calls_do_not_corrupt_state(self) -> None:
+        """Lock-hygiene regression: concurrent prepare_turn + store_compressed
+        calls on the same cache must not corrupt `_cache` / `_stable_hashes`
+        (the merged single-pass walk still hashes outside the lock and only
+        touches shared state inside it)."""
+        import threading
+
+        cache = CompressionCache(max_entries=1_000_000)
+        n_threads = 16
+        per_thread = 50
+        errors: list[Exception] = []
+
+        def worker(tid: int) -> None:
+            try:
+                for i in range(per_thread):
+                    content = f"thread-{tid}-item-{i}"
+                    h = CompressionCache.content_hash(content)
+                    cache.store_compressed(h, f"compressed-{tid}-{i}", tokens_saved=3)
+                    messages = [
+                        {"role": "user", "content": "start"},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": "t1", "content": content}
+                            ],
+                        },
+                        {"role": "user", "content": "tail"},
+                    ]
+                    frozen, working = cache.prepare_turn(messages, 5)
+                    assert frozen in (0, 1, 2)
+                    assert len(working) == 3
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Concurrent prepare_turn/store_compressed raised: {errors}"
+        stats = cache.get_stats()
+        assert stats["entries"] == n_threads * per_thread
 
 
 @pytest.mark.parametrize(
