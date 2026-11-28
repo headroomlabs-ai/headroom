@@ -292,6 +292,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | OpenHands | ✅ | starts proxy + launches |
 | Mistral Vibe | ✅ | starts proxy + launches |
 | Oh My Pi | ✅ | Anthropic + OpenAI/Codex · injects config · starts proxy + launches |
+| Pi CLI | ✅ | transient provider extension · starts proxy + launches |
 | Factory Droid | ✅ | routes via `FACTORY_API_BASE_URL`; Anthropic-model turns compressed, other Factory traffic passed through |
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
