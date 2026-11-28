@@ -2,6 +2,7 @@
 
 from .runtime import (
     CLAUDE_AUTH_KEYS,
+    CODE_MODE_ENV,
     CONTEXT_1M_SUFFIX,
     DEFAULT_1M_MODEL,
     DEFAULT_API_URL,
@@ -15,6 +16,8 @@ from .runtime import (
     claude_auth_conflict_message,
     claude_auth_conflict_sources,
     claude_effective_env,
+    code_mode_gate_short_message,
+    code_mode_requested,
     detect_claude_code_version,
     is_custom_anthropic_base_url,
     parse_claude_code_version,
@@ -61,6 +64,9 @@ __all__ = [
     "parse_claude_code_version",
     "proxy_base_url",
     "resolve_1m_model",
+    "CODE_MODE_ENV",
+    "code_mode_gate_short_message",
+    "code_mode_requested",
     "remote_control_applies_to_auth",
     "remote_control_gate_active",
     "remote_control_gate_message",

@@ -242,6 +242,14 @@ See [issue #746](https://github.com/headroomlabs-ai/headroom/issues/746) for the
   deployment. See [issue #2028](https://github.com/headroomlabs-ai/headroom/issues/2028).
 </Callout>
 
+## Code Mode unavailable when routed through Headroom
+
+**Symptom**: You turned on Claude Code's [Code Mode](https://code.claude.com/docs/en/code-mode) (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` in your shell or user settings), and a session started with `headroom wrap claude`, or with `ANTHROPIC_BASE_URL` pointing at Headroom, prints `Code Mode (experimental) isn't available: it isn't offered yet through a gateway or proxy` and starts with the ordinary tools.
+
+**Cause**: Claude Code does not offer Code Mode through a gateway or proxy (see its [requirements](https://code.claude.com/docs/en/code-mode#requirements)), and routing through Headroom counts as one. The check is in the client, so Headroom cannot turn Code Mode back on. `--no-proxy` does not change this: it reuses a proxy that is already running, and the session is still routed through it. `headroom wrap claude` prints a one-line notice when Code Mode is turned on.
+
+**Fix**: Start Code Mode sessions with `claude` without wrap, for example `env -u ANTHROPIC_BASE_URL claude` when your shell exports the proxy URL, and use Headroom for your other sessions. In a Code Mode session you can still use Headroom's [MCP tools without the proxy](/docs/mcp#mcp-only-no-proxy): Code Mode's JavaScript can call `headroom_compress` and `headroom_retrieve` itself. That compresses on request; it is not the proxy's automatic compression of every request.
+
 ## Remote Control unavailable through custom ANTHROPIC_BASE_URL
 
 **Symptom**: When Claude Code runs with `ANTHROPIC_BASE_URL` set to a custom host (for example, Headroom), the Remote Control menu is absent. Invoking `/remote-control` reports `Remote Control is only available when using Claude via api.anthropic.com`.

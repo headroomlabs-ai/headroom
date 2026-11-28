@@ -195,6 +195,8 @@ For user-managed Serena drift, run `headroom mcp reconcile` to inspect the curre
 
 The LLM calls `headroom_compress` on demand. Compression happens locally in the MCP process. Originals are stored in a local `CompressionStore` with 1-hour TTL.
 
+This setup also works with Claude Code's [Code Mode](https://code.claude.com/docs/en/code-mode), which Claude Code does not offer through a proxy. In Code Mode, Claude's JavaScript can pass a command's output to `headroom_compress` and fetch it back with `headroom_retrieve`, so the raw output does not have to go through the model first. See [Code Mode unavailable when routed through Headroom](/docs/troubleshooting#code-mode-unavailable-when-routed-through-headroom).
+
 ### MCP + Proxy (full setup)
 
 The proxy compresses all traffic at the HTTP level (before the LLM sees content). MCP tools operate after the LLM receives content. They handle different data and do not double-compress.

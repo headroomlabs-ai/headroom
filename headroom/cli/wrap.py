@@ -96,6 +96,8 @@ from headroom.providers.claude import (
     claude_auth_conflict_sources,
     claude_effective_env,
     claude_user_settings_path,
+    code_mode_gate_short_message,
+    code_mode_requested,
     configure_vscode_claude_settings,
     detect_claude_code_version,
     remote_control_applies_to_auth,
@@ -6872,6 +6874,16 @@ def claude(
                         context_1m_enabled=context_1m,
                     )
                 )
+        if not bedrock_bypass and code_mode_requested(
+            shell=os.environ,
+            user_settings=_claude_settings_env(claude_user_settings_path()),
+            managed_settings=_claude_managed_settings_env(_claude_managed_settings_path()),
+        ):
+            # Issue #4951: Claude Code does not offer Code Mode through a proxy;
+            # tell the user who turned it on why this routed session lacks it.
+            click.echo(
+                "  " + code_mode_gate_short_message(version=detect_claude_code_version(claude_bin))
+            )
         if bedrock_bypass:
             click.echo(
                 f"  Warning: Claude Code is in Bedrock mode ({_CLAUDE_BEDROCK_ENV} from "
