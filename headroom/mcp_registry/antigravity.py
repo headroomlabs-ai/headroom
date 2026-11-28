@@ -45,6 +45,7 @@ from .base import (
     _entry_to_spec,
     _spec_to_entry,
     _specs_equivalent,
+    config_file_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,38 +121,49 @@ class AntigravityRegistrar(MCPRegistrar):
         return _entry_to_spec(server_name, entry)
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
-        existing = self.get_server(spec.name)
-
-        if existing is not None and _specs_equivalent(existing, spec):
-            return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
-
-        if existing is not None and not force:
-            return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
-
         config_path = self._resolve_config()
-        data = self._load_config()
-        if data is None and config_path.exists():
-            # The file exists but would not parse: refuse to overwrite it and
-            # turn a hand-edited typo into total loss of the user's MCP setup.
-            return RegisterResult(
-                RegisterStatus.FAILED,
-                f"{config_path} is not valid JSON. Fix or move it, then re-run — "
-                "refusing to overwrite it and lose your MCP servers.",
-            )
-        payload: dict[str, Any] = data if isinstance(data, dict) else {}
-        servers = payload.get("mcpServers")
-        if not isinstance(servers, dict):
-            servers = {}
-            payload["mcpServers"] = servers
-        servers[spec.name] = _spec_to_entry(spec)
-
         try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            fsutil.write_text(config_path, json.dumps(payload, indent=2) + "\n")
+            with config_file_lock(config_path):
+                data = self._load_config(config_path)
+                if data is None and config_path.exists():
+                    # The file exists but would not parse: refuse to overwrite it and
+                    # turn a hand-edited typo into total loss of the user's MCP setup.
+                    return RegisterResult(
+                        RegisterStatus.FAILED,
+                        f"{config_path} is not valid JSON. Fix or move it, then re-run - "
+                        "refusing to overwrite it and lose your MCP servers.",
+                    )
+                payload: dict[str, Any] = data if isinstance(data, dict) else {}
+                servers = payload.get("mcpServers")
+                if not isinstance(servers, dict):
+                    servers = {}
+                    payload["mcpServers"] = servers
+
+                raw_existing = servers.get(spec.name)
+                existing = (
+                    _entry_to_spec(spec.name, raw_existing)
+                    if isinstance(raw_existing, dict)
+                    else None
+                )
+                if existing is not None and _specs_equivalent(existing, spec):
+                    return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
+                if existing is not None and not force:
+                    return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
+
+                servers[spec.name] = _spec_to_entry(spec)
+                try:
+                    config_path.parent.mkdir(parents=True, exist_ok=True)
+                    fsutil.write_text(config_path, json.dumps(payload, indent=2) + "\n")
+                except OSError as exc:
+                    return RegisterResult(
+                        RegisterStatus.FAILED, f"could not write {config_path}: {exc}"
+                    )
+                verb = "updated" if existing is not None else "wrote"
+                return RegisterResult(
+                    RegisterStatus.REGISTERED, f"{verb} {spec.name} in {config_path}"
+                )
         except OSError as exc:
-            return RegisterResult(RegisterStatus.FAILED, f"could not write {config_path}: {exc}")
-        verb = "updated" if existing is not None else "wrote"
-        return RegisterResult(RegisterStatus.REGISTERED, f"{verb} {spec.name} in {config_path}")
+            return RegisterResult(RegisterStatus.FAILED, f"could not lock {config_path}: {exc}")
 
     def unregister_server(self, server_name: str) -> bool:
         removed = False
@@ -159,24 +171,31 @@ class AntigravityRegistrar(MCPRegistrar):
         for config_path in _config_candidates(self._home):
             if not config_path.exists():
                 continue
-            data = self._load_config(config_path)
-            if not isinstance(data, dict):
-                # Refuse to touch a file that does not parse — the same rule
-                # register_server follows — and keep checking the rest.
-                continue
-            servers = data.get("mcpServers")
-            if not isinstance(servers, dict) or server_name not in servers:
-                continue
-            del servers[server_name]
             try:
-                fsutil.write_text(config_path, json.dumps(data, indent=2) + "\n")
+                with config_file_lock(config_path):
+                    if not config_path.exists():
+                        continue
+                    data = self._load_config(config_path)
+                    if not isinstance(data, dict):
+                        # Refuse to touch a file that does not parse - the same rule
+                        # register_server follows - and keep checking the rest.
+                        continue
+                    servers = data.get("mcpServers")
+                    if not isinstance(servers, dict) or server_name not in servers:
+                        continue
+                    del servers[server_name]
+                    try:
+                        fsutil.write_text(config_path, json.dumps(data, indent=2) + "\n")
+                    except OSError:
+                        # The write failed, so this config still registers the
+                        # server. Record it and report failure instead of claiming a
+                        # removal that the untouched file contradicts.
+                        remaining.append(config_path)
+                        continue
+                    removed = True
             except OSError:
-                # The write failed, so this config still registers the
-                # server. Record it and report failure instead of claiming a
-                # removal that the untouched file contradicts.
                 remaining.append(config_path)
                 continue
-            removed = True
         if not removed:
             return False
         # Antigravity caches each MCP server under ~/.gemini/<surface>/mcp/;

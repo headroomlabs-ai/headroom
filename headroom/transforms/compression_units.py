@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
+from ..parser import CCR_MARKER_ALTERNATION
 from .content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -111,9 +112,7 @@ class RoutedCompressionUnit:
     slot: object
 
 
-_CCR_MARKER_RE = re.compile(
-    r"(?m)^.*(?:Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>).*$"
-)
+_CCR_MARKER_RE = re.compile(rf"(?m)^.*(?:{CCR_MARKER_ALTERNATION}).*$")
 
 _LOSSY_UNMARKED_STRATEGIES = {
     CompressionStrategy.KOMPRESS.value,

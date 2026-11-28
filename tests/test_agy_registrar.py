@@ -1,0 +1,1213 @@
+"""Tests for headroom.mcp_registry.agy.AgyRegistrar.
+
+All tests use a tmp_path home_dir seam so the real ~/.gemini is never touched.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from headroom.mcp_registry.agy import AgyRegistrar
+from headroom.mcp_registry.base import RegisterStatus, ServerSpec
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_SPEC = ServerSpec(
+    name="headroom",
+    command="headroom",
+    args=("mcp", "serve"),
+    env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"},
+)
+
+_OTHER_SPEC = ServerSpec(
+    name="other-server",
+    command="/usr/bin/other",
+    args=("--flag",),
+    env={},
+)
+
+
+def _make_reg(tmp_path: Path) -> AgyRegistrar:
+    return AgyRegistrar(home_dir=tmp_path)
+
+
+def _config_path(tmp_path: Path) -> Path:
+    # agy 1.1.x read-path (migrated from .gemini/antigravity-cli/mcp_config.json).
+    return tmp_path / ".gemini" / "config" / "mcp_config.json"
+
+
+def _write_config(tmp_path: Path, data: dict) -> None:
+    p = _config_path(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _read_config(tmp_path: Path) -> dict:
+    p = _config_path(tmp_path)
+    return json.loads(p.read_text())
+
+
+def test_config_writes_use_lf_newlines(tmp_path: Path) -> None:
+    reg = _make_reg(tmp_path)
+    reg.register_server(_SPEC)
+    data = _config_path(tmp_path).read_bytes()
+    assert b"\n" in data
+    assert b"\r\n" not in data
+
+
+# ---------------------------------------------------------------------------
+# detect
+# ---------------------------------------------------------------------------
+
+
+class TestDetect:
+    def test_returns_false_when_dir_absent(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        assert reg.detect() is False
+
+    def test_returns_true_when_appdata_dir_exists(self, tmp_path: Path) -> None:
+        # detect() keys on agy's app-data dir (the stable install marker), not
+        # the migrated config dir (which may not exist until the first write).
+        (tmp_path / ".gemini" / "antigravity-cli").mkdir(parents=True, exist_ok=True)
+        reg = _make_reg(tmp_path)
+        assert reg.detect() is True
+
+    def test_returns_true_when_config_file_exists(self, tmp_path: Path) -> None:
+        _write_config(tmp_path, {"mcpServers": {}})
+        reg = _make_reg(tmp_path)
+        assert reg.detect() is True
+
+
+# ---------------------------------------------------------------------------
+# get_server
+# ---------------------------------------------------------------------------
+
+
+class TestGetServer:
+    def test_returns_none_when_file_absent(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        assert reg.get_server("headroom") is None
+
+    def test_returns_none_when_server_absent(self, tmp_path: Path) -> None:
+        _write_config(tmp_path, {"mcpServers": {}})
+        reg = _make_reg(tmp_path)
+        assert reg.get_server("headroom") is None
+
+    def test_returns_spec_when_present(self, tmp_path: Path) -> None:
+        _write_config(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "headroom": {
+                        "command": "headroom",
+                        "args": ["mcp", "serve"],
+                        "env": {"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"},
+                    }
+                }
+            },
+        )
+        reg = _make_reg(tmp_path)
+        spec = reg.get_server("headroom")
+        assert spec is not None
+        assert spec.name == "headroom"
+        assert spec.command == "headroom"
+        assert tuple(spec.args) == ("mcp", "serve")
+        assert spec.env == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"}
+
+    def test_malformed_json_returns_none(self, tmp_path: Path) -> None:
+        p = _config_path(tmp_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not valid json")
+        reg = _make_reg(tmp_path)
+        assert reg.get_server("headroom") is None
+
+
+# ---------------------------------------------------------------------------
+# register_server — REGISTERED
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterServer:
+    def test_malformed_config_is_not_overwritten(self, tmp_path: Path) -> None:
+        """A config we cannot parse must abort the write, not get replaced.
+
+        ``mcp_config.json`` is shared with the Antigravity IDE and holds the
+        user's own servers; treating an unreadable file as ``{}`` and writing our
+        single entry back would delete all of them.
+        """
+        p = _config_path(tmp_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        original = '{"mcpServers": {"user-server": {"command": "x"}}, TRUNCATED'
+        p.write_text(original)
+
+        result = _make_reg(tmp_path).register_server(_SPEC)
+
+        assert result.status == RegisterStatus.FAILED
+        assert p.read_text() == original
+
+    def test_unregister_leaves_malformed_config_untouched(self, tmp_path: Path) -> None:
+        p = _config_path(tmp_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        original = "{not valid json"
+        p.write_text(original)
+
+        assert _make_reg(tmp_path).unregister_server("headroom") is False
+        assert p.read_text() == original
+
+    def test_registers_new_server(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.REGISTERED
+        config = _read_config(tmp_path)
+        assert "headroom" in config["mcpServers"]
+        entry = config["mcpServers"]["headroom"]
+        assert entry["command"] == "headroom"
+        assert entry["args"] == ["mcp", "serve"]
+
+    def test_registers_creates_parent_dirs(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        assert not _config_path(tmp_path).parent.exists()
+        reg.register_server(_SPEC)
+        assert _config_path(tmp_path).exists()
+
+    # ALREADY
+    def test_already_when_spec_matches(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        reg.register_server(_SPEC)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.ALREADY
+
+    # MISMATCH without force
+    def test_mismatch_when_command_differs_no_force(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        reg.register_server(_SPEC)
+        different = ServerSpec(
+            name="headroom",
+            command="/different/path/headroom",
+            args=("mcp", "serve"),
+            env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"},
+        )
+        result = reg.register_server(different)
+        assert result.status == RegisterStatus.MISMATCH
+        # Config must be unchanged
+        config = _read_config(tmp_path)
+        assert config["mcpServers"]["headroom"]["command"] == "headroom"
+
+    def test_mismatch_when_env_differs_no_force(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        reg.register_server(_SPEC)
+        different = ServerSpec(
+            name="headroom",
+            command="headroom",
+            args=("mcp", "serve"),
+            env={"HEADROOM_PROXY_URL": "http://127.0.0.1:1111"},
+        )
+        result = reg.register_server(different)
+        assert result.status == RegisterStatus.MISMATCH
+
+    # force overwrite
+    def test_force_overwrites_existing(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        reg.register_server(_SPEC)
+        updated = ServerSpec(
+            name="headroom",
+            command="/new/headroom",
+            args=("mcp", "serve"),
+            env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"},
+        )
+        result = reg.register_server(updated, force=True)
+        assert result.status == RegisterStatus.REGISTERED
+        config = _read_config(tmp_path)
+        assert config["mcpServers"]["headroom"]["command"] == "/new/headroom"
+
+    # MERGE: other entries preserved
+    def test_merge_preserves_other_user_servers(self, tmp_path: Path) -> None:
+        # Pre-populate with a user-managed server.
+        _write_config(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "user-server": {
+                        "command": "/usr/bin/user-mcp",
+                        "args": ["--some-flag"],
+                    }
+                }
+            },
+        )
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.REGISTERED
+        config = _read_config(tmp_path)
+        # Both entries must exist.
+        assert "user-server" in config["mcpServers"]
+        assert "headroom" in config["mcpServers"]
+        # User entry untouched.
+        assert config["mcpServers"]["user-server"]["command"] == "/usr/bin/user-mcp"
+
+    def test_missing_file_treated_as_empty(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.REGISTERED
+
+    def test_registers_spec_without_env(self, tmp_path: Path) -> None:
+        spec = ServerSpec(name="minimal", command="headroom", args=())
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(spec)
+        assert result.status == RegisterStatus.REGISTERED
+        config = _read_config(tmp_path)
+        entry = config["mcpServers"]["minimal"]
+        # env key should not be present when empty.
+        assert "env" not in entry
+
+
+# ---------------------------------------------------------------------------
+# unregister_server
+# ---------------------------------------------------------------------------
+
+
+class TestUnregisterServer:
+    def test_returns_false_when_file_absent(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        assert reg.unregister_server("headroom") is False
+
+    def test_returns_false_when_server_absent(self, tmp_path: Path) -> None:
+        _write_config(tmp_path, {"mcpServers": {}})
+        reg = _make_reg(tmp_path)
+        assert reg.unregister_server("headroom") is False
+
+    def test_removes_named_server(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        reg.register_server(_SPEC)
+        removed = reg.unregister_server("headroom")
+        assert removed is True
+        config = _read_config(tmp_path)
+        assert "headroom" not in config["mcpServers"]
+
+    def test_unregister_only_removes_named_server(self, tmp_path: Path) -> None:
+        """Unregistering 'headroom' MUST NOT remove other user entries."""
+        _write_config(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "user-server": {"command": "/bin/user-mcp"},
+                    "headroom": {
+                        "command": "headroom",
+                        "args": ["mcp", "serve"],
+                    },
+                }
+            },
+        )
+        reg = _make_reg(tmp_path)
+        reg.unregister_server("headroom")
+        config = _read_config(tmp_path)
+        assert "user-server" in config["mcpServers"]
+        assert "headroom" not in config["mcpServers"]
+
+    def test_idempotent_double_unregister(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        reg.register_server(_SPEC)
+        assert reg.unregister_server("headroom") is True
+        assert reg.unregister_server("headroom") is False
+
+
+class TestRegistrarSafety:
+    def test_conflict_detail_redacts_env_values(self, tmp_path: Path) -> None:
+        """Conflict messages must never echo user env values (potential credentials)."""
+        secret = "sk-user-super-secret-token-999"
+        _write_config(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "headroom": {
+                        "command": "headroom",
+                        "args": ["mcp", "serve"],
+                        "env": {"API_TOKEN": secret},
+                    }
+                }
+            },
+        )
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC, force=False)
+        assert result.status == RegisterStatus.MISMATCH
+        assert "API_TOKEN" in result.detail
+        assert secret not in result.detail
+
+    def test_failed_write_preserves_existing_config_and_cleans_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write error mid-serialization must leave the shared mcp_config.json intact."""
+        import headroom.mcp_registry.agy as agy_mod
+
+        original = {
+            "mcpServers": {
+                "ide-server": {"command": "/usr/local/bin/ide-mcp"},
+            }
+        }
+        _write_config(tmp_path, original)
+        config_path = tmp_path / ".gemini" / "config" / "mcp_config.json"
+        before_bytes = config_path.read_bytes()
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(agy_mod.json, "dump", _boom)
+
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.FAILED
+        assert config_path.read_bytes() == before_bytes
+        leftover_tmps = list(config_path.parent.glob("*.tmp"))
+        assert leftover_tmps == []
+
+    @pytest.mark.windows_newline
+    def test_write_json_uses_lf_newlines(self, tmp_path: Path) -> None:
+        reg = _make_reg(tmp_path)
+        result = reg.register_server(_SPEC)
+        assert result.status == RegisterStatus.REGISTERED
+        raw = (tmp_path / ".gemini" / "config" / "mcp_config.json").read_bytes()
+        assert b"\n" in raw
+        assert b"\r\n" not in raw
+
+    def test_concurrent_registrations_preserve_both_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two concurrent registrations for different servers must both survive."""
+        import threading
+
+        import headroom.mcp_registry.agy as agy_mod
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"existing": {"command": "/bin/existing"}}},
+        )
+        reg = _make_reg(tmp_path)
+        spec_a = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        spec_b = ServerSpec(name="serena", command="uvx", args=("serena", "start-mcp-server"))
+
+        entered = threading.Event()
+        release = threading.Event()
+        orig_write_json = agy_mod._write_json
+        call_count = 0
+        count_lock = threading.Lock()
+
+        def _coordinated_write(path: Path, data: dict) -> None:
+            nonlocal call_count
+            with count_lock:
+                call_count += 1
+                is_first = call_count == 1
+            if is_first:
+                entered.set()
+                # Hold the first writer briefly so an unlocked second caller
+                # would read the stale pre-write config and clobber this write.
+                release.wait(timeout=0.3)
+            orig_write_json(path, data)
+
+        monkeypatch.setattr(agy_mod, "_write_json", _coordinated_write)
+
+        results: dict[str, object] = {}
+
+        def _worker(label: str, spec: ServerSpec) -> None:
+            results[label] = reg.register_server(spec)
+
+        t1 = threading.Thread(target=_worker, args=("a", spec_a))
+        t2 = threading.Thread(target=_worker, args=("b", spec_b))
+        t1.start()
+        assert entered.wait(timeout=5.0)
+        t2.start()
+        # Give t2 a moment to contend on the lock (or race past read if unlocked).
+        t2.join(timeout=0.1)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert results["a"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        assert results["b"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        config = _read_config(tmp_path)
+        assert set(config["mcpServers"].keys()) == {"existing", "headroom", "serena"}
+
+    def test_cross_process_concurrent_registrations_preserve_both_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """Two separate Headroom processes registering different servers must both survive."""
+        import subprocess
+        import sys
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"existing": {"command": "/bin/existing"}}},
+        )
+        worker_script = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "import headroom.mcp_registry.agy as agy_mod\n"
+            "from headroom.mcp_registry.base import ServerSpec\n"
+            "home = Path(sys.argv[1])\n"
+            "name = sys.argv[2]\n"
+            "delay = float(sys.argv[3])\n"
+            "orig_write = agy_mod._write_json\n"
+            "def slow_write(path, data):\n"
+            "    if delay:\n"
+            "        time.sleep(delay)\n"
+            "    orig_write(path, data)\n"
+            "agy_mod._write_json = slow_write\n"
+            "reg = agy_mod.AgyRegistrar(home_dir=home)\n"
+            "res = reg.register_server(ServerSpec(name=name, command='cmd-' + name, args=()))\n"
+            "print(res.status.value)\n"
+        )
+
+        p1 = subprocess.Popen(
+            [sys.executable, "-c", worker_script, str(tmp_path), "headroom", "0.25"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        p2 = subprocess.Popen(
+            [sys.executable, "-c", worker_script, str(tmp_path), "serena", "0.0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out1, err1 = p1.communicate(timeout=15)
+        out2, err2 = p2.communicate(timeout=15)
+        assert p1.returncode == 0, err1
+        assert p2.returncode == 0, err2
+        assert out1.strip() == RegisterStatus.REGISTERED.value
+        assert out2.strip() == RegisterStatus.REGISTERED.value
+
+        config = _read_config(tmp_path)
+        assert set(config["mcpServers"].keys()) == {"existing", "headroom", "serena"}
+
+    def test_agy_and_antigravity_registrars_share_lock_and_preserve_both_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AgyRegistrar and AntigravityRegistrar must serialize access to shared mcp_config.json."""
+        import threading
+
+        import headroom.mcp_registry.agy as agy_mod
+        from headroom.mcp_registry.antigravity import AntigravityRegistrar
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"existing": {"command": "/bin/existing"}}},
+        )
+        agy_reg = _make_reg(tmp_path)
+        ide_reg = AntigravityRegistrar(home_dir=tmp_path)
+        cli_spec = ServerSpec(name="headroom-cli", command="headroom", args=("mcp", "serve"))
+        ide_spec = ServerSpec(name="headroom-ide", command="headroom", args=("mcp", "serve"))
+
+        entered = threading.Event()
+        release = threading.Event()
+        orig_write_json = agy_mod._write_json
+
+        def _paused_agy_write(path: Path, data: dict) -> None:
+            entered.set()
+            release.wait(timeout=0.3)
+            orig_write_json(path, data)
+
+        monkeypatch.setattr(agy_mod, "_write_json", _paused_agy_write)
+
+        results: dict[str, object] = {}
+
+        def _run_agy() -> None:
+            results["agy"] = agy_reg.register_server(cli_spec)
+
+        def _run_ide() -> None:
+            results["ide"] = ide_reg.register_server(ide_spec)
+
+        t1 = threading.Thread(target=_run_agy)
+        t2 = threading.Thread(target=_run_ide)
+        t1.start()
+        assert entered.wait(timeout=5.0)
+        t2.start()
+        t2.join(timeout=0.1)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert results["agy"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        assert results["ide"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        config = _read_config(tmp_path)
+        assert set(config["mcpServers"].keys()) == {"existing", "headroom-cli", "headroom-ide"}
+
+    def test_windows_config_file_lock_raises_permanent_oserror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Permanent msvcrt.locking errors must fail immediately and propagate to the registrar."""
+        import errno
+        import sys
+        import types
+
+        import headroom.mcp_registry.base as base_mod
+
+        calls = 0
+
+        def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 3:
+                raise AssertionError("config_file_lock retried indefinitely on permanent EBADF")
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=2,
+            LK_UNLCK=0,
+            locking=_fake_locking,
+        )
+        monkeypatch.setattr(base_mod.sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+        monkeypatch.setattr(base_mod.time, "sleep", lambda _secs: None)
+
+        config_path = tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
+        with pytest.raises(OSError) as exc_info:
+            with base_mod.config_file_lock(config_path):
+                pass
+        assert exc_info.value.errno == errno.EBADF
+        assert calls == 1
+
+        # Registrar should receive the error cleanly and report FAILED (thread lock released).
+        reg = _make_reg(tmp_path)
+        calls = 0
+        result = reg.register_server(
+            ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        )
+        assert result.status == RegisterStatus.FAILED
+        assert calls == 1
+
+    def test_windows_config_file_lock_retries_contended_lock_until_available(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Contended msvcrt.locking calls retry until the lock is granted, then unlock on exit."""
+        import errno
+        import sys
+        import types
+
+        import headroom.mcp_registry.base as base_mod
+
+        events: list[int] = []
+        sleeps: list[float] = []
+
+        def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+            events.append(mode)
+            if mode == 2 and len(events) <= 2:
+                raise PermissionError(errno.EACCES, "Permission denied")
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=2,
+            LK_UNLCK=0,
+            locking=_fake_locking,
+        )
+        monkeypatch.setattr(base_mod.sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+        monkeypatch.setattr(base_mod.time, "sleep", lambda secs: sleeps.append(secs))
+
+        config_path = tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
+        entered = False
+        with base_mod.config_file_lock(config_path):
+            entered = True
+
+        assert entered is True
+        assert events == [2, 2, 2, 0]
+        assert len(sleeps) == 2
+
+    def test_windows_config_file_lock_does_not_write_empty_lockfile_before_locking(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows locking must lock byte 0 past EOF without writing a sentinel byte first."""
+        import os
+        import sys
+        import types
+
+        import headroom.mcp_registry.base as base_mod
+
+        seen_sizes: list[int] = []
+
+        def _fake_locking(fd: int, mode: int, nbytes: int) -> None:
+            if mode == 2:
+                seen_sizes.append(os.fstat(fd).st_size)
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=2,
+            LK_UNLCK=0,
+            locking=_fake_locking,
+        )
+        monkeypatch.setattr(base_mod.sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+        config_path = _config_path(tmp_path)
+        with base_mod.config_file_lock(config_path):
+            pass
+
+        assert seen_sizes == [0]
+
+    def test_register_and_unregister_preserve_symlinked_mcp_config(self, tmp_path: Path) -> None:
+        """Atomic writes must update the symlink target and keep mcp_config.json a symlink."""
+        dotfiles = tmp_path / "dotfiles"
+        dotfiles.mkdir()
+        target = dotfiles / "agy-mcp.json"
+        target.write_text(
+            json.dumps({"mcpServers": {"existing": {"command": "/bin/existing"}}}, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        config_link = _config_path(tmp_path)
+        config_link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            config_link.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this platform/user: {exc}")
+
+        reg = _make_reg(tmp_path)
+        spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        result = reg.register_server(spec)
+        assert result.status == RegisterStatus.REGISTERED
+        assert config_link.is_symlink()
+        assert config_link.resolve() == target.resolve()
+        target_data = json.loads(target.read_text(encoding="utf-8"))
+        assert set(target_data["mcpServers"].keys()) == {"existing", "headroom"}
+
+        assert reg.unregister_server("headroom") is True
+        assert config_link.is_symlink()
+        assert config_link.resolve() == target.resolve()
+        target_data = json.loads(target.read_text(encoding="utf-8"))
+        assert set(target_data["mcpServers"].keys()) == {"existing"}
+
+    def test_mcp_status_with_null_mcp_servers_reports_unconfigured_and_preserves_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """{"mcpServers": null} must report AGY unconfigured without raising or editing the file."""
+        from click.testing import CliRunner
+
+        from headroom.cli.mcp import mcp_status
+
+        cfg = _config_path(tmp_path)
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        original_content = '{"mcpServers": null}\n'
+        cfg.write_text(original_content, encoding="utf-8", newline="\n")
+
+        reg = _make_reg(tmp_path)
+        assert reg.get_server("headroom") is None
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        result = CliRunner().invoke(mcp_status, [])
+        assert result.exit_code == 0, result.output
+        assert "AttributeError" not in result.output
+        agy_lines = [line for line in result.output.splitlines() if "Antigravity CLI" in line]
+        assert agy_lines, f"expected Antigravity CLI row in mcp status output:\n{result.output}"
+        assert any("not configured" in line.lower() for line in agy_lines), agy_lines
+        assert cfg.read_text(encoding="utf-8") == original_content
+
+    def test_non_string_entry_fields_do_not_coerce_to_matching_spec(self, tmp_path: Path) -> None:
+        """Edited JSON types (e.g. bool false vs 'False') must not match or be deleted."""
+        _write_config(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "serena": {
+                        "command": "uvx",
+                        "args": ["--enable-web-dashboard", False],
+                    }
+                }
+            },
+        )
+        reg = _make_reg(tmp_path)
+        assert reg.get_server("serena") is None
+
+        spec = ServerSpec(
+            name="serena",
+            command="uvx",
+            args=("--enable-web-dashboard", "False"),
+        )
+        result = reg.register_server(spec, force=False)
+        assert result.status == RegisterStatus.MISMATCH
+        # File still preserves the user's edited JSON boolean.
+        assert _read_config(tmp_path)["mcpServers"]["serena"]["args"][-1] is False
+
+    def test_unwrap_checks_ownership_and_removes_in_one_locked_transaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Concurrent replacement during unwrap must survive instead of being deleted."""
+        import threading
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        installed_spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/usr/local/bin/custom-headroom",
+            args=("--user-managed",),
+        )
+        assert reg1.register_server(installed_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", installed_spec)
+
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        orig_matching = ledger_mod.headroom_installed_matching
+
+        def _paused_matching(*args, **kwargs) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                release.wait(timeout=5.0)
+            return orig_matching(*args, **kwargs)
+
+        monkeypatch.setattr(ledger_mod, "headroom_installed_matching", _paused_matching)
+
+        results: dict[str, object] = {}
+
+        def _run_unwrap() -> None:
+            results["unwrap"] = wrap_mod._remove_headroom_installed_retrieve_mcp(reg1)
+
+        def _run_replace() -> None:
+            results["replace"] = reg2.register_server(replacement_spec, force=True)
+
+        t1 = threading.Thread(target=_run_unwrap)
+        t2 = threading.Thread(target=_run_replace)
+        t1.start()
+        assert entered.wait(timeout=5.0)
+        # Replace completes while unwrap is paused after its initial read,
+        # before unwrap enters the locked deletion transaction.
+        t2.start()
+        t2.join(timeout=5.0)
+        assert not t2.is_alive()
+        release.set()
+        t1.join(timeout=5.0)
+
+        assert not t1.is_alive()
+        assert results["replace"].status == RegisterStatus.REGISTERED  # type: ignore[attr-defined]
+        assert results["unwrap"] == "not_headroom_owned"
+        assert reg1.get_server("headroom") == replacement_spec
+
+        # Confirm removal works when the entry still matches the ledger.
+        ledger_mod.record_install("agy", replacement_spec)
+        assert wrap_mod._remove_headroom_installed_retrieve_mcp(reg1) == "removed"
+        assert reg1.get_server("headroom") is None
+
+    def test_unregister_server_if_skips_write_lock_when_entry_unmatched_or_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Read-only config with no owned entry must not fail by requiring a write lock."""
+        import headroom.mcp_registry.agy as agy_mod
+
+        _write_config(
+            tmp_path,
+            {"mcpServers": {"user-tool": {"command": "/bin/user-tool"}}},
+        )
+
+        def _deny_lock(_path: Path):
+            raise PermissionError("read-only directory")
+
+        monkeypatch.setattr(agy_mod, "_config_file_lock", _deny_lock)
+
+        reg = _make_reg(tmp_path)
+        assert reg.unregister_server_if("headroom", lambda _spec: True) == "not_matched"
+        assert reg.unregister_server_if("user-tool", lambda _spec: False) == "not_matched"
+
+    def test_unwrap_preserves_replacement_ledger_ownership_after_delete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Replacing an entry after unwrap deletes it must leave the replacement ledger-owned."""
+        import threading
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        installed_spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="headroom",
+            args=("mcp", "serve", "--workspace", "/tmp/new"),
+        )
+        assert reg1.register_server(installed_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", installed_spec)
+
+        entered_clear = threading.Event()
+        release_clear = threading.Event()
+        orig_clear = ledger_mod.clear_install
+
+        def _paused_clear(*args, **kwargs) -> None:
+            if not entered_clear.is_set():
+                entered_clear.set()
+                release_clear.wait(timeout=5.0)
+            orig_clear(*args, **kwargs)
+
+        monkeypatch.setattr(ledger_mod, "clear_install", _paused_clear)
+
+        unwrap_results: list[str] = []
+
+        def _run_unwrap() -> None:
+            unwrap_results.append(wrap_mod._remove_headroom_installed_retrieve_mcp(reg1))
+
+        def _run_replace() -> None:
+            assert reg2.register_server(replacement_spec).status == RegisterStatus.REGISTERED
+            ledger_mod.record_install("agy", replacement_spec)
+
+        t1 = threading.Thread(target=_run_unwrap)
+        t2 = threading.Thread(target=_run_replace)
+        t1.start()
+        assert entered_clear.wait(timeout=5.0)
+        t2.start()
+        # Because clear_install runs inside _config_file_lock, t2 must wait for
+        # t1 to finish clearing the old fingerprint before writing its replacement.
+        t2.join(timeout=0.1)
+        assert t2.is_alive()
+        release_clear.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert unwrap_results == ["removed"]
+        assert reg1.get_server("headroom") == replacement_spec
+
+        # Even an out-of-band clear with the old fingerprint must preserve replacement ownership.
+        ledger_mod.clear_install(
+            "agy",
+            "headroom",
+            expected_fingerprint=ledger_mod.spec_fingerprint(installed_spec),
+        )
+
+        # A second unwrap must still recognize the replacement as Headroom-owned.
+        assert wrap_mod._remove_headroom_installed_retrieve_mcp(reg1) == "removed"
+        assert reg1.get_server("headroom") is None
+
+    def test_unwrap_preserves_entry_with_added_cwd_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adding an extra field like 'cwd' to a ledger-owned entry must prevent unwrap deletion."""
+        from click.testing import CliRunner
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg = _make_reg(tmp_path)
+        installed_spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        assert reg.register_server(installed_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", installed_spec)
+
+        # User adds a custom 'cwd' field to the Headroom entry.
+        config = _read_config(tmp_path)
+        config["mcpServers"]["headroom"]["cwd"] = "/tmp/my-project"
+        _write_config(tmp_path, config)
+
+        # Compatible entry with extra 'cwd' stays usable for status and wrap
+        # reuse (ALREADY without overwriting 'cwd'), while ownership rejects it.
+        assert reg.get_server("headroom") == installed_spec
+        assert reg.get_owned_server("headroom") is None
+        assert reg.register_server(installed_spec, force=False).status == RegisterStatus.ALREADY
+        assert _read_config(tmp_path)["mcpServers"]["headroom"]["cwd"] == "/tmp/my-project"
+
+        result = CliRunner().invoke(wrap_mod.unwrap_agy, [])
+        assert result.exit_code == 0, result.output
+        assert "Removed Headroom MCP retrieve tool" not in result.output
+
+        after = _read_config(tmp_path)
+        assert "headroom" in after["mcpServers"]
+        assert after["mcpServers"]["headroom"]["cwd"] == "/tmp/my-project"
+
+    def test_retrieve_setup_rechecks_ownership_under_lock_before_overwriting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Edits made after initial ownership read must not be overwritten by retrieve setup."""
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.agy as agy_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg = _make_reg(tmp_path)
+        old_spec = ServerSpec(name="headroom", command="/old/headroom", args=("mcp", "serve"))
+        new_spec = ServerSpec(name="headroom", command="/new/headroom", args=("mcp", "serve"))
+        assert reg.register_server(old_spec).status == RegisterStatus.REGISTERED
+        ledger_mod.record_install("agy", old_spec)
+
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: new_spec)
+        monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **k: True)
+
+        orig_register = agy_mod.AgyRegistrar.register_server
+
+        def _edit_before_register(self, spec, **kwargs):
+            # Simulate a concurrent user edit (changed command + added cwd)
+            # landing right before register_server acquires the config lock.
+            data = _read_config(tmp_path)
+            data["mcpServers"]["headroom"]["command"] = "/custom/headroom"
+            data["mcpServers"]["headroom"]["cwd"] = "/tmp/user-proj"
+            _write_config(tmp_path, data)
+            return orig_register(self, spec, **kwargs)
+
+        monkeypatch.setattr(agy_mod.AgyRegistrar, "register_server", _edit_before_register)
+
+        assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg) is False
+        after = _read_config(tmp_path)["mcpServers"]["headroom"]
+        assert after["command"] == "/custom/headroom"
+        assert after["cwd"] == "/tmp/user-proj"
+
+    def test_retrieve_setup_failed_handshake_rollback_preserves_replacement_and_ledger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failed handshake rollback must not delete a replacement or clear its ledger record."""
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        setup_spec = ServerSpec(name="headroom", command="/setup/headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/replacement/headroom",
+            args=("mcp", "serve", "--custom"),
+        )
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: setup_spec)
+
+        def _replace_during_failed_handshake(*_args, **_kwargs) -> bool:
+            assert (
+                reg2.register_server(replacement_spec, force=True).status
+                == RegisterStatus.REGISTERED
+            )
+            ledger_mod.record_install("agy", replacement_spec)
+            return False
+
+        monkeypatch.setattr(
+            wrap_mod, "_smoke_verify_mcp_handshake", _replace_during_failed_handshake
+        )
+
+        assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg1) is False
+        assert reg1.get_server("headroom") == replacement_spec
+        assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True
+
+    def test_retrieve_setup_successful_handshake_aborts_if_entry_replaced_during_handshake(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the entry is replaced during a passing handshake, setup must fail and not prime cache."""
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+        from headroom.ccr.mcp_server import CCR_TOOL_NAME
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        setup_spec = ServerSpec(name="headroom", command="/setup/headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/replacement/headroom",
+            args=("mcp", "serve", "--different"),
+        )
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: setup_spec)
+
+        def _replace_during_passing_handshake(*_args, **_kwargs) -> bool:
+            assert (
+                reg2.register_server(replacement_spec, force=True).status
+                == RegisterStatus.REGISTERED
+            )
+            ledger_mod.record_install("agy", replacement_spec)
+            return True
+
+        monkeypatch.setattr(
+            wrap_mod, "_smoke_verify_mcp_handshake", _replace_during_passing_handshake
+        )
+
+        assert wrap_mod._setup_headroom_retrieve_mcp_agy(reg1) is False
+        assert reg1.get_server("headroom") == replacement_spec
+        assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True
+        tool_cache = reg1.cache_dir / "headroom" / f"{CCR_TOOL_NAME}.json"
+        assert not tool_cache.exists()
+
+    def test_retrieve_setup_post_handshake_check_and_ledger_write_share_config_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A replacement registered after the post-handshake check must keep its ledger ownership."""
+        import threading
+
+        import headroom.cli.wrap as wrap_mod
+        import headroom.mcp_registry as registry_mod
+        import headroom.mcp_registry.ledger as ledger_mod
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+        reg1 = _make_reg(tmp_path)
+        reg2 = _make_reg(tmp_path)
+        setup_spec = ServerSpec(name="headroom", command="/setup/headroom", args=("mcp", "serve"))
+        replacement_spec = ServerSpec(
+            name="headroom",
+            command="/replacement/headroom",
+            args=("mcp", "serve", "--newer"),
+        )
+        monkeypatch.setattr(registry_mod, "build_headroom_spec", lambda: setup_spec)
+        monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **k: True)
+
+        entered_record = threading.Event()
+        release_record = threading.Event()
+        orig_record = ledger_mod.record_install
+
+        def _paused_record(agent: str, spec: ServerSpec, *args, **kwargs) -> None:
+            if spec == setup_spec and not entered_record.is_set():
+                entered_record.set()
+                release_record.wait(timeout=5.0)
+            orig_record(agent, spec, *args, **kwargs)
+
+        monkeypatch.setattr(ledger_mod, "record_install", _paused_record)
+
+        setup_results: list[bool] = []
+
+        def _run_setup() -> None:
+            setup_results.append(wrap_mod._setup_headroom_retrieve_mcp_agy(reg1))
+
+        def _run_replace() -> None:
+            assert (
+                reg2.register_server(replacement_spec, force=True).status
+                == RegisterStatus.REGISTERED
+            )
+            ledger_mod.record_install("agy", replacement_spec)
+
+        t1 = threading.Thread(target=_run_setup)
+        t2 = threading.Thread(target=_run_replace)
+        t1.start()
+        assert entered_record.wait(timeout=5.0)
+        t2.start()
+        t2.join(timeout=0.1)
+        assert t2.is_alive(), "replacement did not block on config lock during post-handshake write"
+        release_record.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert setup_results == [True]
+        assert reg1.get_server("headroom") == replacement_spec
+        assert ledger_mod.headroom_installed_matching("agy", replacement_spec) is True
+
+    def test_register_server_inaccessible_config_returns_failed_and_install_continues(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inaccessible config dir must report FAILED without aborting install_everywhere."""
+        import headroom.mcp_registry.agy as agy_mod
+        from headroom.mcp_registry.base import MCPRegistrar, RegisterResult
+        from headroom.mcp_registry.install import install_everywhere
+
+        appdata = tmp_path / ".gemini" / "antigravity-cli"
+        appdata.mkdir(parents=True)
+        reg = _make_reg(tmp_path)
+        spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+
+        assert reg.detect() is True
+
+        def _deny_lock(_path: Path):
+            raise PermissionError("permission denied")
+
+        def _deny_get_server(_name: str):
+            raise PermissionError("permission denied on config dir")
+
+        monkeypatch.setattr(agy_mod, "_config_file_lock", _deny_lock)
+        monkeypatch.setattr(reg, "get_server", _deny_get_server)
+
+        res = reg.register_server(spec)
+        assert res.status == RegisterStatus.FAILED
+
+        class _DummyRegistrar(MCPRegistrar):
+            name = "dummy"
+            display_name = "Dummy"
+            config_hint = "dummy.json"
+
+            def __init__(self) -> None:
+                self.registered: list[ServerSpec] = []
+
+            def detect(self) -> bool:
+                return True
+
+            def get_server(self, server_name: str) -> ServerSpec | None:
+                return None
+
+            def register_server(self, s: ServerSpec, *, force: bool = False) -> RegisterResult:
+                self.registered.append(s)
+                return RegisterResult(RegisterStatus.REGISTERED, "ok")
+
+            def unregister_server(self, server_name: str) -> bool:
+                return False
+
+        dummy = _DummyRegistrar()
+        results = install_everywhere(registrars=[reg, dummy])
+        assert results["agy"].status == RegisterStatus.FAILED
+        assert results["dummy"].status == RegisterStatus.REGISTERED
+        assert len(dummy.registered) == 1
+        assert dummy.registered[0].name == "headroom"
+
+    def test_register_server_readable_matching_config_with_unwritable_lock_returns_already(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Readable matching config returns ALREADY when lock cannot be opened (unless forced)."""
+        import headroom.mcp_registry.agy as agy_mod
+
+        spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+        reg = _make_reg(tmp_path)
+        assert reg.register_server(spec).status == RegisterStatus.REGISTERED
+
+        def _deny_lock(_path: Path):
+            raise PermissionError("read-only config dir")
+
+        monkeypatch.setattr(agy_mod, "_config_file_lock", _deny_lock)
+
+        assert reg.register_server(spec).status == RegisterStatus.ALREADY
+        assert reg.register_server(spec, force=True).status == RegisterStatus.FAILED
+
+    def test_read_json_handles_permission_error_from_open(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_read_json must return {} instead of propagating PermissionError on unreadable config."""
+        import os
+
+        import headroom.mcp_registry.agy as agy_mod
+
+        config_dir = tmp_path / ".gemini" / "config"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "mcp_config.json"
+        config_file.write_text('{"mcpServers": {}}', encoding="utf-8")
+
+        def _deny_open(*_args, **_kwargs):
+            raise PermissionError("cannot traverse parent dir")
+
+        monkeypatch.setattr("builtins.open", _deny_open)
+        assert agy_mod._read_json(config_file) == {}
+        monkeypatch.undo()
+
+        # Also exercise real OS-level chmod 0o000 on POSIX when non-root.
+        if os.name == "posix" and os.geteuid() != 0:
+            appdata = tmp_path / ".gemini" / "antigravity-cli"
+            appdata.mkdir(parents=True, exist_ok=True)
+            reg = _make_reg(tmp_path)
+            spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+            config_dir.chmod(0o000)
+            try:
+                assert reg.detect() is True
+                assert reg.get_server("headroom") is None
+                assert reg.register_server(spec).status == RegisterStatus.FAILED
+                assert reg.unregister_server("headroom") is False
+                assert reg.unregister_server_if("headroom", lambda _s: True) == "failed"
+            finally:
+                config_dir.chmod(0o755)

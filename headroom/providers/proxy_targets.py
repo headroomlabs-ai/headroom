@@ -16,6 +16,7 @@ from headroom.providers.codex.runtime import DEFAULT_API_URL as DEFAULT_OPENAI_A
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.grok.runtime import is_grok_cli_request
 from headroom.providers.vertex import vertex_target_for_location as _vertex_target_for_location
+from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST, normalize_host
 
 LEGACY_API_TARGET_ATTRS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_URL",
@@ -35,6 +36,22 @@ def api_target(proxy: Any, provider_name: str) -> str:
 def vertex_target_for_location(proxy: Any, location: str) -> str:
     """Resolve the Vertex upstream host for a request, region-aware."""
     return _vertex_target_for_location(api_target(proxy, "vertex"), location)
+
+
+def cloudcode_host_base(host: str) -> str | None:
+    """Passthrough base for an allowlisted Cloud Code host, else ``None``.
+
+    agy (Google Antigravity CLI) reaches the proxy via TLS-MITM that terminates
+    the WHOLE connection to the Cloud Code host it addressed, so control-plane
+    calls land on the catch-all rather than a recognized route. Those paths
+    exist only on the Cloud Code host itself; forward them back to it.
+    Membership in ``DEFAULT_ALLOWLIST`` — not a loose suffix match — is the trust
+    boundary: a forged Host such as ``evilcloudcode-pa.googleapis.com`` returns
+    ``None`` (closing the SSRF) so the caller falls back to the configured
+    default.
+    """
+    normalized = normalize_host(host)
+    return f"https://{normalized}" if normalized in DEFAULT_ALLOWLIST else None
 
 
 def route_grok_to_xai(headers: Mapping[str, str], openai_target: str) -> bool:
@@ -90,7 +107,11 @@ def is_anthropic_hello_path(path: str | None) -> bool:
 
 
 def select_passthrough_base_url(
-    proxy: Any, headers: Mapping[str, str], path: str | None = None
+    proxy: Any,
+    headers: Mapping[str, str],
+    path: str | None = None,
+    *,
+    allow_cloudcode_host: bool = False,
 ) -> str:
     """Resolve the upstream base URL for catch-all proxy passthrough requests.
 
@@ -98,6 +119,8 @@ def select_passthrough_base_url(
     (``x-headroom-base-url``) is checked and used by the route itself, so it is
     resolved once and the checked value is the one dialled.
     """
+    if allow_cloudcode_host and (base := cloudcode_host_base(headers.get("host", ""))):
+        return base
     routing = resolve_codex_routing(headers)
     if routing.is_chatgpt_auth:
         return CHATGPT_BACKEND_API_URL

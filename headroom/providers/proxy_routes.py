@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response
 from headroom.log_safety import redact_url
 from headroom.providers.bedrock_models import newest_snapshot
 from headroom.providers.cloudcode import (
+    AGY_DISPATCH_SCOPE_KEY,
     cloudcode_passthrough_target,
     normalize_cloudcode_passthrough_path,
 )
@@ -46,6 +47,9 @@ from headroom.providers.openai_responses import (
 )
 from headroom.providers.proxy_targets import (
     api_target as _api_target,
+)
+from headroom.providers.proxy_targets import (
+    cloudcode_host_base as _cloudcode_host_base,
 )
 from headroom.providers.proxy_targets import (
     openai_compatible_base_url as _openai_compatible_base_url,
@@ -341,23 +345,35 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         normalized_cloudcode_path = normalize_cloudcode_passthrough_path(path)
         if normalized_cloudcode_path is not None:
             normalize_request_path(request, normalized_cloudcode_path)
+            host = request.headers.get("host", "")
+            # When the request came through validated AGY MITM dispatch, preserve
+            # the allowlisted Cloud Code host the client connected to. Otherwise
+            # fall back to Antigravity daily-sandbox routing (#4957) or the
+            # configured Cloud Code target.
+            cloudcode_base = (
+                _cloudcode_host_base(host)
+                if request.scope.get(AGY_DISPATCH_SCOPE_KEY) is True
+                else None
+            ) or cloudcode_passthrough_target(
+                request.headers.get("user-agent"),
+                _api_target(proxy, "cloudcode"),
+            )
 
             return await proxy.handle_passthrough(
                 request,
-                # Antigravity's non-generateContent calls (fetchAvailableModels,
-                # loadCodeAssist) land here, not in the Gemini handler, so the
-                # daily-sandbox routing has to happen at this seam too (#4957).
-                cloudcode_passthrough_target(
-                    request.headers.get("user-agent"),
-                    _api_target(proxy, "cloudcode"),
-                ),
+                cloudcode_base,
             )
 
         return await proxy.handle_passthrough(
             request,
             # The path matters here: this is where unrouted paths land, and
             # Copilot's inline completions are one of them (#3076).
-            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
+            _select_passthrough_base_url(
+                proxy,
+                dict(request.headers),
+                request.url.path,
+                allow_cloudcode_host=request.scope.get(AGY_DISPATCH_SCOPE_KEY) is True,
+            ),
         )
 
     async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
@@ -768,7 +784,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
         return await proxy.handle_passthrough(
             request,
-            _select_passthrough_base_url(proxy, dict(request.headers)),
+            _select_passthrough_base_url(
+                proxy,
+                dict(request.headers),
+                allow_cloudcode_host=request.scope.get(AGY_DISPATCH_SCOPE_KEY) is True,
+            ),
         )
 
     _register_openai_image_routes(app, proxy)

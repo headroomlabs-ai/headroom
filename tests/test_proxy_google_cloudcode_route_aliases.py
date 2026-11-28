@@ -1,3 +1,4 @@
+import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
@@ -196,3 +197,231 @@ def test_cloudcode_override_does_not_leak_between_app_instances(monkeypatch):
         second.json()["url"]
         == "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     )
+
+
+# ---------------------------------------------------------------------------
+# T4: agy agent-model + body detection; env override; Pi/OpenClaw non-regression
+# ---------------------------------------------------------------------------
+
+AGY_AGENT_BODY = {
+    "project": "my-gcp-project",
+    "model": "gemini-3-flash-agent",
+    "request": {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": "Hello from agy"}],
+            }
+        ]
+    },
+}
+
+
+def test_agy_agent_model_body_routes_to_daily_endpoint(monkeypatch):
+    """Unwrapped agy agent-model body routes to the default Antigravity daily endpoint."""
+
+    async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"url": url, "provider": provider, "model": model})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+
+    # No antigravity/ UA header on purpose: detection must rest SOLELY on the
+    # agy body shape (agent-model name + project + request.contents), so this
+    # test fails if the body-shape detection branch is removed.
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:streamGenerateContent",
+            params={"alt": "sse"},
+            json=AGY_AGENT_BODY,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        "provider": "gemini",
+        "model": "gemini-3-flash-agent",
+    }
+
+
+@pytest.mark.parametrize(
+    ("connect_host", "expected_host"),
+    [
+        ("cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"),
+        ("daily-cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"),
+    ],
+)
+def test_mitm_request_stays_on_the_host_the_client_connected_to(
+    monkeypatch, connect_host, expected_host
+):
+    """A MITM'd request validated by make_host_guard re-originates to the host agy CONNECTed to.
+
+    The terminator allowlist covers both cloudcode-pa and daily-cloudcode-pa, so
+    resolving every antigravity request to one default would send the client's
+    request — and its bearer — to a backend it never selected.
+    """
+    from headroom.proxy.agy_dispatch import make_host_guard
+    from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST
+
+    async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"url": url, "provider": provider, "model": model})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+
+    app = make_host_guard(create_app(ProxyConfig(optimize=False)), DEFAULT_ALLOWLIST)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1internal:streamGenerateContent",
+            params={"alt": "sse"},
+            headers={"host": connect_host},
+            json=ANTIGRAVITY_BODY,
+        )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["url"]
+        == f"https://{expected_host}/v1internal:streamGenerateContent?alt=sse"
+    )
+
+
+@pytest.mark.parametrize(
+    "forged_host",
+    [
+        "cloudcode-pa.googleapis.com",
+        "evil-cloudcode-pa.googleapis.com",
+    ],
+)
+def test_unguarded_streaming_request_ignores_untrusted_host(monkeypatch, forged_host):
+    """Ordinary shared-app streaming requests ignore Host-based Cloud Code steering."""
+
+    async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"url": url, "provider": provider, "model": model})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:streamGenerateContent",
+            params={"alt": "sse"},
+            headers={"host": forged_host},
+            json=ANTIGRAVITY_BODY,
+        )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["url"]
+        == "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    )
+
+
+def test_headroom_antigravity_api_url_env_override(monkeypatch):
+    """HEADROOM_ANTIGRAVITY_API_URL env var overrides the corrected default for antigravity traffic."""
+
+    async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"url": url, "provider": provider, "model": model})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+    monkeypatch.setenv("HEADROOM_ANTIGRAVITY_API_URL", "https://my-custom-agy.example.com")
+
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:streamGenerateContent",
+            params={"alt": "sse"},
+            json=ANTIGRAVITY_BODY,
+        )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["url"]
+        == "https://my-custom-agy.example.com/v1internal:streamGenerateContent?alt=sse"
+    )
+
+
+def test_pi_openclaw_requesttype_agent_still_detected(monkeypatch):
+    """Pi/OpenClaw requestType=='agent' detection is not broken by new agy checks."""
+
+    async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"url": url, "provider": provider, "model": model})
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", fake_stream)
+
+    pi_body = {
+        "project": "pi-project",
+        "model": "gemini-1.5-pro",
+        "requestType": "agent",
+        "userAgent": "pi-coding-agent",
+        "request": {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]},
+    }
+
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:streamGenerateContent",
+            params={"alt": "sse"},
+            json=pi_body,
+        )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["url"]
+        == "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    )
+
+
+def test_agy_control_plane_passthrough_routes_to_cloudcode_host(monkeypatch):
+    """agy's non-streamGenerateContent control-plane calls (loadCodeAssist,
+    setUserSettings, …) reach the catch-all and MUST be proxied back to the
+    Cloud Code host agy addressed — not the generic Gemini endpoint that the
+    x-goog-api-key header would otherwise select. Without this the MITM dispatch
+    404s agy's onboarding and agy never issues a generateContent call."""
+
+    async def fake_passthrough(self, request, base_url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"base_url": base_url, "path": request.url.path})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    from headroom.proxy.agy_dispatch import make_host_guard
+    from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST
+
+    app = make_host_guard(create_app(ProxyConfig(optimize=False)), DEFAULT_ALLOWLIST)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1internal:loadCodeAssist",
+            headers={
+                "host": "daily-cloudcode-pa.googleapis.com",
+                # agy sends x-goog-api-key; this previously forced the generic
+                # Gemini host. The Cloud Code host check must win over it.
+                "x-goog-api-key": "test-key",
+            },
+            json={"metadata": {"pluginType": "GEMINI"}},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"] == "/v1internal:loadCodeAssist"
+    assert body["base_url"] == "https://daily-cloudcode-pa.googleapis.com"
+
+
+def test_agy_control_plane_passthrough_rejects_non_allowlisted_host(monkeypatch):
+    """The v1internal control-plane branch forwards to the incoming Host only
+    when it is an allowlisted Cloud Code host. A look-alike host (e.g. a suffix
+    match like ``evilcloudcode-pa.googleapis.com``) must NOT be used as the
+    upstream — it falls back to the static cloudcode target, so a forged Host
+    header cannot steer the MITM passthrough to an attacker-controlled origin."""
+
+    async def fake_passthrough(self, request, base_url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"base_url": base_url, "path": request.url.path})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:loadCodeAssist",
+            headers={
+                "host": "evilcloudcode-pa.googleapis.com",
+                "x-goog-api-key": "test-key",
+            },
+            json={"metadata": {"pluginType": "GEMINI"}},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["base_url"] != "https://evilcloudcode-pa.googleapis.com"

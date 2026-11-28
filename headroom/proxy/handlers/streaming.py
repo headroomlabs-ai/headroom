@@ -278,6 +278,22 @@ class StreamingMixin:
         """Extract observed Anthropic cache-write TTL bucket usage."""
         return anthropic_cache_ttl_buckets(usage)
 
+    @staticmethod
+    def _gemini_usage_meta(data: dict) -> dict | None:
+        """Return a Gemini chunk's ``usageMetadata`` dict, or ``None``.
+
+        Native Gemini puts it top-level; Cloud Code Assist (agy) wraps chunks in
+        a ``response`` envelope (``{"response": {"usageMetadata": {...}}}``),
+        mirroring the request-side wrap (gemini.py ``body["request"]``). A
+        non-dict/absent metadata yields ``None`` so callers skip cleanly — a
+        malformed upstream value can never reach ``.get()`` and crash the parser.
+        """
+        meta = data.get("usageMetadata")
+        if not isinstance(meta, dict):
+            response = data.get("response")
+            meta = response.get("usageMetadata") if isinstance(response, dict) else None
+        return meta if isinstance(meta, dict) else None
+
     def _parse_sse_usage_from_buffer(
         self, stream_state: dict[str, Any], provider: str
     ) -> dict[str, int] | None:
@@ -425,7 +441,7 @@ class StreamingMixin:
                             )
 
             elif provider == "gemini":
-                usage_meta = _sse_dict(data.get("usageMetadata"))
+                usage_meta = self._gemini_usage_meta(data)
                 if usage_meta:
                     usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
                     usage_found["output_tokens"] = gemini_output_tokens(usage_meta)

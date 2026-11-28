@@ -13,9 +13,17 @@ registrars to install headroom across every detected agent.
 
 from __future__ import annotations
 
+import errno
+import os
+import sys
+import threading
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -163,3 +171,76 @@ def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
     if not parts:
         return "spec differs in unidentified field(s)"
     return "; ".join(parts)
+
+
+_CONFIG_THREAD_LOCKS_GUARD = threading.Lock()
+_CONFIG_THREAD_LOCKS: dict[Path, threading.Lock] = {}
+
+_WIN_LOCK_RETRY_ERRNOS = frozenset(
+    code
+    for name in ("EACCES", "EAGAIN", "EDEADLK", "EDEADLOCK")
+    if (code := getattr(errno, name, None)) is not None
+)
+_WIN_LOCK_RETRY_WINERRORS = frozenset({32, 33})  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+
+
+def _is_windows_lock_contention(exc: OSError) -> bool:
+    """True when msvcrt.locking failed because another handle holds the lock."""
+    return (
+        exc.errno in _WIN_LOCK_RETRY_ERRNOS
+        or getattr(exc, "winerror", None) in _WIN_LOCK_RETRY_WINERRORS
+    )
+
+
+def _config_thread_lock_for(path: Path) -> threading.Lock:
+    key = path.resolve()
+    with _CONFIG_THREAD_LOCKS_GUARD:
+        lock = _CONFIG_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CONFIG_THREAD_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def config_file_lock(path: Path) -> Iterator[None]:
+    """Serialize read-modify-replace on a shared MCP config across threads and processes."""
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_name(f".{target.name}.lock")
+    with _config_thread_lock_for(lock_path):
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            if sys.platform == "win32":
+                import msvcrt
+
+                # Windows byte-range locks can extend beyond EOF; do not write a
+                # sentinel byte before acquiring the lock or two starters race.
+                os.lseek(fd, 0, os.SEEK_SET)
+                while True:
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if not _is_windows_lock_contention(exc):
+                            raise
+                        time.sleep(0.05)
+                try:
+                    yield
+                finally:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)

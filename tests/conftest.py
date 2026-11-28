@@ -136,9 +136,15 @@ def _scrub_developer_copilot_tokens(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _scrub_developer_headroom_env(monkeypatch, tmp_path, tmp_path_factory):
+    # Preserve an explicit HEADROOM_OFFLINE opt-in set by the test runner (e.g.
+    # offline CI lanes like agy-windows or local air-gapped runs). Tests that
+    # exercise online behavior clear HEADROOM_OFFLINE explicitly via monkeypatch.
+    inherited_offline = os.environ.get("HEADROOM_OFFLINE")
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
+    if inherited_offline is not None:
+        monkeypatch.setenv("HEADROOM_OFFLINE", inherited_offline)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
     # test its own store so proxy/CLI startup cannot load developer settings and
@@ -204,6 +210,53 @@ def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
 
     ledger_file = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
     monkeypatch.setattr(ledger, "ledger_path", lambda: ledger_file)
+
+
+# Any test that builds the proxy app (`create_app()`) runs its lifespan startup,
+# which calls `registry.start_all()` and starts the subscription tracker. That
+# tracker polls `https://api.anthropic.com/api/oauth/usage` for real — observed
+# on every local run of tests/test_agy_dispatch.py as
+# `httpx - INFO - HTTP Request: GET https://api.anthropic.com/api/oauth/usage`.
+# Same class of bug as the beacon and MCP-ledger fixtures above: a unit test
+# reaching a live external service.
+#
+# There is no env knob that reaches this from a test: `ProxyConfig.
+# subscription_tracking_enabled` defaults to True and HEADROOM_NO_SUBSCRIPTION_
+# TRACKING is wired only through the `headroom proxy` CLI, so `create_app()`
+# always starts the poller. Force `enabled=False` at the tracker factory
+# instead, which is the single seam every caller funnels through.
+#
+# Beyond hygiene this is a determinism fix: the poll made first-request latency
+# depend on live network egress, which timed out the 10s guard in
+# test_dispatch_server_tls_and_route on the Windows CI lane (no offline env
+# there, unlike the Linux shards' HF_HUB_OFFLINE) while passing on Linux.
+@pytest.fixture(autouse=True)
+def _disable_subscription_polling(monkeypatch):
+    # Same guard as the sibling fixtures: the macos/windows-native-wrapper CI
+    # jobs install only pytest and drive the installer shell scripts via
+    # subprocess, so headroom isn't importable and there is no tracker to
+    # disable.
+    try:
+        from headroom.subscription import tracker as _tracker
+    except ModuleNotFoundError:
+        return
+
+    real_configure = _tracker.configure_subscription_tracker
+
+    def _configure_disabled(*args, **kwargs):
+        kwargs["enabled"] = False
+        return real_configure(*args, **kwargs)
+
+    monkeypatch.setattr(_tracker, "configure_subscription_tracker", _configure_disabled)
+    # server.py imports the symbol directly (`from ... import
+    # configure_subscription_tracker`), so patching only the defining module
+    # would leave that already-bound reference pointing at the real one.
+    try:
+        from headroom.proxy import server as _server
+    except ModuleNotFoundError:
+        return
+    if hasattr(_server, "configure_subscription_tracker"):
+        monkeypatch.setattr(_server, "configure_subscription_tracker", _configure_disabled)
 
 
 # The Copilot "routed to Copilot" flag is a module-global ContextVar that
