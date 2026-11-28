@@ -184,6 +184,25 @@ def tool_schema_saved_from_tags(tags: object) -> int:
     return total
 
 
+def accumulate_tool_schema_tags(pending: dict[str, int], tags: object) -> None:
+    """Add one request's tool-schema savings tags into ``pending``, key by key.
+
+    For transports that book several compressed frames on one outcome (the
+    Responses WebSocket): each frame fills its own tag dict, and the summed
+    tags ride on the turn's outcome so :func:`tool_schema_saved_from_tags`
+    sees them. Only :data:`TOOL_SCHEMA_SAVINGS_TAGS` are carried.
+    """
+    if not isinstance(tags, dict):
+        return
+    for key in TOOL_SCHEMA_SAVINGS_TAGS:
+        try:
+            value = int(tags.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value:
+            pending[key] = pending.get(key, 0) + value
+
+
 def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> int:
     """Net a request's message-side saving against the tool saving its turn
     hooks booked on ``turn_hook_tools_saved_tokens``; return it clamped at 0.

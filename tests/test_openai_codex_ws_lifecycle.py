@@ -15,7 +15,7 @@ import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -3119,3 +3119,295 @@ async def test_ws_pending_savings_beyond_32_rows_are_all_booked(
     assert math.isclose(sum(float(row["usd"]) for row in hook_rows), 0.01 * frames_n)
     assert ("other" in {row["source"] for row in hook_rows}) is overflowed
     assert stored == [expected_rows]
+
+
+# ---------------------------------------------------------------------------
+# Per-turn savings accounting on multi-turn WS sessions
+# ---------------------------------------------------------------------------
+
+
+def _completed(response_id: str, usage: dict | None, event_type: str = "response.completed") -> str:
+    response: dict = {"id": response_id}
+    if usage is not None:
+        response["usage"] = usage
+    return json.dumps({"type": event_type, "response": response})
+
+
+_TERMINAL_MARKERS = ('"response.completed"', '"response.failed"', '"response.incomplete"')
+
+
+class _TurnGatedUpstream(_FakeUpstream):
+    """Streams turn N's events only after the handler sent N frames upstream."""
+
+    def __init__(self, turns: list[list[str]]) -> None:
+        super().__init__([], hold_after_events=True)
+        self._turns = turns
+
+    async def _iter(self):
+        for sent_needed, events in enumerate(self._turns, start=1):
+            while len(self.sent) < sent_needed:
+                await asyncio.sleep(0.002)
+            for event in events:
+                yield event
+        await asyncio.Event().wait()
+
+
+class _TurnGatedClient(_FakeWebSocket):
+    """Sends frame N only after turn N-1's terminal event reached it,
+    then disconnects once every turn has ended.
+
+    The handler books a turn's outcome before relaying its
+    ``response.completed``, so each frame lands in the next turn.
+    """
+
+    def __init__(self, frames: list[str]) -> None:
+        super().__init__()
+        self._turn_frames = list(frames)
+        self._turn_count = len(frames)
+        self._next = 0
+
+    def _completed_seen(self) -> int:
+        return sum(1 for text in self.sent_text if any(m in text for m in _TERMINAL_MARKERS))
+
+    async def receive_text(self) -> str:
+        if self._next < self._turn_count:
+            while self._completed_seen() < self._next:
+                await asyncio.sleep(0.002)
+            frame = self._turn_frames[self._next]
+            self._next += 1
+            return frame
+        while self._completed_seen() < self._turn_count:
+            await asyncio.sleep(0.002)
+        raise _FakeWebSocketDisconnect("client closed")
+
+
+async def _run_gated_ws_session(monkeypatch, turns, *, terminal_types=None):
+    """Drive one WS session; ``turns`` is a list of
+    ``(usage | None, transforms, tool_saved_tokens)``, one per frame.
+    ``terminal_types`` overrides each turn's ``response.completed``.
+
+    The compression stub reports each turn's hook tool saving on the
+    ``turn_hook_tools_saved_tokens`` tag, as a turn hook does.
+    """
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "0")
+    monkeypatch.setattr(openai_module, "COMPRESSION_TIMEOUT_SECONDS", 30.0)
+    upstream = _TurnGatedUpstream(
+        [
+            [
+                json.dumps({"type": "response.created", "response": {"id": f"r_{i}"}}),
+                _completed(
+                    f"r_{i}",
+                    usage,
+                    (terminal_types or {}).get(i - 1, "response.completed"),
+                ),
+            ]
+            for i, (usage, _t, _s) in enumerate(turns, start=1)
+        ]
+    )
+    client_ws = _TurnGatedClient([_first_frame() for _ in turns])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    calls = 0
+
+    def _compress(payload, *, model, request_id, savings_tags=None, **_kwargs):
+        nonlocal calls
+        _usage, transforms, tool_saved = turns[calls]
+        calls += 1
+        if savings_tags is not None and tool_saved:
+            savings_tags["turn_hook_tools_saved_tokens"] = tool_saved
+        inner = {"model": "gpt-5.4", "input": f"compressed-{calls}"}
+        return inner, True, 5, list(transforms), "compressed", 10, 5, 10
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=5.0)
+    return outcomes
+
+
+_USAGE = {"input_tokens": 100, "output_tokens": 10}
+
+
+@pytest.mark.asyncio
+async def test_ws_turn_outcome_carries_its_frames_tool_schema_savings(monkeypatch):
+    from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+
+    outcomes = await _run_gated_ws_session(
+        monkeypatch,
+        [(_USAGE, ["text"], 261), (_USAGE, ["text"], 40)],
+    )
+
+    turn_outcomes = [o for o in outcomes if o.provider_input_tokens > 0]
+    assert [tool_schema_saved_from_tags(o.tags) for o in turn_outcomes] == [261, 40]
+    assert sum(tool_schema_saved_from_tags(o.tags) for o in outcomes) == 301
+
+
+@pytest.mark.asyncio
+async def test_ws_shaper_label_is_booked_only_on_its_own_turn(monkeypatch):
+    outcomes = await _run_gated_ws_session(
+        monkeypatch,
+        [(_USAGE, ["output_shaper:verbosity:L2"], 0), (_USAGE, ["text"], 0)],
+    )
+
+    turn_outcomes = [o for o in outcomes if o.provider_input_tokens > 0]
+    assert len(turn_outcomes) == 2
+    assert "output_shaper:verbosity:L2" in turn_outcomes[0].transforms_applied
+    assert "output_shaper:verbosity:L2" not in turn_outcomes[1].transforms_applied
+    labelled = [o for o in outcomes if "output_shaper:verbosity:L2" in o.transforms_applied]
+    assert len(labelled) == 1
+
+
+@pytest.mark.asyncio
+async def test_ws_usage_less_turn_keeps_tool_savings_pending_and_drops_its_labels(monkeypatch):
+    """A usage-less turn's input savings wait for the next usage-carrying turn;
+    its shaping labels do not, since the next turn's output is not the one they
+    describe and the ledger reads the first stratum label it finds."""
+    from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+
+    outcomes = await _run_gated_ws_session(
+        monkeypatch,
+        [(None, ["output_shaper:verbosity:L2"], 261), (_USAGE, ["text"], 40)],
+    )
+
+    usage_outcomes = [o for o in outcomes if o.provider_input_tokens > 0]
+    assert len(usage_outcomes) == 1
+    assert tool_schema_saved_from_tags(usage_outcomes[0].tags) == 301
+    assert "text" in usage_outcomes[0].transforms_applied
+    assert "output_shaper:verbosity:L2" not in usage_outcomes[0].transforms_applied
+    for outcome in outcomes:
+        if outcome.provider_input_tokens <= 0:
+            assert tool_schema_saved_from_tags(outcome.tags) == 0
+            assert "output_shaper:verbosity:L2" not in outcome.transforms_applied
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["response.failed", "response.incomplete"])
+async def test_ws_failed_turn_labels_do_not_reach_the_next_turn(monkeypatch, terminal):
+    outcomes = await _run_gated_ws_session(
+        monkeypatch,
+        [(_USAGE, ["output_shaper:verbosity:L2"], 0), (_USAGE, ["text"], 0)],
+        terminal_types={0: terminal},
+    )
+
+    assert outcomes
+    assert all("output_shaper:verbosity:L2" not in o.transforms_applied for o in outcomes)
+
+
+async def _run_memory_continuation_session(monkeypatch, labels, usages):
+    """Drive one client turn that Headroom answers with memory continuations.
+
+    Every usage but the last belongs to a completion that calls a memory tool,
+    so Headroom runs the tool and sends the next continuation itself; the last
+    is the answer the client sees. ``labels`` are the turn's shaping labels.
+    """
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "0")
+    monkeypatch.setattr(openai_module, "COMPRESSION_TIMEOUT_SECONDS", 30.0)
+    events = []
+    for i, usage in enumerate(usages, start=1):
+        events.append(json.dumps({"type": "response.created", "response": {"id": f"r-{i}"}}))
+        if i < len(usages):
+            function_call = {
+                "type": "function_call",
+                "id": f"fc-{i}",
+                "call_id": f"call-{i}",
+                "name": "memory_search",
+                "arguments": "{}",
+            }
+            events.append(json.dumps({"type": "response.output_item.added", "item": function_call}))
+            events.append(json.dumps({"type": "response.output_item.done", "item": function_call}))
+        events.append(_completed(f"r-{i}", usage))
+    upstream = _FakeUpstream(events)
+    client_ws = _FakeWebSocket(frames=[_first_frame()], hold_after_initial=True)
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.memory_handler = _MemoryWsHandler()
+
+    def _compress(payload, *, model, request_id, **_kwargs):
+        shaped = {**payload, "instructions": "shaped"}
+        return shaped, True, 5, list(labels), "compressed", 10, 5, 10
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=5.0)
+    assert len(upstream.sent) == len(usages), "expected Headroom to send each continuation"
+    return outcomes
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_outcome_keeps_the_turn_labels(monkeypatch):
+    outcomes = await _run_memory_continuation_session(
+        monkeypatch,
+        ["text", "output_shaper:verbosity:L2"],
+        [_USAGE, {"input_tokens": 150, "output_tokens": 20}],
+    )
+
+    turn_outcomes = [o for o in outcomes if o.provider_input_tokens > 0]
+    assert [o.provider_input_tokens for o in turn_outcomes] == [100, 150]
+    assert all("text" in o.transforms_applied for o in turn_outcomes)
+    # One logical turn is one output-savings observation: the hidden memory
+    # completion is billed and keeps its other labels, but only the final
+    # completion carries the shaping label (and the turn's whole output).
+    hidden, final = turn_outcomes
+    assert "output_shaper:verbosity:L2" not in hidden.transforms_applied
+    assert "output_shaper:verbosity:L2" in final.transforms_applied
+    assert [o.output_tokens for o in turn_outcomes] == [10, 20]
+    assert final.shaped_output_tokens == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hidden_outputs, final_output",
+    [([30], 120), ([10, 20], 120)],
+    ids=["one-continuation", "chained-continuations"],
+)
+async def test_ws_memory_continuation_is_one_ledger_observation(
+    monkeypatch, tmp_path, hidden_outputs, final_output
+):
+    """A memory continuation is one logical turn billed as several requests:
+    the recorder sees one sample of the summed output, not one per request,
+    each of which would be credited against the full baseline."""
+    from headroom.proxy import output_savings
+    from headroom.proxy.outcome import emit_request_outcome
+    from headroom.proxy.output_savings import SavingsRecorder, stratum_key, stratum_label
+
+    key = stratum_key(turn_kind="code", input_tokens=8000, model="gpt-5.4", has_tools=True)
+    recorder = SavingsRecorder(str(tmp_path / "o.json"), flush_every=1)
+    for _ in range(5):
+        recorder._ledger.baseline.observe(key, 200)
+    monkeypatch.setattr(output_savings, "_RECORDER", recorder)
+    monkeypatch.setattr(output_savings, "MODELLED_REDUCTION", {})
+
+    usages = [
+        {"input_tokens": 100, "output_tokens": out} for out in [*hidden_outputs, final_output]
+    ]
+    outcomes = await _run_memory_continuation_session(
+        monkeypatch,
+        [stratum_label("treatment", key), "output_shaper:verbosity:L2"],
+        usages,
+    )
+    funnel = SimpleNamespace(metrics=MagicMock(), cost_tracker=None, logger=None)
+    funnel.metrics.record_request = AsyncMock()
+    for outcome in outcomes:
+        await emit_request_outcome(funnel, outcome)
+
+    sample = recorder._ledger.treatment[key]
+    assert (sample.n, sample.sum) == (1, 150)
+    credited = sum(
+        call.kwargs["output_tokens_saved"] for call in funnel.metrics.record_request.call_args_list
+    )
+    assert credited == 50
+    # Billing still sees every upstream request's own output and input.
+    billed = [c.kwargs for c in funnel.metrics.record_request.call_args_list]
+    assert sum(b["output_tokens"] for b in billed) == 150

@@ -56,6 +56,7 @@ from headroom.proxy.savings_attribution import from_tags as savings_from_tags
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.tool_schema_savings_policy import (
+    accumulate_tool_schema_tags,
     net_hook_tool_saving,
     tool_schema_saved_from_tags,
     without_deferral_flags,
@@ -8006,6 +8007,9 @@ class OpenAIHandlerMixin:
         # keeps running and must not book rows for a frame sent uncompressed.
         # Coalesced per source by ``accumulate_savings``, so it stays small.
         ws_turn_savings: list[dict[str, Any]] = []
+        # The same frames' tool-schema savings tags (TOOL_SCHEMA_SAVINGS_TAGS),
+        # summed. Additive to ``tokens_saved``; pending under the same rule.
+        ws_turn_tool_tags: dict[str, int] = {}
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -9180,6 +9184,7 @@ class OpenAIHandlerMixin:
                                 accumulate_savings(
                                     ws_turn_savings, savings_from_tags(_frame_savings)
                                 )
+                                accumulate_tool_schema_tags(ws_turn_tool_tags, _frame_savings)
                                 ws_conversation_tokens_saved = int(_ws_saved)
                                 ws_conversation_key = savings_conversation_key(
                                     _send_body, session_id=f"ws:{session_id}"
@@ -9700,6 +9705,7 @@ class OpenAIHandlerMixin:
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
                         accumulate_savings(ws_turn_savings, savings_from_tags(frame_savings))
+                        accumulate_tool_schema_tags(ws_turn_tool_tags, frame_savings)
                         ws_conversation_tokens_saved = int(frame_saved)
                         ws_conversation_key = savings_conversation_key(
                             new_inner, session_id=f"ws:{session_id}"
@@ -9987,9 +9993,20 @@ class OpenAIHandlerMixin:
 
                         response_started_ms: float | None = None
                         completed_response_model = "unknown"
+                        # Output of hidden memory-tool completions, waiting for
+                        # the continuation's final completion: the output-savings
+                        # ledger observes the logical turn once, not per request.
+                        hidden_output_tokens = 0
 
-                        async def _record_ws_response_metrics() -> None:
-                            """Record one completed Responses turn on long-lived WS sessions."""
+                        async def _record_ws_response_metrics(hidden: bool = False) -> None:
+                            """Record one completed Responses turn on long-lived WS sessions.
+
+                            ``hidden`` marks a memory-tool completion Headroom
+                            answers itself: billed and booked like any request,
+                            but its output joins the final completion's ledger
+                            observation instead of being a sample of its own.
+                            """
+                            nonlocal hidden_output_tokens
                             nonlocal ws_recorded_input_tokens_total
                             nonlocal ws_recorded_output_tokens_total
                             nonlocal ws_recorded_cache_read_tokens_total
@@ -10025,6 +10042,12 @@ class OpenAIHandlerMixin:
                                 attempted_input_tokens_total
                                 - ws_recorded_attempted_input_tokens_total
                             )
+                            shaped_output: int | None = None
+                            if hidden:
+                                hidden_output_tokens += max(0, output_delta)
+                            elif hidden_output_tokens:
+                                shaped_output = hidden_output_tokens + max(0, output_delta)
+                                hidden_output_tokens = 0
                             (
                                 overhead_delta_ms,
                                 ttfb_for_record_ms,
@@ -10065,14 +10088,28 @@ class OpenAIHandlerMixin:
                             # slice WS turns by tag — same surface
                             # as HTTP turns.
                             # Same gate as ``saved_delta``: a usage-less turn
-                            # leaves its rows pending for a usage-carrying one.
+                            # leaves its rows and tool-schema tags pending for
+                            # a usage-carrying one. Labels are per turn: the
+                            # output-savings ledger reads a shaping label as
+                            # "this outcome's output was shaped", so a label
+                            # must not repeat on later turns. A usage-less
+                            # turn's labels are dropped, not carried: they
+                            # describe an output nobody measured, and the next
+                            # turn's own labels describe its output.
                             turn_tags = ws_tags
-                            if ws_turn_savings and input_delta > 0:
-                                turn_tags = {
-                                    **ws_tags,
-                                    SAVINGS_ATTRIBUTION_TAG: list(ws_turn_savings),
-                                }
+                            turn_transforms: tuple[str, ...] = ()
+                            if input_delta > 0:
+                                turn_tags = {**ws_tags, **ws_turn_tool_tags}
+                                if ws_turn_savings:
+                                    turn_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
+                                turn_transforms = tuple(
+                                    label
+                                    for label in transforms_applied
+                                    if not (hidden and label.startswith("output_shaper:"))
+                                )
                                 ws_turn_savings.clear()
+                                ws_turn_tool_tags.clear()
+                            transforms_applied.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -10097,7 +10134,8 @@ class OpenAIHandlerMixin:
                                     overhead_ms=overhead_delta_ms,
                                     ttfb_ms=ttfb_for_record_ms,
                                     pipeline_timing=dashboard_pipeline_timing,
-                                    transforms_applied=tuple(transforms_applied),
+                                    transforms_applied=turn_transforms,
+                                    shaped_output_tokens=shaped_output,
                                     num_messages=len(
                                         body.get("messages") or body.get("input") or []
                                     )
@@ -10251,6 +10289,15 @@ class OpenAIHandlerMixin:
                                     ws_uncached_input_tokens_total += usage_uncached_tokens
 
                                 if event_type in {"response.failed", "response.incomplete"}:
+                                    # No outcome is recorded for this turn, so
+                                    # its labels would ride on the next turn's
+                                    # outcome. Rows and tool-schema tags stay
+                                    # pending: that request was sent, billed
+                                    # usage lands with the next outcome. A
+                                    # failed continuation ends its logical
+                                    # turn, so hidden output is dropped too.
+                                    transforms_applied.clear()
+                                    hidden_output_tokens = 0
                                     for buffered_event in event_buffer:
                                         await websocket.send_text(buffered_event)
                                     _reset()
@@ -10334,7 +10381,11 @@ class OpenAIHandlerMixin:
                                     continue
 
                                 response_completed_seen = True
-                                await _record_ws_response_metrics()
+                                # Recording clears the turn's labels, but the
+                                # continuation below re-sends the same shaped
+                                # template, so its outcome carries them too.
+                                turn_labels = list(transforms_applied)
+                                await _record_ws_response_metrics(hidden=True)
 
                                 logger.info(
                                     f"[{request_id}] WS Memory: Executing "
@@ -10379,6 +10430,8 @@ class OpenAIHandlerMixin:
                                     )
 
                                 if response_memory_generation != ws_memory_generation:
+                                    # No continuation is sent: the turn ends here.
+                                    hidden_output_tokens = 0
                                     for buffered_event in event_buffer:
                                         await websocket.send_text(buffered_event)
                                     _reset()
@@ -10407,6 +10460,7 @@ class OpenAIHandlerMixin:
                                 await _send_upstream(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
+                                _append_unique_transforms(transforms_applied, turn_labels)
                                 logger.info(
                                     f"[{request_id}] WS Memory: Sent continuation "
                                     f"with {len(tool_outputs)} result(s)"
@@ -10729,10 +10783,13 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
-            if ws_turn_savings and residual_input_tokens > 0:
-                # Rows no per-turn record claimed ride with the residual, under
-                # the same input-usage gate as ``residual_tokens_saved``.
-                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
+            # Rows, tool-schema tags and labels no per-turn record claimed ride
+            # with the residual, under the same input-usage gate as
+            # ``residual_tokens_saved``.
+            if residual_input_tokens > 0:
+                ws_session_tags.update(ws_turn_tool_tags)
+                if ws_turn_savings:
+                    ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
@@ -10786,7 +10843,9 @@ class OpenAIHandlerMixin:
                         overhead_ms=final_overhead_delta_ms,
                         ttfb_ms=final_ttfb_ms,
                         pipeline_timing=final_pipeline_timing,
-                        transforms_applied=tuple(transforms_applied),
+                        transforms_applied=tuple(transforms_applied)
+                        if residual_input_tokens > 0
+                        else (),
                         tags=ws_session_tags,
                         conversation_key=ws_conversation_key,
                         conversation_tokens_saved=ws_conversation_tokens_saved,

@@ -211,6 +211,12 @@ class RequestOutcome:
     #     do not measure items yet.
     savings_measure: ItemMeasure | None = None
     transforms_applied: tuple[str, ...] = ()
+    # shaped_output_tokens: the output the output-savings ledger observes for
+    #     this outcome, when it differs from the billed ``output_tokens``. A
+    #     WebSocket memory continuation is one logical turn billed as several
+    #     upstream requests; its final outcome carries the whole turn's output
+    #     here so the ledger sees one observation. None = use output_tokens.
+    shaped_output_tokens: int | None = None
     waste_signals: dict[str, int] | None = None
     num_messages: int = 0
     turn_id: str | None = None
@@ -597,9 +603,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
 
             _rec = get_recorder()
 
+            shaped_output = (
+                outcome.output_tokens
+                if outcome.shaped_output_tokens is None
+                else outcome.shaped_output_tokens
+            )
+
             def _record_and_estimate() -> tuple[int, int]:
-                _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
-                return _rec.request_savings_range(outcome.transforms_applied, outcome.output_tokens)
+                _rec.record_from_labels(outcome.transforms_applied, shaped_output)
+                return _rec.request_savings_range(outcome.transforms_applied, shaped_output)
 
             # Both calls take the recorder lock, and the every-Nth record also
             # does a full read-modify-write of the ledger file — run them
