@@ -1697,10 +1697,6 @@ class TestBroadHandlerSweep:
             "relayed: the handler appends to `error` and the calling thread "
             "re-raises it after join(). Not a swallow, a hand-off.",
         ),
-        "tokenizers/tiktoken_counter.py": (
-            1,
-            "relayed: stores into box['err'], re-raised in the calling thread.",
-        ),
         "transforms/content_router.py": (
             2,
             "relayed: both are watchdog-thread bodies that store into a box "

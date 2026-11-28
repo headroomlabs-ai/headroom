@@ -1305,9 +1305,16 @@ class TokenCountAccuracyResult:
     avg_error_percent: float
     max_error_percent: float
     results: list[dict[str, Any]] = field(default_factory=list)
+    reference_available: bool = True
+    ground_truth_counts: list[int] | None = None
 
     def summary(self) -> str:
         """Generate summary."""
+        if not self.reference_available:
+            return f"""=== Token Counting Accuracy ({self.model}) ===
+Reference vocabulary unavailable — accuracy evaluation skipped.
+Test cases: {self.test_cases}
+No ground truth available for comparison."""
         return f"""=== Token Counting Accuracy ({self.model}) ===
 Test cases: {self.test_cases}
 Exact matches: {self.exact_matches} ({self.exact_matches / self.test_cases:.1%})
@@ -1343,23 +1350,35 @@ def evaluate_token_counting_accuracy(
     ]
 
     token_counter = TokenCounter(model)
+
+    # Try to load reference encoding once — if unavailable, skip accuracy evaluation entirely
+    try:
+        from headroom.tokenizers.tiktoken_counter import load_encoding
+
+        ref_enc = load_encoding("cl100k_base")
+        reference_available = True
+    except Exception:
+        reference_available = False
+        # Return early with unavailability indication — no fallback estimates, no accuracy metrics
+        return TokenCountAccuracyResult(
+            model=model,
+            test_cases=len(test_texts),
+            exact_matches=0,
+            avg_error_percent=0.0,
+            max_error_percent=0.0,
+            results=[],
+            reference_available=False,
+            ground_truth_counts=None,
+        )
+
     results = []
     errors = []
+    ground_truth_counts: list[int] = []
 
     for text in test_texts:
         estimated = token_counter.count_text(text)
-
-        # Note: In a real implementation, we would call the API and check
-        # the actual token count from the response. For now, we compare
-        # against a reference tokenizer.
-        try:
-            import tiktoken
-
-            enc = tiktoken.get_encoding("cl100k_base")
-            actual = len(enc.encode(text))
-        except ImportError:
-            # Fallback: assume estimate is close
-            actual = len(text) // 4
+        actual = len(ref_enc.encode(text))
+        ground_truth_counts.append(actual)
 
         error_percent = abs(estimated - actual) / max(actual, 1) * 100
         errors.append(error_percent)
@@ -1382,6 +1401,8 @@ def evaluate_token_counting_accuracy(
         avg_error_percent=sum(errors) / len(errors) if errors else 0,
         max_error_percent=max(errors) if errors else 0,
         results=results,
+        reference_available=reference_available,
+        ground_truth_counts=ground_truth_counts,
     )
 
 
@@ -1510,18 +1531,30 @@ def main() -> None:
             import json
 
             with open(args.output, "w") as f:
-                json.dump(
-                    {
-                        "model": token_results.model,
-                        "test_cases": token_results.test_cases,
-                        "exact_matches": token_results.exact_matches,
-                        "avg_error_percent": token_results.avg_error_percent,
-                        "max_error_percent": token_results.max_error_percent,
-                        "results": token_results.results,
-                    },
-                    f,
-                    indent=2,
-                )
+                output_data = {
+                    "model": token_results.model,
+                    "test_cases": token_results.test_cases,
+                    "reference_available": token_results.reference_available,
+                }
+                if token_results.reference_available:
+                    output_data.update(
+                        {
+                            "exact_matches": token_results.exact_matches,
+                            "avg_error_percent": token_results.avg_error_percent,
+                            "max_error_percent": token_results.max_error_percent,
+                            "results": token_results.results,
+                        }
+                    )
+                else:
+                    output_data.update(
+                        {
+                            "exact_matches": None,
+                            "avg_error_percent": None,
+                            "max_error_percent": None,
+                            "results": [],
+                        }
+                    )
+                json.dump(output_data, f, indent=2)
     else:
         eval_results = run_batch_compression_eval(
             provider=args.provider,

@@ -67,7 +67,7 @@ from .kompress_compressor import (
     KompressConfig,
     KompressResult,
     ccr_retrieval_marker,
-    payload_tokens,
+    payload_tokens_pair,
     store_kompress_in_ccr,
 )
 
@@ -339,10 +339,9 @@ class RemoteKompressCompressor:
                 marked = compressed + ccr_retrieval_marker(
                     result.original_tokens, result.compressed_tokens, ccr_source, cache_key
                 )
-                # Whole original against whole marked candidate, one unit,
-                # and the accounting reports that measurement.
-                original_tokens = payload_tokens(content)
-                compressed_tokens = payload_tokens(marked)
+                # Whole original against whole marked candidate, one resolved
+                # unit, and the accounting reports that measurement.
+                original_tokens, compressed_tokens = payload_tokens_pair(content, marked)
                 if compressed_tokens >= original_tokens:
                     return self._passthrough(content, n_words)
                 result.cache_key = cache_key

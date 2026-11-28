@@ -6,15 +6,25 @@ It supports multiple encodings:
 - o200k_base: GPT-4o, GPT-4o-mini
 - p50k_base: Codex models, text-davinci-002/003
 - r50k_base: GPT-3 models (davinci, curie, etc.)
+- gpt2: GPT-2 (requires both vocab.bpe and encoder.json)
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import threading
+import pathlib
+import pickle
+import subprocess
+import sys
+import tempfile
+import time
 from functools import lru_cache
 from typing import Any
+
+import tiktoken
+
+from headroom.offline import OfflineEgressBlocked, is_offline
 
 from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
@@ -31,8 +41,22 @@ class TiktokenLoadError(RuntimeError):
     """
 
 
-# Encoding names whose bounded load already timed out — don't block on them again.
-_load_failed: set[str] = set()
+# _download_failed: download errored out (not a timeout) - blocks retries
+_download_failed: set[str] = set()
+
+# After any failed or missed load, back off per encoding instead of paying for a
+# fresh subprocess on every request (gpt-4o and gpt-4o-mini are both o200k_base,
+# and an offline miss would otherwise spawn one child per request). The window
+# expires, so a vocabulary that appears on disk later is picked up without a
+# restart.
+_COOLDOWN_SECONDS = 60.0
+_cooldown_until: dict[str, float] = {}
+
+
+def _cooldown_error(encoding_name: str, message: str) -> TiktokenLoadError:
+    """Record the backoff and build the error to raise for this encoding."""
+    _cooldown_until[encoding_name] = time.monotonic() + _COOLDOWN_SECONDS
+    return TiktokenLoadError(message)
 
 
 def _load_timeout_seconds() -> float:
@@ -86,7 +110,7 @@ MODEL_TO_ENCODING = {
     "code-davinci-001": "p50k_base",
     "code-cushman-002": "p50k_base",
     "code-cushman-001": "p50k_base",
-    # Legacy GPT-3 (r50k_base)
+    # Legacy GPT-3 (p50k_base for davinci-002/003, r50k_base for older)
     "text-davinci-003": "p50k_base",
     "text-davinci-002": "p50k_base",
     "text-davinci-001": "r50k_base",
@@ -103,47 +127,178 @@ MODEL_TO_ENCODING = {
 DEFAULT_ENCODING = "cl100k_base"
 
 
+def _worker_cmd(mode: str, encoding_name: str, out_path: str) -> list[str]:
+    """Command for the dedicated loader entry point (see ``_tiktoken_worker``)."""
+    return [
+        sys.executable,
+        "-m",
+        "headroom.tokenizers._tiktoken_worker",
+        mode,
+        encoding_name,
+        out_path,
+    ]
+
+
+def _worker_env() -> dict[str, str]:
+    """Make ``headroom`` importable in the child even when it isn't installed."""
+    root = str(pathlib.Path(__file__).resolve().parents[2])
+    existing = os.environ.get("PYTHONPATH")
+    return {**os.environ, "PYTHONPATH": root + (os.pathsep + existing if existing else "")}
+
+
+def _check_deadline(encoding_name: str, deadline: float) -> None:
+    """Reject a result whose child wait and payload transfer already overran.
+
+    The budget bounds the subprocess wait and the transfer, not the in-memory
+    rebuild: a reconstruction that starts is a fast native step and its result is
+    kept (see :func:`_get_encoding`), so a late *read* fails here but a completed
+    *rebuild* is never discarded as though fallback had happened on time.
+    """
+    if time.monotonic() > deadline:
+        raise _cooldown_error(
+            encoding_name,
+            f"tiktoken encoding {encoding_name!r} did not load within "
+            f"{_load_timeout_seconds():.1f}s",
+        )
+
+
+def _run_worker(mode: str, encoding_name: str, deadline: float) -> dict[str, Any]:
+    """Run the load in a subprocess, bounded end to end by ``deadline``."""
+    fd, out_path = tempfile.mkstemp(prefix="headroom-tiktoken-", suffix=".pickle")
+    os.close(fd)
+    try:
+        proc = subprocess.Popen(_worker_cmd(mode, encoding_name, out_path), env=_worker_env())
+        try:
+            # wait() returns as soon as the child exits, so a crashed child costs
+            # nothing; only a genuinely stalled load runs to the deadline.
+            proc.wait(timeout=deadline - time.monotonic())
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            logger.warning(
+                "tiktoken encoding %r %s did not finish within %.1fs; falling back to token "
+                "estimation. Pre-populate TIKTOKEN_CACHE_DIR or tune "
+                "HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS.",
+                encoding_name,
+                "download" if mode == "download" else "load",
+                _load_timeout_seconds(),
+            )
+            raise _cooldown_error(
+                encoding_name, f"tiktoken encoding {encoding_name!r} {mode} timed out"
+            ) from None
+        try:
+            # Trusted: our own worker wrote this file; pickle keeps the 100k-entry
+            # rank table cheap to move (an Encoding would re-load by name instead).
+            with open(out_path, "rb") as f:
+                payload = pickle.load(f)
+        except (OSError, EOFError, pickle.UnpicklingError):
+            payload = {"status": "error", "error": f"worker exited with code {proc.returncode}"}
+        _check_deadline(encoding_name, deadline)
+        return payload
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+
+
+def _register(encoding_name: str, payload: dict[str, Any]) -> Any:
+    """Rebuild the encoding from the worker's data and cache it in memory."""
+    enc = tiktoken.Encoding(
+        name=payload["name"],
+        pat_str=payload["pat_str"],
+        mergeable_ranks=payload["mergeable_ranks"],
+        special_tokens=payload["special_tokens"],
+    )
+    tiktoken.registry.ENCODINGS[encoding_name] = enc
+    _cooldown_until.pop(encoding_name, None)
+    _download_failed.discard(encoding_name)  # a load from disk clears a past download failure
+    return enc
+
+
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str):
     """Get a tiktoken encoding, cached for performance.
 
-    Bounded by ``HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS`` (default 10s): tiktoken's
-    vocab download has no network timeout, so we run the load on a worker thread
-    and raise :class:`TiktokenLoadError` if it doesn't finish in time, letting
-    callers fall back to estimation rather than hang the request (GH #956). The
-    first timed-out encoding is remembered so later calls fail fast instead of
-    re-blocking on every request.
+    The subprocess wait and the payload transfer are bounded by
+    ``HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS`` (default 10s); a late read raises
+    :class:`TiktokenLoadError` so callers fall back to estimation instead of
+    blocking a request (GH #956). The native reconstruction in this process is a
+    fast in-memory step: once a payload arrives in budget and the rebuild is
+    started, its result is kept, even if the rebuild itself runs past the budget.
+
+    A warm in-memory encoding is returned directly, without any egress check, so
+    pre-populated vocabularies keep working under ``HEADROOM_OFFLINE=1``.
     """
-    import tiktoken
+    # Fast path: encoding already in memory cache
+    try:
+        if encoding_name in tiktoken.registry.ENCODINGS:
+            return tiktoken.get_encoding(encoding_name)
+    except Exception:
+        pass
 
-    if encoding_name in _load_failed:
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
-
-    box: dict[str, Any] = {}
-
-    def _load() -> None:
-        try:
-            box["enc"] = tiktoken.get_encoding(encoding_name)
-        except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
-            box["err"] = exc
-
-    worker = threading.Thread(target=_load, name=f"tiktoken-load-{encoding_name}", daemon=True)
-    worker.start()
-    worker.join(_load_timeout_seconds())
-
-    if worker.is_alive():
-        _load_failed.add(encoding_name)
-        logger.warning(
-            "tiktoken encoding %r did not load within %.1fs (likely a stalled vocab "
-            "download); falling back to token estimation. Pre-populate TIKTOKEN_CACHE_DIR "
-            "or tune HEADROOM_TIKTOKEN_LOAD_TIMEOUT_SECONDS.",
-            encoding_name,
-            _load_timeout_seconds(),
+    if _cooldown_until.get(encoding_name, 0.0) > time.monotonic():
+        raise TiktokenLoadError(
+            f"tiktoken encoding {encoding_name!r} failed recently; retrying after cooldown"
         )
-        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} load timed out")
-    if "err" in box:
-        raise box["err"]
-    return box["enc"]
+
+    deadline = time.monotonic() + _load_timeout_seconds()
+    result = _run_worker("cache", encoding_name, deadline)
+    status = result["status"]
+
+    if status == "ok":
+        _check_deadline(encoding_name, deadline)
+        return _register(encoding_name, result)
+    if status == "offline_blocked":
+        raise OfflineEgressBlocked("tiktoken encoding download", encoding_name)
+    if status == "invalid_cache":
+        # Corrupt cache - offline it stays broken until the file is replaced,
+        # online a download repairs it.
+        if is_offline():
+            raise _cooldown_error(
+                encoding_name,
+                f"tiktoken encoding {encoding_name!r} has invalid cache entry and "
+                "HEADROOM_OFFLINE=1",
+            )
+        logger.info(
+            "tiktoken encoding %r has invalid cache entry; attempting online repair",
+            encoding_name,
+        )
+    elif status == "not_cached":
+        # A miss is not corruption, but it did cost a subprocess: back off so a
+        # request loop doesn't spawn one per call. Expires, so a vocabulary that
+        # lands on disk later is picked up without a restart.
+        _cooldown_until[encoding_name] = time.monotonic() + _COOLDOWN_SECONDS
+    else:
+        raise _cooldown_error(
+            encoding_name,
+            f"tiktoken encoding {encoding_name!r} failed to load from local cache: "
+            f"{result.get('error')}",
+        )
+
+    if is_offline():
+        raise TiktokenLoadError(
+            f"tiktoken encoding {encoding_name!r} not in local cache and HEADROOM_OFFLINE=1"
+        )
+
+    if encoding_name in _download_failed:
+        # A past download error only suppresses another network attempt; the disk
+        # probe above already ran, so a vocabulary copied into the cache recovers.
+        raise TiktokenLoadError(
+            f"tiktoken encoding {encoding_name!r} previously failed to download"
+        )
+
+    result = _run_worker("download", encoding_name, deadline)
+    if result["status"] == "ok":
+        _check_deadline(encoding_name, deadline)
+        return _register(encoding_name, result)
+    if result["status"] == "offline_blocked":
+        raise OfflineEgressBlocked("tiktoken encoding download", encoding_name)
+
+    _download_failed.add(encoding_name)
+    raise TiktokenLoadError(
+        f"tiktoken encoding {encoding_name!r} download failed: {result.get('error')}"
+    )
 
 
 def load_encoding(encoding_name: str) -> Any:
@@ -180,11 +335,7 @@ def get_encoding_for_model(model: str) -> str:
         return MODEL_TO_ENCODING[model]
 
     # Try prefix matching for versioned models. Ordered most-specific first
-    # so that, e.g., "gpt-4o-*" resolves before "gpt-4-*". Each prefix maps
-    # directly to its encoding: scanning MODEL_TO_ENCODING for the first key
-    # that merely starts with the prefix is order-dependent and wrong — the
-    # "gpt-4" prefix would match the "gpt-4o" dict entry first and return
-    # o200k_base instead of cl100k_base for unknown gpt-4 snapshots.
+    # so that, e.g., "gpt-4o-*" resolves before "gpt-4-*".
     for prefix, encoding in (
         ("gpt-4o", "o200k_base"),
         # chatgpt-4o-latest and dated chatgpt-4o-* aliases are GPT-4o.
