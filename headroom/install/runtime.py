@@ -512,10 +512,57 @@ def run_foreground(manifest: DeploymentManifest) -> int:
             _clear_pid(manifest.profile, expected_pid=proc.pid)
 
 
+def _user_bus_reachable() -> bool:
+    """A user systemd manager can be asked to create a scope."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir and (Path(runtime_dir) / "bus").exists():
+        return True
+    return bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
+
+
+def _system_bus_reachable() -> bool:
+    """The system manager is reachable and we may talk to it."""
+    getuid = getattr(os, "geteuid", None)
+    return getuid is not None and getuid() == 0 and Path("/run/systemd/private").exists()
+
+
+def _escape_caller_cgroup(command: list[str]) -> list[str]:
+    """Wrap ``command`` so it runs in a systemd scope of its own.
+
+    ``start_new_session`` leaves the session but not the caller's cgroup, so
+    when the caller is a systemd unit (e.g. ``Type=oneshot`` with the default
+    ``KillMode=control-group``) the child is killed the moment that unit
+    stops. ``systemd-run --scope`` puts it in a transient scope unit, which
+    the caller's teardown does not reach; scope mode also inherits the
+    caller's environment, unlike a transient service.
+
+    Left alone unless we are inside a systemd unit (``INVOCATION_ID``) *and*
+    a manager we can actually reach exists. Picking a manager that is not
+    reachable is worse than not escaping: ``systemd-run`` would exit before
+    starting the runner, and the caller waits for a readiness that never
+    comes. A system-level service has no user bus, so it only tries the
+    system manager, and only as root.
+    """
+    if _is_windows() or not os.environ.get("INVOCATION_ID"):
+        return command
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        return command
+    if _user_bus_reachable():
+        manager = [systemd_run, "--user"]
+    elif _system_bus_reachable():
+        manager = [systemd_run]
+    else:
+        return command
+    return [*manager, "--scope", "--collect", "--quiet", "--", *command]
+
+
 def start_detached_agent(profile: str) -> subprocess.Popen[str]:
     """Start `headroom install agent run` detached for the given profile."""
 
-    command = [*resolve_headroom_command(), "install", "agent", "run", "--profile", profile]
+    command = _escape_caller_cgroup(
+        [*resolve_headroom_command(), "install", "agent", "run", "--profile", profile]
+    )
     log_file_path = log_path(profile)
     log_file_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(log_file_path, "a", encoding="utf-8", errors="replace")  # noqa: SIM115

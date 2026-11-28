@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -29,6 +30,12 @@ from headroom.install.runtime import (
     stop_runtime,
     wait_ready,
     wait_stopped,
+)
+
+# Stand-in runner for the end-to-end spawn test: records argv it was exec'd with.
+RUNNER_SCRIPT = (
+    "import os, pathlib, sys; "
+    "pathlib.Path(os.environ['HR_OUT']).write_text('ran ' + ' '.join(sys.argv[1:]))"
 )
 
 
@@ -1114,6 +1121,183 @@ def test_start_detached_agent_closes_parent_log_fd(monkeypatch, tmp_path: Path) 
     # Same handle is passed to both streams, and the parent closed it.
     assert captured["stderr"] is log_handle
     assert log_handle.closed is True
+
+
+def test_start_detached_agent_escapes_caller_systemd_cgroup(monkeypatch, tmp_path: Path) -> None:
+    """Under a systemd unit, spawn through ``systemd-run --user --scope``.
+
+    ``start_new_session`` does not leave the caller's cgroup, so a oneshot
+    caller's ``KillMode=control-group`` teardown kills the freshly started
+    runner. A transient scope unit is outside that cgroup.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+
+    commands: list[list[str]] = []
+
+    class FakeProc:
+        pid = 999
+
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda command, **kwargs: commands.append(command) or FakeProc(),
+    )
+
+    monkeypatch.setenv("INVOCATION_ID", "abc123")
+    monkeypatch.setattr(
+        "headroom.install.runtime.shutil.which", lambda name: "/usr/bin/systemd-run"
+    )
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    start_detached_agent("demo")
+    assert commands[0] == [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--",
+        "headroom",
+        "install",
+        "agent",
+        "run",
+        "--profile",
+        "demo",
+    ]
+
+    # No systemd-run binary: plain spawn (detached as before).
+    monkeypatch.setattr("headroom.install.runtime.shutil.which", lambda name: None)
+    start_detached_agent("demo")
+    assert commands[1] == ["headroom", "install", "agent", "run", "--profile", "demo"]
+
+    # Not invoked by a systemd unit: nothing to escape.
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.shutil.which", lambda name: "/usr/bin/systemd-run"
+    )
+    start_detached_agent("demo")
+    assert commands[2] == ["headroom", "install", "agent", "run", "--profile", "demo"]
+
+
+def test_start_detached_agent_skips_scope_when_no_manager_is_reachable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """No reachable manager means a plain spawn, not a dead ``systemd-run``.
+
+    A system-level unit has ``INVOCATION_ID`` but no user bus; spawning
+    ``systemd-run --user`` there exits before running Headroom and the caller
+    then waits out its readiness budget for a runner that never starts.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+    monkeypatch.setenv("INVOCATION_ID", "abc123")
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.shutil.which", lambda name: "/usr/bin/systemd-run"
+    )
+
+    commands: list[list[str]] = []
+
+    class FakeProc:
+        pid = 999
+
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda command, **kwargs: commands.append(command) or FakeProc(),
+    )
+
+    # Non-root system service: neither manager is usable.
+    monkeypatch.setattr("headroom.install.runtime.os.geteuid", lambda: 1000, raising=False)
+    start_detached_agent("demo")
+    assert commands[0] == ["headroom", "install", "agent", "run", "--profile", "demo"]
+
+    # Root system service: the system manager is reachable, so escape there.
+    monkeypatch.setattr("headroom.install.runtime.os.geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr("headroom.install.runtime._system_bus_reachable", lambda: True)
+    start_detached_agent("demo")
+    assert commands[1] == [
+        "/usr/bin/systemd-run",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--",
+        "headroom",
+        "install",
+        "agent",
+        "run",
+        "--profile",
+        "demo",
+    ]
+
+
+def test_user_bus_reachable_reads_runtime_dir_bus(monkeypatch, tmp_path: Path) -> None:
+    """The user manager is only assumed present when its bus socket is."""
+    from headroom.install.runtime import _user_bus_reachable
+
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    assert _user_bus_reachable() is False
+
+    (tmp_path / "bus").write_text("", encoding="utf-8")
+    assert _user_bus_reachable() is True
+
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    assert _user_bus_reachable() is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell shim")
+def test_start_detached_agent_really_runs_runner_through_scope_launcher(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """End-to-end spawn: no mocked ``Popen``, real fork/exec through the shim.
+
+    A stand-in ``systemd-run`` runs here the way it does on a real host: it
+    records its argv, then execs the runner with the caller's environment.
+    Verifies the runner actually starts after the ``--`` separator and that
+    the caller's env survives the scope launcher.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+    monkeypatch.setenv("INVOCATION_ID", "abc123")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+
+    capture = tmp_path / "argv.txt"
+    out = tmp_path / "ran.txt"
+    shim = tmp_path / "systemd-run"
+    shim_text = [
+        "#!/bin/sh",
+        f'printf "%s\\n" "$@" > "{capture}"',
+        'while [ "$1" != "--" ]; do shift; done',
+        "shift",
+        'exec "$@"',
+        "",
+    ]
+    shim.write_text("\n".join(shim_text), encoding="utf-8")
+    shim.chmod(0o755)
+
+    monkeypatch.setenv("HR_OUT", str(out))
+    monkeypatch.setattr("headroom.install.runtime.shutil.which", lambda name: str(shim))
+    monkeypatch.setattr(
+        "headroom.install.runtime.resolve_headroom_command",
+        lambda: [sys.executable, "-c", RUNNER_SCRIPT],
+    )
+
+    proc = start_detached_agent("demo")
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline and not out.exists():
+            time.sleep(0.05)
+    finally:
+        proc.wait(timeout=30)
+
+    argv = capture.read_text(encoding="utf-8").splitlines()
+    assert argv[:5] == ["--user", "--scope", "--collect", "--quiet"]
+    assert argv[5] == "--"
+    assert argv[6] == sys.executable
+    assert out.read_text(encoding="utf-8") == "ran install agent run --profile demo"
 
 
 def test_start_detached_agent_closes_log_fd_when_popen_raises(monkeypatch, tmp_path: Path) -> None:
