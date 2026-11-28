@@ -116,9 +116,55 @@ def test_bedrock_error_maps_to_an_anthropic_error(code, status, error_type) -> N
     resp = _post(_bedrock_backend(runtime), MagicMock(side_effect=AssertionError("upstream")))
 
     assert resp.status_code == status
+    assert resp.json()["error"]["type"] == error_type
+
+
+def test_bedrock_error_message_hides_provider_diagnostics() -> None:
+    """Status and Anthropic error type survive; Bedrock's raw text does not."""
+    runtime = MagicMock()
+    leak = (
+        "User: arn:aws:sts::123456789012:assumed-role/Dev/alice is not authorized to "
+        "perform: bedrock:CountTokens (RequestId: 0f3c9a7e-1111-2222-3333-444455556666)"
+    )
+    runtime.count_tokens.side_effect = botocore_exceptions.ClientError(
+        {
+            "Error": {"Code": "AccessDeniedException", "Message": leak},
+            "ResponseMetadata": {"HTTPStatusCode": 403},
+        },
+        "CountTokens",
+    )
+
+    resp = _post(_bedrock_backend(runtime), MagicMock(side_effect=AssertionError("upstream")))
+
+    assert resp.status_code == 403
     error = resp.json()["error"]
-    assert error["type"] == error_type
-    assert code in error["message"] and "anthropic.claude-sonnet-4-6" in error["message"]
+    assert error["type"] == "permission_error"
+    assert "bedrock:CountTokens IAM permission" in error["message"]
+    for secret in ("123456789012", "arn:aws", "0f3c9a7e", "alice", "AccessDeniedException"):
+        assert secret not in resp.text
+
+
+def test_mantle_pinned_model_is_reported_as_unsupported() -> None:
+    """Mantle has no CountTokens: answer 400 without asking InvokeModel or Anthropic."""
+    runtime = MagicMock()
+    with patch.dict(
+        "os.environ",
+        {"HEADROOM_BEDROCK_MODEL_MAP": "claude-opus-5-5=mantle/anthropic.claude-opus-5-5"},
+    ):
+        backend = _bedrock_backend(runtime)
+    body = {"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}
+
+    resp = _post(backend, MagicMock(side_effect=AssertionError("upstream")), body=body)
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Token counting is not available on Bedrock for claude-opus-5-5.",
+        },
+    }
+    assert not runtime.count_tokens.called
 
 
 def test_caller_named_upstream_keeps_the_passthrough_in_bedrock_mode() -> None:

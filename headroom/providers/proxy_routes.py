@@ -127,6 +127,25 @@ def _same_origin(a: str, b: str) -> bool:
     return key(a) == key(b)
 
 
+def _count_tokens_error_message(exc: ProviderError, status: int, model: Any) -> str:
+    """A fixed client-facing message for a failed backend count; no provider text."""
+    name = model[:200] if isinstance(model, str) and model else "the requested model"
+    if exc.details.get("reason") == "unsupported_model":
+        return f"Token counting is not available on Bedrock for {name}."
+    if status == 401:
+        return "AWS credentials for Bedrock are unavailable on the proxy; refresh them and retry."
+    if status == 403:
+        return (
+            "Bedrock CountTokens denied access for this model; "
+            "check the bedrock:CountTokens IAM permission."
+        )
+    if status in (400, 404):
+        return f"Bedrock CountTokens rejected the request for model {name}."
+    if status == 429:
+        return "Bedrock CountTokens is throttling requests; retry later."
+    return "Bedrock CountTokens failed; see the proxy log for details."
+
+
 async def _count_tokens_on_backend(proxy: Any, request: Request) -> Response | None:
     """Answer ``/v1/messages/count_tokens`` from the Anthropic backend, or None to pass through.
 
@@ -146,13 +165,14 @@ async def _count_tokens_on_backend(proxy: Any, request: Request) -> Response | N
         tokens = await backend.count_tokens(body, dict(request.headers))
     except ProviderError as exc:
         status = int(exc.details.get("status", 502))
+        # The raw provider text (ARNs, account and request IDs) stays in the log.
         logger.warning("count_tokens on backend %s failed: %s", backend.name, exc)
         return JSONResponse(
             {
                 "type": "error",
                 "error": {
                     "type": ANTHROPIC_ERROR_TYPES.get(status, "api_error"),
-                    "message": str(exc),
+                    "message": _count_tokens_error_message(exc, status, body.get("model")),
                 },
             },
             status_code=status,

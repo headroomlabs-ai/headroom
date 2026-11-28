@@ -120,6 +120,8 @@ _BEDROCK_REGION_PREFIXES: dict[str, str] = {
 # Leading segment of a system-defined cross-region inference profile ID
 # ("us.anthropic.claude-...", "global.anthropic.claude-...").
 _BEDROCK_CROSS_REGION_PREFIXES = ("au.", "us.", "eu.", "apac.", "global.")
+# Model-ID routes that send a Bedrock model to the Mantle (Anthropic-native) endpoint.
+_BEDROCK_MANTLE_ROUTES = ("mantle/", "bedrock_mantle/")
 #: Top-level InvokeModel body keys for Claude; anything else 400s on Bedrock.
 _BEDROCK_INVOKE_BODY_KEYS = frozenset(
     {
@@ -1063,15 +1065,29 @@ class LiteLLMBackend(Backend):
 
         In Bedrock mode there is no Anthropic account to pass
         ``/v1/messages/count_tokens`` to (clients send a placeholder key).
+
+        Support boundary: CountTokens covers models served through InvokeModel.
+        A model pinned to Bedrock's Mantle endpoint (``HEADROOM_BEDROCK_MODEL_MAP``
+        value ``mantle/...`` or ``bedrock_mantle/...``) cannot be counted; that
+        raises ``ProviderError`` with ``reason="unsupported_model"`` and status
+        400 instead of calling CountTokens or falling back to Anthropic.
         """
         if self.provider != "bedrock":
             return None
-        # Local import: the module pulls in litellm at import time.
+        # Local imports: headroom.providers.anthropic pulls in litellm at import time.
+        from headroom.exceptions import ProviderError
         from headroom.providers.anthropic import sanitize_anthropic_model_id
 
-        model_id = _bedrock_base_model_id(
-            self.map_model_id(sanitize_anthropic_model_id(body.get("model", "")))
-        )
+        mapped = self.map_model_id(sanitize_anthropic_model_id(body.get("model", "")))
+        if mapped.removeprefix("bedrock/").startswith(_BEDROCK_MANTLE_ROUTES):
+            # Mantle serves the Anthropic-native API, not InvokeModel, and has no
+            # CountTokens equivalent; asking InvokeModel's CountTokens would count
+            # against a model the operator did not route to.
+            raise ProviderError(
+                "Bedrock Mantle models have no CountTokens API",
+                details={"model": mapped, "status": 400, "reason": "unsupported_model"},
+            )
+        model_id = _bedrock_base_model_id(mapped)
         invoke_body = {k: v for k, v in body.items() if k in _BEDROCK_INVOKE_BODY_KEYS}
         if isinstance(invoke_body.get("thinking"), dict):
             # Claude Code sends first-party-only ``display`` values Bedrock rejects.
