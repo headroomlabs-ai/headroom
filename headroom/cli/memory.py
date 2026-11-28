@@ -395,6 +395,12 @@ def _import_memories(store: SQLiteMemoryStore, memories: list[Any]) -> int:
             try:
                 memory = Memory.from_dict(mem_dict)
                 row = store._memory_to_row(memory)
+                # A JSON array/object in a scalar field cannot bind to SQLite.
+                if any(
+                    value is not None and not isinstance(value, (str, int, float, bytes))
+                    for value in row.values()
+                ):
+                    continue
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO memories (
@@ -416,7 +422,7 @@ def _import_memories(store: SQLiteMemoryStore, memories: list[Any]) -> int:
                     row,
                 )
                 imported_count += 1
-            except (KeyError, ValueError, TypeError, IntegrityError):
+            except (KeyError, ValueError, TypeError, OverflowError, IntegrityError):
                 # Skip malformed entries
                 continue
 
@@ -1386,10 +1392,14 @@ def import_memories(ctx: click.Context, db_path: str, file: str, force: bool) ->
 
         store = get_store(db_path)
         imported = _import_memories(store, memories_data)
-        print_success(f"Imported {imported} memory(ies).")
+        if imported:
+            print_success(f"Imported {imported} memory(ies).")
 
         if imported < count:
             print_warning(f"Skipped {count - imported} malformed entries.")
+        if not imported:
+            print_error("No valid memories to import.")
+            sys.exit(1)
 
     except json.JSONDecodeError as e:
         print_error(f"Invalid JSON file: {e}")

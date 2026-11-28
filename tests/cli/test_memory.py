@@ -439,17 +439,17 @@ class TestMemoryPurge:
 
 
 class TestMemoryExportImport:
-    @pytest.mark.parametrize("invalid_kind", ["non_objects", "invalid_row"])
+    @pytest.mark.parametrize("invalid_kind", ["non_objects", "invalid_row", "array_content"])
     def test_import_keeps_valid_rows_around_malformed_records(
         self, runner: CliRunner, temp_db: str, tmp_path: Path, invalid_kind: str
     ) -> None:
         first = Memory(id="first", content="First restored memory", user_id="test-user")
         last = Memory(id="last", content="Last restored memory", user_id="test-user")
-        malformed = (
-            [None, ["not a record"]]
-            if invalid_kind == "non_objects"
-            else [{**first.to_dict(), "content": None}]
-        )
+        malformed = {
+            "non_objects": [None, ["not a record"]],
+            "invalid_row": [{**first.to_dict(), "content": None}],
+            "array_content": [{**first.to_dict(), "content": ["not a text field"]}],
+        }[invalid_kind]
         backup = tmp_path / "mixed-backup.json"
         backup.write_text(
             json.dumps([first.to_dict(), *malformed, last.to_dict()]),
@@ -465,6 +465,19 @@ class TestMemoryExportImport:
         store = SQLiteMemoryStore(temp_db)
         assert asyncio.run(store.get("first")).content == first.content
         assert asyncio.run(store.get("last")).content == last.content
+
+    def test_import_with_no_valid_rows_exits_nonzero(
+        self, runner: CliRunner, temp_db: str, tmp_path: Path
+    ) -> None:
+        backup = tmp_path / "invalid-backup.json"
+        backup.write_text(json.dumps([None, {"not": "a memory"}]), encoding="utf-8", newline="\n")
+        result = runner.invoke(
+            main, ["memory", "import", "--db-path", temp_db, str(backup), "--force"]
+        )
+        assert result.exit_code == 1
+        assert "Skipped 2 malformed entries" in result.output
+        assert "No valid memories to import" in result.output
+        assert "Imported 0" not in result.output
 
     """Tests for export/import commands."""
 
