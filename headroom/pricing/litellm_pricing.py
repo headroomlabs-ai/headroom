@@ -11,11 +11,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.price_table_generation import (
+    advance_price_table_generation,
+    price_table_generation,
+)
 from headroom.pricing.deepseek_tiers import (
     LEGACY_MODEL_IDS,
     OFF_PEAK_RATES_PER_1M,
@@ -60,9 +65,10 @@ except ImportError:
     litellm = None  # type: ignore[assignment]
     LITELLM_AVAILABLE = False
 
-# Least-recently-used first. Keyed by the client-supplied model name, so the
+# Least-recently-used first. Keyed by the price-table generation and the
+# client-supplied model name (see headroom.price_table_generation), so the
 # entry count is capped (#4479); an evicted name is simply resolved again.
-_resolved_model_cache: dict[str, str] = {}
+_resolved_model_cache: dict[tuple[int, str], str] = {}
 _RESOLVED_MODEL_CACHE_MAXSIZE = 256
 
 logger = logging.getLogger("headroom.pricing")
@@ -117,17 +123,92 @@ def resolve_litellm_model(model: str) -> str:
     the bare-prefix rules. Shared by the live (cost.py) and persisted
     (savings_tracker) pricing paths so both figures price identically.
     """
-    cached = _resolved_model_cache.get(model)
+    key = (price_table_generation(), model)
+    cached = _resolved_model_cache.get(key)
     if cached is not None:
-        remember_bounded(_resolved_model_cache, model, cached, _RESOLVED_MODEL_CACHE_MAXSIZE)
+        remember_bounded(_resolved_model_cache, key, cached, _RESOLVED_MODEL_CACHE_MAXSIZE)
         return cached
     priced: str | None = None
     alias = _static_alias_map()
     if alias:
         priced = _reduce_to_priced_key(alias.get(model, model))
     resolved = priced if priced is not None else _resolve_litellm_model_uncached(model)
-    remember_bounded(_resolved_model_cache, model, resolved, _RESOLVED_MODEL_CACHE_MAXSIZE)
+    remember_bounded(_resolved_model_cache, key, resolved, _RESOLVED_MODEL_CACHE_MAXSIZE)
     return resolved
+
+
+#: ``(table, its size, lowercase key -> key)`` for the price table Headroom
+#: last indexed. Read and written as one tuple, so an index is only ever used
+#: with the table it was built from: one built from a table since replaced or
+#: grown is rebuilt, never consulted.
+_catalog_index: tuple[dict[str, Any], int, dict[str, str]] | None = None
+
+
+def publish_price_table(table: dict[str, Any]) -> None:
+    """Make ``table`` LiteLLM's price table, with Headroom's index of it built first.
+
+    ``table`` must not be changed afterwards: readers may be iterating it. The
+    generation advances after the table is bound, so a lookup that read the
+    new generation can only have read the new table.
+    """
+    global _catalog_index
+    _catalog_index = (table, len(table), {key.lower(): key for key in table})
+    litellm.model_cost = table
+    advance_price_table_generation()
+
+
+def invalidate_litellm_lookup_caches() -> None:
+    """Drop LiteLLM's lowercase name index and the model-info caches it clears with it."""
+    invalidate = getattr(
+        getattr(litellm, "utils", None), "_invalidate_model_cost_lowercase_map", None
+    )
+    if invalidate is not None:
+        invalidate()
+
+
+_T = TypeVar("_T")
+
+
+def call_litellm(fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+    """Call a LiteLLM lookup, then drop LiteLLM's caches if a price refresh landed meanwhile.
+
+    LiteLLM memoises model info (rates, limits) in caches a refresh clears. In
+    1.101 they are not keyed on the table, so a lookup that read the old table
+    and returns after that clear stores the old rows again, for every later
+    caller. The lookup that overlapped the refresh clears them on its way out.
+    """
+    generation = price_table_generation()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        if price_table_generation() != generation:
+            invalidate_litellm_lookup_caches()
+
+
+def catalog_key(name: str) -> str | None:
+    """The ``litellm.model_cost`` key for ``name``, matched case-insensitively.
+
+    Headroom looks names up through this, then hands LiteLLM the exact key, so
+    LiteLLM's own lowercase index is never consulted. That index is a global
+    LiteLLM rebuilds without a lock: a lookup rebuilding it while a price
+    refresh replaces the table can store an index of the old table, hiding the
+    refreshed models from mixed-case names. ``None`` when no key matches.
+    """
+    global _catalog_index
+    if not LITELLM_AVAILABLE:
+        return None
+    table = litellm.model_cost
+    if name in table:
+        return name
+    index = _catalog_index
+    if index is None or index[0] is not table or index[1] != len(table):
+        try:
+            index = (table, len(table), {key.lower(): key for key in table})
+        except RuntimeError:  # something grew the table in place mid-scan
+            return None
+        _catalog_index = index
+    key = index[2].get(name.lower())
+    return key if key is not None and key in table else None
 
 
 def _resolve_litellm_model_uncached(model: str) -> str:
@@ -137,12 +218,24 @@ def _resolve_litellm_model_uncached(model: str) -> str:
 
     def is_known_model(candidate: str) -> bool:
         try:
-            litellm.cost_per_token(model=candidate, prompt_tokens=1, completion_tokens=0)
+            call_litellm(
+                litellm.cost_per_token,
+                model=catalog_key(candidate) or candidate,
+                prompt_tokens=1,
+                completion_tokens=0,
+            )
             return True
         except Exception:
             return False
 
-    return resolve_litellm_model_name(model, is_known_model)
+    resolved = resolve_litellm_model_name(model, is_known_model)
+    return catalog_key(resolved) or resolved
+
+
+#: Bare names Claude Code sends that LiteLLM lists only under a provider prefix.
+_PREFIXED_SOURCES = {"MiniMax-M3": "minimax/MiniMax-M3"}
+#: The bare rows :func:`_register_minimax_pricing` made from their prefixed row.
+_mirrored_bare_rows: set[str] = set()
 
 
 def _register_minimax_pricing() -> None:
@@ -155,15 +248,29 @@ def _register_minimax_pricing() -> None:
     `estimate_cost()` succeeds even if (a) the resolver cache is cold,
     or (b) LiteLLM drops the prefixed entry in a future release.
     Pricing mirrors the upstream DB (input $0.60/M, output $2.40/M,
-    cache read $0.12/M as of 2026-06). Re-check after LiteLLM updates.
+    cache read $0.12/M as of 2026-06). Each bare row made here is recorded,
+    so a price refresh keeps it in step with its prefixed row
+    (:func:`mirrored_rows`).
     """
     if not LITELLM_AVAILABLE:
         return
-    source_key = "minimax/MiniMax-M3"
-    if source_key not in litellm.model_cost:
-        return
-    if "MiniMax-M3" not in litellm.model_cost:
-        litellm.model_cost["MiniMax-M3"] = dict(litellm.model_cost[source_key])
+    for bare, source in _PREFIXED_SOURCES.items():
+        if source in litellm.model_cost and bare not in litellm.model_cost:
+            litellm.model_cost[bare] = dict(litellm.model_cost[source])
+            _mirrored_bare_rows.add(bare)
+
+
+def mirrored_rows(model_cost: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Copies of ``model_cost``'s prefixed rows for the bare rows Headroom made.
+
+    A bare row that LiteLLM's table supplied itself was never made by Headroom
+    and is not mirrored, so its own rates stand.
+    """
+    return {
+        bare: dict(model_cost[source])
+        for bare in _mirrored_bare_rows
+        if (source := _PREFIXED_SOURCES[bare]) in model_cost
+    }
 
 
 _register_minimax_pricing()
@@ -220,7 +327,7 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
 
     info = None
     for candidate in pricing_lookup_candidates(model):
-        info = cost_data.get(candidate)
+        info = cost_data.get(catalog_key(candidate) or candidate)
         if info is not None:
             break
 
@@ -354,7 +461,8 @@ def estimate_cost_from_tokens(
     if candidate is None:
         return None
     try:
-        prompt_cost, completion_cost = litellm.cost_per_token(
+        prompt_cost, completion_cost = call_litellm(
+            litellm.cost_per_token,
             model=candidate,
             prompt_tokens=input_tokens,
             completion_tokens=output_tokens,
@@ -439,16 +547,20 @@ def _inject_deepseek_pricing() -> None:
     """
     if not LITELLM_AVAILABLE:
         return
+    litellm.model_cost.update(deepseek_rows(litellm.model_cost))
+
+
+def deepseek_rows(model_cost: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Headroom's DeepSeek rows, each merged over what ``model_cost`` holds for it.
+
+    Also used by :mod:`headroom.pricing.live_prices`, so a refreshed upstream
+    table cannot put the peak rate back.
+    """
+    rows: dict[str, dict[str, Any]] = {}
     for model_name, pricing in _DEEPSEEK_V4_PRICING.items():
-        litellm.model_cost[model_name] = {
-            **litellm.model_cost.get(model_name, {}),
-            **pricing,
-        }
-        prefixed = f"deepseek/{model_name}"
-        litellm.model_cost[prefixed] = {
-            **litellm.model_cost.get(prefixed, {}),
-            **pricing,
-        }
+        for key in (model_name, f"deepseek/{model_name}"):
+            rows[key] = {**model_cost.get(key, {}), **pricing}
+    return rows
 
 
 _inject_deepseek_pricing()

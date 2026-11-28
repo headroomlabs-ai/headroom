@@ -59,12 +59,12 @@ import math
 import re
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
 from typing import Any
 
 from headroom.cache_economics import CACHE_ECONOMICS
 from headroom.log_safety import describe_exception, safe_id
 from headroom.offline import pin_litellm_cost_map_local
+from headroom.price_table_generation import generation_cached
 from headroom.pricing.cache_ttl import CACHE_WRITE_MULTIPLIERS
 
 logger = logging.getLogger(__name__)
@@ -377,7 +377,7 @@ def long_context_tier(info: dict[str, Any]) -> tuple[int, str] | None:
     return None
 
 
-@lru_cache(maxsize=_RATE_CACHE_MAXSIZE)
+@generation_cached(maxsize=_RATE_CACHE_MAXSIZE)
 def long_context_threshold(model: str) -> int:
     """Billed-prompt size above which ``model`` pays its long-context rates.
 
@@ -404,8 +404,14 @@ def _canonical_cache_rate(litellm: Any, model: str, field: str, *, long_context:
     """
     tokens = long_context_threshold(model) + 1 if long_context else 1
     try:
-        input_cost, _ = litellm.cost_per_token(
-            model=model, prompt_tokens=tokens, completion_tokens=0, **{field: tokens}
+        from headroom.pricing.litellm_pricing import call_litellm
+
+        input_cost, _ = call_litellm(
+            litellm.cost_per_token,
+            model=model,
+            prompt_tokens=tokens,
+            completion_tokens=0,
+            **{field: tokens},
         )
         rate = float(input_cost) / tokens
     except Exception:
@@ -433,7 +439,7 @@ def _catalog_row(model: str) -> tuple[Any, str, dict[str, Any]] | None:
     return litellm, resolved_model, info
 
 
-@lru_cache(maxsize=_RATE_CACHE_MAXSIZE)
+@generation_cached(maxsize=_RATE_CACHE_MAXSIZE)
 def resolve_rates(
     model: str,
     *,

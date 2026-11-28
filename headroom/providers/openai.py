@@ -601,7 +601,9 @@ class OpenAIProvider(Provider):
         litellm = _get_litellm_module()
         if litellm is not None:
             try:
-                info = litellm.get_model_info(model)
+                from headroom.pricing.litellm_pricing import call_litellm, catalog_key
+
+                info = call_litellm(litellm.get_model_info, catalog_key(model) or model)
                 if info and "max_input_tokens" in info:
                     max_tokens = info["max_input_tokens"]
                     if max_tokens is not None:

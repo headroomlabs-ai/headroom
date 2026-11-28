@@ -1072,13 +1072,14 @@ class CostTracker:
             return None
 
         try:
-            from headroom.pricing.litellm_pricing import resolve_litellm_model
+            from headroom.pricing.litellm_pricing import call_litellm, resolve_litellm_model
 
             resolved_model = resolve_litellm_model(model)
 
             # litellm.cost_per_token handles all token types natively:
             # prompt_tokens at input rate, cache_read at ~10%, cache_creation at ~125%
-            input_cost, output_cost = litellm.cost_per_token(
+            input_cost, output_cost = call_litellm(
+                litellm.cost_per_token,
                 model=resolved_model,
                 prompt_tokens=input_tokens,
                 completion_tokens=output_tokens,

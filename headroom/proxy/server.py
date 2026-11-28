@@ -3745,12 +3745,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.periodic_toin_stats_task = None
         app.state.periodic_malloc_trim_task = None
         app.state.orphan_watchdog_task = None
+        app.state.price_refresh_task = None
 
         try:
             try:
                 previous_handler = _install_loop_exception_handler()
                 # Startup
                 await proxy.startup()
+                # Current model prices, fetched off the startup path (see module).
+                from headroom.pricing.live_prices import refresh_periodically
+
+                app.state.price_refresh_task = asyncio.create_task(refresh_periodically())
                 if config.periodic_toin_stats_enabled:
                     app.state.periodic_toin_stats_task = asyncio.create_task(
                         _log_toin_stats_periodically()
@@ -3820,6 +3825,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         timeout,
                         exc,
                     )
+
+            price_refresh_task = app.state.price_refresh_task
+            if price_refresh_task is not None:
+                price_refresh_task.cancel()
+                await _timed(
+                    asyncio.gather(price_refresh_task, return_exceptions=True),
+                    label="price_refresh.stop",
+                    timeout=3.0,
+                )
+                app.state.price_refresh_task = None
 
             periodic_toin_stats_task = app.state.periodic_toin_stats_task
             if periodic_toin_stats_task is not None:
