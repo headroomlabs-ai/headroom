@@ -110,6 +110,10 @@ headroom mcp install --force                        # Overwrite existing
 # Check status
 headroom mcp status
 
+# Diagnose a Serena MCP that times out or cannot start
+headroom mcp doctor
+headroom mcp doctor --probe   # also run Serena's health check (real symbol calls)
+
 # Uninstall
 headroom mcp uninstall
 
@@ -210,6 +214,17 @@ The proxy compresses all traffic at the HTTP level (before the LLM sees content)
 **"Entry not found or expired"** -- Local content expires after 1 hour, proxy content after 30 minutes (configurable via `HEADROOM_CCR_TTL_SECONDS`).
 
 **Claude doesn't see headroom tools** -- Run `headroom mcp status`, restart Claude Code, and verify with `/mcp` inside Claude Code.
+
+**Serena tool calls time out (`Request timed out`)** -- Run `headroom mcp doctor` from the terminal you start your agent in. It is read-only and shows where `uvx`, `node`, `npm` and `npx` actually resolve on that `PATH` (the one `headroom wrap` passes to the agent and on to Serena), with your home directory and Windows user name redacted. It reports:
+
+- Windows binaries under `/mnt/<drive>/` on WSL, such as a Windows NVM `npm` ahead of a Linux `node`. Serena installs and starts its TypeScript language server with whatever `npm` it finds.
+- A node toolchain (fnm, nvm, asdf, mise, Volta) that `~/.bashrc` sets up below its `case $- in ... return` guard. Shells that are not interactive, such as an IDE or `wsl.exe <command>`, stop at that guard, so an agent they start never gets that toolchain.
+- Cached language-server launchers Serena cannot execute, with the `chmod +x` to fix them.
+- The error lines in Serena's latest MCP log (`~/.serena/logs/<date>/mcp_*.txt`).
+
+A registered or connected Serena is not proof that its language server works. `headroom mcp doctor --probe` runs Serena's own `project health-check` on the current project. It makes real symbol calls and relays Serena's failure reason. A probe that times out means the language server is hanging while it installs or starts, not that a request is slow. Exit codes: `0` healthy, `1` warnings, `2` failures.
+
+A running Serena keeps a language server that failed to start until Serena restarts. After fixing the cause, restart only Serena and keep the conversation: in Claude Code, run `/mcp`, select `serena` and choose **Reconnect**. For other agents, restart the agent.
 
 ### Claude Code `/usage` attributes a large share to `headroom` MCP
 

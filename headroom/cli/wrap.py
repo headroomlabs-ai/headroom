@@ -46,6 +46,7 @@ from typing import Any, NamedTuple, cast
 import tomllib
 
 from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
+from headroom._subprocess import kill_process_tree as _kill_serena_index_tree
 from headroom._subprocess import pid_alive, proc_identity, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
@@ -2706,54 +2707,6 @@ def _resolve_serena_index_wait_seconds() -> int:
         )
         return 0
     return wait_seconds
-
-
-def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
-    """Kill *proc* and everything it spawned (best-effort, never raises).
-
-    ``uvx`` is a launcher: it resolves the environment and then runs the real
-    ``serena`` executable as a grandchild. Killing only the direct child leaves
-    that grandchild alive and reparented to PID 1, so every timed-out pre-index
-    leaked one process that never exits (#2938 — the same failure mode as #615
-    and #880). The child is started in its own process group precisely so the
-    whole tree can be signalled here.
-    """
-    if sys.platform == "win32":
-        # Windows has no process groups to signal for an already-wedged child;
-        # ``taskkill /T`` walks the tree by parent PID instead. ``/F`` because a
-        # process blocked in a read will not act on a graceful close request.
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except Exception:
-            pass
-    else:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
-    # Backstop: if the tree kill above did not land, at least the direct child
-    # goes. Then reap so the parent does not leave a zombie behind, and close
-    # the capture pipes we opened so the wrap does not carry stray fds into the
-    # agent it is about to exec.
-    try:
-        proc.kill()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=10)
-    except Exception:
-        pass
-    for stream in (proc.stdout, proc.stderr, proc.stdin):
-        try:
-            if stream is not None:
-                stream.close()
-        except Exception:
-            pass
 
 
 #: Handle on the background ``serena project index`` child, so the wrap can

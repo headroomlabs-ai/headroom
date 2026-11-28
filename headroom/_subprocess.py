@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess as _sp
 import sys
 from typing import Any
@@ -111,3 +112,51 @@ def Popen(*args: Any, **kwargs: Any) -> _sp.Popen:
         kwargs.setdefault("encoding", "utf-8")
         kwargs.setdefault("errors", "replace")
     return _sp.Popen(*args, **kwargs)
+
+
+def kill_process_tree(proc: _sp.Popen) -> None:
+    """Kill *proc* and everything it spawned (best-effort, never raises).
+
+    Start *proc* in its own process group (``start_new_session=True`` on POSIX,
+    ``CREATE_NEW_PROCESS_GROUP`` on Windows) so the whole tree can be signalled.
+    ``uvx`` is a launcher: it runs the real ``serena`` executable as a
+    grandchild. Killing only the direct child leaves that grandchild alive and
+    reparented to PID 1, so every timed-out Serena run leaked one process that
+    never exits (#2938, the same failure mode as #615 and #880).
+    """
+    if sys.platform == "win32":
+        # Windows has no process groups to signal for an already-wedged child;
+        # ``taskkill /T`` walks the tree by parent PID instead. ``/F`` because a
+        # process blocked in a read will not act on a graceful close request.
+        try:
+            _sp.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+    # Backstop: if the tree kill above did not land, at least the direct child
+    # goes. Then reap so the parent does not leave a zombie behind, and close
+    # the capture pipes so the caller does not carry stray fds (e.g. into the
+    # agent ``headroom wrap`` is about to exec).
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
