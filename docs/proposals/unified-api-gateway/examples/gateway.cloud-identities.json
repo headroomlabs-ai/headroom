@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "runtime": {
+    "profile": "gateway",
+    "engine": "python",
+    "bind": "127.0.0.1",
+    "port": 8787,
+    "workers": 1,
+    "remote_enabled": false,
+    "stateless": false
+  },
+  "transforms": {
+    "mode": "off"
+  },
+  "privacy": {
+    "beacon": false,
+    "payload_logging": false,
+    "metrics": "local"
+  },
+  "client_auth": {
+    "required": true,
+    "principals": [
+      {
+        "id": "local-app",
+        "secret_ref": "env:HEADROOM_GATEWAY_CLIENT_TOKEN",
+        "scopes": [
+          "inference",
+          "models"
+        ],
+        "routes": [
+          "vertex-native",
+          "bedrock-native"
+        ]
+      }
+    ]
+  },
+  "credentials": [
+    {
+      "id": "vertex-work",
+      "provider": "vertex",
+      "source": {
+        "kind": "gcp-adc",
+        "project": "REPLACE_WITH_AUTHORIZED_PROJECT"
+      },
+      "refresh_owner": "sdk",
+      "allowed_origins": [
+        "https://us-central1-aiplatform.googleapis.com:443"
+      ],
+      "allowed_path_prefixes": [
+        "/v1/projects/REPLACE_WITH_AUTHORIZED_PROJECT/locations/us-central1/"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "bedrock-work",
+      "provider": "bedrock",
+      "source": {
+        "kind": "aws-chain",
+        "region": "us-east-1",
+        "profile": "REPLACE_WITH_AUTHORIZED_PROFILE"
+      },
+      "refresh_owner": "sdk",
+      "allowed_origins": [
+        "https://bedrock-runtime.us-east-1.amazonaws.com:443"
+      ],
+      "allowed_path_prefixes": [
+        "/model/"
+      ],
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "vertex-native",
+      "public_model": "REPLACE_WITH_ENABLED_VERTEX_MODEL",
+      "upstream_model": "REPLACE_WITH_ENABLED_VERTEX_MODEL",
+      "provider": "vertex",
+      "upstream_origin": "https://us-central1-aiplatform.googleapis.com:443",
+      "upstream_path_prefix": "/v1/projects/REPLACE_WITH_AUTHORIZED_PROJECT/locations/us-central1/",
+      "credentials": [
+        "vertex-work"
+      ],
+      "ingress_protocols": [
+        "vertex-generate"
+      ],
+      "native_protocols": [
+        "vertex-generate"
+      ],
+      "translation": "disabled",
+      "body_contract": "strict-native",
+      "private_network": false,
+      "retry": {
+        "max_attempts": 1,
+        "ambiguous_commit": "never",
+        "after_output": "never"
+      },
+      "billing": {
+        "allow_paid_fallback": false
+      },
+      "enabled": true,
+      "catalog": {
+        "source": "configured",
+        "entitlements": {
+          "vertex-work": "allowed"
+        }
+      },
+      "capabilities": {
+        "vertex-generate": {
+          "http-json": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          },
+          "http-stream": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "bedrock-native",
+      "public_model": "REPLACE_WITH_ENABLED_BEDROCK_MODEL",
+      "upstream_model": "REPLACE_WITH_ENABLED_BEDROCK_MODEL",
+      "provider": "bedrock",
+      "upstream_origin": "https://bedrock-runtime.us-east-1.amazonaws.com:443",
+      "upstream_path_prefix": "/model/",
+      "credentials": [
+        "bedrock-work"
+      ],
+      "ingress_protocols": [
+        "bedrock-invoke"
+      ],
+      "native_protocols": [
+        "bedrock-invoke"
+      ],
+      "translation": "disabled",
+      "body_contract": "strict-native",
+      "private_network": false,
+      "retry": {
+        "max_attempts": 1,
+        "ambiguous_commit": "never",
+        "after_output": "never"
+      },
+      "billing": {
+        "allow_paid_fallback": false
+      },
+      "enabled": true,
+      "catalog": {
+        "source": "configured",
+        "entitlements": {
+          "bedrock-work": "allowed"
+        }
+      },
+      "capabilities": {
+        "bedrock-invoke": {
+          "http-json": {
+            "operations": [
+              "generate"
+            ],
+            "features": [
+              "text",
+              "tools",
+              "parallel_tools",
+              "inline_images",
+              "structured_output",
+              "signed_state"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "admission": {
+    "max_concurrency": 128,
+    "queue_limit": 128,
+    "queue_timeout_seconds": 0,
+    "budget_usd": null,
+    "budget_period": "process",
+    "unknown_cost_policy": "allow"
+  },
+  "limits": {
+    "request_deadline_seconds": 120
+  }
+}
