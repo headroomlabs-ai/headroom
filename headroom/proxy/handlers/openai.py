@@ -537,6 +537,18 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     return normalized
 
 
+def _is_deepseek_request(request_headers: dict[str, str], model: str | None) -> bool:
+    """Return True when a chat-completions request belongs to DeepSeek Harness.
+
+    dsh sends ``x-deepseek-harness-user-id`` on every provider request after
+    credential resolution; the ``deepseek-*`` model prefix is a fallback for
+    non-harness clients targeting DeepSeek models.
+    """
+    if _header_get(request_headers, "x-deepseek-harness-user-id") is not None:
+        return True
+    return isinstance(model, str) and model.startswith("deepseek-")
+
+
 def _reject_unsafe_openai_override(raw_base_url: str) -> NoReturn:
     """Refuse an ``x-headroom-base-url`` that resolves to a non-public address.
 
@@ -2394,15 +2406,16 @@ class OpenAIHandlerMixin:
         """Return True when inbound headers request full passthrough."""
         return _headroom_bypass_enabled(headers)
 
-    def _resolve_openai_upstream(self, request: Request) -> str:
-        """Return the OpenAI upstream base URL for ``request``.
+    def _resolve_openai_upstream(self, request: Request, model: str | None = None) -> str:
+        """Return the upstream base URL for ``request``.
 
         Honors the ``x-headroom-base-url`` request header so OpenAI-compatible
         gateways (LiteLLM, CPA, self-hosted vLLM, Azure OpenAI) route through
         the dedicated ``/v1/chat/completions`` and ``/v1/responses`` handlers,
         not just the generic passthrough route that already honors it.
 
-        When the header is absent, official Grok CLI requests (identified by
+        When the header is absent, DeepSeek Harness headers or DeepSeek models
+        select the configured DeepSeek upstream. Official Grok CLI requests (identified by
         ``x-xai-token-auth`` / Grok UA tokens) route to ``api.x.ai`` so a
         shared proxy started for Claude/Codex does not forward Grok session
         tokens to ``api.openai.com`` — but only while ``OPENAI_API_URL`` is
@@ -2410,9 +2423,13 @@ class OpenAIHandlerMixin:
         Otherwise falls back to the configured ``OPENAI_API_URL``
         (``OPENAI_TARGET_API_URL``).
         """
-        return self._openai_upstream_from(request, _resolve_openai_upstream_base(request.headers))
+        return self._openai_upstream_from(
+            request, _resolve_openai_upstream_base(request.headers), model
+        )
 
-    def _openai_upstream_from(self, request: Request, custom: str | None) -> str:
+    def _openai_upstream_from(
+        self, request: Request, custom: str | None, model: str | None = None
+    ) -> str:
         """Pick the upstream given this request's already-resolved override.
 
         Handlers resolve ``x-headroom-base-url`` once and pass that one result
@@ -2422,6 +2439,8 @@ class OpenAIHandlerMixin:
         """
         if custom is not None:
             return custom
+        if _is_deepseek_request(request.headers, model):
+            return self.DEEPSEEK_API_URL
         if route_grok_to_xai(request.headers, self.OPENAI_API_URL):
             return XAI_API_URL
         return self.OPENAI_API_URL
@@ -3681,7 +3700,7 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         custom_upstream_base_url = await _resolve_openai_upstream_base_async(request.headers)
-        upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
+        upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url, model)
         # Ghost text and next edits: CAPI does not serve these models. A
         # caller-chosen x-headroom-base-url is left alone, as in
         # select_passthrough_base_url.
@@ -6471,7 +6490,9 @@ class OpenAIHandlerMixin:
         # below sends the request to chatgpt.com.
         custom_upstream_base_url = await _resolve_openai_upstream_base_async(request.headers)
         upstream_base_url = custom_upstream_base_url
-        openai_upstream_base_url = self._openai_upstream_from(request, custom_upstream_base_url)
+        openai_upstream_base_url = self._openai_upstream_from(
+            request, custom_upstream_base_url, model
+        )
         headers = merge_extra_headers(
             headers,
             self._openai_extra_headers_for_upstream(openai_upstream_base_url),
