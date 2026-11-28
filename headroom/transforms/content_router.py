@@ -1310,6 +1310,86 @@ _DEFAULT_DETECT_TIMEOUT_SECS = 5.0
 # page from a fenced example embedded in prose.
 _TOP_LEVEL_HTML_DOCUMENT = re.compile(r"^\s*(?:<!doctype\s+html|<html[\s>])", re.IGNORECASE)
 
+# A bare ``git diff`` tool result, checked line by line against the shape the
+# native DiffCompressor parses. The diff detector fires on a single header
+# anywhere in the sample, so a prose answer with a fenced diff also reads as
+# GIT_DIFF; anything outside this shape keeps the content on MIXED.
+#
+# ``git status --short``, ``git diff --stat`` and ``git log -p`` header lines
+# are accepted only before the first ``diff --git`` header, where DiffCompressor
+# keeps them verbatim. After a header it reads every line up to the next header
+# as hunk content and trims unchanged lines, so a second commit's header, a
+# trailing stat summary or a closing tool-envelope tag would be dropped.
+_DIFF_PREAMBLE_LINE = re.compile(
+    r"\s*$"
+    r"| "
+    r"|commit [0-9a-f]{7,}"
+    r"|(?:Author|AuthorDate|Commit|CommitDate|Date|Merge):"
+    r"|[MADRCUT?!][ MADRCUT?!] \S"
+)
+_DIFF_GIT_HEADER = re.compile(r"diff --git a/.+ b/.+$")
+# File-header records DiffCompressor re-emits. ``old mode``/``new mode`` and a
+# non-regular ``new file mode`` (executable bit) have no representation there,
+# so a diff carrying them stays on MIXED.
+_DIFF_FILE_HEADER_LINE = re.compile(
+    r"index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?$"
+    r"|(?:new|deleted) file mode 100644$"
+    r"|(?:dis)?similarity index \d+%$"
+    r"|(?:rename|copy) (?:from|to) \S"
+    r"|Binary files .+ differ$"
+    r"|--- (?:a/.+|/dev/null)$"
+    r"|\+\+\+ (?:b/.+|/dev/null)$"
+)
+_DIFF_HUNK_HEADER = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
+def _is_bare_diff_document(document: str) -> bool:
+    """True when ``document`` is a ``git diff`` whose hunks match their headers.
+
+    Every line after the first ``diff --git`` header must be a file-header
+    record, a hunk header, or a hunk line counted against the old/new line
+    counts its hunk header declares. A line past the end of a hunk that does
+    not start the next hunk or file is not diff content.
+    """
+    seen_header = False
+    in_file_header = False
+    old_left = new_left = 0
+    for line in document.removesuffix("\n").split("\n"):
+        if old_left or new_left:
+            if line.startswith(" ") or not line:
+                if not (old_left and new_left):
+                    return False
+                old_left -= 1
+                new_left -= 1
+            elif line.startswith("-") and old_left:
+                old_left -= 1
+            elif line.startswith("+") and new_left:
+                new_left -= 1
+            elif not line.startswith("\\"):
+                return False
+            continue
+        if _DIFF_GIT_HEADER.match(line):
+            seen_header = True
+            in_file_header = True
+            continue
+        if not seen_header:
+            if not _DIFF_PREAMBLE_LINE.match(line):
+                return False
+            continue
+        hunk = _DIFF_HUNK_HEADER.match(line)
+        if hunk:
+            in_file_header = False
+            old_left = 1 if hunk.group(1) is None else int(hunk.group(1))
+            new_left = 1 if hunk.group(2) is None else int(hunk.group(2))
+            continue
+        if in_file_header and _DIFF_FILE_HEADER_LINE.match(line):
+            continue
+        # ``\ No newline at end of file`` follows the hunk's last line.
+        if not in_file_header and line.startswith("\\"):
+            continue
+        return False
+    return seen_header and not (old_left or new_left)
+
 
 def _detect_timeout_secs() -> float:
     """Watchdog budget (seconds) for one native detect call.
@@ -3696,6 +3776,19 @@ class ContentRouter(Transform):
                 # the fence lines. Keep that shape on MIXED.
                 document = _strip_detection_envelope(content)
                 if _TOP_LEVEL_HTML_DOCUMENT.match(document):
+                    return self._strategy_from_detection(detection)
+                return CompressionStrategy.MIXED
+            # Same false positive on a unified diff: changed PHP/JS lines start
+            # with ``[``/``{`` and comments read as prose, so a plain
+            # ``git diff`` result trips both signals. MIXED then splits the
+            # hunks into text sections, rejoins them with blank lines inside
+            # hunks, and can hand changed lines to lossy ML compression (#5050).
+            # Only a result made entirely of diff lines gets the override; a
+            # diff embedded in prose, multi-commit ``git log -p`` output, or a
+            # diff inside a tool-output envelope (DiffCompressor would read the
+            # closing tag as hunk context) stays on MIXED.
+            if detection.content_type == ContentType.GIT_DIFF:
+                if _is_bare_diff_document(content):
                     return self._strategy_from_detection(detection)
                 return CompressionStrategy.MIXED
             return CompressionStrategy.MIXED

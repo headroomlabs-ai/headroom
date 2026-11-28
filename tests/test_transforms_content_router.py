@@ -1404,6 +1404,260 @@ def test_html_strategy_without_extractor_passes_through(
     assert result.compressed == MIXED_HTML_PRODUCT_PAGE
 
 
+# ``git status --short && git diff --stat && git diff`` on PHP/JS (#5050):
+# array/brace lines trip ``has_json_blocks`` and comments trip ``has_prose``.
+MIXED_GIT_DIFF = """\
+ M src/Form/SignupType.php
+ M src/Resources/public/js/signup.js
+ M src/Resources/translations/messages.en.xlf
+ src/Form/SignupType.php                    | 12 ++++++++----
+ src/Resources/public/js/signup.js          |  4 ++++
+ src/Resources/translations/messages.en.xlf |  6 ++++++
+ 3 files changed, 18 insertions(+), 4 deletions(-)
+diff --git a/src/Form/SignupType.php b/src/Form/SignupType.php
+index 1111111..2222222 100644
+--- a/src/Form/SignupType.php
++++ b/src/Form/SignupType.php
+@@ -18,10 +18,14 @@ use Symfony\\Component\\Validator\\Constraints\\Regex;
+ class SignupType extends AbstractType
+ {
+     private function addPhoneFields(FormBuilderInterface $builder, array $options): void
+     {
+-        $builder->add('phone', 'text', [
+-            'required' => true,
+-            'max_length' => 9,
+-        ]);
++        $phoneOptions = [
++            'required' => true,
++            'attr' => [
++                'pattern' => self::PHONE_PATTERN,
++            ],
++        ];
++        $builder->add('phone', 'text', $phoneOptions + ['label' => 'signup.label.phone']);
++        $builder->add('phoneConfirm', 'text', $phoneOptions);
+     }
+ }
+diff --git a/src/Resources/public/js/signup.js b/src/Resources/public/js/signup.js
+index 3333333..4444444 100644
+--- a/src/Resources/public/js/signup.js
++++ b/src/Resources/public/js/signup.js
+@@ -54,4 +54,8 @@
+       var rawStep = $trigger.data('targetStep');
+       var validatedStep = Math.max(1, Math.min(Number(rawStep), this.$steps.length));
++      // Moving forward is blocked until the phone fields of the current step are valid.
++      if (validatedStep > this._getActiveStep().data('step') && !this._validateActiveStep()) {
++        return;
++      }
+       this._handleStep(validatedStep, $trigger.data('targetInput'));
+     },
+diff --git a/src/Resources/translations/messages.en.xlf b/src/Resources/translations/messages.en.xlf
+index 5555555..6666666 100644
+--- a/src/Resources/translations/messages.en.xlf
++++ b/src/Resources/translations/messages.en.xlf
+@@ -7298,4 +7298,10 @@
+         <target>Make a new payment</target>
+       </trans-unit>
++      <trans-unit id="LPW92ab" resname="signup.phone.paste_error">
++        <target>Pasting is not allowed. Please enter the phone number manually.</target>
++      </trans-unit>
++      <trans-unit id="BGzyiiW" resname="signup.phone.confirm_hint">
++        <target>Enter the same phone number again so that we can be sure it is correct.</target>
++      </trans-unit>
+     </body>
+   </file>
+"""
+
+FENCED_GIT_DIFF_IN_PROSE = f"""Here is the change I made to the signup form for the phone fields.
+The old field had no format check, so the new options add a pattern.
+Moving forward in the wizard is also blocked until the fields are valid.
+
+```diff
+{MIXED_GIT_DIFF}```
+
+Run the form tests again before you merge this branch.
+The translation keys still need a matching entry in the French file.
+"""
+
+
+def test_mixed_git_diff_routes_to_diff() -> None:
+    """A unified diff the detector calls GIT_DIFF must reach DiffCompressor (#5050).
+
+    Both signals come from the real heuristic and the pure-Python detector, so
+    the shape that tripped MIXED in the issue is the one under test.
+    """
+    from headroom.transforms.content_detector import detect_content_type
+
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(MIXED_GIT_DIFF) is True
+    detection = detect_content_type(MIXED_GIT_DIFF)
+    assert detection.content_type is ContentType.GIT_DIFF
+
+    strategy = router._determine_strategy(MIXED_GIT_DIFF, mixed=True, detection=detection)
+    assert strategy is CompressionStrategy.DIFF
+
+
+def _force_git_diff_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(ContentType.GIT_DIFF, 1.0, {}),
+    )
+
+
+def test_mixed_git_diff_keeps_hunk_lines_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The MIXED path rejoined hunk sections with blank lines and could send
+    changed lines to lossy ML; on DIFF every ``+``/``-`` line survives as-is."""
+    _force_git_diff_detection(monkeypatch)
+
+    result = ContentRouter(ContentRouterConfig()).compress(MIXED_GIT_DIFF)
+
+    assert result.strategy_used is CompressionStrategy.DIFF
+    out_lines = result.compressed.split("\n")
+    for line in MIXED_GIT_DIFF.split("\n"):
+        if line.startswith(("+", "-")):
+            assert line in out_lines
+    assert "class SignupType extends AbstractType\n {\n" in result.compressed
+
+
+def test_mixed_git_diff_through_diff_compressor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With lossless folding off the diff reaches DiffCompressor itself: the
+    status/stat preamble and every changed line survive, and no blank line is
+    inserted inside a hunk."""
+    monkeypatch.setenv("HEADROOM_LOSSLESS_COMPACTION", "0")
+    _force_git_diff_detection(monkeypatch)
+
+    result = ContentRouter(ContentRouterConfig()).compress(MIXED_GIT_DIFF)
+
+    assert result.strategy_used is CompressionStrategy.DIFF
+    assert result.compressed.startswith(MIXED_GIT_DIFF.split("diff --git", 1)[0])
+    out_lines = result.compressed.split("\n")
+    for line in MIXED_GIT_DIFF.split("\n"):
+        if line.startswith(("+", "-")):
+            assert line in out_lines
+    assert "" not in out_lines
+
+
+_MIXED_GIT_DIFF_NO_INDEX = "\n".join(
+    line for line in MIXED_GIT_DIFF.split("\n") if not line.startswith("index ")
+)
+
+
+@pytest.mark.parametrize(
+    ("content", "must_keep"),
+    [
+        (
+            f"<returncode>0</returncode>\n<output>\n{_MIXED_GIT_DIFF_NO_INDEX}</output>",
+            ["</output>"],
+        ),
+        (
+            _MIXED_GIT_DIFF_NO_INDEX + "\n    Run the integration tests before merging.\n"
+            "    This is important for all reviewers.\n",
+            ["Run the integration tests before merging.", "This is important for all reviewers."],
+        ),
+        (
+            # ``git diff && git diff --stat``: the stat summary follows the patch.
+            _MIXED_GIT_DIFF_NO_INDEX.split("\n", 7)[7] + "\n".join(MIXED_GIT_DIFF.split("\n")[3:7]),
+            MIXED_GIT_DIFF.split("\n")[3:7],
+        ),
+        (
+            _MIXED_GIT_DIFF_NO_INDEX.replace(
+                "b/src/Resources/public/js/signup.js\n",
+                "b/src/Resources/public/js/signup.js\nold mode 100644\nnew mode 100755\n",
+            ),
+            ["old mode 100644", "new mode 100755"],
+        ),
+    ],
+    ids=["tool_envelope", "trailing_prose", "trailing_stat", "mode_change"],
+)
+def test_mixed_git_diff_outside_hunks_stays_mixed(
+    monkeypatch: pytest.MonkeyPatch, content: str, must_keep: list[str]
+) -> None:
+    """DiffCompressor reads every line after a hunk as hunk context and trims
+    it, and has no record for ``old mode``/``new mode``. Content outside the
+    hunks the headers declare keeps the MIXED route and survives compression
+    when lossless folding does not run."""
+    monkeypatch.setenv("HEADROOM_LOSSLESS_COMPACTION", "0")
+    _force_git_diff_detection(monkeypatch)
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(content) is True
+    detection = DetectionResult(ContentType.GIT_DIFF, 1.0, {})
+    assert router._determine_strategy(content, mixed=True, detection=detection) is (
+        CompressionStrategy.MIXED
+    )
+
+    result = router.compress(content)
+    for text in must_keep:
+        assert text in result.compressed
+
+
+def _git_log_patch_entry(sha_digit: str, subject: str) -> str:
+    return (
+        f"commit {sha_digit * 40}\n"
+        "Author: Dev <dev@example.com>\n"
+        "Date:   Tue Nov 25 18:00:00 2026 +0000\n"
+        "\n"
+        f"    {subject}\n"
+        "\n"
+        f"{MIXED_GIT_DIFF.split(chr(10), 7)[7]}"
+    )
+
+
+def test_single_commit_git_log_patch_routes_to_diff() -> None:
+    """``git log -p -1``: the commit header precedes the first diff header,
+    where DiffCompressor keeps it verbatim, so the override still applies."""
+    from headroom.transforms.content_detector import detect_content_type
+
+    content = _git_log_patch_entry("1", "[skip ci] Keeps the translation keys in sync.")
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(content) is True
+    detection = detect_content_type(content)
+    assert detection.content_type is ContentType.GIT_DIFF
+
+    strategy = router._determine_strategy(content, mixed=True, detection=detection)
+    assert strategy is CompressionStrategy.DIFF
+
+
+def test_multi_commit_git_log_patch_stays_mixed() -> None:
+    """In ``git log -p`` output a later commit's header sits after a diff
+    header, where DiffCompressor would read it as hunk context and drop it."""
+    from headroom.transforms.content_detector import detect_content_type
+
+    content = _git_log_patch_entry("1", "Validate phone fields.") + _git_log_patch_entry(
+        "2", "[skip ci] Keeps the translation keys in sync."
+    )
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(content) is True
+    detection = detect_content_type(content)
+    assert detection.content_type is ContentType.GIT_DIFF
+
+    strategy = router._determine_strategy(content, mixed=True, detection=detection)
+    assert strategy is CompressionStrategy.MIXED
+
+    result = router.compress(content)
+    assert f"commit {'1' * 40}" in result.compressed
+    assert f"commit {'2' * 40}" in result.compressed
+    assert "[skip ci] Keeps the translation keys in sync." in result.compressed
+
+
+def test_fenced_git_diff_in_prose_stays_mixed() -> None:
+    """A diff fenced inside a prose answer also reads as GIT_DIFF, but sending
+    the whole answer to DiffCompressor would treat the prose as diff text."""
+    from headroom.transforms.content_detector import detect_content_type
+
+    router = ContentRouter(ContentRouterConfig())
+
+    assert is_mixed_content(FENCED_GIT_DIFF_IN_PROSE) is True
+    detection = detect_content_type(FENCED_GIT_DIFF_IN_PROSE)
+    assert detection.content_type is ContentType.GIT_DIFF
+
+    strategy = router._determine_strategy(FENCED_GIT_DIFF_IN_PROSE, mixed=True, detection=detection)
+    assert strategy is CompressionStrategy.MIXED
+
+
 def test_source_code_passthrough_does_not_invoke_kompress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
