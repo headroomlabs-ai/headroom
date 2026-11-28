@@ -85,3 +85,90 @@ class SessionCcrTracker:
 
         with self._lock:
             self._sessions.clear()
+
+
+class SessionExpansionDedupTracker:
+    """Bounded LRU tracker for per-session CCR proactive-expansion dedup.
+
+    Prevents the same compressed-content hash from being proactively
+    re-injected more than once per session (#2186): a same-messages
+    re-request or a continued conversation must not receive duplicate
+    expansion blocks for content the agent already saw this session.
+    Dedup is per-session, not global — a different conversation may
+    legitimately need the same expansion.
+    """
+
+    def __init__(self, max_sessions: int) -> None:
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be > 0")
+        self._max_sessions = max_sessions
+        self._lock = threading.RLock()
+        self._sessions: OrderedDict[str, set[str]] = OrderedDict()
+
+    def claim(self, session_id: str, hash_keys: list[str]) -> list[str]:
+        """Atomically reserve and return the hash_keys still eligible here.
+
+        Selection and recording happen under ONE lock hold: a claimed hash
+        is invisible to every other request for this session the moment it
+        is handed out. A check-then-act split (select under the lock, record
+        after the append) lets two concurrent turns of the same session — a
+        normal path for shared-session agents — both select the same hash
+        and both append it, which is the duplicate this tracker exists to
+        prevent.
+
+        The claim IS the commit; there is no separate commit call. A caller
+        that ends up not appending MUST hand the hashes back via
+        :meth:`release`, otherwise they stay reserved for the session's
+        lifetime. Failing closed that way is deliberate: a dropped release
+        costs one missed optimization, a dropped claim costs a permanent
+        per-turn token tax (#2186).
+
+        Claiming counts as a use: an active session that keeps being
+        *asked* about without reserving anything new must not age out
+        behind other sessions, or its already-seen hashes come back and get
+        proactively expanded a second time.
+        """
+
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        with self._lock:
+            seen = self._sessions.get(session_id)
+            if seen is None:
+                if not hash_keys:
+                    return []
+                seen = set()
+                self._sessions[session_id] = seen
+            claimed = [h for h in hash_keys if h not in seen]
+            seen.update(claimed)
+            self._sessions.move_to_end(session_id)
+            while len(self._sessions) > self._max_sessions:
+                self._sessions.popitem(last=False)
+            return claimed
+
+    def release(self, session_id: str, hash_keys: list[str]) -> None:
+        """Hand claimed hash_keys back to the eligible pool.
+
+        For every path that claims before knowing whether the append will
+        happen: expansion execution returning nothing or a subset,
+        cache-mode gating, the already-forwarded target guard, an
+        ineligible tail. Only pass hashes THIS request received from
+        :meth:`claim` — releasing another request's claim re-opens the
+        duplicate window.
+        """
+
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        if not hash_keys:
+            return
+        with self._lock:
+            seen = self._sessions.get(session_id)
+            if seen is None:
+                return
+            seen.difference_update(hash_keys)
+            self._sessions.move_to_end(session_id)
+
+    def reset(self) -> None:
+        """Clear all session state."""
+
+        with self._lock:
+            self._sessions.clear()

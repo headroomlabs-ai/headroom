@@ -95,6 +95,13 @@ class CompressedContext:
     query_context: str  # The query/context when compression happened
     sample_content: str  # Preview of what was compressed (for relevance matching)
     workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
+    # Every conversation that has tracked this content (see analyze_query).
+    # A SET, not one id: `_contexts` is keyed by content hash alone, so two
+    # sessions compressing identical content land on the same entry. Storing
+    # a single id let the second session's re-track overwrite the first's,
+    # and session A then lost eligibility for a context it still owned.
+    # Empty = legacy/no-session tracking, scoped by workspace only.
+    session_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -174,6 +181,7 @@ class ContextTracker:
         compressed_count: int,
         *,
         workspace_key: str,
+        session_id: str | None = None,
         query_context: str = "",
         sample_content: str = "",
     ) -> None:
@@ -203,6 +211,15 @@ class ContextTracker:
             )
             return
 
+        # Content-addressed entry: a re-track of the same hash from another
+        # session ADDS that session as an owner instead of replacing the
+        # previous one. Overwriting evicted the first session's ownership and
+        # cost it eligibility for content it still held.
+        previous = self._contexts.get(hash_key)
+        session_ids = previous.session_ids if previous else frozenset()
+        if session_id is not None:
+            session_ids = session_ids | {session_id}
+
         context = CompressedContext(
             hash_key=hash_key,
             turn_number=turn_number,
@@ -213,10 +230,11 @@ class ContextTracker:
             query_context=query_context,
             sample_content=sample_content[:2000],  # Limit sample size
             workspace_key=workspace_key,
+            session_ids=session_ids,
         )
 
         # Add or update context
-        if hash_key in self._contexts:
+        if previous is not None:
             self._turn_order.remove(hash_key)
         self._contexts[hash_key] = context
         self._turn_order.append(hash_key)
@@ -239,6 +257,7 @@ class ContextTracker:
         current_turn: int | None = None,
         *,
         workspace_key: str,
+        session_id: str | None = None,
         present_hashes: Collection[str] | None = None,
     ) -> list[ExpansionRecommendation]:
         """Analyze a query to find relevant compressed contexts.
@@ -263,7 +282,9 @@ class ContextTracker:
                 (#1174). ``None`` skips this filter.
 
         Returns:
-            List of expansion recommendations, sorted by relevance.
+            List of expansion recommendations, sorted by relevance. Only
+            contexts with tool provenance (``tool_name`` set) are eligible;
+            compressed instruction/system text is never proactively expanded.
         """
         if not self.config.enabled or not self.config.proactive_expansion:
             return []
@@ -294,6 +315,37 @@ class ContextTracker:
             if context.workspace_key != workspace_key:
                 continue
             if present_hashes is not None and hash_key not in present_hashes:
+                continue
+
+            # Session filter (#2186): a NEW session (e.g. started after
+            # Claude Code's /compact) must not have old compressed content
+            # surfaced back into it — the whole point of compacting was to
+            # drop it. Only enforced when both sides have concrete ids;
+            # legacy/no-session callers keep workspace-only scoping.
+            # Membership, not equality: a hash tracked by several sessions
+            # stays eligible for every one of them (same-content parallel
+            # sessions must not evict each other).
+            if (
+                session_id is not None
+                and context.session_ids
+                and session_id not in context.session_ids
+            ):
+                continue
+
+            # Tool-provenance filter. Proactive expansion exists to restore
+            # *tool ground truth* the compressor summarized away. Entries with
+            # no tool provenance are compressed instruction/system text (agent
+            # rules, injected reminders): the model already holds them in
+            # compressed form together with a retrieval marker, so re-injecting
+            # the full original buys nothing and costs the whole original.
+            #
+            # It is also strictly loss-making. Expansion *appends* the original
+            # while the compressed copy stays in the prefix, so the request
+            # carries both. On instruction text — which compresses poorly
+            # (~18% observed) — that lands well above the uncompressed
+            # baseline for the same content, and the append is replayed to the
+            # provider on every later turn of the conversation.
+            if context.tool_name is None:
                 continue
 
             # Check age

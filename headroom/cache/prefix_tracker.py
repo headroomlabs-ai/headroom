@@ -941,6 +941,57 @@ def _breakpoint_index(
     return relation.stable_prefix_blocks - 1
 
 
+def position_already_forwarded(
+    messages: list[dict[str, Any]],
+    index: int,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> bool:
+    """True when ``messages[index]`` already carries the bytes forwarded at
+    that same position last turn.
+
+    Asked of a POST-overlay message list (every caller runs after
+    ``overlay_cached_prefix``), this answers "did the overlay replay last
+    turn's cached bytes into this exact position" without re-deriving the
+    overlay's trigger conditions — it inspects the bytes the overlay actually
+    produced, so it stays correct for both replay shapes:
+
+    * leading-run replay — the position IS ``previous_forwarded[index]``;
+    * block-append merge — the position's content STARTS WITH last turn's
+      forwarded blocks, with this turn's new blocks appended after them.
+
+    Callers use it as an injection guard: appending to such a position adds a
+    second copy of whatever was injected there last turn, and changes bytes
+    the provider already hashed, busting the prefix cache from that point
+    (#2186).
+
+    Deliberately conservative in one direction: a position whose bytes happen
+    to equal last turn's forwarded bytes without the overlay having replayed
+    them (a diverged head with a coincidentally identical message at the same
+    index) also reports True. Appending there is then merely skipped, which
+    is the same safe direction every caller already takes.
+    """
+    prev_fwd = previous_forwarded_messages
+    if not prev_fwd or index < 0 or index >= len(prev_fwd) or index >= len(messages):
+        return False
+    current = messages[index]
+    previous = prev_fwd[index]
+    if not isinstance(current, dict) or not isinstance(previous, dict):
+        return False
+    if _canonicalize_for_prefix_compare(current) == _canonicalize_for_prefix_compare(previous):
+        return True
+    current_content = current.get("content")
+    previous_content = previous.get("content")
+    if not isinstance(current_content, list) or not isinstance(previous_content, list):
+        return False
+    if len(current_content) < len(previous_content):
+        return False
+    split = len(previous_content)
+    return bool(
+        _canonicalize_for_prefix_compare(current_content[:split])
+        == _canonicalize_for_prefix_compare(previous_content)
+    )
+
+
 def _client_marker_positions(
     client_messages: list[dict[str, Any]],
 ) -> list[tuple[int, int, dict[str, Any]]]:
