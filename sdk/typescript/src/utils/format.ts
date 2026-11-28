@@ -782,18 +782,26 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
 // private `mime_type` key so the reverse conversion can rebuild the complete
 // { mimeType, fileUri } that @google/generative-ai requires; the proxy passes non-text
 // parts through unchanged, so the key survives /v1/compress.
-function geminiMediaImageUrl(part: any): { url: string; mime_type?: string } | null {
+function geminiMediaImageUrl(part: any): { url: string; mime_type?: string; display_name?: string } | null {
   const blob = part.inlineData;
   if (blob && typeof blob === "object" && blob.mimeType && blob.data) {
-    return { url: `data:${blob.mimeType};base64,${blob.data}` };
+    return withDisplayName({ url: `data:${blob.mimeType};base64,${blob.data}` }, blob);
   }
   const file = part.fileData;
   if (file && typeof file === "object" && typeof file.fileUri === "string") {
-    return typeof file.mimeType === "string"
-      ? { url: file.fileUri, mime_type: file.mimeType }
-      : { url: file.fileUri };
+    return withDisplayName(
+      typeof file.mimeType === "string" ? { url: file.fileUri, mime_type: file.mimeType } : { url: file.fileUri },
+      file,
+    );
   }
   return null;
+}
+
+// A Blob / FileData `displayName` is the name the model refers to the file by. It rides on the
+// private `display_name` key next to `mime_type` and goes back inside the rebuilt media object.
+function withDisplayName<T extends object>(imageUrl: T, media: any): T {
+  if (typeof media.displayName === "string") (imageUrl as any).display_name = media.displayName;
+  return imageUrl;
 }
 
 const MIME_BY_EXTENSION: Record<string, string> = {
@@ -805,34 +813,44 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   pdf: "application/pdf",
 };
 
-// Private key carrying the Gemini part fields that have no OpenAI counterpart: `thought`,
-// `thoughtSignature` and the provider-assigned `functionCall.id` / `functionResponse.id`.
-// It rides on the OpenAI message, the content block or the tool call, exactly where the part
-// that owned it lands — the proxy copies messages and content blocks with their extra keys
-// and never rewrites tool calls, so the values come back from /v1/compress as they went in.
-// Restoring them matters: Gemini 3 answers a function-call turn whose first functionCall lost
-// its `thoughtSignature` with a 400 (issue #4770).
+// Private key carrying what the OpenAI shape has no slot for. It rides on the OpenAI message,
+// the content block or the tool call, exactly where the part that owned it lands — the proxy
+// copies messages and content blocks with their extra keys and never rewrites tool calls, so
+// the values come back from /v1/compress as they went in. The bag holds:
+//   part      every field of the part beside its data field (`thought`, `thoughtSignature`,
+//             `videoMetadata`, `mediaProcessing`, `partMetadata`, ...)
+//   call      every field of a functionCall / functionResponse the tool call or tool message
+//             cannot hold (`id`, a response's `name`, `parts`, `willContinue`, `scheduling`, ...)
+//   position  on a tool call: how many content parts preceded the functionCall in its turn
+//   sameTurn  on a message: it continues the Gemini turn of the message before it
+// Gemini's own field names live only under `part` and `call`, so they cannot collide with the
+// two keys the converter adds.
+// Restoring all of it matters: Gemini 3 answers a function-call turn whose first functionCall
+// lost its `thoughtSignature` with a 400 (issue #4770), and a turn has to come back as one
+// turn with its parts in the order they were sent.
 const GEMINI_EXTRAS_KEY = "_headroomGemini";
 
+// The part kinds the converter translates. A part of any other kind — executableCode,
+// codeExecutionResult, a server-side toolCall / toolResponse, or one added after this was
+// written — rides verbatim on a `gemini_part` block, which the proxy passes through.
+const TRANSLATED_PART_KINDS = new Set(["text", "inlineData", "fileData", "functionCall", "functionResponse"]);
+
 function geminiPartExtras(part: any): Record<string, any> | undefined {
-  const extras: Record<string, any> = {};
-  if (part.thought === true) extras.thought = true;
-  if (part.thoughtSignature !== undefined) extras.thoughtSignature = part.thoughtSignature;
-  return Object.keys(extras).length > 0 ? extras : undefined;
+  const rest = definedEntries(part, (key) => !TRANSLATED_PART_KINDS.has(key));
+  return rest ? { part: rest } : undefined;
 }
 
-// A functionCall carries its provider-assigned id; a functionResponse carries the id it
-// answers plus the name Gemini needs to rebuild the part (the id replaces the name in
-// `tool_call_id`, so the name has to ride along separately).
-function geminiIdExtras(call: any): Record<string, any> | undefined {
-  return call.id !== undefined ? { id: call.id } : undefined;
+// The fields of a functionCall (beside `name` / `args`) or functionResponse (beside `response`)
+// with no OpenAI slot. The response's `name` is among them: its id replaces it in `tool_call_id`.
+function geminiCallExtras(call: any, translated: string[]): Record<string, any> | undefined {
+  const rest = definedEntries(call, (key) => !translated.includes(key));
+  return rest ? { call: rest } : undefined;
 }
 
-function geminiResponseExtras(call: any): Record<string, any> | undefined {
-  const extras: Record<string, any> = {};
-  if (call.id !== undefined) extras.id = call.id;
-  if (call.name !== undefined) extras.name = call.name;
-  return Object.keys(extras).length > 0 ? extras : undefined;
+function definedEntries(source: any, keep: (key: string) => boolean): Record<string, any> | undefined {
+  const out: Record<string, any> = {};
+  for (const [key, value] of Object.entries(source)) if (keep(key) && value !== undefined) out[key] = value;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function withGeminiExtras<T extends object>(target: T, extras: Record<string, any> | undefined): T {
@@ -840,9 +858,16 @@ function withGeminiExtras<T extends object>(target: T, extras: Record<string, an
   return target;
 }
 
-function geminiExtras(source: any): Record<string, any> {
-  const extras = source?.[GEMINI_EXTRAS_KEY];
-  return extras && typeof extras === "object" ? extras : {};
+// The carried bag, with `part` and `call` always present.
+function geminiExtras(source: any): {
+  part: Record<string, any>;
+  call: Record<string, any>;
+  position?: number;
+  sameTurn?: boolean;
+} {
+  const record = (value: any) => (value && typeof value === "object" ? value : {});
+  const bag = record(source?.[GEMINI_EXTRAS_KEY]);
+  return { ...bag, part: record(bag.part), call: record(bag.call) };
 }
 
 // Merge the extra bags of one source part, dropping the entry entirely when empty so plain
@@ -852,29 +877,47 @@ function mergeGeminiExtras(...parts: (Record<string, any> | undefined)[]): Recor
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-// Rebuild one Gemini part from an OpenAI text/image block that may carry the extras above.
-function geminiPartFromBlock(block: any): any {
-  const extras = geminiExtras(block);
-  return withGeminiPartExtras(
-    block.type === "image_url" ? geminiMediaPart(block.image_url) : { text: block.text },
-    extras,
-  );
+// One OpenAI content block per Gemini part, or null for a functionCall / functionResponse
+// (those become a tool call and a tool message).
+function geminiPartToBlock(p: any): any | null {
+  if (p.functionCall || p.functionResponse) return null;
+  if (p.text !== undefined) return withGeminiExtras({ type: "text" as const, text: p.text }, geminiPartExtras(p));
+  const imageUrl = geminiMediaImageUrl(p);
+  if (imageUrl) return withGeminiExtras({ type: "image_url" as const, image_url: imageUrl }, geminiPartExtras(p));
+  return { type: "gemini_part" as const, part: p };
 }
 
-function withGeminiPartExtras(part: any, extras: Record<string, any>): any {
-  if (extras.thought === true) part.thought = true;
-  if (extras.thoughtSignature !== undefined) part.thoughtSignature = extras.thoughtSignature;
-  return part;
+// Text-only blocks collapse to one joined string, as they always did. A turn with media, a
+// carried part or a block-level extra keeps one block per part: joining would drop them. So
+// does a turn that goes out as several messages (`splitTurn`): its text parts are separate
+// parts of a larger turn, and a joined string could not be split again.
+function geminiBlocksToContent(blocks: any[], splitTurn = false): string | any[] {
+  const plain = blocks.every((b) => b.type === "text" && !(GEMINI_EXTRAS_KEY in b));
+  return plain && (!splitTurn || blocks.length === 1) ? blocks.map((b) => b.text).join("\n") : blocks;
+}
+
+// The OpenAI blocks the reverse conversion rebuilds Gemini parts from.
+function isGeminiBlock(p: ContentPart): boolean {
+  return p.type === "text" || p.type === "image_url" || p.type === "gemini_part";
+}
+
+// Rebuild one Gemini part from an OpenAI block: a carried part verbatim, else the text or media
+// part with its extras.
+function geminiPartFromBlock(block: any): any {
+  if (block.type === "gemini_part") return block.part;
+  const part = block.type === "image_url" ? geminiMediaPart(block.image_url) : { text: block.text };
+  return Object.assign(part, geminiExtras(block).part);
 }
 
 // OpenAI image_url -> Gemini part. data: URIs become inlineData. Other urls become fileData
 // with the carried MIME type, else one inferred from a common extension, else fileUri only.
-function geminiMediaPart(imageUrl: { url: string; mime_type?: string }): any {
+function geminiMediaPart(imageUrl: { url: string; mime_type?: string; display_name?: string }): any {
+  const named = imageUrl.display_name !== undefined ? { displayName: imageUrl.display_name } : {};
   const m = /^data:([^;,]+);base64,(.*)$/s.exec(imageUrl.url);
-  if (m) return { inlineData: { mimeType: m[1], data: m[2] } };
+  if (m) return { inlineData: { mimeType: m[1], data: m[2], ...named } };
   const ext = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(imageUrl.url)?.[1]?.toLowerCase();
   const mimeType = imageUrl.mime_type ?? (ext ? MIME_BY_EXTENSION[ext] : undefined);
-  return { fileData: mimeType ? { mimeType, fileUri: imageUrl.url } : { fileUri: imageUrl.url } };
+  return { fileData: mimeType ? { mimeType, fileUri: imageUrl.url, ...named } : { fileUri: imageUrl.url, ...named } };
 }
 
 export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
@@ -890,42 +933,25 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
     const parts: any[] = msg.parts ?? [];
 
     if (role === "user") {
-      // Check for functionResponse parts
-      const funcResponses = parts.filter((p: any) => p.functionResponse);
-      const hasMedia = parts.some((p: any) => p.inlineData || p.fileData);
-
-      if (hasMedia) {
-        const content = parts
-          .filter((p: any) => p.text !== undefined || p.inlineData || p.fileData)
-          .map((p: any) => {
-            if (p.text !== undefined) {
-              return withGeminiExtras({ type: "text" as const, text: p.text }, geminiPartExtras(p));
-            }
-            const imageUrl = geminiMediaImageUrl(p);
-            return imageUrl
-              ? withGeminiExtras({ type: "image_url" as const, image_url: imageUrl }, geminiPartExtras(p))
-              : null;
-          })
-          .filter((p: any): p is NonNullable<typeof p> => p !== null);
-
-        if (content.length > 0) {
-          result.push({ role: "user", content });
+      // OpenAI has no single message for this turn: each functionResponse is a tool message
+      // and the parts between them are user messages. They go out in source order, and every
+      // message after the turn's first carries `sameTurn`, so the reverse conversion rebuilds
+      // one turn with each part where it was. Such a turn never joins its text parts.
+      const first = result.length;
+      const splitTurn = parts.some((p: any) => p.functionResponse);
+      let run: any[] = [];
+      const flushRun = () => {
+        if (run.length > 0) result.push({ role: "user", content: geminiBlocksToContent(run, splitTurn) });
+        run = [];
+      };
+      for (const p of parts) {
+        if (!p.functionResponse) {
+          const block = geminiPartToBlock(p);
+          if (block) run.push(block);
+          continue;
         }
-      } else {
-        const textParts = parts.filter((p: any) => p.text !== undefined);
-        if (textParts.length > 0) {
-          // Same rule as assistant turns: joining would drop a per-part field, so keep
-          // blocks whenever any part carries extras.
-          const content = textParts.some((p: any) => geminiPartExtras(p))
-            ? textParts.map((p: any) =>
-                withGeminiExtras({ type: "text" as const, text: p.text }, geminiPartExtras(p)),
-              )
-            : textParts.map((p: any) => p.text).join("\n");
-          result.push({ role: "user", content });
-        }
-      }
-      for (const fr of funcResponses) {
-        const call = fr.functionResponse;
+        flushRun();
+        const call = p.functionResponse;
         // The response may omit its id; fall back to the call of the same name that is
         // still unanswered, so both sides of the round trip agree on one id.
         const pending = pendingCallIds.get(call.name);
@@ -941,44 +967,37 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
           role: "tool",
           content: JSON.stringify(call.response),
           tool_call_id: id,
-        }, mergeGeminiExtras(geminiPartExtras(fr), geminiResponseExtras(call))));
+        }, mergeGeminiExtras(geminiPartExtras(p), geminiCallExtras(call, ["response"]))));
+      }
+      flushRun();
+      for (const sibling of result.slice(first + 1)) {
+        withGeminiExtras(sibling, { ...(sibling as any)[GEMINI_EXTRAS_KEY], sameTurn: true });
       }
       continue;
     }
 
     if (role === "assistant") {
-      const textParts = parts.filter((p: any) => p.text !== undefined);
-      const funcCalls = parts.filter((p: any) => p.functionCall);
-      const hasMedia = parts.some((p: any) => p.inlineData || p.fileData);
-
-      let content: AssistantMessage["content"];
-      if (hasMedia) {
-        // Keep generated media (e.g. image output) as ordered parts.
-        content = parts
-          .filter((p: any) => p.text !== undefined || p.inlineData || p.fileData)
-          .map((p: any) => {
-            if (p.text !== undefined) {
-              return withGeminiExtras({ type: "text" as const, text: p.text }, geminiPartExtras(p));
-            }
-            const imageUrl = geminiMediaImageUrl(p);
-            return imageUrl
-              ? withGeminiExtras({ type: "image_url" as const, image_url: imageUrl }, geminiPartExtras(p))
-              : null;
-          })
-          .filter((p: any): p is NonNullable<typeof p> => p !== null);
-      } else if (textParts.some((p: any) => geminiPartExtras(p))) {
-        // A turn whose text parts carry extras keeps them as separate blocks, the only
-        // OpenAI shape that can hold a per-part field. Joining would drop them.
-        content = textParts.map((p: any) =>
-          withGeminiExtras({ type: "text" as const, text: p.text }, geminiPartExtras(p)),
-        );
-      } else {
-        content = textParts.length > 0 ? textParts.map((p: any) => p.text).join("\n") : null;
+      // Content blocks in source order; each functionCall remembers how many preceded it.
+      const blocks: any[] = [];
+      const funcCalls: Array<{ p: any; position: number }> = [];
+      for (const p of parts) {
+        if (p.functionCall) {
+          funcCalls.push({ p, position: blocks.length });
+          continue;
+        }
+        const block = geminiPartToBlock(p);
+        if (block) blocks.push(block);
       }
+      // OpenAI lists tool calls after the content. A call that sat before a content part
+      // carries its `position` so the reverse conversion puts it back there, and the turn
+      // then keeps one block per part: a joined string could not be split again.
+      const interleaved = funcCalls.some((c) => c.position < blocks.length);
+      const content: AssistantMessage["content"] =
+        blocks.length === 0 ? null : interleaved ? blocks : geminiBlocksToContent(blocks);
       const openaiMsg: AssistantMessage = { role: "assistant", content };
 
       if (funcCalls.length > 0) {
-        openaiMsg.tool_calls = funcCalls.map((p: any): ToolCall => {
+        openaiMsg.tool_calls = funcCalls.map(({ p, position }): ToolCall => {
           const id = p.functionCall.id ?? `gemini_${p.functionCall.name}`;
           const pending = pendingCallIds.get(p.functionCall.name) ?? [];
           pending.push(id);
@@ -991,7 +1010,11 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
               // `args` is optional in the Gemini API; OpenAI requires an object.
               arguments: JSON.stringify(p.functionCall.args ?? {}),
             },
-          }, mergeGeminiExtras(geminiPartExtras(p), geminiIdExtras(p.functionCall)));
+          }, mergeGeminiExtras(
+            geminiPartExtras(p),
+            geminiCallExtras(p.functionCall, ["name", "args"]),
+            interleaved ? { position } : undefined,
+          ));
         });
       }
       result.push(openaiMsg);
@@ -1005,7 +1028,15 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
 export function openAIToGemini(messages: OpenAIMessage[]): any[] {
   const result: any[] = [];
 
-  for (const msg of messages) {
+  // A message geminiToOpenAI marked `sameTurn` goes back into the turn before it; anything
+  // else starts a new turn.
+  const pushUserParts = (msg: OpenAIMessage, parts: any[]) => {
+    const last = result[result.length - 1];
+    if (geminiExtras(msg).sameTurn && last?.role === "user") last.parts.push(...parts);
+    else result.push({ role: "user", parts });
+  };
+
+  for (const [index, msg] of messages.entries()) {
     if (msg.role === "system") {
       // Gemini system is top-level; if in messages, convert to user
       result.push({ role: "user", parts: [{ text: msg.content }] });
@@ -1013,35 +1044,34 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
     }
 
     if (msg.role === "user") {
-      // A turn keeps one part per block whenever a part carries extras or media, so a
-      // `thoughtSignature` on one block is not merged into its neighbours. Text-only
-      // turns keep collapsing to one joined part.
-      const blocks = Array.isArray(msg.content)
-        ? msg.content.filter((p) => p.type === "text" || p.type === "image_url")
-        : [];
-      const keepsParts =
-        (Array.isArray(msg.content) && msg.content.some((p) => p.type === "image_url")) ||
-        blocks.some((p) => Object.keys(geminiExtras(p)).length > 0);
-      if (keepsParts) {
-        result.push({ role: "user", parts: blocks.map(geminiPartFromBlock) });
+      // A message keeps one part per block whenever a block is more than plain text (media, a
+      // carried part, extras such as a `thoughtSignature`), so nothing is merged into its
+      // neighbours. So does a message of a turn that went out as several (it is marked
+      // `sameTurn`, or the next message is): geminiToOpenAI never joins the text parts of
+      // such a turn. Any other text-only content keeps collapsing to one joined part.
+      const blocks = Array.isArray(msg.content) ? msg.content.filter(isGeminiBlock) : [];
+      const splitTurn = geminiExtras(msg).sameTurn || geminiExtras(messages[index + 1]).sameTurn;
+      if (blocks.length > 0 && (splitTurn || blocks.some((p) => p.type !== "text" || GEMINI_EXTRAS_KEY in p))) {
+        pushUserParts(msg, blocks.map(geminiPartFromBlock));
         continue;
       }
       const text = typeof msg.content === "string"
         ? msg.content
         : blocks.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n");
-      result.push({ role: "user", parts: [{ text }] });
+      pushUserParts(msg, [{ text }]);
       continue;
     }
 
     if (msg.role === "assistant") {
       const parts: any[] = [];
+      const positioned = msg.tool_calls?.some((tc) => geminiExtras(tc).position !== undefined) ?? false;
       if (typeof msg.content === "string") {
         if (msg.content) parts.push({ text: msg.content });
       } else if (Array.isArray(msg.content)) {
-        const blocks = msg.content.filter((p) => p.type === "text" || p.type === "image_url");
-        if (blocks.some((p) => Object.keys(geminiExtras(p)).length > 0)) {
-          // Keep each block its own part so a `thought` / `thoughtSignature` on one of
-          // them is not merged into its neighbours.
+        const blocks = msg.content.filter(isGeminiBlock);
+        if (positioned || blocks.some((p) => p.type === "gemini_part" || GEMINI_EXTRAS_KEY in p)) {
+          // Keep each block its own part so a carried part, a `thought` / `thoughtSignature`
+          // on one of them, or a functionCall that sat between them, keeps its neighbours.
           for (const p of blocks) parts.push(geminiPartFromBlock(p));
         } else {
           for (const g of groupAssistantParts(msg.content)) {
@@ -1051,6 +1081,9 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
         }
       }
       if (msg.tool_calls) {
+        // A call that carries `position`, the number of content parts that preceded it, goes
+        // back there; the others go last.
+        let inserted = 0;
         for (const tc of msg.tool_calls) {
           // `arguments` may be missing or malformed; a proxy round-trip drops
           // `undefined`. Keep whatever is there rather than discarding a tool
@@ -1058,9 +1091,9 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
           let args: any;
           try { args = JSON.parse(tc.function.arguments ?? "{}"); } catch { args = tc.function.arguments ?? {}; }
           const extras = geminiExtras(tc);
-          const call: any = { name: tc.function.name, args };
-          if (extras.id !== undefined) call.id = extras.id;
-          parts.push(withGeminiPartExtras({ functionCall: call }, extras));
+          const part = { functionCall: { ...extras.call, name: tc.function.name, args }, ...extras.part };
+          if (typeof extras.position === "number") parts.splice(extras.position + inserted++, 0, part);
+          else parts.push(part);
         }
       }
       result.push({ role: "model", parts });
@@ -1072,16 +1105,10 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
       const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
       try { response = JSON.parse(text); } catch { response = { result: text }; }
       const extras = geminiExtras(msg);
-      const call: any = {
-        name: extras.name ?? msg.tool_call_id?.replace(/^gemini_/, "") ?? "unknown",
-        response,
-      };
-      if (extras.id !== undefined) call.id = extras.id;
-      // A signed functionResponse keeps its `thought` / `thoughtSignature` on the part.
-      result.push({
-        role: "user",
-        parts: [withGeminiPartExtras({ functionResponse: call }, extras)],
-      });
+      const name = extras.call.name ?? msg.tool_call_id?.replace(/^gemini_/, "") ?? "unknown";
+      // The response's id, multimodal parts, willContinue and scheduling come back from the
+      // carried bag; a signed functionResponse keeps its `thoughtSignature` on the part.
+      pushUserParts(msg, [{ functionResponse: { ...extras.call, name, response }, ...extras.part }]);
       continue;
     }
   }

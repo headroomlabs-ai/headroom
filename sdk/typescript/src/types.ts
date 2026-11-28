@@ -50,11 +50,23 @@ export interface PassthroughContentPart {
   [key: string]: unknown;
 }
 
+/**
+ * A Gemini part with no OpenAI counterpart — `executableCode`, `codeExecutionResult`,
+ * a server-side `toolCall` / `toolResponse`, or a kind added after this was written —
+ * carried verbatim through `/v1/compress`, which passes unknown parts through, so the
+ * model gets the code it ran and its results back on the next turn.
+ */
+export interface GeminiPassthroughContentPart {
+  type: "gemini_part";
+  part: Record<string, unknown>;
+}
+
 export type ContentPart =
   | TextContentPart
   | ImageContentPart
   | ReasoningContentPart
-  | PassthroughContentPart;
+  | PassthroughContentPart
+  | GeminiPassthroughContentPart;
 
 export interface ToolCall {
   id: string;
