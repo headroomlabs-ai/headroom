@@ -122,21 +122,26 @@ pub fn python_module_source(n: usize) -> String {
     code
 }
 
-/// Go source the tree-sitter code compressor declines (exact
-/// passthrough: the language has no elision rules), yet which the
-/// detector still classifies as `SourceCode` and which clears the
-/// 2048-byte threshold. This is the shape that used to fall through to
-/// Kompress (#4214).
-pub fn go_handlers_source(n: usize) -> String {
+/// A Python script the tree-sitter code compressor declines (exact
+/// passthrough), yet which the detector still classifies as `SourceCode`
+/// and which clears the 2048-byte threshold. Executable top-level code runs
+/// before the definitions, and the compressor emits declarations before
+/// top-level code, so compressing would reorder them; it keeps the original
+/// instead (`reorder_unsafe`, as the Python reference does). This is the
+/// shape that used to fall through to Kompress (#4214).
+pub fn python_script_source(n: usize) -> String {
     use std::fmt::Write as _;
 
-    let mut code = String::new();
+    let mut code =
+        String::from("import os\nimport sys\n\nos.environ.setdefault(\"APP_MODE\", \"dev\")\n\n\n");
     for i in 0..n {
         let _ = write!(
             code,
-            "func Handle{i}(w http.ResponseWriter, r *http.Request) {{\n\t\
-             id := r.URL.Query().Get(\"id\")\n\t\
-             fmt.Fprintf(w, \"%s-{i}\", id)\n}}\n\n"
+            "def handle_{i}(request):\n    \
+             value = request.args.get(\"id\")\n    \
+             if value is None:\n        \
+             return None\n    \
+             return f\"{{value}}-{i}\"\n\n\n"
         );
     }
     code

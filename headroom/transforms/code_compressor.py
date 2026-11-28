@@ -436,6 +436,14 @@ class LangConfig:
     # descendants individually while the top-level pass re-emits the whole
     # wrapper verbatim, duplicating content. Prefer the false negative.
     opaque_node_types: frozenset[str] | None = None
+    # Optional wrappers that prefix exactly one declaration (C++
+    # `template <...>`). The prefix is kept verbatim and the declaration it
+    # wraps is compressed, so the two stay attached.
+    prefix_wrapper_node_types: frozenset[str] | None = None
+    # Emit the output in source order instead of grouped by kind. C and C++
+    # declare before use: grouping moved a namespace above the `#define` or
+    # `constexpr` it uses, leaving output that parses but no longer compiles.
+    source_ordered: bool = False
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
@@ -499,6 +507,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         uses_colon_after_signature=False,
         detection_hints=("fn ", "struct ", "impl ", "mod ", "use "),
         class_body_node_types=frozenset({"declaration_list"}),
+        # Inline modules (`mod tests { ... }`); `mod name;` has no body and
+        # is kept as written.
+        container_node_types=frozenset({"mod_item"}),
+        # `macro_rules!` is textually scoped: grouping moved a function or
+        # module above the macro it invokes.
+        source_ordered=True,
     ),
     CodeLanguage.JAVA: LangConfig(
         import_nodes=frozenset({"import_declaration"}),
@@ -523,6 +537,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("#include", "typedef ", "int main("),
+        source_ordered=True,
     ),
     CodeLanguage.CPP: LangConfig(
         import_nodes=frozenset({"preproc_include"}),
@@ -534,7 +549,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("#include", "namespace ", "class ", "::"),
-        class_body_node_types=frozenset({"field_declaration_list"}),
+        # `declaration_list` is the member list of namespaces and
+        # `extern "C" { ... }` blocks; classes use `field_declaration_list`.
+        class_body_node_types=frozenset({"field_declaration_list", "declaration_list"}),
+        container_node_types=frozenset({"namespace_definition", "linkage_specification"}),
+        prefix_wrapper_node_types=frozenset({"template_declaration"}),
+        source_ordered=True,
     ),
     CodeLanguage.PERL: LangConfig(
         import_nodes=frozenset({"use_statement", "use_version_statement"}),
@@ -647,6 +667,9 @@ class CodeStructure:
     # moves a definition across executable code, changing class bases,
     # decorators, or default expressions evaluated at definition time.
     reorder_unsafe: bool = False
+    # (start_byte, end_byte, text) per emitted top-level fragment, filled for
+    # languages with ``LangConfig.source_ordered``.
+    source_order: list[tuple[int, int, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -1644,7 +1667,10 @@ class CodeAwareCompressor(Transform):
             return code, structure, {}
 
         # Assemble compressed code
-        compressed = self._assemble_compressed(structure, language)
+        if lang_config and lang_config.source_ordered:
+            compressed = _assemble_in_source_order(structure, code)
+        else:
+            compressed = self._assemble_compressed(structure, language)
 
         # Expose scores with short names for the public API
         symbol_scores: dict[str, float] = {}
@@ -1785,11 +1811,36 @@ class CodeAwareCompressor(Transform):
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
+            if (
+                lang_config.prefix_wrapper_node_types
+                and node_type in lang_config.prefix_wrapper_node_types
+            ):
+                wrapped = self._compress_prefix_wrapper(
+                    node, code, language, lang_config, body_limits, analysis
+                )
+                if wrapped is None:
+                    # Nothing compressible inside (a template alias or
+                    # prototype): leave it uncaptured, unvisited, so the
+                    # top-level sweep keeps it verbatim.
+                    return
+                compressed, wraps_class = wrapped
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                target = (
+                    structure.class_definitions if wraps_class else structure.function_signatures
+                )
+                target.append(leading + _validated_candidate(node, compressed))
+                captured_byte_ranges.append((node.start_byte, node.end_byte))
+                return
+
             if lang_config.container_node_types and node_type in lang_config.container_node_types:
+                # Attributes and doc comments stay on the container
+                # (`#[cfg(test)]` on `mod tests`); detached, a dangling
+                # attribute would decorate whatever came next.
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_class_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.class_definitions.append(_validated_candidate(node, compressed))
+                structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1844,7 +1895,40 @@ class CodeAwareCompressor(Transform):
             for child in node.children:
                 visit(child)
 
-        visit(root)
+        # Visit each top-level node with a rollback point. A wrapper no handler
+        # recognizes (a C/C++ include guard or `#ifdef`, a TypeScript
+        # `namespace`, a Python `if` block) is recursed into, so declarations
+        # inside it get captured and compressed on their own, while the sweep
+        # below re-emits the uncaptured wrapper verbatim: the output would hold
+        # its content twice. When that happens, undo the nested captures and
+        # let the wrapper go out verbatim, once. Only the root needs this: the
+        # sweep is the one place uncaptured nodes are re-emitted.
+        list_fields = [
+            name
+            for name, value in vars(structure).items()
+            if isinstance(value, list) and name != "source_order"
+        ]
+        for child in root.children:
+            lists_before = {name: list(getattr(structure, name)) for name in list_fields}
+            captured_before = len(captured_byte_ranges)
+            imports_before = set(import_entries)
+            visit(child)
+            child_range = (child.start_byte, child.end_byte)
+            nested_captures = any(
+                child.start_byte <= start and end <= child.end_byte
+                for start, end in captured_byte_ranges[captured_before:]
+            )
+            if nested_captures and child_range not in captured_byte_ranges:
+                for name, value in lists_before.items():
+                    setattr(structure, name, value)
+                del captured_byte_ranges[captured_before:]
+                for start in set(import_entries) - imports_before:
+                    del import_entries[start]
+            elif lang_config.source_ordered:
+                # Whatever this root node added to the buckets is its text.
+                for name in list_fields:
+                    for text in getattr(structure, name)[len(lists_before[name]) :]:
+                        structure.source_order.append((child.start_byte, child.end_byte, text))
 
         # Capture top-level code that wasn't handled by any of the above.
         # This preserves global variables, constants, if __name__ blocks,
@@ -1902,6 +1986,8 @@ class CodeAwareCompressor(Transform):
                 else:
                     structure.top_level_code.append(text)
                     saw_top_level_code = True
+                if lang_config.source_ordered:
+                    structure.source_order.append((child.start_byte, child.end_byte, text))
 
         if demoted_import_starts:
             # Python only: the import branch above is the sole producer of
@@ -1941,7 +2027,7 @@ class CodeAwareCompressor(Transform):
         # (methods inside classes).
         code_lines = code.split("\n")
         start_row = node.start_point[0]
-        node_lines = _get_node_lines(node, code_lines)
+        node_lines = _get_exact_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
 
         func_name = _get_definition_name(node)
@@ -2222,7 +2308,6 @@ class CodeAwareCompressor(Transform):
         code_lines = code.split("\n")
         start_row = node.start_point[0]
         node_lines = _get_node_lines(node, code_lines)
-        node_text = "\n".join(node_lines)
 
         # Find the class/member container. For some languages this is not the
         # same node type as a function body's executable block.
@@ -2233,8 +2318,19 @@ class CodeAwareCompressor(Transform):
                 body_node = child
                 break
 
-        if body_node is None:
-            return node_text
+        # Bodiless declarations (`mod a;`, `extern "C" int f();`) and one-line
+        # ones (`mod ffi { pub struct Handle; }`) have nothing to compress:
+        # keep exactly their own text. The line-based rebuild below would
+        # repeat a one-line body after its header, and take in any sibling on
+        # the same line.
+        if body_node is None or node.start_point[0] == node.end_point[0]:
+            text = "\n".join(_get_exact_node_lines(node, code_lines))
+            # C++ `class S {};`: the `;` is a sibling of the class node, and the
+            # extractor marks it captured with the class, so it must be emitted
+            # here or the output loses it and fails validation.
+            if _get_same_line_trailing_semicolon(node) is not None:
+                text += ";"
+            return text
 
         # Class header (signature) — everything before the body
         node_start_line = node.start_point[0]
@@ -2261,25 +2357,67 @@ class CodeAwareCompressor(Transform):
         # Process each child of the class body individually
         body_parts: list[str] = []
         processed_ranges: list[tuple[int, int]] = []
-        last_processed_end = -1
+        # Rows the header already emitted: a member on the brace line
+        # (`namespace a { int x;`) is in the header text and must not be
+        # emitted again.
+        last_processed_end = node.start_point[0] + len(header_lines) - 1
+        # The closing-brace row is emitted whole after the members, so a member
+        # that ends on it (`int f() { return 1; } }`) must not be emitted again.
+        closing_row: int | None = None
+        if (
+            not lang_config.uses_colon_after_signature
+            and body_node.end_point[0] != node.start_point[0]
+        ):
+            closing_row = body_node.end_point[0]
 
-        for child in body_node.children:
-            if not child.is_named:
+        def _rows(member: Any) -> tuple[int, int]:
+            first, last = member.start_point[0], member.end_point[0]
+            if member.end_point[1] == 0 and last > first:
+                last -= 1
+            return first, last
+
+        # Rows are emitted whole and each row at most once. Members that share
+        # a row (`void ping() {} int version = 1;`, `x = 1; y = 2`) form one
+        # group: compressing one of them on its own would cut its siblings out
+        # of the shared row, so the group's rows are kept verbatim instead. A
+        # trailing comment on a member's last row stays with that member.
+        named_children = [child for child in body_node.children if child.is_named]
+        groups: list[tuple[list[Any], int, int]] = []
+        for child in named_children:
+            first, last = _rows(child)
+            if groups and first <= groups[-1][2]:
+                members, group_first, group_last = groups[-1]
+                members.append(child)
+                groups[-1] = (members, group_first, max(group_last, last))
+            else:
+                groups.append(([child], first, last))
+
+        for members, group_first, group_last in groups:
+            owns_rows = (
+                members[0].type not in _COMMENT_NODE_TYPES
+                and all(m.type in _COMMENT_NODE_TYPES for m in members[1:])
+                # A trailing comment that runs past the member's last row
+                # (`int x = 1; /* a` ... `b */`) is cut if the member is
+                # rendered alone, and a later `*/` would then close it.
+                and _rows(members[0])[1] == group_last
+                and group_first > last_processed_end
+                and (closing_row is None or group_last < closing_row)
+            )
+            if not owns_rows:
+                verbatim_first = max(group_first, last_processed_end + 1)
+                verbatim_last = group_last
+                if closing_row is not None and verbatim_last >= closing_row:
+                    verbatim_last = closing_row - 1
+                if verbatim_first <= verbatim_last:
+                    body_parts.append("\n".join(code_lines[verbatim_first : verbatim_last + 1]))
+                    for member in members:
+                        processed_ranges.append((member.start_byte, member.end_byte))
+                last_processed_end = max(last_processed_end, group_last)
                 continue
 
-            # Use line-based extraction for children too
-            child_start = child.start_point[0]
-            child_end = child.end_point[0]
-            if child.end_point[1] == 0 and child_end > child_start:
-                child_end -= 1
-            # Statements can share a physical line (`x = 1; y = 2`). The line
-            # slice already carries all of them; skip only rows already
-            # emitted, keeping any continuation lines of this node.
-            if child_start <= last_processed_end:
-                child_start = last_processed_end + 1
-                if child_start > child_end:
-                    continue
-            last_processed_end = child_end
+            child = members[0]
+            child_start, child_end = _rows(child)
+            last_processed_end = group_last
             child_text = "\n".join(code_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually
@@ -2308,6 +2446,16 @@ class CodeAwareCompressor(Transform):
                     body_parts.append(method_compressed)
                 else:
                     body_parts.append(child_text)
+                processed_ranges.append((child.start_byte, child.end_byte))
+            # Prefixed declarations (C++ `template <...>`) inside a container
+            elif (
+                lang_config.prefix_wrapper_node_types
+                and child.type in lang_config.prefix_wrapper_node_types
+            ):
+                wrapped = self._compress_prefix_wrapper(
+                    child, code, language, lang_config, body_limits, analysis
+                )
+                body_parts.append(wrapped[0] if wrapped is not None else child_text)
                 processed_ranges.append((child.start_byte, child.end_byte))
             # Nested classes / containers (e.g. nested namespaces) — recurse
             elif child.type in lang_config.class_nodes or (
@@ -2340,7 +2488,7 @@ class CodeAwareCompressor(Transform):
         if not lang_config.uses_colon_after_signature:
             if body_end_line != start_row:
                 closing_line = code_lines[body_end_line]
-                closing_text = closing_line[: body_node.end_point[1]]
+                closing_text = closing_line[: _char_col(closing_line, body_node.end_point[1])]
                 if _get_same_line_trailing_semicolon(node) is not None:
                     closing_text += ";"
                 if closing_text.strip():
@@ -2349,6 +2497,58 @@ class CodeAwareCompressor(Transform):
             result_parts.extend(after_lines)
 
         return "\n".join(result_parts)
+
+    def _compress_prefix_wrapper(
+        self,
+        node: Any,
+        code: str,
+        language: CodeLanguage,
+        lang_config: LangConfig,
+        body_limits: dict[str, int],
+        analysis: _SymbolAnalysis,
+    ) -> tuple[str, bool] | None:
+        """Compress the declaration a prefix wrapper holds, keeping the prefix.
+
+        Returns ``(text, wraps_class)``, or ``None`` when the wrapper holds no
+        function, class or container (the caller keeps it verbatim).
+        """
+        inner = None
+        for child in node.named_children:
+            if (
+                child.type in lang_config.function_nodes
+                or child.type in lang_config.class_nodes
+                or (
+                    lang_config.container_node_types
+                    and child.type in lang_config.container_node_types
+                )
+            ):
+                inner = child
+                break
+        if inner is None:
+            return None
+        wraps_class = inner.type not in lang_config.function_nodes
+        if wraps_class:
+            compressed = self._compress_class_ast(
+                inner, code, language, lang_config, body_limits, analysis
+            )
+        else:
+            compressed = self._compress_function_ast(
+                inner, code, language, lang_config, body_limits, analysis
+            )
+        prefix = _slice_code_bytes(code, node.start_byte, inner.start_byte)
+        if "\n" in prefix:
+            # The compressed declaration starts with its whole first line,
+            # indentation included; keep that indentation once.
+            prefix = prefix.rstrip(" \t")
+        suffix = _slice_code_bytes(code, inner.end_byte, node.end_byte)
+        if suffix.strip() == ";" and compressed.rstrip().endswith(";"):
+            # Class compression already re-adds the same-line `;`.
+            suffix = ""
+        first_line = code.split("\n")[node.start_point[0]]
+        indent = first_line[: _char_col(first_line, node.start_point[1])]
+        if indent.strip():
+            indent = ""
+        return indent + prefix + compressed + suffix, wraps_class
 
     def _extract_generic_structure(self, root: Any, code: str) -> CodeStructure:
         """Extract structure from generic/unknown code.
@@ -2703,11 +2903,71 @@ def _get_node_lines(node: Any, code_lines: list[str]) -> list[str]:
     duplicating it. Trim the sibling prefix from the first line when it's not
     pure whitespace; keep the whole line (indentation intact) otherwise.
     """
-    start_row, start_col = node.start_point
+    start_row, start_byte_col = node.start_point
     end_row = node.end_point[0]
     node_lines = list(code_lines[start_row : end_row + 1])
-    if node_lines and node_lines[0][:start_col].strip():
-        node_lines[0] = node_lines[0][start_col:]
+    if node_lines:
+        start_col = _char_col(node_lines[0], start_byte_col)
+        if node_lines[0][:start_col].strip():
+            node_lines[0] = node_lines[0][start_col:]
+    return node_lines
+
+
+def _assemble_in_source_order(structure: CodeStructure, code: str) -> str:
+    """Join top-level fragments in their original order.
+
+    A blank line separates two fragments when the source had one between
+    them, so the output keeps the file's grouping.
+    """
+    # Encode once: tree-sitter offsets are UTF-8 bytes, and slicing through
+    # `_slice_code_bytes` would re-encode the whole file per fragment.
+    code_bytes = code.encode("utf-8")
+    parts: list[str] = []
+    previous: tuple[int, int] | None = None
+    for start, end, text in sorted(structure.source_order, key=lambda entry: entry[0]):
+        if previous is not None:
+            # Some nodes (C `#include`, `#define`) end after their newline.
+            gap_start = previous[1]
+            if previous[1] > previous[0] and code_bytes[previous[1] - 1 : previous[1]] == b"\n":
+                gap_start -= 1
+            if re.search(rb"\n[ \t]*\n", code_bytes[gap_start:start]):
+                parts.append("")
+        parts.append(text.rstrip("\n"))
+        previous = (start, end)
+    return "\n".join(parts)
+
+
+def _char_col(line: str, byte_col: int) -> int:
+    """Convert a tree-sitter column (a UTF-8 byte offset) to a str index.
+
+    Slicing a Python str with a byte column cuts a line after any non-ASCII
+    character too far right: `template <typename Größe> bool f()` lost the
+    `bo` of `bool`.
+    """
+    if line.isascii():
+        return byte_col
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
+
+
+def _get_exact_node_lines(node: Any, code_lines: list[str]) -> list[str]:
+    """Like `_get_node_lines`, but also drop code after the node's end.
+
+    A declaration kept as written must not carry a sibling that shares its
+    last line (`mod a; mod b;`, `extern "C" int f(); extern "C" int g();`):
+    the sibling is emitted on its own as well, so the output would hold it
+    twice. A trailing comment stays, as before.
+    """
+    node_lines = _get_node_lines(node, code_lines)
+    if not node_lines:
+        return node_lines
+    end_row, end_byte_col = node.end_point
+    last_line = code_lines[end_row]
+    end_col = _char_col(last_line, end_byte_col)
+    tail = last_line[end_col:].strip()
+    if tail and not tail.startswith(("//", "/*", "#")):
+        # The first line may already be trimmed at the node's start column.
+        keep = len(node_lines[-1]) - (len(last_line) - end_col)
+        node_lines[-1] = node_lines[-1][:keep]
     return node_lines
 
 

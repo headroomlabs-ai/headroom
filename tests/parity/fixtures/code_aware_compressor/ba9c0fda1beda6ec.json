@@ -19,10 +19,10 @@
   "input_sha256": "ba9c0fda1beda6ec7b8447e7aa39a743f073cf02e914f52e99aaa6ebda3c4dc1",
   "output": {
     "cache_key": null,
-    "compressed": "#include <iostream>\n\n#include <vector>\n\n#include <string>\n\n\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        for (const auto &item : items) {\n            if (item.empty()) {\n                continue;\n            }\n            results.push_back(item);\n            count_++;\n        }\n        return results;\n    }\n\nprivate:\n    std::string name_;\n    int count_;\n};\n\nint main() {\n    app::Processor p(\"main\");\n    return 0;\n}\n\nnamespace app {\n\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        for (const auto &item : items) {\n            if (item.empty()) {\n                continue;\n            }\n            results.push_back(item);\n            count_++;\n        }\n        return results;\n    }\n\nprivate:\n    std::string name_;\n    int count_;\n};\n\n}\n// namespace app\n// variant 1",
+    "compressed": "#include <iostream>\n#include <vector>\n#include <string>\n\nnamespace app {\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        // [8 lines omitted]\n    }\nprivate:\n    std::string name_;\n    int count_;\n};\n}\n// namespace app\n\nint main() {\n    app::Processor p(\"main\");\n    return 0;\n}\n\n// variant 1",
     "compressed_bodies": 0,
-    "compressed_tokens": 281,
-    "compression_ratio": 1.7453416149068324,
+    "compressed_tokens": 116,
+    "compression_ratio": 0.7204968944099379,
     "language": "cpp",
     "language_confidence": 1.0,
     "original": "#include <iostream>\n#include <vector>\n#include <string>\n\nnamespace app {\n\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        for (const auto &item : items) {\n            if (item.empty()) {\n                continue;\n            }\n            results.push_back(item);\n            count_++;\n        }\n        return results;\n    }\n\nprivate:\n    std::string name_;\n    int count_;\n};\n\n}  // namespace app\n\nint main() {\n    app::Processor p(\"main\");\n    return 0;\n}\n\n// variant 1",
@@ -34,6 +34,6 @@
     },
     "syntax_valid": true
   },
-  "recorded_at": "2026-06-19T00:15:16.350553+00:00",
+  "recorded_at": "2026-11-25T07:33:22.363124+00:00",
   "transform": "code_aware_compressor"
 }
