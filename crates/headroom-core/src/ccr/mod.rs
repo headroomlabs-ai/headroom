@@ -81,6 +81,7 @@ pub fn max_lifetime_for(idle_ttl: Duration) -> Duration {
 
 /// `u64` seconds -> `i64` for SQLite/Redis. Saturates: `u64::MAX` ("never
 /// expire") must not wrap to -1 and expire at once.
+#[cfg(any(feature = "sqlite", feature = "redis"))]
 pub(crate) fn secs_i64(secs: u64) -> i64 {
     i64::try_from(secs).unwrap_or(i64::MAX)
 }

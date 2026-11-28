@@ -35,6 +35,7 @@ use headroom_core::transforms::{detect_content_type, BlockAction, ContentType, L
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+#[cfg(feature = "code")]
 use serde_json::Value;
 
 // ─── Part 0: kill-switch alias round trip (bug class extinction) ──────
@@ -582,6 +583,7 @@ proptest! {
 
 // ─── Part 1, property 3: byte fidelity around the SourceCode arm ──────
 
+#[cfg(feature = "code")]
 #[test]
 fn byte_fidelity_outside_compressed_source_block() {
     // Same central invariant as `live_zone_dispatch.rs`'s
@@ -653,6 +655,42 @@ fn byte_fidelity_outside_compressed_source_block() {
     let parsed: Value = serde_json::from_slice(&new_body).expect("output is valid JSON");
     assert_eq!(parsed["model"], "claude-sonnet-4-6");
     assert_eq!(parsed["system"], "you are a helpful assistant");
+}
+
+/// In builds without the `code` feature the SourceCode arm is a
+/// deterministic no-op: the dispatcher must report `NoChange` so the
+/// caller forwards the original body byte-for-byte.
+#[cfg(not(feature = "code"))]
+#[test]
+fn source_code_arm_without_code_is_no_change() {
+    let code = python_module_source(10);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+    let (body, _) = body_with_tool_result(&code);
+    match dispatch(&body) {
+        LiveZoneOutcome::NoChange { manifest } => {
+            let action = manifest
+                .block_outcomes
+                .iter()
+                .find(|b| b.block_type == "tool_result")
+                .expect("tool_result block present in manifest")
+                .action
+                .clone();
+            match action {
+                BlockAction::NoCompressionApplied { content_type } => {
+                    assert_eq!(content_type, "source_code");
+                }
+                other => panic!("expected NoCompressionApplied for source_code, got {other:?}"),
+            }
+        }
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "without the `code` feature source code must never be rewritten; \
+             expected NoChange, got Modified. manifest: {manifest:?}"
+        ),
+    }
 }
 
 /// The same byte-fidelity invariant for the PlainText/Kompress arm.

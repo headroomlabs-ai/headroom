@@ -238,6 +238,7 @@ fn diff_tool_result_routes_to_diff_compressor() {
     }
 }
 
+#[cfg(feature = "code")]
 #[test]
 fn source_code_tool_result_routes_to_code_compressor() {
     // Detector classifies this as SourceCode. PR-B4 wires the arm up to
@@ -286,6 +287,80 @@ fn source_code_tool_result_routes_to_code_compressor() {
     }
 }
 
+/// Without the `code` feature there is no AST compressor. In the minimal
+/// build (no `code`, no `ml`) source-code blocks must fall through to a
+/// deterministic no-op: the dispatcher reports `NoCompressionApplied`
+/// and the caller forwards the original bytes untouched.
+#[cfg(all(not(feature = "code"), not(feature = "ml")))]
+#[test]
+fn source_code_tool_result_no_op_without_code_or_ml() {
+    let code = python_module_source(10);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+
+    let (body, _) = body_with_tool_result(&code);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "no SourceCode compressor is compiled in (neither `code` nor `ml`); \
+             expected NoChange, got Modified. manifest: {manifest:?}"
+        ),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::NoCompressionApplied { content_type } => {
+            assert_eq!(content_type, "source_code");
+        }
+        other => panic!("expected NoCompressionApplied for source_code, got {other:?}"),
+    }
+}
+
+/// With `ml` enabled but `code` disabled, the SourceCode arm must still
+/// preserve source code as a NoOp rather than routing to Kompress (#4214).
+#[cfg(all(not(feature = "code"), feature = "ml"))]
+#[test]
+fn source_code_tool_result_never_kompressed_without_code() {
+    let _ = kompress_available();
+    let code = python_module_source(10);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+    let (body, _) = body_with_tool_result(&code);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "without the `code` feature source code must never be rewritten by Kompress; \
+             expected NoChange, got Modified. manifest: {manifest:?}"
+        ),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::NoCompressionApplied { content_type } => {
+            assert_eq!(content_type, "source_code");
+        }
+        other => panic!("expected NoCompressionApplied for source_code, got {other:?}"),
+    }
+}
+
 #[test]
 fn source_code_declined_by_code_compressor_is_never_kompressed() {
     // The code compressor leaves Go source untouched (exact passthrough).
@@ -322,6 +397,7 @@ fn source_code_declined_by_code_compressor_is_never_kompressed() {
     }
 }
 
+#[cfg(feature = "code")]
 #[test]
 fn issue_4214_script_is_never_kompressed() {
     // The Python script quoted in #4214, repeated until the block clears the
@@ -347,6 +423,33 @@ fn issue_4214_script_is_never_kompressed() {
             ),
             other => panic!("unexpected action {other:?}"),
         },
+    }
+}
+
+/// In builds without the `code` feature (even when `ml` is enabled), the #4214
+/// script must be passed through unchanged as a NoOp, never handed to Kompress.
+#[cfg(not(feature = "code"))]
+#[test]
+fn issue_4214_script_is_never_kompressed() {
+    let _ = kompress_available();
+    let code = format!("{ISSUE_4214_SCRIPT}\n").repeat(3);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold"
+    );
+    let (body, _) = body_with_tool_result(&code);
+
+    match dispatch(&body) {
+        LiveZoneOutcome::NoChange { manifest } => {
+            let action = tool_result_action(&manifest);
+            assert!(
+                matches!(&action, BlockAction::NoCompressionApplied { content_type } if content_type == "source_code"),
+                "expected a source_code NoOp, got {action:?}"
+            );
+        }
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "without the `code` feature the #4214 script must never be rewritten; manifest: {manifest:?}"
+        ),
     }
 }
 

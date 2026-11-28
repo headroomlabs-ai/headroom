@@ -115,12 +115,19 @@ fn classify_string(s: &str, cfg: &ClassifyConfig) -> CellClass {
     // can't possibly be JSON containers. Parsing `"123"` would
     // technically succeed as JSON-the-number, but that's a scalar,
     // not a recursion target.
-    let trimmed = s.trim_start();
+    let trimmed = s.trim_start_matches([' ', '\t', '\n', '\r']);
     if matches!(trimmed.chars().next(), Some('{') | Some('[')) {
         if let Ok(parsed) = serde_json::from_str::<Value>(s) {
             if matches!(parsed, Value::Object(_) | Value::Array(_)) {
                 return CellClass::StringifiedJson(parsed);
             }
+        } else if serde_json::from_str::<&serde_json::value::RawValue>(s).is_ok() {
+            // Syntactically valid JSON container that `Value` cannot represent
+            // (e.g. numeric token exceeding `f64` range like `1e400` when the
+            // `arbitrary-precision` feature is disabled). Keep the full string
+            // verbatim as a Scalar so it is preserved and not replaced by an
+            // opaque CCR marker without a retrieval store.
+            return CellClass::Scalar;
         }
     }
 
@@ -312,6 +319,21 @@ mod tests {
     #[test]
     fn math_with_lt_is_not_html() {
         let s = "a < b but not really ".repeat(20);
+        match classify_cell(&Value::String(s), &cfg()) {
+            CellClass::Opaque(OpaqueKind::LongString) => {}
+            other => panic!("expected LongString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_json_whitespace_not_treated_as_json_container() {
+        // Non-breaking space is Unicode whitespace, but not ASCII/JSON whitespace.
+        // A long string starting with non-JSON whitespace followed by an otherwise valid
+        // JSON object must be treated as opaque, not as a JSON container.
+        let valid_json = format!(r#"{{"key":"{}"}}"#, "x".repeat(300));
+        assert!(serde_json::from_str::<Value>(&valid_json).is_ok());
+
+        let s = format!("\u{00a0}{valid_json}");
         match classify_cell(&Value::String(s), &cfg()) {
             CellClass::Opaque(OpaqueKind::LongString) => {}
             other => panic!("expected LongString, got {other:?}"),
