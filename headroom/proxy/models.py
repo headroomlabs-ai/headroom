@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -192,6 +193,12 @@ class ProxyConfig:
     # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
     # direct-to-AWS, re-signing behavior unchanged.
     bedrock_api_url: str | None = None
+    # Optional callable that returns a boto3 ``bedrock-runtime`` client
+    # for the LiteLLM backend. When set, the returned client is passed
+    # to ``litellm.acompletion(..., aws_bedrock_client=client)`` so the
+    # session can transparently refresh STS credentials. ``None`` keeps
+    # the default behavior (litellm builds its own client from env).
+    bedrock_client_factory: Callable[[str | None], Any] | None = None
     # Factory Droid upstream (`--factory-api-url` / FACTORY_TARGET_API_URL).
     # When set, `/api/llm/a/v1/messages` is compressed and forwarded here and
     # every other `/api/*` path is passed through verbatim; it serves `/api/*`
