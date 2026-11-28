@@ -747,6 +747,23 @@ def _is_anthropic_family_model(litellm_model: str) -> bool:
     return "claude" in m or "anthropic" in m
 
 
+def _accepts_native_thinking(litellm_model: str) -> bool:
+    """True when ``thinking`` can be passed to litellm as its own argument.
+
+    A Claude model id is not enough: an OpenAI-compatible gateway serving Claude
+    (``openai/claude-...``) uses an adapter that rejects or drops the argument,
+    so it has to keep travelling in ``extra_body``.
+    """
+    if not _is_anthropic_family_model(litellm_model):
+        return False
+    try:
+        model, provider, _, _ = litellm.get_llm_provider(litellm_model)
+        supported = litellm.get_supported_openai_params(model=model, custom_llm_provider=provider)
+    except Exception:
+        return False
+    return "thinking" in (supported or [])
+
+
 def _thinking_block_to_dict(block: Any) -> dict[str, Any]:
     """Normalise a litellm thinking block (dict or pydantic) to a plain dict."""
     if isinstance(block, dict):
@@ -1875,10 +1892,10 @@ class LiteLLMBackend(Backend):
                     kwargs[param] = body[param]
 
             extra_body = _build_openai_extra_body(body)
-            # Anthropic's native thinking config is a litellm kwarg for
-            # Anthropic-family targets; left in `extra_body` it does not reach
-            # the Messages request as the top-level `thinking` field.
-            if "thinking" in extra_body and _is_anthropic_family_model(litellm_model):
+            # Anthropic's native thinking config is a litellm kwarg where the
+            # adapter supports it; left in `extra_body` it does not reach the
+            # Anthropic Messages request as the top-level `thinking` field.
+            if "thinking" in extra_body and _accepts_native_thinking(litellm_model):
                 kwargs["thinking"] = extra_body.pop("thinking")
             if extra_body:
                 kwargs["extra_body"] = extra_body
@@ -2090,10 +2107,10 @@ class LiteLLMBackend(Backend):
                 kwargs["stream_options"] = body["stream_options"]
 
             extra_body = _build_openai_extra_body(body)
-            # Anthropic's native thinking config is a litellm kwarg for
-            # Anthropic-family targets; left in `extra_body` it does not reach
-            # the Messages request as the top-level `thinking` field.
-            if "thinking" in extra_body and _is_anthropic_family_model(litellm_model):
+            # Anthropic's native thinking config is a litellm kwarg where the
+            # adapter supports it; left in `extra_body` it does not reach the
+            # Anthropic Messages request as the top-level `thinking` field.
+            if "thinking" in extra_body and _accepts_native_thinking(litellm_model):
                 kwargs["thinking"] = extra_body.pop("thinking")
             if extra_body:
                 kwargs["extra_body"] = extra_body
