@@ -7,12 +7,15 @@ import logging
 import os
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
+from headroom.exceptions import ProviderError
 from headroom.log_safety import redact_url
 from headroom.providers.bedrock_models import newest_snapshot
+from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.cloudcode import (
     cloudcode_passthrough_target,
     normalize_cloudcode_passthrough_path,
@@ -76,6 +79,7 @@ from headroom.providers.vertex import (
     vertex_publisher_provider_name,
     with_vertex_diagnostics,
 )
+from headroom.proxy.buffered_ccr_response import ANTHROPIC_ERROR_TYPES
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -111,6 +115,73 @@ async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Re
     )
 
 
+def _same_origin(a: str, b: str) -> bool:
+    """True when two URLs name the same scheme, host, port and path (default ports implied)."""
+
+    def key(url: str) -> tuple[str, str, int | None, str]:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        port = parts.port if parts.port is not None else {"https": 443, "http": 80}.get(scheme)
+        return scheme, (parts.hostname or "").lower(), port, parts.path.rstrip("/")
+
+    return key(a) == key(b)
+
+
+def _count_tokens_error_message(exc: ProviderError, status: int, model: Any) -> str:
+    """A fixed client-facing message for a failed backend count; no provider text."""
+    name = model[:200] if isinstance(model, str) and model else "the requested model"
+    if exc.details.get("reason") == "unsupported_model":
+        return f"Token counting is not available on Bedrock for {name}."
+    if status == 401:
+        return "AWS credentials for Bedrock are unavailable on the proxy; refresh them and retry."
+    if status == 403:
+        return (
+            "Bedrock CountTokens denied access for this model; "
+            "check the bedrock:CountTokens IAM permission."
+        )
+    if status in (400, 404):
+        return f"Bedrock CountTokens rejected the request for model {name}."
+    if status == 429:
+        return "Bedrock CountTokens is throttling requests; retry later."
+    return "Bedrock CountTokens failed; see the proxy log for details."
+
+
+async def _count_tokens_on_backend(proxy: Any, request: Request) -> Response | None:
+    """Answer ``/v1/messages/count_tokens`` from the Anthropic backend, or None to pass through.
+
+    In Bedrock mode there is no Anthropic account behind the placeholder key
+    clients send, so the passthrough would 401; the backend counts instead.
+    """
+    backend = getattr(proxy, "anthropic_backend", None)
+    if backend is None:
+        return None
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    try:
+        tokens = await backend.count_tokens(body, dict(request.headers))
+    except ProviderError as exc:
+        status = int(exc.details.get("status", 502))
+        # The raw provider text (ARNs, account and request IDs) stays in the log.
+        logger.warning("count_tokens on backend %s failed: %s", backend.name, exc)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {
+                    "type": ANTHROPIC_ERROR_TYPES.get(status, "api_error"),
+                    "message": _count_tokens_error_message(exc, status, body.get("model")),
+                },
+            },
+            status_code=status,
+        )
+    if tokens is None:
+        return None
+    return JSONResponse({"input_tokens": tokens})
+
+
 def _register_provider_passthrough_route(
     app: FastAPI,
     proxy: Any,
@@ -141,6 +212,16 @@ def _register_provider_passthrough_route(
                 spec.sub_path,
                 spec.provider_name,
             )
+        # Only where the passthrough would reach api.anthropic.com: an operator
+        # who points the Anthropic target at a gateway keeps getting its counts.
+        if (
+            spec.provider_name == "anthropic"
+            and spec.sub_path == "count_tokens"
+            and _same_origin(_api_target(proxy, "anthropic"), DEFAULT_ANTHROPIC_API_URL)
+        ):
+            counted = await _count_tokens_on_backend(proxy, request)
+            if counted is not None:
+                return counted
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, spec.provider_name),
