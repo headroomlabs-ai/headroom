@@ -103,7 +103,9 @@ def test_authenticated_callers_get_one_bucket_per_credential(monkeypatch, endpoi
 def test_loopback_callers_get_one_bucket_per_credential(monkeypatch, endpoint) -> None:
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     path, body, upstream_body = endpoint
-    with TestClient(create_app(_config()), client=("127.0.0.1", 1)) as client:
+    with TestClient(
+        create_app(_config()), base_url="http://127.0.0.1", client=("127.0.0.1", 1)
+    ) as client:
         client.app.state.proxy._retry_request = AsyncMock(
             side_effect=lambda *a, **k: httpx.Response(200, json=upstream_body)
         )
@@ -225,7 +227,9 @@ def test_loopback_gateway_config_direct_and_forwarded_callers(monkeypatch, endpo
     monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "127.0.0.0/8")
     path, body, upstream_body = endpoint
     forwarded = {"x-forwarded-for": "203.0.113.9"}
-    with TestClient(create_app(_config()), client=("127.0.0.1", 1)) as client:
+    with TestClient(
+        create_app(_config()), base_url="http://127.0.0.1", client=("127.0.0.1", 1)
+    ) as client:
         client.app.state.proxy._retry_request = AsyncMock(
             side_effect=lambda *a, **k: httpx.Response(200, json=upstream_body)
         )

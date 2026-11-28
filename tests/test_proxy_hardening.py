@@ -441,6 +441,77 @@ class TestWebSocketAuthMiddleware:
         assert downstream.called is False
         assert _closed_with_policy_violation(sent)
 
+    async def test_rust_front_remote_marker_takes_alias_trust_away(self):
+        # host.docker.internal on our own port from loopback is a container on
+        # Docker Desktop; marked by the Rust front, it is a relayed remote caller.
+        def scope(*extra):
+            return {
+                **_ws_scope(
+                    client=LOOPBACK, headers=[("host", "host.docker.internal:8787"), *extra]
+                ),
+                "server": ("127.0.0.1", 8787),
+            }
+
+        unmarked = _SpyApp()
+        await _drive(WebSocketAuthMiddleware(unmarked, proxy_token="s3cr3t-token"), scope())
+        marked = _SpyApp()
+        sent = await _drive(
+            WebSocketAuthMiddleware(marked, proxy_token="s3cr3t-token"),
+            scope(("x-headroom-front-remote", "1")),
+        )
+
+        assert unmarked.called is True
+        assert marked.called is False
+        assert _closed_with_policy_violation(sent)
+
+    @pytest.mark.parametrize("client", [LOOPBACK, ("172.17.0.1", 40000)])
+    async def test_accepts_the_rust_front_relay_proof(self, client):
+        # The Rust front strips the token of a remote caller it authenticated
+        # and sends the proof instead; a container front arrives from the
+        # bridge gateway on Linux.
+        from headroom.proxy.server import front_relay_proof
+
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+        headers = [
+            ("host", "127.0.0.1:8788"),
+            ("x-headroom-front-remote", "1"),
+            ("x-headroom-front-proof", front_relay_proof("s3cr3t-token")),
+        ]
+
+        await _drive(mw, _ws_scope(client=client, headers=headers))
+
+        assert downstream.called is True
+
+    async def test_accepts_the_proof_under_a_container_alias_upstream_host(self):
+        # The handshake a containerised front relays keeps its upstream's
+        # Host (the alias) and carries the marker and the proof.
+        from headroom.proxy.server import front_relay_proof
+
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+        headers = [
+            ("host", "host.docker.internal:8788"),
+            ("x-headroom-front-remote", "1"),
+            ("x-headroom-front-proof", front_relay_proof("s3cr3t-token")),
+        ]
+
+        await _drive(
+            mw, {**_ws_scope(client=LOOPBACK, headers=headers), "server": ("127.0.0.1", 8788)}
+        )
+
+        assert downstream.called is True
+
+    async def test_rejects_a_wrong_rust_front_relay_proof(self):
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+        headers = [("x-headroom-front-remote", "1"), ("x-headroom-front-proof", "0" * 64)]
+
+        sent = await _drive(mw, _ws_scope(client=LOOPBACK, headers=headers))
+
+        assert downstream.called is False
+        assert _closed_with_policy_violation(sent)
+
     async def test_rejects_wrong_credential(self):
         downstream = _SpyApp()
         mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")

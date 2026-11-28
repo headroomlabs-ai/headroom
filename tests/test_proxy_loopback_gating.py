@@ -532,7 +532,8 @@ def test_dns_rebinding_host_header_rejected() -> None:
     # shape) must still be rejected by the second gate.
     client = TestClient(_make_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
     resp = client.get("/transformations/feed", headers={"host": "attacker.example"})
-    assert resp.status_code == 404, resp.text
+    # Refused at the security gate, before the route's own 404 guard.
+    assert resp.status_code == 403, resp.text
 
 
 @pytest.mark.parametrize(
@@ -970,7 +971,7 @@ def test_token_does_not_exempt_a_loopback_peer_from_the_host_check(
     local = TestClient(app, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 1))
     assert local.get(path).status_code != 404
     rebound = TestClient(app, base_url="http://attacker.example", client=("127.0.0.1", 1))
-    assert rebound.get(path).status_code == 404
+    assert rebound.get(path).status_code == 403
 
 
 def test_dashboard_shell_is_not_gated() -> None:
@@ -1191,15 +1192,38 @@ def test_settings_write_allowed_for_real_loopback() -> None:
     assert resp.status_code == 200, resp.text
 
 
-@pytest.mark.parametrize("host", ["headroom-remote.invalid", "evil.example:8787"])
+@pytest.mark.parametrize(
+    ("host", "refused"),
+    # The relay Host (no token configured) passes the gate as a remote caller
+    # and meets the routes' own 404; any other foreign Host is refused at the
+    # security gate (403).
+    [("headroom-remote.invalid", 404), ("evil.example:8787", 403)],
+)
 def test_local_only_routes_refuse_the_hosts_the_rust_front_relays_for_remote_callers(
-    host: str,
+    host: str, refused: int
 ) -> None:
     # The Rust front reaches this proxy from 127.0.0.1. For a caller that is
     # not local on its side it sends a non-loopback Host (the reserved
     # headroom-remote.invalid when the Host would otherwise name loopback),
     # so these routes must refuse a loopback peer carrying such a Host.
     client = TestClient(_make_app(), base_url=f"http://{host}", client=("127.0.0.1", 12345))
+    assert client.get("/admin/upstream").status_code == refused
+    assert client.get("/debug/tasks").status_code == refused
+    assert client.get("/transformations/feed").status_code == refused
+
+
+def test_local_only_routes_refuse_a_proven_rust_front_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The front's proof stands in for the proxy token, not for being local.
+    from headroom.proxy.server import FRONT_RELAY_PROOF_HEADER, front_relay_proof
+
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cr3t-token")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom-remote.invalid",
+        client=("127.0.0.1", 12345),
+        headers={FRONT_RELAY_PROOF_HEADER: front_relay_proof("s3cr3t-token")},
+    )
     assert client.get("/admin/upstream").status_code == 404
     assert client.get("/debug/tasks").status_code == 404
-    assert client.get("/transformations/feed").status_code == 404

@@ -163,7 +163,7 @@ def _drive_handler(client_host: str, monkeypatch, tmp_path) -> SubscriptionTrack
             image_optimize=False,
         )
     )
-    with TestClient(app, client=(client_host, 50000)) as client:
+    with TestClient(app, base_url="http://127.0.0.1", client=(client_host, 50000)) as client:
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return httpx.Response(

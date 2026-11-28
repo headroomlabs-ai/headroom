@@ -111,7 +111,7 @@ async def _call_tool_as(
     app.state.proxy.http_client = mock
     app.state.proxy.http_client_h1 = mock
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8787") as client:
         response = await client.post(
             "/v1/messages",
             json={

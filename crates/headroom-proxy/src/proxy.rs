@@ -676,10 +676,17 @@ pub(crate) async fn forward_http(
         if let Some(host) = crate::inbound_auth::host_override_for_non_local(
             outgoing_headers.get(http::header::HOST),
             &state.config.upstream,
+            state.config.python_upstream,
         ) {
             outgoing_headers.insert(http::header::HOST, host);
         }
     }
+    crate::inbound_auth::insert_relay_identity(
+        &mut outgoing_headers,
+        req.extensions(),
+        &state.config.upstream,
+        state.config.python_upstream,
+    );
 
     // ─── COMPRESSION GATE ──────────────────────────────────────────────
     //

@@ -2188,8 +2188,8 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     """
     mode = get_strip_internal_headers_mode()
     if mode == "disabled":
-        # Always return a copy so callers can mutate without surprise.
-        return dict(headers)
+        # A copy without the Headroom credentials (NEVER_FORWARDED_HEADERS).
+        return strip_internal_headers(headers, mode=mode)
     from headroom.proxy.tenant_key import (
         DEFAULT_TENANT_KEY_HEADER,
         TENANT_KEY_HEADER_ENV_VAR,

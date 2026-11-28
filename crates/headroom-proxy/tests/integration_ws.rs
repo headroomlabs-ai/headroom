@@ -94,3 +94,87 @@ async fn ws_client_close_propagates() {
     assert!(got.is_ok(), "expected close echo within 3s");
     proxy.shutdown().await;
 }
+
+/// Upstream that accepts one WebSocket handshake and reports its headers.
+// tungstenite's handshake callback returns its own (large) error response type.
+#[allow(clippy::result_large_err)]
+async fn header_capturing_upstream() -> (SocketAddr, tokio::sync::oneshot::Receiver<http::HeaderMap>)
+{
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut tx = Some(tx);
+        let callback = |req: &Request, resp: Response| {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(req.headers().clone());
+            }
+            Ok(resp)
+        };
+        if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await {
+            let _ = ws.close(None).await;
+        }
+    });
+    (addr, rx)
+}
+
+/// Headers a `--python-upstream` upstream saw for one WebSocket handshake
+/// through a front with a token, from a client sending `extra` headers.
+async fn relayed_ws_handshake(extra: &[(&str, &str)]) -> http::HeaderMap {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (upstream_addr, seen) = header_capturing_upstream().await;
+    let proxy = common::start_proxy_with(&format!("http://{upstream_addr}"), |c| {
+        c.proxy_token = headroom_proxy::inbound_auth::ProxyToken::new("ws-token");
+        c.python_upstream = true;
+    })
+    .await;
+    let mut req = format!("{}/v1/live", proxy.ws_url())
+        .into_client_request()
+        .unwrap();
+    for (k, v) in extra {
+        req.headers_mut().insert(
+            http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            http::HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    let _ = tokio_tungstenite::connect_async(req).await;
+    let headers = tokio::time::timeout(Duration::from_secs(5), seen)
+        .await
+        .unwrap()
+        .unwrap();
+    proxy.shutdown().await;
+    headers
+}
+
+#[tokio::test]
+async fn ws_relay_for_a_remote_caller_carries_the_marker_and_proof() {
+    // A loopback peer naming the front by a public Host with the token is a
+    // remote caller relayed by a same-host reverse proxy.
+    let seen = relayed_ws_handshake(&[
+        ("host", "proxy.example:8787"),
+        ("x-headroom-proxy-token", "ws-token"),
+        ("x-headroom-front-remote", "0"),
+    ])
+    .await;
+    let expected = headroom_proxy::inbound_auth::ProxyToken::new("ws-token")
+        .unwrap()
+        .relay_proof();
+    assert_eq!(seen.get("x-headroom-front-remote").unwrap(), "1");
+    assert_eq!(
+        seen.get("x-headroom-front-proof")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected
+    );
+    assert!(seen.get("x-headroom-proxy-token").is_none());
+}
+
+#[tokio::test]
+async fn ws_relay_for_a_local_caller_carries_no_marker() {
+    let seen = relayed_ws_handshake(&[("x-headroom-front-remote", "1")]).await;
+    assert!(seen.get("x-headroom-front-remote").is_none());
+    assert!(seen.get("x-headroom-front-proof").is_none());
+}

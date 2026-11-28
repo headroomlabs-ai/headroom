@@ -142,6 +142,14 @@ def test_strip_disabled_mode_passes_internal_headers_through(
     assert out["authorization"] == "Bearer x"
 
 
+def test_strip_disabled_mode_never_forwards_the_front_relay_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_STRIP_INTERNAL_HEADERS", "disabled")
+    out = _strip_internal_headers({"X-Headroom-Front-Proof": "0" * 64, "X-Headroom-Team": "a"})
+    assert out == {"X-Headroom-Team": "a"}
+
+
 def test_strip_disabled_mode_returns_copy_not_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -685,3 +693,31 @@ def test_merge_extra_headers_none_returns_same_object() -> None:
     """No configured extras -> caller's dict is returned unchanged (no copy)."""
     headers = {"a": "b"}
     assert merge_extra_headers(headers, None, upstream_url=None) is headers
+
+
+def test_disabled_mode_never_forwards_the_front_relay_proof_e2e(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Diagnostic mode keeps labels but drops the Rust front's relay proof."""
+    monkeypatch.setenv("HEADROOM_STRIP_INTERNAL_HEADERS", "disabled")
+    client, transport = _make_anthropic_app()
+    resp = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-headroom-team": "payments",
+            "x-headroom-front-proof": "0" * 64,
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert transport.captured_headers is not None
+    upstream = {k.lower(): v for k, v in transport.captured_headers.items()}
+    assert upstream.get("x-headroom-team") == "payments"
+    assert "x-headroom-front-proof" not in upstream

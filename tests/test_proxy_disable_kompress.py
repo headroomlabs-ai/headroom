@@ -231,7 +231,7 @@ def test_disabled_kompress_reasoning_request_never_queries_remote_loader(
         )
 
     reasoning = " ".join(f"reason{i}" for i in range(100))
-    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
         proxy = app.state.proxy
 
         async def install_transport() -> None:

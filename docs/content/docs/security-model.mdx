@@ -273,8 +273,46 @@ refused with **403**. A cross-site subresource load, which carries no `Origin`, 
 refused by `Sec-Fetch-Site: cross-site` unless it is a top-level navigation. Requests
 with no `Origin` (SDKs, coding agents, curl) are unaffected.
 
+Before any of that, a loopback peer must name the proxy by a local `Host:`: a loopback
+literal (`127.0.0.1`, `[::1]`), `localhost`, a container host alias
+(`host.docker.internal`, `host.containers.internal`), or a host listed in
+`HEADROOM_WS_ORIGINS` / `HEADROOM_CORS_ORIGINS`. Anything else gets **403** whatever
+the request carries: a page whose hostname was pointed at 127.0.0.1 connects from
+loopback under its own name, and browsers differ in which provenance headers they send
+on such a request. Listed hosts are compared by host and port, not scheme, so an
+`https://` page behind a TLS-terminating reverse proxy matches. A listed origin's port is
+its explicit port, else its scheme's default; a `Host:` without a port matches a listed
+origin on port 80 or 443, and one with a port matches only that port. Health probes
+(`GET /health`, `/livez`, `/readyz`) skip this check, as they skip the token. A hosts-file alias or
+spellings such as `0.0.0.0`, `localhost.` or `127.1` are refused until listed. The same
+local-`Host` rule decides the `HEADROOM_PROXY_TOKEN` exemption on HTTP and WebSocket
+alike: a listed name gets past the `Host` check but still needs the token when one is
+set. The container aliases count only for a request without browser provenance
+(`Origin`, `Referer`, `Sec-Fetch-*`) on the proxy's own port (a `Host:` without a port
+means the connection scheme's default), since a network's DNS can
+answer those names too. They count from a loopback peer because Docker Desktop delivers
+container callers to the host from 127.0.0.1. The Rust front never forwards an alias a
+remote caller chose, and a front that reaches this proxy as
+`http://host.docker.internal:<port>` must run with `--python-upstream true` so its
+relayed HTTP callers arrive as `headroom-remote.invalid`. That relay `Host` is HTTP only: a
+relayed WebSocket handshake keeps the upstream's own `Host` (for example `127.0.0.1:8787` or
+`host.docker.internal:8787`), so on WebSocket the remote marker (and, with
+`--python-upstream`, the proof) is what identifies a remote caller. Every HTTP request and
+WebSocket handshake the front relays for a remote caller carries
+`X-Headroom-Front-Remote: 1`; a request carrying it is never treated as local here, whatever
+its `Host`. The proof is accepted from any peer, as the token is (a containerised
+front on Linux arrives from the bridge gateway), and on WebSocket handshakes as on HTTP. Requests the Rust front (`crates/headroom-proxy`) relays for a
+caller it authenticated carry `X-Headroom-Front-Proof`, derived from
+`HEADROOM_PROXY_TOKEN`; with the same token configured here that proof stands in for the
+token the front strips. With a token configured, the front's `Host:
+headroom-remote.invalid` alone proves nothing and is refused; with no token configured
+here (a token-less front on an acknowledged open bind) it passes as a remote,
+unauthenticated caller. Either way a relayed caller does not reach the loopback-only
+routes.
+
 A reverse proxy on the same host that forwards a public hostname to `127.0.0.1` needs the
-page's origin (`https://name`) listed in `HEADROOM_WS_ORIGINS`: the proxy sees a loopback
+page's origin (`https://name`) listed in `HEADROOM_WS_ORIGINS`, and its callers need the
+proxy token if one is set: the proxy sees a loopback
 peer with a non-loopback `Host`, which is indistinguishable from a re-pointed hostname.
 Only `http`, `https`, `ws` and `wss` origins can be listed. Pages that send an app scheme (such as
 `tauri://localhost`) or `Origin: null` (sandboxed iframes, `file://` pages) are always

@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -155,6 +156,7 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+from headroom.proxy.internal_header_policy import FRONT_RELAY_PROOF_HEADER
 from headroom.proxy.kompress_health_detail_policy import (
     KOMPRESS_DETAIL_LOADED,
     KOMPRESS_DETAIL_NOT_CACHED,
@@ -900,6 +902,175 @@ def _is_cors_listed_origin(origin: str) -> bool:
     return normalized in listed
 
 
+#: :data:`FRONT_RELAY_PROOF_HEADER` (imported) is what the Rust front adds to a
+#: request it relays for a caller that proved it holds ``HEADROOM_PROXY_TOKEN``
+#: there. The value is derived from the token (:func:`front_relay_proof`), so
+#: only a process that knows the token can produce it.
+_FRONT_RELAY_PROOF_CONTEXT = b"headroom-front-relay-v1\0"
+#: Header the Rust front sets to ``1`` on every request it relays for a caller
+#: that is not local there, whatever ``Host`` it sends (and drops from what
+#: clients send). Not a secret: it only takes local trust away.
+FRONT_REMOTE_HEADER = "x-headroom-front-remote"
+#: ``Host`` the Rust front sends for every caller that is not local there.
+_FRONT_RELAY_HOST = "headroom-remote.invalid"
+
+#: Names a container uses to reach a proxy on its host. Docker Desktop and
+#: Podman deliver those connections from a loopback peer. A network's DNS can
+#: answer them too, so they count only for a request with no browser provenance
+#: on the proxy's own port.
+_CONTAINER_HOST_ALIASES = frozenset({"host.docker.internal", "host.containers.internal"})
+_BROWSER_PROVENANCE_HEADERS = ("origin", "referer", "sec-fetch-site", "sec-fetch-mode")
+
+_ORIGIN_LIST_ENVS = ("HEADROOM_WS_ORIGINS", "HEADROOM_CORS_ORIGINS")
+
+
+_SCHEME_DEFAULT_PORTS = {"http": 80, "ws": 80, "https": 443, "wss": 443}
+
+
+def _listed_hosts() -> set[tuple[str, int | None]]:
+    """``(host, port)`` of every origin in HEADROOM_WS_ORIGINS / HEADROOM_CORS_ORIGINS.
+
+    The port is the origin's explicit port, else its scheme's default (``None``
+    for an unknown scheme). The scheme itself is not compared (see
+    :func:`_is_listed_host`).
+    """
+    hosts: set[tuple[str, int | None]] = set()
+    for env in _ORIGIN_LIST_ENVS:
+        for entry in os.environ.get(env, "").split(","):
+            entry = entry.strip()
+            if not entry or entry == "*":
+                continue
+            try:
+                parts = urlsplit(entry)
+                port = parts.port
+            except ValueError:
+                continue
+            if parts.hostname:
+                if port is None:
+                    port = _SCHEME_DEFAULT_PORTS.get(parts.scheme.lower())
+                hosts.add((parts.hostname.lower().rstrip("."), port))
+    return hosts
+
+
+def _host_header_key(host_header: str) -> tuple[str, int | None] | None:
+    """``(host, port)`` of a ``Host`` header; ``port`` is ``None`` when it names none."""
+    try:
+        parts = urlsplit(f"//{host_header.strip()}")
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.hostname:
+        return None
+    return parts.hostname.lower().rstrip("."), port
+
+
+def _is_listed_host(host_header: str) -> bool:
+    """Whether a ``Host`` names an origin listed in HEADROOM_WS_ORIGINS / HEADROOM_CORS_ORIGINS.
+
+    Compared by host and port, not scheme: the proxy runs without
+    ``proxy_headers``, so behind a TLS-terminating reverse proxy it sees
+    ``http`` for an ``https`` page. A ``Host`` without a port matches a listed
+    origin on either scheme's default port.
+    """
+    key = _host_header_key(host_header)
+    if key is None:
+        return False
+    host, port = key
+    return any(
+        listed_host == host and (listed_port == port or (port is None and listed_port in (80, 443)))
+        for listed_host, listed_port in _listed_hosts()
+    )
+
+
+def front_relay_proof(token: str) -> str:
+    """The value the Rust front sends in :data:`FRONT_RELAY_PROOF_HEADER`."""
+    return hashlib.sha256(_FRONT_RELAY_PROOF_CONTEXT + token.encode("utf-8")).hexdigest()
+
+
+def _is_front_relay(headers: Mapping[str, str], proof: bytes) -> bool:
+    """A request carrying the Rust front's proof for this proxy's token.
+
+    Accepted from any peer, as the token itself is: a front in a container
+    reaches this proxy from the bridge gateway on Linux, not from loopback.
+    """
+    sent = headers.get(FRONT_RELAY_PROOF_HEADER)
+    return (
+        bool(proof)
+        and sent is not None
+        and hmac.compare_digest(sent.encode("utf-8", "replace"), proof)
+    )
+
+
+def _loopback_trusted(
+    peer: str | None,
+    host_header: str | None,
+    headers: Mapping[str, str],
+    own_port: int | None,
+) -> bool:
+    """Whether a caller counts as local: loopback peer *and* a local ``Host``.
+
+    A loopback peer alone is not enough: a page whose hostname was pointed at
+    127.0.0.1 connects from loopback with its own name in ``Host``. Local names
+    are loopback literals and ``localhost``; the container host aliases count
+    too, but only on this proxy's own port and for a request without browser
+    provenance. This is the rule for the token exemption on both transports.
+    A request the Rust front marks as relayed for a remote caller
+    (:data:`FRONT_REMOTE_HEADER`) is never local, whatever its ``Host``: a
+    containerised front reaching this proxy as ``host.docker.internal``
+    arrives from loopback under Docker Desktop.
+    """
+    if headers.get(FRONT_REMOTE_HEADER) is not None:
+        return False
+    if not is_loopback_host(peer):
+        return False
+    if is_loopback_host_header(host_header):
+        return True
+    key = _host_header_key(host_header) if host_header else None
+    if key is None or key[0] not in _CONTAINER_HOST_ALIASES:
+        return False
+    return key[1] == own_port and not any(headers.get(h) for h in _BROWSER_PROVENANCE_HEADERS)
+
+
+def _own_port(scope: Mapping[str, Any]) -> int | None:
+    server = scope.get("server")
+    return server[1] if server and len(server) > 1 else None
+
+
+def _host_with_default_port(host_header: str | None, scope: Mapping[str, Any]) -> str | None:
+    """``host_header`` with the connection scheme's default port when it names none."""
+    key = _host_header_key(host_header) if host_header else None
+    if key is None or key[1] is not None:
+        return host_header
+    default = _SCHEME_DEFAULT_PORTS.get(str(scope.get("scheme", "http")))
+    return f"{host_header}:{default}" if default else host_header
+
+
+def _request_loopback_trusted(request: Request) -> bool:
+    client = getattr(request, "client", None)
+    peer = getattr(client, "host", None) if client is not None else None
+    headers = request.headers
+    host = _host_with_default_port(headers.get("host"), request.scope)
+    return _loopback_trusted(peer, host, headers, _own_port(request.scope))
+
+
+def _refused_loopback_host(request: Request) -> str | None:
+    """The ``Host`` to refuse for a loopback peer, or ``None`` to go on.
+
+    A loopback peer with a ``Host`` that is not local (see
+    :func:`_loopback_trusted`) and not listed in HEADROOM_WS_ORIGINS /
+    HEADROOM_CORS_ORIGINS is refused whatever else it sends: that is the shape
+    of a page whose hostname was pointed at 127.0.0.1, and browsers differ in
+    which provenance headers (``Origin``, ``Sec-Fetch-*``) such a request carries.
+    A same-host reverse proxy or a hosts-file alias lists its name there.
+    """
+    client = getattr(request, "client", None)
+    peer = getattr(client, "host", None) if client is not None else None
+    if not is_loopback_host(peer) or _request_loopback_trusted(request):
+        return None
+    host_header = request.headers.get("host") or ""
+    return None if _is_listed_host(host_header) else host_header
+
+
 def _is_refused_browser_request(request: Request) -> bool:
     """Return True for a browser request from a page the proxy does not trust.
 
@@ -912,20 +1083,16 @@ def _is_refused_browser_request(request: Request) -> bool:
     ``Origin``, these pass: loopback pages (the dashboard), the origins the
     WebSocket routes accept (``HEADROOM_WS_ORIGINS`` / ``HEADROOM_CORS_ORIGINS``),
     and, for a non-loopback peer, a page served from this proxy's own address
-    (a remote dashboard). A loopback peer gets no same-origin pass: there a
-    non-loopback Host means a page's hostname was pointed at 127.0.0.1.
+    (a remote dashboard). A loopback peer gets no same-origin pass.
     A cross-site subresource load (``<img>``, ``<script>``) carries no
     ``Origin`` on GET, so ``Sec-Fetch-Site: cross-site`` is refused too, except
-    for a top-level navigation.
+    for a top-level navigation. A loopback peer under a foreign ``Host`` is
+    refused before this, by :func:`_refused_loopback_host`.
     """
     headers = request.headers
     origin = headers.get("origin")
     if origin:
-        if (
-            _is_loopback_ws_origin(origin)
-            or _is_allowed_websocket_origin(dict(headers))
-            or _is_cors_listed_origin(origin)
-        ):
+        if _is_trusted_page_origin(origin):
             return False
         client = getattr(request, "client", None)
         peer = getattr(client, "host", None) if client is not None else None
@@ -938,6 +1105,15 @@ def _is_refused_browser_request(request: Request) -> bool:
     fetch_site = (headers.get("sec-fetch-site") or "").lower()
     fetch_mode = (headers.get("sec-fetch-mode") or "").lower()
     return fetch_site == "cross-site" and fetch_mode != "navigate"
+
+
+def _is_trusted_page_origin(origin: str) -> bool:
+    """A loopback page, or an origin listed in HEADROOM_WS_ORIGINS / HEADROOM_CORS_ORIGINS."""
+    return (
+        _is_loopback_ws_origin(origin)
+        or _is_allowed_websocket_origin({"origin": origin})
+        or _is_cors_listed_origin(origin)
+    )
 
 
 def _apply_stateless_persistence(config: ProxyConfig) -> None:
@@ -3331,6 +3507,7 @@ def _auth_rejection_path(path: object) -> str:
 
 
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
+_FRONT_RELAY_PROOF_HEADER = FRONT_RELAY_PROOF_HEADER.encode("ascii")
 
 
 def _is_proxy_token_bearer(value: bytes, token_bytes: bytes) -> bool:
@@ -3360,8 +3537,8 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
     this once, on the scope, covers every handler and transport at once instead
     of relying on each upstream call site to remember.
 
-    ``x-headroom-proxy-token`` is dropped unconditionally, so it cannot reach an
-    upstream even with ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``. An
+    ``x-headroom-proxy-token`` and the Rust front's ``x-headroom-front-proof``
+    are dropped unconditionally, so neither can reach an upstream even with ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``. An
     ``Authorization`` header is dropped only when it carries the configured
     token; any other value is a provider credential and is left alone.
     """
@@ -3372,7 +3549,7 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
         (name, value)
         for name, value in headers
         if not (
-            name.lower() == _PROXY_TOKEN_HEADER
+            name.lower() in (_PROXY_TOKEN_HEADER, _FRONT_RELAY_PROOF_HEADER)
             or (
                 token_bytes
                 and name.lower() == b"authorization"
@@ -3414,6 +3591,9 @@ class WebSocketAuthMiddleware:
         # compare_digest on str raises TypeError for non-ASCII input, which
         # would turn a rejected handshake into a 500.
         self.token_bytes = proxy_token.encode("utf-8") if proxy_token else b""
+        self.front_relay_proof = (
+            front_relay_proof(proxy_token).encode("ascii") if proxy_token else b""
+        )
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] != "websocket":
@@ -3434,12 +3614,13 @@ class WebSocketAuthMiddleware:
         headers = Headers(scope=scope)
         client = scope.get("client")
         client_host = client[0] if client else None
-        # Loopback exemption needs both gates the HTTP admin guards apply: a
-        # loopback peer *and* a loopback ``Host:`` header. The Host check is
+        # Loopback exemption needs a loopback peer *and* a local ``Host:``
+        # (_loopback_trusted, shared with the HTTP gate). The Host check is
         # the DNS-rebinding defence — a browser on this machine coerced into
         # opening a socket to 127.0.0.1 still sends ``Host: attacker.com``. A
         # missing peer address (UDS, adapters) is not loopback (fails closed).
-        if is_loopback_host(client_host) and is_loopback_host_header(headers.get("host")):
+        host = _host_with_default_port(headers.get("host"), scope)
+        if _loopback_trusted(client_host, host, headers, _own_port(scope)):
             # Exempt from the token, not from the scrub: a loopback client that
             # sends the token anyway must not have it forwarded upstream.
             scrub_proxy_token_headers(scope, self.token_bytes)
@@ -3447,9 +3628,12 @@ class WebSocketAuthMiddleware:
             return
 
         provided = read_proxy_token(headers)
-        if provided is not None and hmac.compare_digest(
+        token_ok = provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
-        ):
+        )
+        # The Rust front stripped the token of a caller it authenticated and
+        # sends the proof instead, as on HTTP.
+        if token_ok or _is_front_relay(headers, self.front_relay_proof):
             scrub_proxy_token_headers(scope, self.token_bytes)
             await self.app(scope, receive, send)
             return
@@ -4561,6 +4745,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Pre-encode once for constant-time comparison (compare_digest on str raises
     # TypeError for non-ASCII input, which would turn a 401 into a 500).
     _proxy_token_bytes = _proxy_token.encode("utf-8") if _proxy_token else b""
+    # What the Rust front sends for a caller it authenticated with this token.
+    _front_relay_proof = front_relay_proof(_proxy_token).encode("ascii") if _proxy_token else b""
     # Health/readiness probes must stay reachable without a token so
     # orchestrators can check a container that binds non-loopback.
     #
@@ -4636,6 +4822,45 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # 0) Browser provenance. Runs before the token check because loopback
         #    callers skip that check, and a page in the user's browser reaches
         #    the proxy as a loopback caller.
+        client = getattr(request, "client", None)
+        client_host = getattr(client, "host", None) if client is not None else None
+        # Relayed by the Rust front for a caller that presented this token there.
+        front_relay = _is_front_relay(request.headers, _front_relay_proof)
+        # With no token here there is nothing to prove: a token-less front
+        # (acknowledged open bind) relays its remote callers under its relay
+        # Host without a proof. They pass as remote, unauthenticated callers,
+        # never as local ones. The front itself refuses rebound loopback Hosts.
+        unproven_relay = not _proxy_token and _host_header_key(
+            request.headers.get("host") or ""
+        ) == (_FRONT_RELAY_HOST, None)
+        # Health probes answer every caller, as the token check below lets
+        # them: the Rust front relays a remote monitor's probe without a proof.
+        health_probe = request.method == "GET" and request.url.path in _AUTH_EXEMPT_PATHS
+        refused_host = (
+            None
+            if front_relay or unproven_relay or health_probe
+            else _refused_loopback_host(request)
+        )
+        if refused_host is not None:
+            logger.warning(
+                "event=proxy_loopback_host_rejected method=%s path=%s host=%s",
+                request.method,
+                _auth_rejection_path(request.url.path),
+                safe_id(refused_host),
+            )
+            rejection = JSONResponse(
+                status_code=403,
+                content={
+                    "error": "request to a loopback listener under a non-local Host rejected",
+                    "hint": (
+                        f"if {safe_id(refused_host)} is a name you use for this proxy (a "
+                        "reverse proxy on this host, a hosts-file alias), add its origin "
+                        "to HEADROOM_WS_ORIGINS"
+                    ),
+                },
+            )
+            _apply_security_headers(rejection)
+            return rejection
         if _is_refused_browser_request(request):
             logger.warning(
                 "event=proxy_browser_origin_rejected method=%s path=%s origin=%s",
@@ -4659,8 +4884,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         #    endpoints already use (see loopback_guard).
         if _proxy_token:
             path = request.url.path
-            client = getattr(request, "client", None)
-            client_host = getattr(client, "host", None) if client is not None else None
             # Anthropic SDK clients (Claude Code among them) probe reachability
             # with an unauthenticated GET/HEAD /api/hello that never carries
             # custom headers, so it cannot hold the proxy token. Let it past
@@ -4675,7 +4898,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             if hello_probe:
                 request.state.headroom_local_hello_probe = True
             exempt = hello_probe or (request.method == "GET" and path in _AUTH_EXEMPT_PATHS)
-            if not exempt and not is_loopback_host(client_host):
+            if front_relay:
+                request.state.proxy_authenticated = True
+            elif not exempt and not _request_loopback_trusted(request):
                 provided = _extract_proxy_token(request.headers)
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8", "replace"), _proxy_token_bytes
@@ -4807,13 +5032,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     def _authenticated_at_gate(request: Request) -> bool:
         """True when the security gate verified this request's proxy token.
 
-        The gate exempts loopback peers without checking the ``Host`` header,
-        so only a *non-loopback* request that reached a handler while a token
-        is configured has proven it holds the token. A loopback peer must
-        still pass the loopback (peer + Host) check: the DNS-rebinding defence.
+        The gate marks exactly the requests whose token it compared
+        (``request.state.proxy_authenticated``); a caller it exempted as local
+        has proven nothing and must still pass the loopback (peer + Host) check.
         """
-        client = getattr(request, "client", None)
-        return bool(_proxy_token) and not is_loopback_host(getattr(client, "host", None))
+        return getattr(request.state, "proxy_authenticated", False) is True
 
     def _is_host_of_loopback_published_container(request: Request) -> bool:
         """True for the host's own dashboard reaching a loopback-published container.

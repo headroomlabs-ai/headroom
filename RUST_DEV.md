@@ -54,9 +54,11 @@ at it; end users notice nothing.
 make build-proxy
 ./target/release/headroom-proxy --help
 
-# Run against a local upstream (listens on 127.0.0.1:8787 by default)
+# Run in front of the Headroom Python proxy (listens on 127.0.0.1:8787 by default).
+# --python-upstream true (or HEADROOM_PROXY_PYTHON_UPSTREAM=true) declares the
+# upstream is the Python proxy; leave it off for any other backend.
 ./target/release/headroom-proxy \
-    --upstream http://127.0.0.1:8788
+    --upstream http://127.0.0.1:8788 --python-upstream true
 
 # Health checks
 curl -s http://127.0.0.1:8787/healthz            # => {"ok":true,...}
@@ -66,18 +68,31 @@ curl -s http://127.0.0.1:8787/healthz/upstream   # => 200 if upstream reachable
 ### Operator runbook (Phase 1 cutover)
 
 ```bash
+# 0. One token for both processes, exported before either starts: the Rust
+#    proxy checks it from remote callers, and the Python proxy checks the
+#    relay proof the Rust proxy derives from it (see below).
+export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
+
 # 1. Move the Python proxy to a private port (e.g. 8788)
 HEADROOM_HOST=127.0.0.1 HEADROOM_PORT=8788 python -m headroom.proxy &  # or your existing launcher
 
 # 2. Run the Rust proxy on the previously-public port (8787) pointing at it.
 #    The Python proxy sees every relayed request as coming from 127.0.0.1,
-#    so the Rust proxy enforces HEADROOM_PROXY_TOKEN itself (see below).
-export HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
-./target/release/headroom-proxy --listen 0.0.0.0:8787 --upstream http://127.0.0.1:8788 &
+#    so the Rust proxy enforces HEADROOM_PROXY_TOKEN itself, and
+#    --python-upstream tells it the upstream is the Python proxy (see below).
+./target/release/headroom-proxy --listen 0.0.0.0:8787 \
+    --upstream http://127.0.0.1:8788 --python-upstream true &
 
-# 3. End users keep hitting :8787 unchanged.
-# 4. Confirm passthrough:
-curl -si http://127.0.0.1:8787/v1/models
+# 3. End users keep hitting :8787 unchanged, now sending the token. Remote
+#    callers reach it through your TLS terminator: the token is a bearer
+#    credential and must not cross the network in plaintext. The terminator
+#    must keep the client's Host (see "Inbound authentication" below).
+# 4. Confirm passthrough, locally and as a remote caller would:
+curl -si 'http://127.0.0.1:8787/v1/models'
+curl -si -H "X-Headroom-Proxy-Token: $HEADROOM_PROXY_TOKEN" \
+    'https://<your-proxy-hostname>/v1/models'
+#    (A plaintext http://<lan-ip>:8787 check is only for an isolated test
+#    network with a disposable token.)
 # 5. Rollback = stop the Rust proxy and rebind Python back to 8787.
 ```
 
@@ -94,6 +109,7 @@ curl -si http://127.0.0.1:8787/v1/models
 | `--max-body-bytes` |  | `100MB` | for buffered cases; streams bypass |
 | `--log-level` |  | `info` | `RUST_LOG`-style filter |
 | `--rewrite-host` / `--no-rewrite-host` | | rewrite | rewrite Host to upstream (default) |
+| `--python-upstream` | `HEADROOM_PROXY_PYTHON_UPSTREAM` | `false` | the upstream is the Headroom Python proxy: relay non-local callers under `headroom-remote.invalid` over HTTP (WebSocket handshakes keep the upstream's `Host` and rely on the remote marker) and send the relay proof on both (below); leave off for any other backend |
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
 | `--stats` | `HEADROOM_PROXY_STATS` | `true` | native savings stats + `/dashboard` (below) |
 | `--stats-path` | `HEADROOM_PROXY_STATS_PATH` | `~/.headroom/native_stats.json` | ledger persistence (honours `HEADROOM_WORKSPACE_DIR`) |
@@ -110,20 +126,115 @@ Python proxy trusts loopback callers (no token needed, and access to
 
 - With a token set, a non-loopback peer must send it as
   `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`,
-  or gets `401 {"error":"unauthorized"}`. Loopback peers are exempt, as
-  in the Python proxy. The token is removed from the request before it
-  is forwarded (`Authorization` only when it carries the token).
+  or gets `401 {"error":"unauthorized"}`. Loopback peers that name this
+  proxy by a loopback `Host` (`127.0.0.1`, `[::1]`, `localhost`) are
+  exempt, as in the Python proxy; so is a loopback peer that sends no
+  `Host` at all (a raw HTTP/1.0 client; browsers always send one). The token is removed from the request
+  before it is forwarded (`Authorization` only when it carries the token).
+- A loopback peer under any other `Host` (a hosts-file alias, a same-host
+  reverse proxy that keeps the public `Host`, or a browser page whose
+  hostname was pointed at 127.0.0.1) needs the token too; with no token
+  configured it gets `403`.
+- With `--python-upstream`, a caller that presented the token is
+  forwarded with `X-Headroom-Front-Proof`, a value derived from the token
+  (never the token itself), and only when `--upstream` is a loopback
+  address, `localhost`, or a container host alias (`host.docker.internal`,
+  `host.containers.internal`, for a front in a container). Python proxies that verify the proof accept it
+  in place of the token the front strips; that verification ships in the
+  Python security-gate change that follows this one. Until then the
+  Python proxy ignores the header and never forwards it upstream, in any
+  `HEADROOM_STRIP_INTERNAL_HEADERS` mode. **Set the same
+  `HEADROOM_PROXY_TOKEN` for both processes** when the front serves
+  non-local callers: a verifying Python proxy refuses what the front
+  relays for them otherwise (`403`). The front drops any
+  `X-Headroom-Front-Proof` a client sends, and never sends one without
+  `--python-upstream`.
 - A caller that is not local here (a non-loopback peer, or a loopback
-  peer whose `Host` is not a loopback name) is never forwarded with a
+  peer whose `Host` is not a loopback name) is never forwarded over HTTP with a
   `Host` that may name loopback (including scoped IPv6 such as
   `[::1%lo]`), whatever `--rewrite-host` is and whatever the upstream
   name resolves to: that `Host` is replaced with
   `headroom-remote.invalid`, so the Python proxy's local-only routes
   (`/admin`, `/debug`, `/settings`, ...) stay closed to it, with or
-  without a token.
+  without a token. With `--python-upstream` the relayed `Host` is always
+  `headroom-remote.invalid`, even under `--no-rewrite-host`; without it a
+  public `Host` kept by `--no-rewrite-host` reaches the backend as sent,
+  so a same-host gateway can still route on it. This `Host` rule is
+  HTTP only: a relayed WebSocket handshake always carries the upstream's
+  own `Host` (the WebSocket client sets it, e.g. `127.0.0.1:8788`), and
+  relies on the remote marker below (plus the relay proof with
+  `--python-upstream`) to keep a remote caller from counting as local.
 - `GET /healthz`, `/healthz/upstream`, `/health`, `/livez` and `/readyz`
-  stay reachable without the token, and `GET`/`HEAD /api/hello` is
-  answered locally with an empty `200`.
+  stay reachable without the token, and also from a loopback peer under
+  a public `Host` when no token is configured (a monitor behind a
+  same-host reverse proxy). `GET`/`HEAD /api/hello` is answered locally
+  with an empty `200`. No other route is exempt.
+- A loopback peer under a loopback `Host` is indistinguishable from a
+  client on this machine. A same-host TLS terminator or reverse proxy
+  (nginx, Caddy, ...) in front of the Rust proxy must therefore relay only
+  requests for its public name, with that name as `Host`: if it relays a
+  request whose `Host` is `127.0.0.1` or `localhost`, whether it rewrote
+  it or the client sent it, that caller counts as local here, skips the
+  token and reaches the Python proxy's local-only routes. (A container
+  alias such as `host.docker.internal` is not local to the front, which
+  requires the token for it; only the Python proxy trusts those names
+  from a loopback peer. The front never forwards a caller-chosen alias
+  under `--no-rewrite-host`; a front that reaches the Python proxy as
+  `http://host.docker.internal:<port>` must run with `--python-upstream
+  true`, so its relayed callers carry `headroom-remote.invalid` instead.) Validate the authority explicitly; `$host` alone passes
+  through whatever the client sent. For nginx:
+
+  ```nginx
+  # WebSocket routes need the upgrade forwarded. Through the Rust proxy they
+  # are /v1/live, /v1/codex/live, /backend-api/live, /backend-api/codex/live,
+  # /v1/codex/responses, /backend-api/responses, /backend-api/codex/responses.
+  # (It mounts /v1/responses for POST only: a WebSocket upgrade there gets 405.)
+  map $http_upgrade $connection_upgrade {
+      default upgrade;
+      ''      close;
+  }
+  # Any authority other than the public name never reaches the front.
+  server {
+      listen 443 ssl default_server;
+      ssl_reject_handshake on;   # unknown SNI (IP literals, localhost, ...)
+      return 444;                # known SNI, other Host: close, no response
+  }
+  server {
+      listen 443 ssl;
+      server_name proxy.example.com;     # your public name, nothing else
+      ssl_certificate     /etc/ssl/headroom/fullchain.pem;
+      ssl_certificate_key /etc/ssl/headroom/privkey.pem;
+      location / {
+          proxy_pass http://127.0.0.1:8787;
+          proxy_set_header Host $host;   # the validated public name
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_buffering off;           # streaming responses
+      }
+  }
+  ```
+
+  Callers of the public name then need the token; any other authority
+  (`Host: 127.0.0.1:8787`, `localhost`, `host.docker.internal`, an IP) is
+  closed by nginx and never reaches the front. Alternatively, have the terminator forward to the
+  front on a non-loopback address. The front logs
+  `event=proxy_loopback_listen_with_token` at startup as a reminder when
+  it listens on loopback with a token configured.
+- Every request and WebSocket handshake relayed for a caller that is not
+  local here carries `X-Headroom-Front-Remote: 1`, in every mode and
+  whatever `Host` is sent;
+  the front drops any value a client sends. It is not a secret: the Python
+  proxy never treats a request carrying it as local (loopback or
+  container-alias `Host`), so a remote caller cannot borrow a name the
+  Python proxy would trust from the front's loopback connection. Other
+  backends can ignore it.
+  The Python proxy enforces it only from the release that adds marker
+  checks; an older one ignores it and still counts a relayed WebSocket
+  handshake (loopback peer, loopback upstream `Host`) as local. The front
+  has already required the token from that caller, but the Python side
+  grants it local treatment, so upgrade the Python proxy first when
+  WebSocket clients reach the front remotely.
 - A non-loopback `--listen` with no token refuses to start. Set
   `HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` only when something else
   already restricts who can reach the port.

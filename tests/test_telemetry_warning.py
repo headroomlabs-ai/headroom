@@ -407,7 +407,9 @@ class TestStatsEndpointTelemetryFlag:
 
         from httpx import ASGITransport, AsyncClient
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
             resp = await client.get("/stats")
 
         assert resp.status_code == 200
@@ -430,7 +432,9 @@ class TestStatsEndpointTelemetryFlag:
 
         from httpx import ASGITransport, AsyncClient
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
             resp = await client.get("/stats")
 
         assert resp.status_code == 200
@@ -454,7 +458,9 @@ class TestStatsEndpointTelemetryFlag:
 
         from httpx import ASGITransport, AsyncClient
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
             resp = await client.get("/stats")
 
         assert resp.status_code == 200

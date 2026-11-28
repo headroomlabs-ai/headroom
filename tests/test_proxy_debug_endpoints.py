@@ -606,19 +606,19 @@ def test_debug_endpoints_return_404_for_non_loopback_client(app_and_external_cli
 
 
 def test_debug_endpoints_block_dns_rebinding(app_and_rebinding_client):
-    """Loopback client + ``Host: attacker.com`` must 404 like an external client.
+    """Loopback client + ``Host: attacker.com`` must never reach /debug/*.
 
     Regression for the DNS-rebinding gap: prior to 2026-06 the guard
     only checked ``request.client.host``, which a rebound browser
-    passes trivially. Adding a ``Host:`` header allowlist closes that
-    gap so a malicious site cannot read /debug/* over the user's
-    loopback proxy via the wide-open CORS policy.
+    passes trivially. The security gate now refuses a loopback peer
+    under an unlisted non-local ``Host`` (403) before routing; a
+    non-loopback client still gets the routes' own 404
+    (``test_debug_endpoints_return_404_for_non_loopback_client``).
     """
     _, client = app_and_rebinding_client
     for path in ("/debug/tasks", "/debug/ws-sessions", "/debug/warmup"):
         response = client.get(path)
-        assert response.status_code == 404, path
-        assert response.status_code != 403
+        assert response.status_code == 403, path
 
 
 def test_existing_health_routes_unchanged(client):

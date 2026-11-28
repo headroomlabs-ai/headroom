@@ -334,6 +334,20 @@ pub struct CliArgs {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
+    /// The upstream is the Headroom Python proxy on this machine. Non-local
+    /// callers are then relayed under `Host: headroom-remote.invalid` even
+    /// with `--no-rewrite-host`, and callers that presented the proxy token
+    /// carry `X-Headroom-Front-Proof` (only to a loopback upstream). Leave it
+    /// off for any other upstream: a generic backend then keeps the caller's
+    /// public `Host` under `--no-rewrite-host` and never sees the proof.
+    #[arg(
+        long = "python-upstream",
+        env = "HEADROOM_PROXY_PYTHON_UPSTREAM",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub python_upstream: bool,
+
     /// Rewrite the outgoing Host header to the upstream host (default).
     /// Pair with --no-rewrite-host to preserve the client-supplied Host.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -731,6 +745,8 @@ pub struct Config {
     pub max_body_bytes: u64,
     pub log_level: String,
     pub rewrite_host: bool,
+    /// Upstream is the Headroom Python proxy (`--python-upstream`).
+    pub python_upstream: bool,
     pub graceful_shutdown_timeout: Duration,
     /// Master switch for the LLM compression interceptor. When `false`,
     /// the proxy is pure streaming passthrough and never buffers a body.
@@ -851,6 +867,7 @@ impl Config {
             max_body_bytes: args.max_body_bytes,
             log_level: args.log_level,
             rewrite_host,
+            python_upstream: args.python_upstream,
             graceful_shutdown_timeout: args.graceful_shutdown_timeout,
             compression: args.compression,
             compression_max_body_bytes,
@@ -899,6 +916,7 @@ impl Config {
             max_body_bytes: 100 * 1024 * 1024,
             log_level: "warn".into(),
             rewrite_host: true,
+            python_upstream: false,
             graceful_shutdown_timeout: Duration::from_secs(5),
             compression: false,
             compression_max_body_bytes: 100 * 1024 * 1024,

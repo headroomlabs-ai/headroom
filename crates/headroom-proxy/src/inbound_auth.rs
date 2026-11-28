@@ -25,6 +25,20 @@ pub const PROXY_TOKEN_ENV: &str = "HEADROOM_PROXY_TOKEN";
 /// Same variable and truthy values as the Python bind policy.
 pub const OPEN_BIND_ACK_ENV: &str = "HEADROOM_ALLOW_UNAUTHENTICATED_BIND";
 const PROXY_TOKEN_HEADER: &str = "x-headroom-proxy-token";
+/// Proof, sent upstream, that this front authenticated the caller with the
+/// token. Same name and derivation as Python's `FRONT_RELAY_PROOF_HEADER` /
+/// `front_relay_proof`: the Python proxy behind the front accepts it in
+/// place of the token this front strips. Removed from every inbound request.
+pub const RELAY_PROOF_HEADER: &str = "x-headroom-front-proof";
+
+/// Set to `1` on every request relayed for a [`NonLocalCaller`], whatever
+/// `Host` is sent and in every mode, and removed from what clients send.
+/// Not a secret: it only takes trust away. The Python proxy never treats a
+/// request carrying it as local (loopback or container-alias `Host`), so a
+/// remote caller cannot borrow a local name it would trust from this
+/// process's loopback connection.
+pub const FRONT_REMOTE_HEADER: &str = "x-headroom-front-remote";
+const RELAY_PROOF_CONTEXT: &[u8] = b"headroom-front-relay-v1\0";
 
 /// A configured proxy token. `Debug` never prints the value, because
 /// `Config` derives `Debug`.
@@ -41,6 +55,21 @@ impl ProxyToken {
 
     fn matches(&self, provided: &str) -> bool {
         constant_time_eq(provided.as_bytes(), self.0.as_bytes())
+    }
+
+    /// The [`RELAY_PROOF_HEADER`] value for this token: lowercase hex
+    /// SHA-256 of a fixed context and the token. Derived, so the token
+    /// itself never leaves this process.
+    pub fn relay_proof(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(RELAY_PROOF_CONTEXT);
+        hasher.update(self.0.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
@@ -150,14 +179,58 @@ fn is_hello_probe(method: &Method, path: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct NonLocalCaller;
 
+/// Request extension: the [`RELAY_PROOF_HEADER`] value to send upstream,
+/// set only for a non-local caller that presented the token here. Sent
+/// only to a loopback upstream (see [`upstream_takes_relay_proof`]).
+#[derive(Clone, Debug)]
+pub struct RelayProof(pub HeaderValue);
+
 /// `Host` sent upstream in place of one that may name loopback, for a
 /// [`NonLocalCaller`]. A reserved name (RFC 2606), never the caller's own
 /// value: the caller controls that, and the upstream's parser may accept
 /// loopback forms this one does not.
 pub const NON_LOCAL_HOST: &str = "headroom-remote.invalid";
 
-/// For a [`NonLocalCaller`]: [`NON_LOCAL_HOST`] when the `Host` that would
-/// be sent may name loopback, else `None` (keep it). That `Host` is the
+/// What the front tells its upstream about a caller it relays, on HTTP and
+/// WebSocket alike: the remote marker for a [`NonLocalCaller`], and, when
+/// that caller presented the token and the upstream is a `--python-upstream`
+/// address that may take it, the relay proof standing in for the stripped
+/// token. A local caller's request is left as it is.
+pub(crate) fn insert_relay_identity(
+    headers: &mut HeaderMap,
+    extensions: &axum::http::Extensions,
+    upstream: &url::Url,
+    python_upstream: bool,
+) {
+    if extensions.get::<NonLocalCaller>().is_none() {
+        return;
+    }
+    headers.insert(FRONT_REMOTE_HEADER, HeaderValue::from_static("1"));
+    if let Some(proof) = extensions.get::<RelayProof>() {
+        if python_upstream && upstream_takes_relay_proof(upstream) {
+            headers.insert(RELAY_PROOF_HEADER, proof.0.clone());
+        }
+    }
+}
+
+/// Whether a `--python-upstream` upstream may receive the relay proof: the
+/// Python proxy on this machine, addressed as a loopback IP literal,
+/// `localhost`, or (from a container) a container host alias.
+pub(crate) fn upstream_takes_relay_proof(upstream: &url::Url) -> bool {
+    match upstream.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
+        Some(url::Host::Domain(name)) => {
+            name.eq_ignore_ascii_case("localhost") || names_container_host_alias(name)
+        }
+        None => false,
+    }
+}
+
+/// For a [`NonLocalCaller`]: [`NON_LOCAL_HOST`] when the upstream is the
+/// Python proxy (`--python-upstream`), which tells relayed callers apart by
+/// that name, or when the `Host` that would be sent may name loopback; else
+/// `None` (keep it, so a generic backend can route on the caller's `Host`). That `Host` is the
 /// explicit outgoing one (`--no-rewrite-host`), else the upstream URL's
 /// authority. Judged on the value, not on the upstream address, so an
 /// upstream name that resolves to loopback cannot be paired with a
@@ -165,15 +238,31 @@ pub const NON_LOCAL_HOST: &str = "headroom-remote.invalid";
 pub(crate) fn host_override_for_non_local(
     outgoing: Option<&HeaderValue>,
     upstream: &url::Url,
+    python_upstream: bool,
 ) -> Option<HeaderValue> {
-    let effective = match outgoing {
-        Some(h) => h.to_str().ok().map(str::to_owned),
-        None => upstream.host_str().map(|h| match upstream.port() {
-            Some(port) => format!("{h}:{port}"),
-            None => h.to_owned(),
-        }),
+    if python_upstream {
+        return Some(HeaderValue::from_static(NON_LOCAL_HOST));
+    }
+    let replace = match outgoing {
+        // A Host the caller chose (`--no-rewrite-host`): never one the
+        // Python proxy would trust as local, container aliases included.
+        Some(h) => {
+            let value = h.to_str().ok();
+            may_name_loopback(value) || value.is_some_and(names_container_host_alias)
+        }
+        // The upstream URL's own authority: a generic backend configured as
+        // `http://host.docker.internal:4000` keeps the name it routes on.
+        None => may_name_loopback(
+            upstream
+                .host_str()
+                .map(|h| match upstream.port() {
+                    Some(port) => format!("{h}:{port}"),
+                    None => h.to_owned(),
+                })
+                .as_deref(),
+        ),
     };
-    may_name_loopback(effective.as_deref()).then(|| HeaderValue::from_static(NON_LOCAL_HOST))
+    replace.then(|| HeaderValue::from_static(NON_LOCAL_HOST))
 }
 
 /// Conservative superset of what the Python proxy treats as a loopback
@@ -185,6 +274,19 @@ fn may_name_loopback(value: Option<&str>) -> bool {
         None => true,
         Some(v) => v.contains('%') || is_loopback_host_header(Some(v)),
     }
+}
+
+/// Python's `_CONTAINER_HOST_ALIASES`, on any port; case and a trailing
+/// dot ignored. The Python proxy trusts them from a loopback peer (Docker
+/// Desktop delivers container callers to the host from 127.0.0.1); this
+/// front does not, they only decide which caller-chosen `Host` it relays.
+fn names_container_host_alias(value: &str) -> bool {
+    let host = value.trim();
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    ["host.docker.internal", "host.containers.internal"]
+        .iter()
+        .any(|alias| host.eq_ignore_ascii_case(alias))
 }
 
 /// Same rules as Python's `loopback_guard.is_loopback_host_header`:
@@ -211,14 +313,20 @@ fn is_loopback_host_header(value: Option<&str>) -> bool {
 }
 
 /// Router-wide middleware. Marks every caller that is not local with
-/// [`NonLocalCaller`]. When a token is configured, a non-loopback (or
-/// unknown) peer must also present it or gets 401 with no upstream
-/// contact, and the credential is removed before forwarding.
+/// [`NonLocalCaller`]. A loopback peer under a `Host` that does not name
+/// loopback is the shape of a browser page whose hostname was pointed at
+/// 127.0.0.1, so it is treated like a remote peer: with a token configured
+/// it must present it (401 otherwise), and without one it is refused (403).
+/// A non-local caller that presented the token is forwarded with a
+/// [`RelayProof`]; the credential itself is removed before forwarding.
 pub async fn inbound_gate(
     State(token): State<Option<ProxyToken>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    // Only this process may vouch for a caller upstream, or mark it remote.
+    req.headers_mut().remove(RELAY_PROOF_HEADER);
+    req.headers_mut().remove(FRONT_REMOTE_HEADER);
     // No ConnectInfo is no evidence of a local caller: fail closed, as
     // Python's is_loopback_host(None) does.
     let peer = req
@@ -226,13 +334,23 @@ pub async fn inbound_gate(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
     let loopback_peer = peer.as_ref().is_some_and(is_loopback);
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    // A browser always sends a Host, so a loopback peer without one (a raw
+    // HTTP/1.0 client on this machine) is not the rebound-page shape: it is
+    // local, like a loopback Host.
+    let local = loopback_peer && (host.is_none() || is_loopback_host_header(host));
+    let mut authenticated = false;
     if let Some(token) = &token {
         // Answered here and empty, never relayed upstream without a
         // credential: the same answer the Python proxy gives it.
         if is_hello_probe(req.method(), req.uri().path()) {
             return StatusCode::OK.into_response();
         }
-        if !loopback_peer && !is_health_probe(req.method(), req.uri().path()) {
+        if !local && !is_health_probe(req.method(), req.uri().path()) {
             let provided = read_proxy_token(req.headers());
             if !provided.is_some_and(|p| token.matches(p)) {
                 tracing::warn!(
@@ -248,20 +366,35 @@ pub async fn inbound_gate(
                 )
                     .into_response();
             }
+            authenticated = true;
         }
         let headers = req.headers_mut();
         headers.remove(PROXY_TOKEN_HEADER);
         if bearer(headers).is_some_and(|b| token.matches(b)) {
             headers.remove(header::AUTHORIZATION);
         }
+    } else if loopback_peer && !local && !is_health_probe(req.method(), req.uri().path()) {
+        tracing::warn!(
+            event = "proxy_loopback_host_rejected",
+            method = %req.method(),
+            path = req.uri().path(),
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "request to a loopback listener under a non-loopback Host rejected",
+                "hint": "use 127.0.0.1 or localhost, or set HEADROOM_PROXY_TOKEN and send it",
+            })),
+        )
+            .into_response();
     }
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()));
-    if !(loopback_peer && is_loopback_host_header(host)) {
+    if !local {
         req.extensions_mut().insert(NonLocalCaller);
+        if let (true, Some(token)) = (authenticated, &token) {
+            if let Ok(proof) = HeaderValue::from_str(&token.relay_proof()) {
+                req.extensions_mut().insert(RelayProof(proof));
+            }
+        }
     }
     next.run(req).await
 }
@@ -302,6 +435,87 @@ mod tests {
                 Ok(BindPolicy::OpenAcknowledged)
             );
         }
+    }
+
+    #[test]
+    fn relay_proof_goes_only_to_a_loopback_upstream() {
+        for ok in [
+            "http://127.0.0.1:8788",
+            "http://[::1]:8788",
+            "http://LOCALHOST:1",
+            "http://host.docker.internal:8788",
+            "http://HOST.CONTAINERS.INTERNAL:8788",
+        ] {
+            assert!(upstream_takes_relay_proof(&ok.parse().unwrap()), "{ok}");
+        }
+        for no in [
+            "https://api.anthropic.com",
+            "http://10.0.0.5:8788",
+            "http://localhost.example.com",
+            "http://host.docker.internal.example.com",
+        ] {
+            assert!(!upstream_takes_relay_proof(&no.parse().unwrap()), "{no}");
+        }
+    }
+
+    #[test]
+    fn relay_identity_for_a_container_alias_upstream() {
+        // CI has no container DNS, so the alias upstream is checked here: a
+        // front in a container dialling the Python proxy as
+        // host.docker.internal sends the marker and the proof Python derives
+        // from the same token (see `relay_proof_matches_python`).
+        let token = ProxyToken::new("abc").unwrap();
+        let proof = HeaderValue::from_str(&token.relay_proof()).unwrap();
+        let identity = |upstream: &str, python: bool, remote: bool, proved: bool| {
+            let mut ext = axum::http::Extensions::new();
+            if remote {
+                ext.insert(NonLocalCaller);
+            }
+            if proved {
+                ext.insert(RelayProof(proof.clone()));
+            }
+            let mut headers = HeaderMap::new();
+            insert_relay_identity(&mut headers, &ext, &upstream.parse().unwrap(), python);
+            (
+                headers.get(FRONT_REMOTE_HEADER).cloned(),
+                headers.get(RELAY_PROOF_HEADER).cloned(),
+            )
+        };
+        let marker = Some(HeaderValue::from_static("1"));
+        for upstream in [
+            "http://host.docker.internal:8788",
+            "http://host.containers.internal:8788",
+        ] {
+            assert_eq!(
+                identity(upstream, true, true, true),
+                (marker.clone(), Some(proof.clone()))
+            );
+            // Without --python-upstream the marker still goes, the proof never.
+            assert_eq!(
+                identity(upstream, false, true, true),
+                (marker.clone(), None)
+            );
+            // A remote caller that did not present the token: marker only.
+            assert_eq!(
+                identity(upstream, true, true, false),
+                (marker.clone(), None)
+            );
+            // A local caller: nothing.
+            assert_eq!(identity(upstream, true, false, false), (None, None));
+        }
+        assert_eq!(
+            identity("http://proxy.internal.example:8788", true, true, true),
+            (marker, None)
+        );
+    }
+
+    #[test]
+    fn relay_proof_matches_python() {
+        // headroom.proxy.server.front_relay_proof("abc")
+        assert_eq!(
+            ProxyToken::new("abc").unwrap().relay_proof(),
+            "33d9db219abd5b185118a8980948fe91930384fdf1a44fa3a964fcdb670be2e3"
+        );
     }
 
     #[test]
@@ -358,19 +572,43 @@ mod tests {
             "::1%lo",
         ] {
             assert_eq!(
-                host_override_for_non_local(Some(&hv(host)), &alias).unwrap(),
+                host_override_for_non_local(Some(&hv(host)), &alias, false).unwrap(),
                 NON_LOCAL_HOST,
                 "{host}"
             );
         }
         // Rewritten Host on a loopback upstream: the reserved name.
         assert_eq!(
-            host_override_for_non_local(None, &loopback).unwrap(),
+            host_override_for_non_local(None, &loopback, false).unwrap(),
             NON_LOCAL_HOST
         );
         // Not loopback: left alone.
-        assert!(host_override_for_non_local(None, &alias).is_none());
-        assert!(host_override_for_non_local(Some(&hv("proxy.example")), &loopback).is_none());
+        assert!(host_override_for_non_local(None, &alias, false).is_none());
+        // The container host aliases the Python proxy trusts from loopback.
+        for host in [
+            "host.docker.internal",
+            "HOST.DOCKER.INTERNAL.:8787",
+            "host.containers.internal:443",
+        ] {
+            assert_eq!(
+                host_override_for_non_local(Some(&hv(host)), &loopback, false).unwrap(),
+                NON_LOCAL_HOST,
+                "{host}"
+            );
+        }
+        // A generic upstream addressed by a container name keeps it (default
+        // Host rewriting); only a caller-chosen alias is replaced.
+        let container = up("http://host.docker.internal:4000");
+        assert!(host_override_for_non_local(None, &container, false).is_none());
+        // A generic loopback backend keeps a public Host it may route on.
+        assert!(
+            host_override_for_non_local(Some(&hv("proxy.example")), &loopback, false).is_none()
+        );
+        // The Python proxy (--python-upstream) always gets the reserved name.
+        assert_eq!(
+            host_override_for_non_local(Some(&hv("proxy.example")), &loopback, true).unwrap(),
+            NON_LOCAL_HOST
+        );
     }
 
     #[test]

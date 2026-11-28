@@ -48,3 +48,19 @@ def test_strip_internal_headers_disabled_returns_copy_unchanged() -> None:
 
     assert copied == headers
     assert copied is not headers
+
+
+def test_disabled_mode_never_keeps_headroom_credentials() -> None:
+    # Diagnostic mode forwards internal labels, but the proxy token and the
+    # Rust front's relay proof authenticate to Headroom only.
+    headers = {
+        "X-Headroom-Front-Proof": "0" * 64,
+        "X-Headroom-Proxy-Token": "proxy-token",
+        "X-Headroom-Team": "payments",
+        "content-type": "application/json",
+    }
+
+    assert strip_internal_headers(headers, mode="disabled") == {
+        "X-Headroom-Team": "payments",
+        "content-type": "application/json",
+    }
