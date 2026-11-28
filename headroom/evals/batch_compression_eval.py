@@ -1355,6 +1355,7 @@ def evaluate_token_counting_accuracy(
         try:
             import tiktoken
 
+            guard_egress("load tiktoken encoding", destination="tiktoken encoding cl100k_base")
             enc = tiktoken.get_encoding("cl100k_base")
             actual = len(enc.encode(text))
         except ImportError:

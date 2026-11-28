@@ -30,7 +30,7 @@ from typing import Any, Literal
 
 from ..config import TransformResult
 from ..log_safety import describe_exception, safe_id
-from ..offline import OFFLINE_ENV, OfflineEgressBlocked
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked, guard_egress
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     _resolve_revision,
@@ -1683,6 +1683,7 @@ def payload_tokens(text: str) -> int:
         try:
             import tiktoken
 
+            guard_egress("load tiktoken encoding", destination="tiktoken encoding cl100k_base")
             _payload_encoder = tiktoken.get_encoding("cl100k_base")
         except Exception:
             _payload_encoder = False
