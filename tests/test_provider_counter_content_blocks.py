@@ -559,3 +559,25 @@ def test_url_and_file_document_sources_are_one_nominal_page() -> None:
         {"type": "file", "file_id": "file_1"},
     ):
         assert count_content_blocks([{"type": "document", "source": source}], len) == 1500
+
+
+def test_openai_file_parts_are_priced_by_pages_not_as_text() -> None:
+    """The same 12-page PDF as a Chat Completions ``file`` or a Responses ``input_file``."""
+    data_url = "data:application/pdf;base64," + base64.b64encode(_pdf(12)).decode()
+    for part in (
+        {"type": "file", "file": {"filename": "report.pdf", "file_data": data_url}},
+        {"type": "input_file", "filename": "report.pdf", "file_data": data_url},
+    ):
+        assert count_content_blocks([part], len) == 12 * 1500
+        for name, counter in _counters().items():
+            got = counter.count_messages([{"role": "user", "content": [part]}])
+            assert 12 * 1500 <= got < 12 * 1500 + 100, f"{name} priced a 12-page PDF at {got}"
+
+
+def test_openai_file_ids_and_urls_are_one_nominal_page() -> None:
+    for part in (
+        {"type": "file", "file": {"file_id": "file-abc"}},
+        {"type": "input_file", "file_id": "file-abc"},
+        {"type": "input_file", "file_url": "https://example.com/a.pdf"},
+    ):
+        assert count_content_blocks([part], len) == 1500
