@@ -328,9 +328,12 @@ mod tests {
     #[test]
     fn non_json_whitespace_not_treated_as_json_container() {
         // Non-breaking space is Unicode whitespace, but not ASCII/JSON whitespace.
-        // A long string starting with non-JSON whitespace followed by `{}` must be
-        // treated as opaque, not as a JSON container.
-        let s = format!("\u{00a0}{{{}}}", "x".repeat(300));
+        // A long string starting with non-JSON whitespace followed by an otherwise valid
+        // JSON object must be treated as opaque, not as a JSON container.
+        let valid_json = format!(r#"{{"key":"{}"}}"#, "x".repeat(300));
+        assert!(serde_json::from_str::<Value>(&valid_json).is_ok());
+
+        let s = format!("\u{00a0}{valid_json}");
         match classify_cell(&Value::String(s), &cfg()) {
             CellClass::Opaque(OpaqueKind::LongString) => {}
             other => panic!("expected LongString, got {other:?}"),
