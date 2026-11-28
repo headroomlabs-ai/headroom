@@ -135,7 +135,7 @@ it.
 
 ## Failure Learning
 
-`headroom learn` supports OpenCode as a scan target. It reads past sessions from the newer of `~/.local/share/opencode/opencode-local.db` and `~/.local/share/opencode/opencode.db`, or from `HEADROOM_OPENCODE_DB` when you set an explicit override, and writes corrections to your project's `AGENTS.md`.
+`headroom learn` supports OpenCode as a scan target. It reads past sessions from the newer of `opencode-local.db` and `opencode.db` in `$XDG_DATA_HOME/opencode`, which defaults to `~/.local/share/opencode` when `XDG_DATA_HOME` is unset or relative. Set `HEADROOM_OPENCODE_DB` to use a specific database. Learn writes corrections to your project's `AGENTS.md`.
 
 ```bash
 headroom learn --agent opencode --apply

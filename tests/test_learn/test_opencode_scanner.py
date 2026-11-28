@@ -92,7 +92,7 @@ def _patch_default_paths(monkeypatch: pytest.MonkeyPatch, db_dir: Path) -> tuple
     canonical_db = db_dir / "opencode.db"
     local_db = db_dir / "opencode-local.db"
     monkeypatch.setattr(opencode_module, "_OPENCODE_DIR", db_dir, raising=False)
-    monkeypatch.setattr(opencode_module, "_OPENCODE_DB", canonical_db, raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     return canonical_db, local_db
 
 
@@ -247,6 +247,28 @@ def test_opencode_plugin_equal_mtime_prefers_canonical(
     assert projects[0].name == "Canonical"
 
 
+def test_opencode_plugin_discovers_sessions_in_xdg_data_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_path = tmp_path / "repo"
+    _write_agents_file(project_path)
+    default = tmp_path / "default"
+    default.mkdir()
+    canonical_db, _ = _patch_default_paths(monkeypatch, default)
+    _create_opencode_db(canonical_db, project_path, project_name="Old data directory")
+
+    data_home = tmp_path / "xdg-data"
+    db_dir = data_home / "opencode"
+    db_dir.mkdir(parents=True)
+    _create_opencode_db(db_dir / "opencode.db", project_path, project_name="Current data directory")
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+
+    plugin = OpenCodePlugin()
+    projects = plugin.discover_projects()
+    assert [project.name for project in projects] == ["Current data directory"]
+    assert [session.session_id for session in plugin.scan_project(projects[0])] == ["session-1"]
+
+
 def test_opencode_plugin_env_override_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project_path = tmp_path / "repo"
     _write_agents_file(project_path)
@@ -274,6 +296,7 @@ def test_opencode_plugin_env_override_wins(tmp_path: Path, monkeypatch: pytest.M
     )
     _set_mtime(canonical_db, seconds=1)
     _set_mtime(local_db, seconds=2)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     monkeypatch.setenv(opencode_module._OPENCODE_DB_ENV, str(override_db))
 
     plugin = OpenCodePlugin()
@@ -306,12 +329,15 @@ def test_opencode_plugin_missing_override_stays_missing(
     assert plugin.discover_projects() == []
 
 
+@pytest.mark.parametrize("data_home", [None, "", "relative/path"])
 def test_opencode_plugin_no_default_database_detects_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data_home: str | None
 ) -> None:
     db_dir = tmp_path / "opencode"
     db_dir.mkdir()
     canonical_db, _ = _patch_default_paths(monkeypatch, db_dir)
+    if data_home is not None:
+        monkeypatch.setenv("XDG_DATA_HOME", data_home)
 
     plugin = OpenCodePlugin()
 

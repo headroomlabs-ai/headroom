@@ -1,8 +1,7 @@
 """OpenCode plugin for headroom learn.
 
-Reads conversation data from the OpenCode SQLite database at
-``~/.local/share/opencode/opencode.db`` or
-``~/.local/share/opencode/opencode-local.db``. Set
+Reads ``opencode.db`` or ``opencode-local.db`` under OpenCode's XDG data
+directory (``~/.local/share/opencode`` by default). Set
 ``HEADROOM_OPENCODE_DB`` to force a specific database path.
 
 Supports both schemas:
@@ -43,7 +42,6 @@ from ._paths import path_exists
 logger = logging.getLogger(__name__)
 
 _OPENCODE_DIR = Path.home() / ".local" / "share" / "opencode"
-_OPENCODE_DB = _OPENCODE_DIR / "opencode.db"
 _OPENCODE_DB_ENV = "HEADROOM_OPENCODE_DB"
 _OPENCODE_DB_CANDIDATES = ("opencode-local.db", "opencode.db")
 
@@ -149,7 +147,7 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
     @property
     def description(self) -> str:
         return (
-            "OpenCode (~/.local/share/opencode/{opencode.db,opencode-local.db}; "
+            "OpenCode (XDG data directory; defaults to ~/.local/share/opencode; "
             "HEADROOM_OPENCODE_DB overrides)"
         )
 
@@ -292,9 +290,11 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
         if override is not None:
             return Path(override).expanduser()
 
+        data_home = Path(os.environ.get("XDG_DATA_HOME", ""))
+        db_dir = data_home / "opencode" if data_home.is_absolute() else _OPENCODE_DIR
         ranked_candidates: list[tuple[int, int, Path]] = []
         for name in _OPENCODE_DB_CANDIDATES:
-            candidate = _OPENCODE_DIR / name
+            candidate = db_dir / name
             try:
                 mtime_ns = candidate.stat().st_mtime_ns
             except OSError:
@@ -304,7 +304,7 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
         if ranked_candidates:
             return max(ranked_candidates)[2]
 
-        return _OPENCODE_DB
+        return db_dir / "opencode.db"
 
     def _scan_session(
         self,
