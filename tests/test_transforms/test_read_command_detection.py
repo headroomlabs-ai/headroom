@@ -16,6 +16,7 @@ from headroom.transforms.content_router import (
     ContentRouter,
     ContentRouterConfig,
     _is_read_command,
+    _read_output_should_be_protected,
 )
 
 
@@ -42,6 +43,13 @@ from headroom.transforms.content_router import (
         "cd /repo && cat foo.py",
         "sudo cat foo.py",
         "rtk cat foo.py",
+        "git show HEAD:src/foo.py",
+        "git --no-pager show HEAD:src/foo.py | cat -n",
+        "git show 'release:src/file name.py'",
+        "git show --no-color HEAD:src/foo.py",
+        "git show HEAD:src/foo.py --",
+        "git show :0:src/foo.py",
+        "git show 'main@{12:00}:src/foo.py'",
         'bash -lc "cat foo.py"',
         # The `-c` argument is not the first token after the shell.
         'bash --norc -lc "cat foo.py"',
@@ -87,6 +95,9 @@ def test_chained_reads_are_detected(command: str) -> None:
         # A pipeline stage consumes the previous stage's output, not a file:
         # `head` here truncates grep output, it does not read bar.py.
         "grep -n x foo.py | head -40",
+        "grep -n x foo.py |\ncat",
+        "printf 'derived output\\n' | # explanation\ncat",
+        "printf 'derived output\\n' |& # explanation\ncat",
         # Writes are never reads.
         "cat > foo.py",
         # The write lives in the read segment itself — a pipeline is one segment,
@@ -110,6 +121,12 @@ def test_chained_reads_are_detected(command: str) -> None:
         "sed -- -n foo.py",  # Option parsing ends at --.
         # Lockfiles are regenerated, never byte-patched.
         "cat uv.lock",
+        "git show HEAD:uv.lock",
+        "git show :0:uv.lock",
+        "git show 'main@{12:00}:uv.lock'",
+        "git show HEAD -- src/foo.py",  # A patch, not the file's contents.
+        "git show HEAD:src/foo.py -- src/bar.py",
+        "git show HEAD:src/foo.py > copy.py",
         # `-n` from a sibling segment must not qualify a bare `sed`.
         "sed 's/a/b/' foo.py && ls -n",
         # A segment that is only an env assignment resolves to no program.
@@ -121,6 +138,41 @@ def test_chained_reads_are_detected(command: str) -> None:
 )
 def test_non_reads_are_not_detected(command: str) -> None:
     assert _is_read_command(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git show HEAD:src/foo.py\nwc -l src/foo.py",
+        "wc -l src/foo.py\ngit show HEAD:src/foo.py",
+        "git show HEAD:src/foo.py |\ncat -n",
+        "git show HEAD:src/foo.py | # line numbers\ncat -n",
+    ],
+)
+def test_git_reads_in_multiline_commands_are_detected(command: str) -> None:
+    assert _is_read_command(command) is True
+
+
+@pytest.mark.parametrize("command", ["git show HEAD:src", "git show HEAD:src\n# List paths"])
+def test_git_tree_listing_is_not_protected(command: str) -> None:
+    assert not _read_output_should_be_protected(
+        "tree HEAD:src\n\napp.py\nmodels/\n", command=command
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat notes.txt",
+        "git show HEAD:notes.txt",
+        "git show HEAD:src; cat notes.txt",
+        "git show HEAD:src | cat - notes.txt",
+    ],
+)
+def test_file_can_start_with_a_git_tree_header(command: str) -> None:
+    assert _read_output_should_be_protected(
+        "tree HEAD:src\n\nKeep this note unchanged.\n", command=command
+    )
 
 
 @pytest.mark.parametrize(
@@ -213,6 +265,46 @@ def test_quiet_sed_output_reaches_read_protection(flag: str, comment: str, monke
         )
     )
     result = router.apply(messages, EstimatingTokenCounter(), protect_recent=0)
+    assert "router:shell_small_result_verbatim" not in result.transforms_applied
+    assert "router:read_protected" in result.transforms_applied
+    assert result.messages[2]["content"] == content
+
+
+def test_cat_note_with_tree_header_reaches_read_protection(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    monkeypatch.setenv("HEADROOM_SHELL_RESULT_MIN_CHARS", "2000")
+    content = "tree t:src\n\n" + "".join(
+        f"Step {i}: Preserve this deployment note exactly for the follow-up.\n" for i in range(40)
+    )
+    messages = [
+        {"role": "user", "content": "Read the deployment note."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "read-note",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": json.dumps({"command": "cat notes.txt"}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "read-note", "content": content},
+    ]
+    router = ContentRouter(
+        ContentRouterConfig(
+            enable_code_aware=False,
+            enable_kompress=False,
+            protect_analysis_context=False,
+            protect_recent_reads_fraction=0.0,
+        )
+    )
+
+    result = router.apply(messages, EstimatingTokenCounter(), protect_recent=0)
+
     assert "router:shell_small_result_verbatim" not in result.transforms_applied
     assert "router:read_protected" in result.transforms_applied
     assert result.messages[2]["content"] == content
