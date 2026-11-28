@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1805,7 +1807,7 @@ def test_release_metadata_sync_runs_on_release_please_branch() -> None:
     # Sync, then gate on the verifier, then commit — in that order.
     sync = content.index("python scripts/version-sync.py")
     verify = content.index("python scripts/verify-versions.py", sync)
-    commit = content.index("git commit", verify)
+    commit = content.index("commit --no-verify", verify)
     assert sync < verify < commit
 
     # Must no-op rather than loop when the branch is already in sync.
@@ -1863,7 +1865,7 @@ def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
     )
-    steps = workflow["jobs"]["sync"]["steps"]
+    steps = [s for job in workflow["jobs"].values() for s in job["steps"]]
 
     checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
     assert checkouts, "expected a checkout step"
@@ -1874,11 +1876,239 @@ def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -
         assert "token" not in step.get("with", {}), step
 
 
+def test_metadata_sync_never_runs_branch_code_where_the_release_token_is() -> None:
+    """Branch-supplied scripts and the release credential must not share a job.
+
+    ``release-metadata-sync`` runs ``scripts/*.py`` from a branch anyone with write
+    access can push (``release-please--branches--**``). Code that runs in a job can
+    plant ``.git/hooks/*``, ``git config`` entries or ``GITHUB_ENV`` lines that fire
+    in the job's later steps, including the one that holds the token. So: no job that
+    runs ``scripts/`` may mention the token, and the job that holds it runs no
+    branch code, disables git hooks, and keeps the token off every command line.
+    """
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+    )
+
+    def runs_branch_code(step: dict) -> bool:
+        return "scripts/" in str(step.get("run", ""))
+
+    def mentions_token(step: dict) -> bool:
+        blob = str(step.get("env", {})) + str(step.get("with", {})) + str(step.get("run", ""))
+        return any(
+            marker in blob
+            for marker in ("SYNC_TOKEN", "steps.app-token", "secrets.", "create-github-app-token")
+        ) or "create-github-app-token" in str(step.get("uses", ""))
+
+    holders = 0
+    for name, job in workflow["jobs"].items():
+        steps = job["steps"]
+        if any(runs_branch_code(s) for s in steps):
+            assert not any(mentions_token(s) for s in steps), f"job {name!r} mixes both"
+            assert job.get("permissions", {}).get("contents") == "read", name
+        holders_here = [s for s in steps if "SYNC_TOKEN" in str(s.get("env", {}))]
+        if holders_here:
+            holders += 1
+            assert len(holders_here) == 1, name
+            run = holders_here[0]["run"]
+            assert "--no-verify" in run and "core.hooksPath" in run, run
+            assert "git commit" not in run.replace("commit --no-verify", ""), run
+            assert not any(
+                "SYNC_TOKEN" in line and "GIT_CONFIG" not in line
+                for line in run.splitlines()
+                if line.strip().startswith("git ") or "@github.com" in line
+            ), run
+            assert "x-access-token:${SYNC_TOKEN}@" not in run
+    assert holders == 1, "expected exactly one job that holds the release token"
+
+
+def _metadata_sync_push_steps() -> dict[str, str]:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+    )
+    return {s["name"]: s["run"] for s in workflow["jobs"]["push"]["steps"] if "run" in s}
+
+
+_APPLY_STEP = "Apply the patch to the files version-sync writes"
+_PUSH_STEP = "Commit and push the synced metadata"
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _allowed_paths() -> list[str]:
+    run = _metadata_sync_push_steps()[_APPLY_STEP]
+    block = run.split("allowed=(", 1)[1].split(")", 1)[0]
+    return block.split()
+
+
+def _run_step(script: str, repo: Path, tmp: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    base = {"PATH": os.environ["PATH"], "HOME": str(tmp), "RUNNER_TEMP": str(tmp)}
+    return subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=repo,
+        env={**base, **env},
+        capture_output=True,
+        text=True,
+    )
+
+
+def _repo_with_allowed_files(path: Path) -> Path:
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "t@example.invalid")
+    _git(path, "config", "user.name", "t")
+    for name in [*_allowed_paths(), ".github/workflows/ci.yml"]:
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_text("v1\n", encoding="utf-8")
+    _git(path, "add", "-A")
+    _git(path, "commit", "-q", "-m", "base")
+    return path
+
+
+def _patch(repo: Path, change: str) -> str:
+    """Make ``change`` in ``repo``, return it as a binary patch, and undo it."""
+    if change == "bump":
+        (repo / "pyproject.toml").write_text("v2\n", encoding="utf-8")
+        (repo / ".github/plugin/marketplace.json").write_text("v2\n", encoding="utf-8")
+    elif change == "non-ascii workflow":
+        (repo / ".github/workflows/\u00e9.yml").write_text("on: push\n", encoding="utf-8")
+    elif change == "rename into workflows":
+        (repo / "server.json").rename(repo / ".github/workflows/server.yml")
+    elif change == "edit workflow":
+        (repo / ".github/workflows/ci.yml").write_text("v2\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    patch = _git(repo, "diff", "--cached", "--binary")
+    _git(repo, "reset", "-q", "--hard")
+    _git(repo, "clean", "-qfd")
+    return patch
+
+
+@pytest.mark.parametrize(
+    ("change", "accepted"),
+    [
+        ("bump", True),
+        ("non-ascii workflow", False),
+        ("rename into workflows", False),
+        ("edit workflow", False),
+    ],
+)
+def test_metadata_sync_applies_only_patches_to_version_files(
+    tmp_path: Path, change: str, accepted: bool
+) -> None:
+    """The patch comes from branch code; the token job may push only version files."""
+    repo = _repo_with_allowed_files(tmp_path / "repo")
+    (tmp_path / "sync.patch").write_text(_patch(repo, change), encoding="utf-8")
+
+    result = _run_step(_metadata_sync_push_steps()[_APPLY_STEP], repo, tmp_path)
+
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+    if not accepted:
+        assert "refusing to push it" in result.stdout
+
+
+def test_metadata_sync_allowlist_covers_what_version_sync_writes(tmp_path: Path) -> None:
+    """Every file version-sync.py changes, including optional ones, is allowlisted.
+
+    The fixture holds every tracked JSON, TOML and lock file of the repository
+    (plus .releasemetadata), so a target the script writes only when it exists
+    is present too.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    tracked = _git(ROOT, "ls-files", "-z").split("\0")
+    for name in tracked:
+        if name and (
+            name == ".releasemetadata" or Path(name).suffix in {".json", ".toml", ".lock"}
+        ):
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / name, repo / name)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "real files")
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/version-sync.py"),
+            "--root",
+            str(repo),
+            "--version",
+            "99.0.0",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    changed = _git(repo, "status", "--porcelain", "--untracked-files=all").splitlines()
+    assert changed, "version-sync changed nothing"
+    assert {line[3:] for line in changed} <= set(_allowed_paths())
+
+
+def _release_remote(tmp_path: Path) -> tuple[Path, Path, str]:
+    """A repo pushed to a bare origin's release branch; returns repo, origin, event SHA."""
+    origin = tmp_path / "origin.git"
+    repo = _repo_with_allowed_files(tmp_path / "repo")
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    _git(repo, "remote", "add", "origin", str(origin))
+    (repo / "README").write_text("release commit\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "release commit")
+    _git(repo, "push", "-q", "origin", "HEAD:refs/heads/release-please--branches--main")
+    return repo, origin, _git(repo, "rev-parse", "HEAD").strip()
+
+
+def _sync_and_push(repo: Path, tmp_path: Path, event_sha: str) -> subprocess.CompletedProcess[str]:
+    (tmp_path / "sync.patch").write_text(_patch(repo, "bump"), encoding="utf-8")
+    steps = _metadata_sync_push_steps()
+    assert _run_step(steps[_APPLY_STEP], repo, tmp_path).returncode == 0
+    return _run_step(
+        steps[_PUSH_STEP],
+        repo,
+        tmp_path,
+        SYNC_TOKEN="not-a-real-token",
+        GITHUB_REF_NAME="release-please--branches--main",
+        GITHUB_SHA=event_sha,
+    )
+
+
+def test_metadata_sync_push_step_leaves_a_rewound_branch_alone(tmp_path: Path) -> None:
+    """If the release branch was rewound to the parent, the sync must not restore it."""
+    repo, origin, event_sha = _release_remote(tmp_path)
+    parent = _git(repo, "rev-parse", "HEAD~1").strip()
+    _git(origin, "update-ref", "refs/heads/release-please--branches--main", parent)
+
+    result = _sync_and_push(repo, tmp_path, event_sha)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    remote_tip = _git(origin, "rev-parse", "release-please--branches--main").strip()
+    assert remote_tip == parent
+
+
+def test_metadata_sync_push_step_commits_without_hooks(tmp_path: Path) -> None:
+    repo, origin, event_sha = _release_remote(tmp_path)
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {tmp_path / 'hook-ran'}\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    result = _sync_and_push(repo, tmp_path, event_sha)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (tmp_path / "hook-ran").exists()
+    log = _git(origin, "log", "--format=%s", "release-please--branches--main")
+    assert log.splitlines()[:2] == ["chore: sync generated version metadata", "release commit"]
+
+
 @pytest.mark.parametrize(
     "workflow_path,job",
     [
         (".github/workflows/release-please.yml", "release-please"),
-        (".github/workflows/release-metadata-sync.yml", "sync"),
+        (".github/workflows/release-metadata-sync.yml", "push"),
     ],
 )
 def test_release_workflows_prefer_scoped_app_token(workflow_path: str, job: str) -> None:
