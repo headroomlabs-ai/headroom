@@ -65,6 +65,20 @@ def network_client(workspace):
 
 
 class TestSchemaAndRead:
+    @pytest.mark.parametrize("route", ["/settings", "/settings/schema"])
+    def test_invalid_utf8_settings_do_not_break_reads(self, client, route):
+        path = settings_store.paths.settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = b'{"mode":"\xff"}'
+        path.write_bytes(payload)
+
+        response = client.get(route)
+
+        assert response.status_code == 200, response.text
+        assert path.read_bytes() == payload
+        if route == "/settings":
+            assert response.json() == {}
+
     def test_schema_returns_grouped_fields(self, client):
         resp = client.get("/settings/schema")
         assert resp.status_code == 200, resp.text
