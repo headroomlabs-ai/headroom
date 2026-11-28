@@ -115,7 +115,7 @@ fn classify_string(s: &str, cfg: &ClassifyConfig) -> CellClass {
     // can't possibly be JSON containers. Parsing `"123"` would
     // technically succeed as JSON-the-number, but that's a scalar,
     // not a recursion target.
-    let trimmed = s.trim_start_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    let trimmed = s.trim_start_matches([' ', '\t', '\n', '\r']);
     if matches!(trimmed.chars().next(), Some('{') | Some('[')) {
         if let Ok(parsed) = serde_json::from_str::<Value>(s) {
             if matches!(parsed, Value::Object(_) | Value::Array(_)) {

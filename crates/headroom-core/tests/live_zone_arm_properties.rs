@@ -35,6 +35,7 @@ use headroom_core::transforms::{detect_content_type, BlockAction, ContentType, L
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+#[cfg(feature = "code")]
 use serde_json::Value;
 
 // ─── Part 0: kill-switch alias round trip (bug class extinction) ──────

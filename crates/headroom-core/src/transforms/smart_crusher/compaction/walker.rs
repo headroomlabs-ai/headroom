@@ -170,7 +170,7 @@ fn walk_string(s: String, ctx: &DocumentCompactor) -> Value {
 /// or `[`) AND parses cleanly to Object/Array. Returns None otherwise —
 /// we don't recurse on bare scalars even if they parse.
 pub fn try_parse_json_container(s: &str) -> Option<Value> {
-    let trimmed = s.trim_start_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    let trimmed = s.trim_start_matches([' ', '\t', '\n', '\r']);
     if !matches!(trimmed.chars().next(), Some('{') | Some('[')) {
         return None;
     }
