@@ -165,6 +165,158 @@ jobs:
         if: ${{ !cancelled() && matrix.os == 'macos-26' }}
         run: cargo test -p headroom-core --test magika_idle_threads -- --nocapture
 
+  # `--workspace` in `test` does NOT imply `--all-features`, so the `redis`
+  # feature — and with it `ccr/backends/redis.rs` — is compiled, linted and
+  # executed by this dedicated job instead. It stays ubuntu-only because
+  # `services:` containers cannot start on the macOS leg of the `test`
+  # matrix (GitHub runners only support service containers on Linux), and
+  # gating the steps alone would still fail the whole macOS leg at
+  # "Set up job".
+  test-ccr-backends:
+    name: test CCR backends (redis/valkey)
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Sidecars for the `redis` feature's CCR backend tests below. BOTH servers
+    # run, and the suite is executed against each in turn: the backend claims
+    # to be RESP-compatible rather than Redis-specific, and a claim about two
+    # servers is only proven by testing two servers. They are cheap to run
+    # together — the whole backend surface is PING/SETEX/GET/EXPIRE/DEL,
+    # with no Lua, no module and no cluster command, so neither sidecar needs
+    # anything beyond a stock image.
+    #
+    # Distinct host ports because both listen on 6379 inside their own
+    # container; the two test steps below select a server purely by URL.
+    #
+    # Pinned by digest, not just tag, to match the supply-chain posture of
+    # the `audit` job (cargo-audit + cargo-deny) — a mutable tag would let a
+    # server under test change without a commit. Note this is stricter than
+    # the repo's compose files, which pin images by version tag alone
+    # (`qdrant/qdrant:v1.17.1`, `neo4j:5.26`); the extra strictness is here
+    # because these two containers ARE the compatibility evidence.
+    #
+    # Each digest below is the multi-arch INDEX digest, which is the only kind
+    # that works here. `docker image inspect`'s RepoDigests on a developer
+    # machine reports the digest of the single platform manifest that machine
+    # pulled, so copying it from an arm64 laptop pins an arm64 image and the
+    # amd64 runner dies with `exec format error` before any step runs. Get it
+    # with `docker buildx imagetools inspect <image> --format
+    # '{{.Manifest.Digest}}'` and check the MediaType says `image.index`.
+    services:
+      redis:
+        image: redis:8.2-alpine@sha256:30abb90e62f14b737010746def3ba99cc79fe19dcdb3d37b41f21fc62e7da19d
+        ports:
+          - 6379:6379
+        # Without a health gate the first test can connect before the server
+        # is accepting, which surfaces as a flaky `PING` failure in
+        # `RedisCcrStore::open` rather than as an obvious startup race.
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey:9.1.1-alpine@sha256:de31910896150d5e754a07d57d227cfdde4e258ddd0d1aa4607f2d2f95843715
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Provide ONNX Runtime dylib
+        # headroom-core is built with `ort-load-dynamic` (see its
+        # Cargo.toml): the ONNX Runtime shared library is dlopen'd at
+        # runtime instead of statically linked — provide it here too so any
+        # transitive ort initialisation cannot deadlock the job.
+        run: |
+          # >= 1.24, not 1.16: `ort`'s ORT_API_VERSION resolves to 24 because
+          # `fastembed` enables its `api-24` feature.
+          pip install 'onnxruntime>=1.24'
+          python - <<'PY' >> "$GITHUB_ENV"
+          import pathlib, sys
+
+          def die(msg: str) -> None:
+              print(f"::error::{msg}", file=sys.stderr)
+              raise SystemExit(1)
+
+          try:
+              import onnxruntime
+          except Exception as exc:  # noqa: BLE001 - any import failure is fatal here
+              die(f"onnxruntime is not importable: {exc}")
+
+          version = onnxruntime.__version__
+          try:
+              major, minor = (int(part) for part in version.split(".")[:2])
+          except ValueError:
+              die(f"cannot parse onnxruntime version {version!r}")
+          if (major, minor) < (1, 24):
+              die(
+                  f"onnxruntime {version} is too old: ort requires >= 1.24 "
+                  "(ORT_API_VERSION=24, set by fastembed's api-24 feature). "
+                  "ort DEADLOCKS instead of erroring below this, so the tests "
+                  "would hang rather than fail."
+              )
+
+          capi = pathlib.Path(onnxruntime.__file__).parent / "capi"
+          libs = sorted(capi.glob("libonnxruntime.so*")) or sorted(capi.glob("libonnxruntime*.dylib"))
+          if not libs:
+              die(f"no libonnxruntime shared library under {capi}")
+
+          print(f"ORT_DYLIB_PATH={libs[0]}")
+          print(f"onnxruntime {version} -> {libs[0]}", file=sys.stderr)
+          PY
+      # Deliberately `-p headroom-core` and not `--all-targets`: the
+      # workspace benches fail on unrelated pre-existing lints
+      # (deprecated `criterion::black_box` in `bench "ccr_store"`), so
+      # widening the scope here would drag unrelated cleanup into any PR
+      # that touches Rust.
+      - name: cargo clippy (redis feature)
+        run: cargo clippy -p headroom-core --features redis -- -D warnings
+      # Same suite, twice, once per server. Two steps rather than a job-level
+      # matrix on purpose: a matrix would re-run the whole build for each
+      # server, which is several minutes of duplicated work to gain nothing.
+      # These two steps add roughly 9s each on top of a build that is
+      # already warm.
+      #
+      # Separate steps rather than one step with a loop so that a failure
+      # names the server in the check output — "against Valkey" red with
+      # "against Redis" green is the single most useful signal this job can
+      # produce, because it is the only thing here that isolates a genuine
+      # RESP divergence from a bug in the backend itself.
+      - name: cargo test CCR backends against Redis
+        # The redis-gated tests early-return unless this URL is set, so
+        # supplying it is what actually executes them. Contributors without
+        # a server leave it unset and the suite still passes.
+        env:
+          HEADROOM_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test -p headroom-core --features redis --test ccr_backends
+      - name: cargo test CCR backends against Valkey
+        # `!cancelled()` rather than the default (an implicit `success()`),
+        # because a step with no `if:` is skipped once an earlier step has
+        # failed. Without it a Redis failure aborts the job before this
+        # step runs and there is no Valkey result at all — which defeats
+        # the reason for having two named steps. Both servers must always
+        # report, so that "both red" (a bug in the backend) stays
+        # distinguishable from "one red" (a genuine RESP divergence).
+        if: ${{ !cancelled() }}
+        env:
+          HEADROOM_TEST_REDIS_URL: redis://127.0.0.1:6380
+        run: cargo test -p headroom-core --features redis --test ccr_backends
+
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
     needs: rust-changes
