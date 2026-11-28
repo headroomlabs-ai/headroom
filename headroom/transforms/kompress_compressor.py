@@ -1662,13 +1662,41 @@ class KompressResult:
 _payload_encoder: Any = None
 
 
-def payload_tokens(text: str) -> int:
-    """Token count of a complete payload, in one consistent unit.
+def _payload_encoding() -> Any:
+    """The cl100k_base encoder, or None while it cannot load.
+
+    A refused or timed-out vocabulary load is not remembered here: the
+    bounded loader fails fast while it cannot load and returns the vocabulary
+    once it is cached, so the BPE unit comes back without a restart. Only a
+    missing or broken tiktoken disables the encoder for the process.
+    """
+    global _payload_encoder
+    if _payload_encoder is None:
+        try:
+            from headroom.tokenizers.tiktoken_counter import TiktokenLoadError, load_encoding
+
+            try:
+                # The bounded, offline-aware loader: a bare tiktoken.get_encoding
+                # downloads a cold vocab with no timeout, even under HEADROOM_OFFLINE.
+                _payload_encoder = load_encoding("cl100k_base")
+            except TiktokenLoadError:
+                return None
+        except Exception:
+            _payload_encoder = False
+    return _payload_encoder or None
+
+
+def payload_token_counts(*texts: str) -> tuple[int, ...]:
+    """Token counts of complete payloads, all in one unit.
 
     The unit is cl100k_base (tiktoken, a hard dependency), used as a fixed
     estimate. Actual model tokenizers, including those of other OpenAI
     models, can differ. Without an encoder, the fallback compares character
     counts; that heuristic is not a bound on provider token counts.
+
+    The unit is resolved once for all ``texts``, so counts that are compared
+    with each other never mix characters and BPE tokens, even when the
+    vocabulary becomes available between two of them.
 
     The CCR gate measures the whole original and the whole candidate-plus-
     marker with this, never a marker-only cost against a word count: the
@@ -1678,20 +1706,22 @@ def payload_tokens(text: str) -> int:
     of the two complete texts in one unit establishes that the shipped
     payload is smaller.
     """
-    global _payload_encoder
-    if _payload_encoder is None:
+    encoder = _payload_encoding()
+    if encoder is not None:
         try:
-            import tiktoken
-
-            _payload_encoder = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            _payload_encoder = False
-    if _payload_encoder:
-        try:
-            return len(_payload_encoder.encode(text, disallowed_special=()))
+            return tuple(len(encoder.encode(text, disallowed_special=())) for text in texts)
         except Exception:
             pass
-    return len(text)
+    return tuple(len(text) for text in texts)
+
+
+def payload_tokens(text: str) -> int:
+    """Token count of one payload, in :func:`payload_token_counts`' unit.
+
+    Two calls can resolve different units; compare counts from a single
+    :func:`payload_token_counts` call instead.
+    """
+    return payload_token_counts(text)[0]
 
 
 def ccr_retrieval_marker(
@@ -2204,7 +2234,7 @@ class KompressCompressor(Transform):
 
             # CCR marker: anything the lossy pass shrank must stay retrievable,
             # and the complete marked payload must be smaller than the
-            # original. Both are measured whole, in one unit (payload_tokens);
+            # original. Both are measured whole, in one unit (payload_token_counts);
             # a candidate that is not is passed through. The accounting then
             # reports that same measurement, so ``tokens_saved`` describes
             # the shipped payload rather than a word count.
@@ -2220,8 +2250,7 @@ class KompressCompressor(Transform):
                     marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
-                    original_tokens = payload_tokens(content)
-                    compressed_tokens = payload_tokens(marked)
+                    original_tokens, compressed_tokens = payload_token_counts(content, marked)
                     if compressed_tokens >= original_tokens:
                         return self._passthrough(content, n_words)
                     compressed = marked
@@ -2663,8 +2692,7 @@ class KompressCompressor(Transform):
                     marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
-                    original_tokens = payload_tokens(content)
-                    compressed_tokens = payload_tokens(marked)
+                    original_tokens, compressed_tokens = payload_token_counts(content, marked)
                     if compressed_tokens >= original_tokens:
                         results[text_idx] = self._passthrough(content, n_words)
                         continue

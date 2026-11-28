@@ -15,6 +15,7 @@ space-prefixed form in the source.
 from __future__ import annotations
 
 import hashlib
+import time
 
 import pytest
 
@@ -152,3 +153,75 @@ def test_no_ccr_mode_ships_unmarked_lossy_unchanged(monkeypatch):
     assert "Retrieve more" not in result.compressed
     [batched] = compressor.compress_batch([SINGLE_TOKEN_SOURCE], batch_size=8)
     assert batched.compressed_tokens == 59
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batched"])
+def test_a_vocab_arriving_mid_gate_does_not_mix_units(monkeypatch, batched):
+    # The reviewer's repro: offline with a cold cache, cl100k_base is seeded
+    # right after the original is counted. Two separate counts then compared
+    # 597 characters with 106 BPE tokens and shipped a candidate that grew
+    # from 100 to 106 tokens. One unit per comparison: this pass counts both
+    # sides in characters, and once the vocab is there both sides are BPE.
+    from headroom.tokenizers import tiktoken_counter
+    from headroom.tokenizers.tiktoken_counter import TiktokenVocabNotCached
+
+    real = pytest.importorskip("tiktoken").get_encoding("cl100k_base")
+    loads = []
+
+    def _arrives_after_first_load(_name):
+        loads.append(_name)
+        if len(loads) == 1:
+            raise TiktokenVocabNotCached("cold cache")
+        return real
+
+    monkeypatch.setattr(kc, "_payload_encoder", None)
+    monkeypatch.setattr(tiktoken_counter, "load_encoding", _arrives_after_first_load)
+    _install(monkeypatch, drop=41)
+    compressor = _compressor(monkeypatch)
+
+    def run():
+        if batched:
+            return compressor.compress_batch([SINGLE_TOKEN_SOURCE], batch_size=8)[0]
+        return compressor.compress(SINGLE_TOKEN_SOURCE)
+
+    during = run()
+    assert during.original_tokens == len(SINGLE_TOKEN_SOURCE)
+    assert during.compressed_tokens == len(during.compressed)
+
+    after = run()
+    assert after.compressed == SINGLE_TOKEN_SOURCE
+    assert after.compression_ratio == 1.0
+
+
+def test_a_fast_vocab_failure_does_not_disable_bpe_for_the_process(monkeypatch):
+    # A download that failed fast escaped as a raw ConnectionError, which the
+    # payload counter's broad handler turned into "no encoder, ever".
+    import tiktoken
+
+    from headroom.tokenizers import tiktoken_counter
+
+    real = tiktoken.get_encoding("cl100k_base")
+    calls = []
+
+    def _fails_once(name):
+        calls.append(name)
+        if len(calls) == 1:
+            raise ConnectionError("Name or service not known")
+        return real
+
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.setattr(kc, "_payload_encoder", None)
+    monkeypatch.setattr(tiktoken, "get_encoding", _fails_once)
+    monkeypatch.setattr(tiktoken_counter, "_slots", {})
+    monkeypatch.setattr(tiktoken_counter, "_RETRY_COOLDOWN_SECONDS", 0.0)
+    tiktoken_counter._get_encoding.cache_clear()
+    try:
+        assert payload_tokens(SINGLE_TOKEN_SOURCE) == len(SINGLE_TOKEN_SOURCE)
+        assert kc._payload_encoder is None
+        # The retry runs in the background; the counter adopts it once it lands.
+        deadline = time.monotonic() + 5.0
+        while payload_tokens(SINGLE_TOKEN_SOURCE) != _tok(SINGLE_TOKEN_SOURCE):
+            assert time.monotonic() < deadline, "BPE never came back"
+            time.sleep(0.02)
+    finally:
+        tiktoken_counter._get_encoding.cache_clear()
