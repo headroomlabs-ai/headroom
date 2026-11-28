@@ -7,7 +7,7 @@ Headroom provides explicit exceptions for debugging, with a core safety guarante
 
 ## Error Hierarchy
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 
 ```
@@ -66,11 +66,30 @@ from headroom import (
 ```
 
 </Tab>
+<Tab value="Go">
+
+```
+*headroom.Error (kind="connection|auth|configuration|provider|storage|
+                 tokenization|cache|validation|transform|compress")
+*headroom.CompressError  // wraps *Error with StatusCode + ErrorType
+```
+
+```go
+import "github.com/headroomlabs-ai/headroom/sdk/golang"
+
+// Sentinels for errors.Is matching:
+//   headroom.ErrConnection, headroom.ErrAuth, headroom.ErrCompress,
+//   headroom.ErrConfiguration, headroom.ErrProvider, headroom.ErrStorage,
+//   headroom.ErrTokenization, headroom.ErrCache, headroom.ErrValidation,
+//   headroom.ErrTransform
+```
+
+</Tab>
 </Tabs>
 
 ## Catching Errors
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 
 ```ts twoslash
@@ -119,6 +138,29 @@ except HeadroomError as e:
 ```
 
 </Tab>
+<Tab value="Go">
+
+```go
+import (
+    "errors"
+    "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+_, err := client.Compress(ctx, msgs, headroom.CompressOptions{Model: "gpt-4o"})
+
+switch {
+case errors.Is(err, headroom.ErrConnection):
+    log.Printf("cannot reach proxy: %v", err)
+case errors.Is(err, headroom.ErrAuth):
+    log.Printf("auth failed: %v", err)
+default:
+    if ce, ok := headroom.AsCompressError(err); ok {
+        log.Printf("compress failed (%d %s): %v", ce.StatusCode, ce.ErrorType, err)
+    }
+}
+```
+
+</Tab>
 </Tabs>
 
 ## Error Types in Detail
@@ -131,7 +173,7 @@ Raised when configuration is invalid. In the Python SDK (0.37.0),
 `default_mode` string is validated by the `HeadroomMode` enum and raises a
 plain **`ValueError`**, not `ConfigurationError`.
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { ConfigurationError } from 'headroom-ai';
@@ -151,6 +193,17 @@ try:
 except ValueError as e:
     print(f"Invalid mode: {e}")
     # 'invalid_mode' is not a valid HeadroomMode
+```
+</Tab>
+<Tab value="Go">
+```go
+// errors.Is(err, headroom.ErrConfiguration) matches when the proxy returns
+// a configuration_error response. Underlying *Error has Details map.
+if errors.Is(err, headroom.ErrConfiguration) {
+    var herr *headroom.Error
+    errors.As(err, &herr)
+    log.Printf("config error: %v details=%v", herr.Message, herr.Details)
+}
 ```
 </Tab>
 </Tabs>
@@ -248,7 +301,7 @@ const error = mapProxyError(400, 'configuration_error', 'Invalid mode');
 
 All Headroom exceptions include a `details` dict/object with additional context:
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { HeadroomError } from 'headroom-ai';
@@ -270,6 +323,18 @@ except HeadroomError as e:
     # - provider: which provider was involved
     # - model: which model was requested
     # - original_error: underlying exception
+```
+</Tab>
+<Tab value="Go">
+```go
+var herr *headroom.Error
+if errors.As(err, &herr) {
+    log.Printf("kind=%s message=%s details=%v", herr.Kind, herr.Message, herr.Details)
+}
+// CompressError additionally carries StatusCode and ErrorType.
+if ce, ok := headroom.AsCompressError(err); ok {
+    log.Printf("HTTP %d type=%s", ce.StatusCode, ce.ErrorType)
+}
 ```
 </Tab>
 </Tabs>
