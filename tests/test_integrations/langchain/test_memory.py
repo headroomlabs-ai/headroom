@@ -96,6 +96,76 @@ class TestHeadroomChatMessageHistoryInit:
 
 
 class TestHeadroomChatMessageHistoryMessages:
+    def test_history_above_threshold_preserves_native_message_data(self):
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+        from langchain_core.messages import ChatMessage
+
+        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
+
+        base = InMemoryChatMessageHistory(
+            messages=[
+                HumanMessage(
+                    id="question",
+                    content=[{"type": "text", "text": "Summarize the deployment."}],
+                    additional_kwargs={"source": "agent"},
+                ),
+                ChatMessage(id="review", role="reviewer", content="Keep the rollback details."),
+                ToolMessage(
+                    id="deployment-output",
+                    tool_call_id="deploy",
+                    name="deployment",
+                    content="Current deployment is blue.",
+                    artifact={"pool": "blue"},
+                ),
+            ]
+        )
+        history = HeadroomChatMessageHistory(base, compress_threshold_tokens=1)
+
+        assert history.messages == base.messages
+        assert history.get_compression_stats()["compression_count"] == 1
+
+    def test_compressed_tool_output_keeps_native_artifact(self):
+        import json
+
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+
+        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
+
+        text = json.dumps(
+            [
+                {"id": i, "msg": f"Result {i} ok", "blob": f"payload-{i:04d}-" + "abcde" * 48}
+                for i in range(200)
+            ]
+        )
+        tool = ToolMessage(
+            content=text,
+            id="result",
+            tool_call_id="lookup",
+            name="lookup",
+            artifact={"count": 200},
+        )
+        history = HeadroomChatMessageHistory(
+            InMemoryChatMessageHistory(
+                messages=[
+                    HumanMessage(content="Get items"),
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"id": "lookup", "name": "get", "args": {}}],
+                    ),
+                    tool,
+                ]
+            ),
+            compress_threshold_tokens=100,
+        )
+
+        result = history.messages[-1]
+        assert isinstance(result, ToolMessage)
+        assert len(result.content) < len(text)
+        assert result.id == tool.id
+        assert result.tool_call_id == tool.tool_call_id
+        assert result.artifact == tool.artifact
+        assert tool.content == text
+
     """Tests for message access and compression."""
 
     def test_messages_returns_empty_when_no_messages(self, mock_base_history, mock_provider):
@@ -314,78 +384,6 @@ class TestHeadroomChatMessageHistoryConversion:
         assert result[0]["role"] == "tool"
         assert result[0]["tool_call_id"] == "call_1"
         assert result[0]["content"] == '{"result": "data"}'
-
-    def test_convert_from_openai_system(self, mock_base_history, mock_provider):
-        """Convert OpenAI system message back to LangChain."""
-        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
-
-        history = HeadroomChatMessageHistory(mock_base_history, provider=mock_provider)
-
-        openai_msgs = [{"role": "system", "content": "System prompt"}]
-        result = history._convert_from_openai(openai_msgs)
-
-        assert len(result) == 1
-        assert isinstance(result[0], SystemMessage)
-        assert result[0].content == "System prompt"
-
-    def test_convert_from_openai_user(self, mock_base_history, mock_provider):
-        """Convert OpenAI user message back to LangChain."""
-        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
-
-        history = HeadroomChatMessageHistory(mock_base_history, provider=mock_provider)
-
-        openai_msgs = [{"role": "user", "content": "Hello"}]
-        result = history._convert_from_openai(openai_msgs)
-
-        assert isinstance(result[0], HumanMessage)
-        assert result[0].content == "Hello"
-
-    def test_convert_from_openai_assistant(self, mock_base_history, mock_provider):
-        """Convert OpenAI assistant message back to LangChain."""
-        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
-
-        history = HeadroomChatMessageHistory(mock_base_history, provider=mock_provider)
-
-        openai_msgs = [{"role": "assistant", "content": "Response"}]
-        result = history._convert_from_openai(openai_msgs)
-
-        assert isinstance(result[0], AIMessage)
-        assert result[0].content == "Response"
-
-    def test_convert_from_openai_assistant_with_tool_calls(self, mock_base_history, mock_provider):
-        """Convert OpenAI assistant message with tool_calls back to LangChain."""
-        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
-
-        history = HeadroomChatMessageHistory(mock_base_history, provider=mock_provider)
-
-        openai_msgs = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "call_1", "name": "search", "args": {}}],
-            }
-        ]
-        result = history._convert_from_openai(openai_msgs)
-
-        assert isinstance(result[0], AIMessage)
-        # LangChain may add a 'type' field to tool_calls, so just check key fields
-        assert len(result[0].tool_calls) == 1
-        assert result[0].tool_calls[0]["id"] == "call_1"
-        assert result[0].tool_calls[0]["name"] == "search"
-        assert result[0].tool_calls[0]["args"] == {}
-
-    def test_convert_from_openai_tool(self, mock_base_history, mock_provider):
-        """Convert OpenAI tool message back to LangChain."""
-        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
-
-        history = HeadroomChatMessageHistory(mock_base_history, provider=mock_provider)
-
-        openai_msgs = [{"role": "tool", "tool_call_id": "call_1", "content": '{"data": 1}'}]
-        result = history._convert_from_openai(openai_msgs)
-
-        assert isinstance(result[0], ToolMessage)
-        assert result[0].tool_call_id == "call_1"
-        assert result[0].content == '{"data": 1}'
 
 
 class TestHeadroomChatMessageHistoryTokenCounting:

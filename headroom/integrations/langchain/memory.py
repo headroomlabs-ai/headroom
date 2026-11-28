@@ -19,6 +19,7 @@ Example:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -231,8 +232,22 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
             model_limit=self._threshold,
         )
 
-        # Convert back to LangChain format
-        return self._convert_from_openai(result.messages)
+        # The live-zone pipeline preserves message positions. Apply its content
+        # edits to the original LangChain objects so provider metadata, custom
+        # roles, tool artifacts and message IDs survive a history read.
+        if len(result.messages) != len(messages):
+            return list(messages)
+        restored = []
+        for original, before, after in zip(messages, openai_messages, result.messages, strict=True):
+            if before["role"] != after.get("role"):
+                return list(messages)
+            content = after.get("content", original.content)
+            restored.append(
+                original
+                if content == original.content
+                else original.model_copy(update={"content": content})
+            )
+        return restored
 
     def _convert_to_openai(self, messages: list[BaseMessage]) -> list[dict[str, Any]]:
         """Convert LangChain messages to OpenAI format.
@@ -245,7 +260,7 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
         """
         result = []
         for msg in messages:
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            content = msg.content
 
             if isinstance(msg, SystemMessage):
                 result.append({"role": "system", "content": content})
@@ -253,8 +268,18 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
                 result.append({"role": "user", "content": content})
             elif isinstance(msg, AIMessage):
                 entry: dict[str, Any] = {"role": "assistant", "content": content}
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    entry["tool_calls"] = msg.tool_calls
+                if msg.tool_calls:
+                    entry["tool_calls"] = [
+                        {
+                            "id": call.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": json.dumps(call["args"], default=str),
+                            },
+                        }
+                        for call in msg.tool_calls
+                    ]
                 result.append(entry)
             elif isinstance(msg, ToolMessage):
                 result.append(
@@ -271,36 +296,6 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
                         "role": getattr(msg, "type", "user"),
                         "content": content,
                     }
-                )
-        return result
-
-    def _convert_from_openai(self, messages: list[dict[str, Any]]) -> list[BaseMessage]:
-        """Convert OpenAI format back to LangChain messages.
-
-        Args:
-            messages: OpenAI format messages.
-
-        Returns:
-            LangChain messages.
-        """
-        result: list[BaseMessage] = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-
-            if role == "system":
-                result.append(SystemMessage(content=content))
-            elif role == "user":
-                result.append(HumanMessage(content=content))
-            elif role == "assistant":
-                tool_calls = msg.get("tool_calls", [])
-                result.append(AIMessage(content=content, tool_calls=tool_calls))
-            elif role == "tool":
-                result.append(
-                    ToolMessage(
-                        content=content,
-                        tool_call_id=msg.get("tool_call_id", ""),
-                    )
                 )
         return result
 
