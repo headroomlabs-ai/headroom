@@ -136,6 +136,7 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --port 8787
 | `--memory` | `false` | Enable persistent user memory and provider-appropriate memory tools. In `--mode cache`, automatic context injection is skipped only for Anthropic `/v1/messages` to preserve prefix stability; OpenAI chat/responses and Gemini append memory to the live-zone tail. Use `--mode token` for automatic memory context on the Anthropic path. |
 | `--memory-db-path` | `{cwd}/.headroom/memory.db` | Override the memory SQLite path |
 | `--no-memory-tools` | `false` | Disable automatic memory tool injection |
+| `--memory-tool-receipts` | `text` | Record proxy-run memory calls in the client stream (`text` or `off`). The calls are hidden from the client (GH #2195), so without a receipt a later turn cannot tell a save ran and saves again (GH #4888). |
 | `--no-memory-context` | `false` | Disable automatic memory context injection |
 | `--memory-top-k` | `10` | Number of memories to inject as context |
 | `--learn` | `false` | Enable live traffic learning; implies `--memory` |

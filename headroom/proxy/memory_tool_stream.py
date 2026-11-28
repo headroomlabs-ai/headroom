@@ -24,12 +24,20 @@ blocks and their input, held tail frames) is charged its size on the wire
 against ``max_retained_bytes``; past it the filter drops what it holds and
 raises ``MemoryToolStreamOverflowError`` rather than forwarding withheld
 bytes.
+
+Because the client never sees the hidden call, its history shows the model's
+own text with no tool call behind it, and a later turn concludes the save
+never ran and saves again (GH #4888). ``format_receipt`` builds one short line
+naming what the proxy ran, and ``receipt_frames`` emits it as a trailing text
+block so the client's history records it. ``MemoryToolStreamFilter`` itself
+never invents a receipt: the caller runs the calls and decides.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Collection
 from typing import Any
 
@@ -76,6 +84,122 @@ def _parse_frame(frame: bytes) -> tuple[str | None, dict[str, Any] | None]:
 
 def _render_frame(event_name: str, payload: dict[str, Any]) -> bytes:
     return f"event: {event_name}\ndata: {json.dumps(payload)}\n\n".encode()
+
+
+def _receipt_frames(index: int, text: str) -> list[bytes]:
+    """A complete text block carrying ``text``, at client index ``index``."""
+    return [
+        _render_frame(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "text", "text": ""},
+            },
+        ),
+        _render_frame(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": text},
+            },
+        ),
+        _render_frame("content_block_stop", {"type": "content_block_stop", "index": index}),
+    ]
+
+
+# The failure phrase a receipt carries. Handler message bodies, and the
+# exception text they embed, stay on the model's side of the proxy: the receipt
+# lands in assistant history and in the client's SSE stream, so it names the
+# outcome only (GH #4888 review).
+_FAILURE_RECEIPT = "error"
+
+# The ``view`` helpers for the native memory tool report a backend failure
+# without the bare ``Error:`` prefix every other handler uses, e.g.
+# ``Error searching memories: backend down``, ``Error getting recent
+# memories: ...`` and ``Error listing memories: ...`` (GH #4888). A receipt
+# that only looked for ``Error:`` called those ``ok``.
+_NATIVE_VIEW_FAILURE = re.compile(r"^Error(?: \w+){1,4} memor(?:y|ies):", re.IGNORECASE)
+
+
+def _native_outcome(content: str) -> str:
+    """One fixed phrase for a native memory tool's plain-text result.
+
+    Native handlers answer with prose, not JSON (``Error: ...`` or a sentence
+    like "File created successfully at: ..."), so a failed create and a
+    successful one are both strings here. A failure is reported as a bare
+    ``error``: the handler's text can carry a backend exception, and a receipt
+    is visible to the client and recorded in history.
+    """
+    if _NATIVE_VIEW_FAILURE.match(content) or content.startswith("Error:"):
+        return _FAILURE_RECEIPT
+    if content.startswith("No replacement was performed"):
+        return "not applied"
+    return "ok"
+
+
+def _receipt_status(payload: Any) -> str:
+    """One short phrase for a memory tool result's JSON body."""
+    if not isinstance(payload, dict):
+        return "done"
+    status = payload.get("status")
+    if status == "saved":
+        memory_id = str(payload.get("memory_id") or "")
+        return f"ok id={memory_id[:8]}" if memory_id else "ok"
+    if status == "found":
+        return f"found {payload.get('count', 0)}"
+    if status == "updated":
+        memory_id = str(payload.get("memory_id") or "")
+        return f"ok id={memory_id[:8]}" if memory_id else "ok"
+    if status == "deleted":
+        return f"deleted id={str(payload.get('memory_id') or '')[:8]}"
+    if status == "not_found":
+        return "not_found"
+    if status == "ok":
+        return f"ok {payload.get('count', '')}".strip()
+    if status == "error":
+        return _FAILURE_RECEIPT
+    return str(status) if status else "done"
+
+
+def format_receipt(calls: list[dict[str, Any]], results: list[dict[str, Any]]) -> str | None:
+    """One line naming the hidden calls the proxy ran, for the client's history.
+
+    The client never sees the hidden ``tool_use`` or its ``tool_result``
+    (GH #2195), so a later turn reads the model's own text with no tool call
+    behind it and saves again (GH #4888). This receipt stays in the client's
+    history, so the model, transcripts and hooks all see that the call ran.
+    """
+    if not calls:
+        return None
+    by_id = {result.get("tool_use_id"): result for result in results if isinstance(result, dict)}
+    parts: list[str] = []
+    for call in calls:
+        name = str(call.get("name") or "memory")
+        result = by_id.get(call.get("id"))
+        if result is None:
+            parts.append(f"{name} skipped")
+            continue
+        content = result.get("content")
+        payload = content
+        if isinstance(content, str):
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                payload = None
+        if payload is None and isinstance(content, str) and name == "memory":
+            # Anthropic's native memory tool answers in prose, not JSON; keep
+            # the outcome. A custom ``memory_*`` tool returns JSON, so a
+            # non-decoding body there stays the uninformative "done" rather
+            # than claiming "ok".
+            command = call.get("input")
+            if isinstance(command, dict) and command.get("command"):
+                name = f"memory {command['command']}"
+            parts.append(f"{name} {_native_outcome(content)}")
+            continue
+        parts.append(f"{name} {_receipt_status(payload)}")
+    return "[headroom memory] " + "; ".join(parts)
 
 
 class MemoryToolStreamFilter:
@@ -324,6 +448,19 @@ class MemoryToolStreamFilter:
         if client_index == upstream_index:
             return frame
         return _render_frame(event_name, {**payload, "index": client_index})
+
+    def receipt_frames(self, text: str | None) -> list[bytes]:
+        """One text block naming the hidden calls this turn ran, or nothing.
+
+        Emitted before the closing tail so the client message ends with it;
+        ``next_index`` advances past it so a later continuation stays
+        contiguous.
+        """
+        if not text:
+            return []
+        frames = _receipt_frames(self.next_index, text)
+        self.next_index += 1
+        return frames
 
     def closing_frames(self, *, prior_usage: dict[str, int] | None = None) -> list[bytes]:
         """End the client message after this round without a continuation.

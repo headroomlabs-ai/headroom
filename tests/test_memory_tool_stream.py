@@ -100,6 +100,16 @@ SAVE = {
     "input": {"content": "deploy region is ap-southeast-1"},
 }
 BASH = {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "ls"}}
+NATIVE_VIEW = {
+    "type": "tool_use",
+    "id": "toolu_native",
+    "name": "memory",
+    "input": {"command": "view", "path": "/memories/"},
+}
+
+
+def _native_result(content: str) -> dict[str, Any]:
+    return {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
 
 
 class TestMemoryToolStreamFilter:
@@ -226,6 +236,10 @@ def _proxy(upstream_bodies: list[bytes], tool_results: list[dict[str, Any]]) -> 
 
 
 async def _client_view(proxy: HeadroomProxy, **kwargs: Any) -> list[dict[str, Any]]:
+    return _events(await _client_raw(proxy, **kwargs))
+
+
+async def _client_raw(proxy: HeadroomProxy, **kwargs: Any) -> bytes:
     result = await proxy._stream_response(
         url="https://api.anthropic.com/v1/messages",
         headers={"x-api-key": "sk-test"},
@@ -247,11 +261,652 @@ async def _client_view(proxy: HeadroomProxy, **kwargs: Any) -> list[dict[str, An
         memory_user_id="user-1",
         **kwargs,
     )
-    raw = b"".join([chunk async for chunk in result.body_iterator])
-    return _events(raw)
+    return b"".join([chunk async for chunk in result.body_iterator])
 
 
-SAVE_RESULT = [{"type": "tool_result", "tool_use_id": "toolu_mem", "content": '{"status":"saved"}'}]
+SAVE_RESULT = [
+    {
+        "type": "tool_result",
+        "tool_use_id": "toolu_mem",
+        "content": '{"status":"saved","memory_id":"7f58fdac1234"}',
+    }
+]
+
+
+class TestMemoryReceipts:
+    """The client's history records that a hidden call ran (GH #4888)."""
+
+    def test_format_receipt_names_each_call_and_result(self) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        text = format_receipt(
+            [SAVE],
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_mem",
+                    "content": SAVE_RESULT[0]["content"],
+                }
+            ],
+        )
+        assert text == "[headroom memory] memory_save ok id=7f58fdac"
+
+    def test_format_receipt_reports_a_call_with_no_result_as_skipped(self) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        assert format_receipt([SAVE], []) == "[headroom memory] memory_save skipped"
+
+    @pytest.mark.asyncio
+    async def test_one_receipt_names_calls_across_continuation_rounds(self) -> None:
+        # Round 1 calls memory_save, round 2 calls memory_search, then the
+        # model answers. The client sees one receipt naming both.
+        search = {
+            "type": "tool_use",
+            "id": "toolu_search",
+            "name": "memory_search",
+            "input": {"query": "deploy region"},
+        }
+        search_result = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_search",
+            "content": '{"status":"found","count":2}',
+        }
+        proxy = _proxy(
+            [
+                _sse([SAVE], "tool_use"),
+                _sse([search], "tool_use"),
+                _sse([{"type": "text", "text": "Done."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy.memory_handler.handle_memory_tool_calls = AsyncMock(
+            side_effect=[SAVE_RESULT, [search_result]]
+        )
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and "text" in e["delta"]
+        ]
+        assert texts == [
+            "Done.",
+            "[headroom memory] memory_save ok id=7f58fdac; memory_search found 2",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_receipt_keeps_block_indices_contiguous(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        starts = [e["index"] for e in events if e["type"] == "content_block_start"]
+        assert starts == [0, 1, 2]
+
+    def test_format_receipt_is_none_without_calls(self) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        assert format_receipt([], []) is None
+
+    def test_receipt_block_is_a_contiguous_text_block(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_sse([TEXT, SAVE], "tool_use"))
+        frames = flt.receipt_frames("[headroom memory] memory_save ok")
+        events = _events(b"".join(frames))
+        assert [e["type"] for e in events] == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+        ]
+        # The hidden block was index 1 upstream; the receipt takes the client
+        # index the hidden block would have, so indices stay contiguous.
+        assert {e["index"] for e in events} == {1}
+        assert events[1]["delta"]["text"] == "[headroom memory] memory_save ok"
+        assert flt.next_index == 2
+
+    def test_receipt_frames_are_empty_without_text(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        assert flt.receipt_frames(None) == []
+
+    @pytest.mark.asyncio
+    async def test_client_sees_a_receipt_for_the_hidden_save(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [e["delta"]["text"] for e in events if e["type"] == "content_block_delta"]
+        assert texts == ["Saving that.", "Saved.", "[headroom memory] memory_save ok id=7f58fdac"]
+        # Receipt is the last block, before the held tail.
+        assert [e["type"] for e in events][-5:] == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_receipts_off_leaves_the_stream_clean(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "off"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [e["delta"]["text"] for e in events if e["type"] == "content_block_delta"]
+        assert texts == ["Saving that.", "Saved."]
+
+    @pytest.mark.asyncio
+    async def test_receipt_is_emitted_when_the_round_also_called_a_client_tool(self) -> None:
+        proxy = _proxy([_sse([SAVE, BASH], "tool_use")], SAVE_RESULT)
+        proxy._config.memory_tool_receipts = "text"
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        texts = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and "text" in e["delta"]
+        ]
+        assert texts == ["[headroom memory] memory_save ok id=7f58fdac"]
+        assert [e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"] == [
+            "tool_use"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_finalizer_sees_the_receipt_block(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = "text"
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+        await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        finalized = proxy._finalize_stream_response.await_args.kwargs["parsed_response"]
+        texts = [b.get("text") for b in finalized["content"]]
+        assert texts[-1] == "[headroom memory] memory_save ok id=7f58fdac"
+
+
+RETRIEVE = {
+    "type": "tool_use",
+    "id": "toolu_ccr",
+    "name": "headroom_retrieve",
+    "input": {"hash": "abc123"},
+}
+RETRIEVE_RESULT = {
+    "type": "tool_result",
+    "tool_use_id": "toolu_ccr",
+    "content": '{"status":"found","count":1}',
+}
+
+
+class _StubCCRHandler:
+    """Serves withheld ``headroom_retrieve`` calls, one result each."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def serve_withheld_retrievals(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.calls.append(tool_calls[0])
+        return [RETRIEVE_RESULT]
+
+
+class TestMemoryReceiptsWithRetrievalAndClientTool:
+    """A round that saves, retrieves and calls a client tool at once (GH #4888).
+
+    Main holds client tool calls during a retrieval and drops the unrun ones in
+    the continuation; the receipt must ride along without disturbing that, stay
+    the client's last block, and keep indices contiguous.
+    """
+
+    def _proxy(self, receipts: str) -> HeadroomProxy:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE, RETRIEVE, BASH], "tool_use"),
+                _sse([{"type": "text", "text": "Done."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        proxy._config.memory_tool_receipts = receipts
+        proxy.ccr_response_handler = _StubCCRHandler()
+        return proxy
+
+    @pytest.mark.asyncio
+    async def test_receipt_trails_a_mixed_round_and_the_client_call_is_dropped(
+        self,
+    ) -> None:
+        proxy = self._proxy("text")
+        events = await _client_view(
+            proxy, server_memory_tool_names=MEMORY_TOOLS, serve_ccr_retrieval=True
+        )
+
+        texts = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and "text" in e["delta"]
+        ]
+        assert texts == ["Saving that.", "Done.", "[headroom memory] memory_save ok id=7f58fdac"]
+        # The receipt is the client's last block; indices stay contiguous.
+        assert [e["index"] for e in events if e["type"] == "content_block_start"] == [0, 1, 2]
+        # The retrieval ran; the unrun client call did not reach the client.
+        assert proxy.ccr_response_handler.calls == [RETRIEVE]
+        assert not any(e.get("content_block", {}).get("name") == "Bash" for e in events)
+        assert not any(
+            e.get("content_block", {}).get("name") == "headroom_retrieve" for e in events
+        )
+        # The continuation carries both proxy results and drops the client call.
+        continuation = json.loads(
+            proxy.http_client.build_request.call_args_list[1].kwargs["content"]
+        )
+        assistant, tool_result = continuation["messages"][-2:]
+        assert [b["name"] for b in assistant["content"] if b["type"] == "tool_use"] == [
+            "memory_save",
+            "headroom_retrieve",
+        ]
+        assert [b["tool_use_id"] for b in tool_result["content"]] == [
+            "toolu_mem",
+            "toolu_ccr",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_receipts_off_keeps_the_mixed_round_identical(self) -> None:
+        """With receipts off the client gets the round bytes unchanged.
+
+        Byte equality, not selected parsed fields: a receipt that leaked into
+        the stream, a changed stop reason or an unreconciled usage total would
+        otherwise pass.
+        """
+        proxy = self._proxy("off")
+        raw = await _client_raw(
+            proxy, server_memory_tool_names=MEMORY_TOOLS, serve_ccr_retrieval=True
+        )
+
+        expected = b"".join(
+            _frame(payload)
+            for payload in (
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [],
+                        "stop_reason": None,
+                        "usage": {"input_tokens": 10, "output_tokens": 1},
+                    },
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "Saving that."},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": "Done."},
+                },
+                {"type": "content_block_stop", "index": 1},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 10},
+                },
+                {"type": "message_stop"},
+            )
+        )
+        assert raw == expected
+        assert proxy.ccr_response_handler.calls == [RETRIEVE]
+
+    @pytest.mark.asyncio
+    async def test_held_client_tool_precedes_the_receipt_for_client_and_finalizer(
+        self,
+    ) -> None:
+        """Receipt ordering matches tracked history when a client tool is held.
+
+        With retrieval serving on, a round of memory_save + Bash and no
+        retrieval returns to the client without continuing, so the filter
+        releases Bash at close. The receipt must come after it: the client's
+        block order and the tracked history the prefix tracker compares against
+        must be identical, or the next turn's prefix match diverges.
+        """
+        proxy = _proxy([_sse([SAVE, BASH], "tool_use")], SAVE_RESULT)
+        proxy._config.memory_tool_receipts = "text"
+        proxy.ccr_response_handler = _StubCCRHandler()
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+        events = await _client_view(
+            proxy, server_memory_tool_names=MEMORY_TOOLS, serve_ccr_retrieval=True
+        )
+
+        # What the client saw, index by index: a tool name, or the text it
+        # accumulated for a text block (the receipt arrives as deltas).
+        started: dict[int, str] = {}
+        for e in events:
+            if e["type"] == "content_block_start":
+                block = e["content_block"]
+                started[e["index"]] = block.get("name") or ""
+            elif e["type"] == "content_block_delta" and "text" in e.get("delta", {}):
+                started[e["index"]] = started.get(e["index"], "") + e["delta"]["text"]
+        client_order = [started[i] for i in sorted(started)]
+
+        finalized = proxy._finalize_stream_response.await_args.kwargs["parsed_response"]
+        history_order = [
+            b["name"] if b["type"] == "tool_use" else b["text"] for b in finalized["content"]
+        ]
+
+        # The client received Bash before the receipt...
+        assert client_order == ["Bash", "[headroom memory] memory_save ok id=7f58fdac"]
+        # ...which is exactly the order tracked for the next turn's prefix match.
+        assert history_order == client_order
+        assert proxy.ccr_response_handler.calls == []
+
+
+class TestNativeMemoryReceipts:
+    """Native memory tools answer in prose; the receipt keeps the outcome."""
+
+    def _runs(self, content: str, command: str) -> str | None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        call = {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "memory",
+            "input": {"command": command, "path": "/memories/a.txt"},
+        }
+        result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
+        return format_receipt([call], [result])
+
+    def test_native_create_success_names_the_command(self) -> None:
+        assert (
+            self._runs("File created successfully at: /memories/a.txt", "create")
+            == "[headroom memory] memory create ok"
+        )
+
+    def test_native_validation_error_is_not_a_success_receipt(self) -> None:
+        text = self._runs("Error: file_text is required (the memory content)", "create")
+        assert text == "[headroom memory] memory create error"
+        assert "ok" not in text
+
+    def test_native_failure_keeps_handler_text_out_of_the_receipt(self) -> None:
+        text = self._runs("Error: " + "x" * 300, "create")
+        assert text == "[headroom memory] memory create error"
+        assert "x" not in text
+
+    def test_native_unsuccessful_replacement_is_not_ok(self) -> None:
+        text = self._runs(
+            "No replacement was performed, old_str `foo` did not appear verbatim in memories.",
+            "str_replace",
+        )
+        assert text == "[headroom memory] memory str_replace not applied"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Error searching memories: backend down",
+            "Error getting recent memories: backend down",
+            "Error listing memories: backend down",
+        ],
+    )
+    def test_native_view_backend_failures_are_not_ok(self, content: str) -> None:
+        """The ``view`` helpers drop the bare ``Error:`` prefix (GH #4888).
+
+        ``_semantic_search``, ``_get_recent_memories`` and
+        ``_list_all_memories`` answer ``Error searching/getting recent/listing
+        memories: ...``, so a receipt matching only ``Error:`` reported those
+        backend failures as ``ok``.
+        """
+        text = self._runs(content, "view")
+        assert text == "[headroom memory] memory view error"
+        assert "ok" not in text
+        assert "backend down" not in text
+
+    def test_native_view_backend_failure_keeps_the_exception_out(self) -> None:
+        text = self._runs("Error listing memories: internal-backend-marker", "view")
+        assert text == "[headroom memory] memory view error"
+        assert "internal-backend-marker" not in text
+
+    def test_native_view_success_is_still_ok(self) -> None:
+        assert (
+            self._runs("Showing up to 20 memories:\n\n     1\ta memory", "view")
+            == "[headroom memory] memory view ok"
+        )
+
+    def test_native_success_and_failure_differ(self) -> None:
+        assert self._runs("File created successfully at: /memories/a.txt", "create") != self._runs(
+            "Error: path is required", "create"
+        )
+
+    def test_custom_tool_with_a_non_json_body_does_not_claim_ok(self) -> None:
+        """Only the native ``memory`` tool answers in prose.
+
+        A custom ``memory_*`` tool returns JSON; an anomalous non-JSON body is
+        not evidence that the call succeeded, so the receipt must not say so.
+        """
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        call = {"type": "tool_use", "id": "toolu_custom", "name": "memory_save", "input": {}}
+        result = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_custom",
+            "content": "<html>502</html>",
+        }
+        text = format_receipt([call], [result])
+        assert text == "[headroom memory] memory_save done"
+        assert "ok" not in text
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"status": "found", "count": 3}, "memory_search found 3"),
+            ({"status": "updated", "memory_id": "abcdef123456"}, "memory_update ok id=abcdef12"),
+            (
+                {"status": "deleted", "memory_id": "abcdef123456"},
+                "memory_delete deleted id=abcdef12",
+            ),
+            ({"status": "not_found"}, "memory_delete not_found"),
+            ({"status": "ok", "count": 2}, "memory_search ok 2"),
+            ({"status": "error", "error": "backend down"}, "memory_save error"),
+            ({"status": "queued"}, "memory_save queued"),
+            ({"status": ""}, "memory_save done"),
+        ],
+    )
+    def test_json_status_maps_to_a_receipt_phrase(
+        self, payload: dict[str, object], expected: str
+    ) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        name = expected.split()[0]
+        call = {"type": "tool_use", "id": "toolu_j", "name": name, "input": {}}
+        result = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_j",
+            "content": json.dumps(payload),
+        }
+        assert format_receipt([call], [result]) == f"[headroom memory] {expected}"
+
+
+class TestNativeFailureSourceToReceipt:
+    """The receipt reads the strings the real view helpers emit on failure.
+
+    Source-tied on purpose: a change to the helpers' failure prose that the
+    formatter no longer recognises fails here, not only in a literal-string
+    test (GH #4888).
+    """
+
+    @staticmethod
+    async def _view_failures(tmp_path: Any) -> list[str]:
+        """What the three view helpers return when the backend raises."""
+        from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+
+        class _DownBackend:
+            async def search_memories(self, **kwargs: Any) -> Any:
+                raise RuntimeError("internal-backend-marker")
+
+        handler = MemoryHandler(
+            MemoryConfig(
+                enabled=False,
+                use_native_tool=True,
+                native_memory_dir=str(tmp_path / "native"),
+            ),
+            agent_type="codex",
+        )
+        backend = _DownBackend()
+        return [
+            await handler._semantic_search("x", "u1", backend=backend),
+            await handler._get_recent_memories("u1", backend=backend),
+            await handler._list_all_memories("u1", backend=backend),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_view_helper_failures_reach_the_receipt_as_errors(self, tmp_path: Any) -> None:
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        produced = await self._view_failures(tmp_path)
+        assert all(text.startswith("Error") for text in produced)
+
+        for content in produced:
+            text = format_receipt([NATIVE_VIEW], [_native_result(content)])
+            assert text == "[headroom memory] memory view error"
+            assert "ok" not in text
+            assert "internal-backend-marker" not in text
+
+    @pytest.mark.asyncio
+    async def test_root_overview_fallback_is_not_a_success_receipt(self, tmp_path: Any) -> None:
+        """`view /memories` whose overview lookup raised is an error, not ok.
+
+        ``_get_memory_overview`` answers the root path with help text on
+        failure. That text is prose like a real overview, so the formatter
+        used to call it ``ok``: the client could not tell the failed lookup
+        from a store with no memories (GH #4888).
+        """
+        from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        class _DownBackend:
+            async def search_memories(self, **kwargs: Any) -> Any:
+                raise RuntimeError("internal-backend-marker")
+
+        handler = MemoryHandler(
+            MemoryConfig(
+                enabled=False,
+                use_native_tool=True,
+                native_memory_dir=str(tmp_path / "native"),
+            ),
+            agent_type="codex",
+        )
+
+        # The real dispatch entry point for view /memories — not a stubbed
+        # helper — so a change to the failure path here fails the test.
+        handler._backend = _DownBackend()
+        content = await handler._execute_native_memory_tool(
+            {"command": "view", "path": "/memories"}, "u1"
+        )
+        assert content.startswith("Error")
+        assert "internal-backend-marker" not in content
+
+        call = {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "memory",
+            "input": {"command": "view", "path": "/memories"},
+        }
+        result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
+        text = format_receipt([call], [result])
+        assert text == "[headroom memory] memory view error"
+        assert "ok" not in text
+        assert "internal-backend-marker" not in text
+
+    @pytest.mark.asyncio
+    async def test_successful_empty_overview_still_reads_ok(self, tmp_path: Any) -> None:
+        """The control: a store with no memories is a success, not an error."""
+        from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+        from headroom.proxy.memory_tool_stream import format_receipt
+
+        class _EmptyBackend:
+            async def search_memories(self, **kwargs: Any) -> Any:
+                return []
+
+        handler = MemoryHandler(
+            MemoryConfig(
+                enabled=False,
+                use_native_tool=True,
+                native_memory_dir=str(tmp_path / "native"),
+            ),
+            agent_type="codex",
+        )
+        handler._backend = _EmptyBackend()
+        content = await handler._execute_native_memory_tool(
+            {"command": "view", "path": "/memories"}, "u1"
+        )
+        assert "0 memories stored" in content
+
+        call = {
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "memory",
+            "input": {"command": "view", "path": "/memories"},
+        }
+        result = {"type": "tool_result", "tool_use_id": "toolu_native", "content": content}
+        assert format_receipt([call], [result]) == "[headroom memory] memory view ok"
+
+    @pytest.mark.asyncio
+    async def test_backend_text_reaches_neither_the_stream_nor_the_history(
+        self, tmp_path: Any
+    ) -> None:
+        """A raising backend leaves no marker in the SSE or in tracked history."""
+        produced = await self._view_failures(tmp_path)
+        proxy = _proxy(
+            [_sse([TEXT, NATIVE_VIEW, BASH], "tool_use")],
+            [_native_result(produced[0])],
+        )
+        proxy._config.memory_tool_receipts = "text"
+        proxy.ccr_response_handler = _StubCCRHandler()
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+
+        raw = await _client_raw(proxy, server_memory_tool_names=frozenset({"memory"}))
+        events = _events(raw)
+
+        receipt = "[headroom memory] memory view error"
+        assert any(
+            e["type"] == "content_block_delta" and e["delta"].get("text") == receipt for e in events
+        )
+        assert b"internal-backend-marker" not in raw
+
+        finalized = proxy._finalize_stream_response.await_args.kwargs["parsed_response"]
+        history = [b.get("text") for b in finalized["content"] if b["type"] == "text"]
+        assert "internal-backend-marker" not in json.dumps(history)
+        assert receipt in history
 
 
 class TestStreamingMemoryContinuation:
