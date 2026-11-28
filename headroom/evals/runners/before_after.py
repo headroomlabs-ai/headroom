@@ -17,6 +17,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from headroom.evals.anthropic_compat import (
+    anthropic_response_text,
+    anthropic_thinking_kwargs,
+    is_sonnet_5_5,
+)
 from headroom.evals.core import (
     EvalCase,
     EvalMode,
@@ -35,7 +40,7 @@ class LLMConfig:
     """Configuration for LLM calls."""
 
     provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "claude-sonnet-5-5"
     temperature: float = 0.0  # Deterministic for reproducibility
     max_tokens: int = 1024
     headroom_proxy_url: str | None = None  # e.g. "http://localhost:8787" for full-stack eval
@@ -52,7 +57,7 @@ class BeforeAfterRunner:
 
     Example:
         ```python
-        runner = BeforeAfterRunner(llm_config=LLMConfig(model="claude-sonnet-4-20250514"))
+        runner = BeforeAfterRunner(llm_config=LLMConfig(model="claude-sonnet-5-5"))
         results = runner.run(suite)
         print(results.summary())
         ```
@@ -157,11 +162,19 @@ Question: {query}
 
 Answer:"""
 
+        # Claude Sonnet 5.5 rejects sampling parameters.
+        sampling: dict[str, Any] = (
+            {}
+            if is_sonnet_5_5(self.llm_config.model)
+            else {"temperature": self.llm_config.temperature}
+        )
         response = self._proxy_client.chat.completions.create(
             model=self.llm_config.model,
             max_tokens=self.llm_config.max_tokens,
-            temperature=self.llm_config.temperature,
             messages=[{"role": "user", "content": prompt}],
+            **sampling,
+            # Same thinking setting as the direct arm.
+            **anthropic_thinking_kwargs(self.llm_config.model),
         )
         content = response.choices[0].message.content
         return str(content) if content else ""
@@ -182,8 +195,9 @@ Answer:"""
                 model=self.llm_config.model,
                 max_tokens=self.llm_config.max_tokens,
                 messages=[{"role": "user", "content": prompt}],
+                **anthropic_thinking_kwargs(self.llm_config.model),
             )
-            return str(response.content[0].text)
+            return anthropic_response_text(response)
         elif self.llm_config.provider == "openai":
             response = self._llm_client.chat.completions.create(
                 model=self.llm_config.model,
@@ -521,7 +535,7 @@ Answer:"""
 def run_quick_eval(
     n_samples: int = 5,
     provider: Literal["anthropic", "openai", "ollama"] = "anthropic",
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-5-5",
 ) -> EvalSuiteResult:
     """Run a quick evaluation with built-in samples.
 

@@ -40,6 +40,12 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
+from headroom.evals.anthropic_compat import (
+    anthropic_response_text,
+    anthropic_thinking_kwargs,
+    anthropic_thinking_params,
+    is_sonnet_5_5,
+)
 from headroom.evals.metrics import (
     compute_exact_match,
     compute_f1,
@@ -74,21 +80,22 @@ class BatchRequest:
 
     custom_id: str
     messages: list[dict[str, Any]]
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "claude-sonnet-5-5"
     max_tokens: int = 1024
     temperature: float = 0.0
 
     def to_anthropic_format(self) -> dict[str, Any]:
         """Convert to Anthropic batch API format."""
-        return {
-            "custom_id": self.custom_id,
-            "params": {
-                "model": self.model,
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "messages": self.messages,
-            },
+        params: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": self.messages,
+            **anthropic_thinking_params(self.model),
         }
+        # Claude Sonnet 5.5 rejects sampling parameters.
+        if not is_sonnet_5_5(self.model):
+            params["temperature"] = self.temperature
+        return {"custom_id": self.custom_id, "params": params}
 
     def to_openai_format(self) -> dict[str, Any]:
         """Convert to OpenAI batch API format."""
@@ -936,7 +943,7 @@ def get_all_test_cases() -> list[BatchTestCase]:
 class TokenCounter:
     """Token counter for evaluation."""
 
-    def __init__(self, model: str = "claude-sonnet-4-20250514"):
+    def __init__(self, model: str = "claude-sonnet-5-5"):
         self.model = model
         self._tokenizer: Any = None
 
@@ -1024,9 +1031,9 @@ class BatchCompressionEvaluator:
     def _get_default_model(self, provider: str) -> str:
         """Get default model for provider."""
         return {
-            "anthropic": "claude-sonnet-4-20250514",
+            "anthropic": "claude-sonnet-5-5",
             "openai": "gpt-4o",
-        }.get(provider, "claude-sonnet-4-20250514")
+        }.get(provider, "claude-sonnet-5-5")
 
     def _init_llm_client(self) -> Any:
         """Initialize LLM client."""
@@ -1059,8 +1066,9 @@ class BatchCompressionEvaluator:
                 model=self.model,
                 max_tokens=1024,
                 messages=messages,
+                **anthropic_thinking_kwargs(self.model),
             )
-            return str(response.content[0].text)
+            return anthropic_response_text(response)
         elif self.provider == "openai":
             response = self._llm_client.chat.completions.create(
                 model=self.model,
@@ -1316,7 +1324,7 @@ Max error: {self.max_error_percent:.2f}%"""
 
 
 def evaluate_token_counting_accuracy(
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-5-5",
 ) -> TokenCountAccuracyResult:
     """Evaluate token counting accuracy against provider's official count.
 

@@ -17,6 +17,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
+from headroom.evals.anthropic_compat import (
+    anthropic_response_text,
+    anthropic_thinking_kwargs,
+    litellm_model_kwargs,
+)
 from headroom.offline import guard_egress, pin_litellm_cost_map_local
 
 logger = logging.getLogger(__name__)
@@ -99,13 +104,13 @@ def create_openai_judge(
 
 
 def create_anthropic_judge(
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-5-5",
     api_key: str | None = None,
 ) -> Callable[[str, str, str], tuple[float, str]]:
     """Create an LLM judge using Anthropic's API.
 
     Args:
-        model: Anthropic model to use (default: claude-sonnet-4-20250514).
+        model: Anthropic model to use (default: claude-sonnet-5-5).
         api_key: Anthropic API key (uses ANTHROPIC_API_KEY env var if not provided).
 
     Returns:
@@ -141,11 +146,10 @@ def create_anthropic_judge(
             model=model,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
+            **anthropic_thinking_kwargs(model),
         )
 
-        text = ""
-        if response.content and hasattr(response.content[0], "text"):
-            text = response.content[0].text
+        text = anthropic_response_text(response)
         return _parse_judge_response(text)
 
     return judge
@@ -186,10 +190,9 @@ def create_litellm_judge(
         )
 
         response = litellm.completion(
-            model=model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
             max_tokens=200,
+            **litellm_model_kwargs(model),
         )
 
         text = response.choices[0].message.content or ""

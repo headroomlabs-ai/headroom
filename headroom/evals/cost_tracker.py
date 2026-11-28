@@ -19,6 +19,7 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-4o-mini-2024-07-18": {"input": 0.15, "output": 0.60},
     # Anthropic
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00},
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
     "claude-haiku-3-5-20241022": {"input": 1.00, "output": 5.00},
     "claude-3-5-haiku-20241022": {"input": 1.00, "output": 5.00},
