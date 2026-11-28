@@ -664,9 +664,14 @@ def restore_frozen_prefix(
     frozen = min(frozen_message_count, len(original_messages))
     restored = list(candidate_messages)
 
-    # Defensive: if a transform dropped prefix messages, restore them.
-    if len(restored) < frozen:
-        return list(original_messages[:frozen]) + restored, frozen
+    if not restored:
+        return list(original_messages[:frozen]), frozen
+
+    # Once messages have been dropped, positions no longer establish whether
+    # a candidate message came from the frozen prefix or the live suffix.
+    # Use the original request rather than dropping or duplicating history.
+    if len(restored) < len(original_messages):
+        return list(original_messages), frozen
 
     changed = 0
     for idx in range(frozen):
