@@ -112,9 +112,10 @@ class OutcomeSnapshot:
     tokens_saved: int = 0
     #: The share of ``tokens_saved`` new to this conversation, which is what
     #: running totals book (PERF ``tok_novel``). The proxy funnel always sets
-    #: both; they differ only on ``/v1/responses``, where the whole transcript
-    #: is re-sent and recompressed every turn, and ``tokens_saved -
-    #: novel_tokens_saved`` is the re-sent history removed again.
+    #: both; they differ on ``/v1/responses``, where the whole transcript is
+    #: re-sent and recompressed every turn, and on Anthropic ``/v1/messages``,
+    #: where the replayed frozen prefix keeps earlier turns' compression.
+    #: ``tokens_saved - novel_tokens_saved`` is the history removed again.
     novel_tokens_saved: int = 0
     #: Whose request this was: ``{dimension: label}``, for now ``project`` and
     #: ``client`` when known. Self-reported labels, not authenticated

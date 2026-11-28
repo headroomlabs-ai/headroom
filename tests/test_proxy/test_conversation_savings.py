@@ -3,13 +3,14 @@
 OpenAI's ``/v1/responses`` re-sends the whole transcript every turn and the
 router recompresses all of it, so a turn's ``tokens_saved`` is the running
 total for the conversation. Summing that across turns counts every removed
-token again on every remaining turn. Anthropic's frozen cached prefix means
-its ``tokens_saved`` is already novel-only, which is why the two providers'
-lifetime totals were never comparable.
+token again on every remaining turn. Anthropic's ``/v1/messages`` replays its
+frozen prefix in the compressed form forwarded last turn, so its
+``tokens_saved`` is a running total too (#5069).
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -171,9 +172,8 @@ async def test_the_request_log_keeps_the_wire_truth() -> None:
 
 @pytest.mark.asyncio
 async def test_paths_without_conversation_identity_are_unchanged() -> None:
-    """Anthropic and every other handler leave the pair unset. Their
-    ``tokens_saved`` is already novel-only, so it must reach the trackers
-    untouched however many turns go by."""
+    """Handlers that leave the pair unset report novel-only ``tokens_saved``,
+    so it must reach the trackers untouched however many turns go by."""
     handler = _Handler()
     for _ in range(3):
         await emit_request_outcome(
@@ -244,8 +244,8 @@ def test_the_streaming_constructor_carries_the_pair() -> None:
 
 
 def test_the_streaming_constructor_defaults_the_pair_off() -> None:
-    """Every other streaming caller (Anthropic SSE, Bedrock, OpenAI chat via
-    backend) must keep reporting novel-only savings unchanged."""
+    """A streaming caller that passes no pair (OpenAI chat via backend) must
+    keep reporting its savings unchanged."""
     outcome = RequestOutcome.from_stream(
         body={"model": "claude-opus-5", "messages": []},
         provider="anthropic",
@@ -263,6 +263,126 @@ def test_the_streaming_constructor_defaults_the_pair_off() -> None:
     )
     assert outcome.conversation_key is None
     assert outcome.conversation_tokens_saved is None
+
+
+# --- Anthropic /v1/messages (#5069) -------------------------------------------
+
+
+def _anthropic_outcome(tokens_saved: int, **overrides: Any) -> RequestOutcome:
+    defaults: dict[str, Any] = {
+        "request_id": "req-1",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "original_tokens": 40_000 + tokens_saved,
+        "optimized_tokens": 40_000,
+        "output_tokens": 125,
+        "tokens_saved": tokens_saved,
+        "attempted_input_tokens": 40_000 + tokens_saved,
+        "conversation_key": "anthropic:lineage-a",
+        "conversation_tokens_saved": tokens_saved,
+    }
+    defaults.update(overrides)
+    return RequestOutcome(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_noop_turns_do_not_re_book_the_frozen_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shape reported in #5069: consecutive noop turns of one Claude Code
+    session all logged ``tok_saved=856``, because the replayed prefix keeps the
+    first turn's compression. The running totals must book it once, and the
+    PERF line must say so with ``tok_novel``."""
+    handler = _Handler()
+    with caplog.at_level("INFO", logger="headroom.proxy"):
+        for _ in range(4):
+            await emit_request_outcome(handler, _anthropic_outcome(856))
+        await emit_request_outcome(handler, _anthropic_outcome(2_342))
+
+    booked = [
+        call.kwargs["tokens_saved"] for call in handler.metrics.record_request.await_args_list
+    ]
+    assert booked == [856, 0, 0, 0, 1_486]
+    perf = [r.getMessage() for r in caplog.records if " PERF " in r.getMessage()]
+    assert len(perf) == 5
+    assert "tok_novel" not in perf[0]  # equal to tok_saved: not repeated
+    assert "tok_saved=856 tok_novel=0 " in perf[1]
+    assert "tok_saved=2342 tok_novel=1486 " in perf[4]
+
+
+def _anthropic_app(monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]) -> Any:
+    pytest.importorskip("fastapi")
+    from headroom.proxy.loopback_guard import require_loopback
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    async def _spy(_self: Any, outcome: Any, *a: Any, **kw: Any) -> None:
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(type(app.state.proxy), "_record_request_outcome", _spy, raising=True)
+    return app
+
+
+def test_anthropic_handler_keys_savings_by_conversation_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handler must hand the funnel the pair: one key per conversation,
+    stable across its turns, and the request's ``tokens_saved`` as the running
+    total. Without it the funnel falls back to booking ``tokens_saved`` every
+    turn, which is the #5069 inflation."""
+    httpx = pytest.importorskip("httpx")
+    respx = pytest.importorskip("respx")
+    from fastapi.testclient import TestClient
+
+    outcomes: list[Any] = []
+    app = _anthropic_app(monkeypatch, outcomes)
+    reply = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 100, "output_tokens": 1},
+    }
+    headers = {"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"}
+    turn_one = [{"role": "user", "content": "first question in conversation A"}]
+    turn_two = [
+        *turn_one,
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "follow-up in conversation A"},
+    ]
+    other = [{"role": "user", "content": "an unrelated conversation B"}]
+
+    with respx.mock:
+        respx.post("https://api.anthropic.com/v1/messages").mock(
+            return_value=httpx.Response(200, json=reply)
+        )
+        with TestClient(app) as client:
+            for messages in (turn_one, turn_two, other):
+                result = client.post(
+                    "/v1/messages",
+                    json={"model": "claude-sonnet-4-5", "max_tokens": 16, "messages": messages},
+                    headers=headers,
+                )
+                assert result.status_code == 200
+
+    first, second, unrelated = outcomes
+    assert first.conversation_key and first.conversation_key.startswith("anthropic:")
+    assert second.conversation_key == first.conversation_key
+    assert unrelated.conversation_key != first.conversation_key
+    for outcome in outcomes:
+        assert outcome.conversation_tokens_saved == outcome.tokens_saved
 
 
 # --- identity: real Responses bodies, not an injected key -------------------
@@ -417,3 +537,172 @@ async def test_the_snapshot_says_whose_request_it_was() -> None:
     assert seen[0].conversation_key == "conv-a"
     assert seen[0].original_tokens == 156_260
     assert dict(seen[1].attribution) == {}
+
+
+_LOG_OUTPUT = "\n".join(
+    f"2026-11-27T07:{i % 60:02d}:00 INFO worker-{i % 7} step {i} completed ok" for i in range(600)
+)
+_EXPANDED_OUTPUT = "\n".join(
+    f"src/auth/middleware_{i}.py session token login handler" for i in range(40)
+)
+_EXPANDED_SAMPLE = "\n".join(_EXPANDED_OUTPUT.splitlines()[:4])
+_EXPANSION_QUERY = "list the auth middleware files"
+
+
+def _expansion_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, *, optimize: bool
+) -> tuple[Any, int]:
+    """Drive one real ``/v1/messages`` turn whose query proactively expands a
+    tracked compression; return the outcome the handler hands the funnel and
+    the expansion size it counted."""
+    pytest.importorskip("fastapi")
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.cache.compression_store import (
+        detach_compression_store,
+        get_compression_store,
+        reset_compression_store,
+    )
+    from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    # A private in-memory CCR store. The default is the developer's SQLite file,
+    # and reset_compression_store() deletes every row in the store it resets, so
+    # detach any store an earlier test left behind instead of resetting it.
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    detach_compression_store()
+    app = create_app(
+        ProxyConfig(
+            optimize=optimize,
+            mode="token",
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=True,
+            ccr_proactive_expansion=True,
+            image_optimize=False,
+        )
+    )
+    outcomes: list[Any] = []
+
+    async def _spy(_self: Any, outcome: Any, *a: Any, **kw: Any) -> None:
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(type(app.state.proxy), "_record_request_outcome", _spy, raising=True)
+    counted: list[int] = []
+    real_count = AnthropicHandlerMixin._proactive_expansion_tokens.__func__
+
+    def _counting(cls: Any, messages: Any, count_text: Any) -> int:
+        n = real_count(cls, messages, count_text)
+        counted.append(n)
+        return n
+
+    monkeypatch.setattr(
+        AnthropicHandlerMixin, "_proactive_expansion_tokens", classmethod(_counting)
+    )
+
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_expansion",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+            },
+        )
+
+    def tool_turn(tid: str, command: str, content: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": command}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": tid, "content": content}],
+            },
+        ]
+
+    cwd = str(tmp_path)
+    try:
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            hash_key = get_compression_store().store(
+                _EXPANDED_OUTPUT,
+                _EXPANDED_SAMPLE,
+                original_item_count=40,
+                compressed_item_count=4,
+                tool_name="Bash",
+                query_context=_EXPANSION_QUERY,
+            )
+            workspace_key, _ = proxy._resolve_ccr_workspace(
+                SimpleNamespace(headers={"x-headroom-cwd": cwd}), {}
+            )
+            proxy.ccr_context_tracker.track_compression(
+                hash_key=hash_key,
+                turn_number=1,
+                tool_name="Bash",
+                original_count=40,
+                compressed_count=4,
+                workspace_key=workspace_key,
+                query_context=_EXPANSION_QUERY,
+                sample_content=_EXPANDED_SAMPLE,
+            )
+            proxy._retry_request = _fake_retry
+
+            messages: list[dict[str, Any]] = [{"role": "user", "content": "run the worker"}]
+            messages += tool_turn("t0", "./worker", _LOG_OUTPUT)
+            messages += tool_turn(
+                "t1", "ls", f"[40 items compressed to 4. Retrieve more: hash={hash_key}]"
+            )
+            messages += [
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": _EXPANSION_QUERY},
+            ]
+            response = client.post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": "test-key",
+                    "anthropic-version": "2023-06-01",
+                    "x-headroom-cwd": cwd,
+                },
+                json={"model": "claude-sonnet-4-6", "max_tokens": 16, "messages": messages},
+            )
+            assert response.status_code == 200, response.text
+    finally:
+        reset_compression_store()
+    (outcome,) = outcomes
+    assert counted and counted[-1] > 0, "setup: the turn did not proactively expand"
+    return outcome, counted[-1]
+
+
+def test_proactive_expansion_is_added_back_to_the_anthropic_running_total(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Expansion text is sent on one turn only and the tracker strips it, so the
+    replayed prefix keeps the removal. The handler must feed the ledger the
+    wire saving with the expansion added back; otherwise expand-then-not
+    re-books the same removal on the next turn (#5069 follow-up). Asserted on
+    the outcome the real handler hands the funnel."""
+    outcome, expansion = _expansion_outcome(monkeypatch, tmp_path, optimize=True)
+    assert outcome.tokens_saved > 0, "setup: nothing was compressed"
+    assert outcome.conversation_key and outcome.conversation_key.startswith("anthropic:")
+    assert outcome.conversation_tokens_saved == outcome.tokens_saved + expansion
+
+
+def test_proactive_expansion_alone_books_nothing_on_the_anthropic_ledger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A turn that only expands removes nothing. Adding the expansion back to
+    the clamped per-request saving would book the expansion's own size as a
+    removal; the running total has to come from the signed wire saving."""
+    outcome, _ = _expansion_outcome(monkeypatch, tmp_path, optimize=False)
+    assert outcome.tokens_saved == 0
+    assert outcome.conversation_tokens_saved == 0

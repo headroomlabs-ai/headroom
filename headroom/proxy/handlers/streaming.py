@@ -2182,6 +2182,8 @@ class StreamingMixin:
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
         backend: Any | None = None,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> StreamingResponse:
         """Stream response from Bedrock backend with metrics tracking.
 
@@ -2443,6 +2445,8 @@ class StreamingMixin:
                     ttfb_ms=stream_state["ttfb_ms"] or 0,
                     pipeline_timing=pipeline_timing,
                     original_messages=original_messages,
+                    conversation_key=conversation_key,
+                    conversation_tokens_saved=conversation_tokens_saved,
                 )
                 await self._record_request_outcome(outcome)
 

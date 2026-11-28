@@ -4,9 +4,12 @@ Providers disagree about what a request's ``tokens_saved`` means, and the
 disagreement only shows up once something sums it.
 
 Anthropic's cached prefix is frozen -- the router leaves it alone so the
-provider's prefix cache keeps hitting -- so a turn's ``tokens_saved`` covers
-only content that newly entered the conversation. Summing across turns counts
-each removed token once.
+provider's prefix cache keeps hitting -- but it is frozen in its COMPRESSED
+form: every turn replays the bytes forwarded last turn, while ``tok_before``
+counts the client's original bytes. A turn's ``tokens_saved`` therefore
+includes every earlier turn's removal again, and a noop turn of a long session
+repeats the last figure (#5069). The handler keys it by prefix-tracker lineage
+so it is differenced the same way as the ``/v1/responses`` series below.
 
 OpenAI's ``/v1/responses`` carries the whole transcript in every request and
 the router recompresses all of it, so a turn's ``tokens_saved`` is the running
