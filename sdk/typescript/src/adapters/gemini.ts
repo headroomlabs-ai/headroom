@@ -9,8 +9,8 @@ import type { CompressOptions } from "../types.js";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 interface GeminiModelLike {
-  generateContent: (params: any) => any;
-  generateContentStream?: (params: any) => any;
+  generateContent: (params: any, ...requestOptions: any[]) => any;
+  generateContentStream?: (params: any, ...requestOptions: any[]) => any;
   [key: string]: any;
 }
 
@@ -74,11 +74,12 @@ export function withHeadroom<T extends GeminiModelLike>(
       : { ...params, contents: result.messages };
   };
 
-  const compressedGenerate = async (params: any) =>
-    originalGenerate(await compressParams(params));
+  const compressedGenerate = async (params: any, ...requestOptions: unknown[]) =>
+    originalGenerate(await compressParams(params), ...requestOptions);
 
   const compressedStream = originalStream
-    ? async (params: any) => originalStream(await compressParams(params))
+    ? async (params: any, ...requestOptions: unknown[]) =>
+        originalStream(await compressParams(params), ...requestOptions)
     : undefined;
 
   return new Proxy(model, {

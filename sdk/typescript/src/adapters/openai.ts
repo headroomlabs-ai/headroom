@@ -6,7 +6,7 @@ import type { CompressOptions, OpenAIMessage } from "../types.js";
 interface OpenAILike {
   chat: {
     completions: {
-      create: (params: any) => any;
+      create: (params: any, ...requestOptions: any[]) => any;
     };
   };
   [key: string]: any;
@@ -38,7 +38,7 @@ export function withHeadroom<T extends OpenAILike>(
     client.chat.completions,
   );
 
-  const compressedCreate = async (params: any) => {
+  const compressedCreate = async (params: any, ...requestOptions: unknown[]) => {
     const messages: OpenAIMessage[] = params.messages;
     const model = options.model ?? params.model ?? "gpt-4o";
 
@@ -48,10 +48,10 @@ export function withHeadroom<T extends OpenAILike>(
       model,
     });
 
-    return originalCreate({
-      ...params,
-      messages: result.messages,
-    });
+    return originalCreate(
+      { ...params, messages: result.messages },
+      ...requestOptions,
+    );
   };
 
   const completionsProxy = new Proxy(client.chat.completions, {

@@ -26,6 +26,20 @@ describe("withHeadroom (OpenAI)", () => {
     mockFetch.mockReset();
   });
 
+  it("forwards per-request SDK options after compressing messages", async () => {
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess());
+    const create = vi.fn<(params: unknown, options?: unknown) => Promise<unknown>>();
+    const wrapped = withHeadroom({ chat: { completions: { create } } });
+    const options = { timeout: 1000, signal: new AbortController().signal };
+
+    await wrapped.chat.completions.create(
+      { model: "gpt-4o", messages: [{ role: "user", content: "input" }] },
+      options,
+    );
+
+    expect(create.mock.calls[0][1]).toBe(options);
+  });
+
   it("intercepts chat.completions.create and compresses messages", async () => {
     mockFetch.mockResolvedValueOnce(mockCompressSuccess());
 

@@ -5,7 +5,7 @@ import type { CompressOptions } from "../types.js";
 
 interface AnthropicLike {
   messages: {
-    create: (params: any) => any;
+    create: (params: any, ...requestOptions: any[]) => any;
   };
   [key: string]: any;
 }
@@ -38,7 +38,7 @@ export function withHeadroom<T extends AnthropicLike>(
 ): T {
   const originalCreate = client.messages.create.bind(client.messages);
 
-  const compressedCreate = async (params: any) => {
+  const compressedCreate = async (params: any, ...requestOptions: unknown[]) => {
     const messages = params.messages;
     const model =
       options.model ?? params.model ?? "claude-sonnet-4-5-20250929";
@@ -49,10 +49,10 @@ export function withHeadroom<T extends AnthropicLike>(
       model,
     });
 
-    return originalCreate({
-      ...params,
-      messages: result.compressed ? result.messages : messages,
-    });
+    return originalCreate(
+      { ...params, messages: result.compressed ? result.messages : messages },
+      ...requestOptions,
+    );
   };
 
   const messagesProxy = new Proxy(client.messages, {

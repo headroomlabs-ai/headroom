@@ -27,6 +27,23 @@ describe("Gemini withHeadroom", () => {
     vi.clearAllMocks();
   });
 
+  it.each(["generateContent", "generateContentStream"] as const)(
+    "forwards per-request SDK options from %s",
+    async (method) => {
+      mockFetch.mockResolvedValueOnce(mockCompressResponse([]));
+      const model = {
+        generateContent: vi.fn<(params: unknown, options?: unknown) => Promise<unknown>>(),
+        generateContentStream: vi.fn<(params: unknown, options?: unknown) => Promise<unknown>>(),
+      };
+      const wrapped = withHeadroom(model);
+      const options = { timeout: 1000, signal: new AbortController().signal };
+
+      await wrapped[method]("input", options);
+
+      expect(model[method].mock.calls[0][1]).toBe(options);
+    },
+  );
+
   it("wraps generateContent with compression", async () => {
     const originalResult = { response: { text: () => "Generated text" } };
     const mockModel = {
