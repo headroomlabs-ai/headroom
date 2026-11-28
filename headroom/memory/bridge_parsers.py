@@ -210,8 +210,164 @@ def extract_relationships_from_section(
 
 
 # ---------------------------------------------------------------------------
-# Format detection
+# Format detection & fenced code blocks
 # ---------------------------------------------------------------------------
+
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_ATX_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$")
+_PRE_OPEN_RE = re.compile(r"^ {0,3}<pre(?:\s|>|$)", re.IGNORECASE)
+_PRE_CLOSE_RE = re.compile(r"</pre>", re.IGNORECASE)
+_THEMATIC_BREAK_RE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_LIST_ITEM_RE = re.compile(r"^( {0,3})([-+*]|\d{1,9}[.)])(?:([ \t]+)(.*))?$")
+
+
+@dataclass
+class _BlockState:
+    fence: tuple[str, int] | None = None
+    fence_indent: int = 0
+    in_pre: bool = False
+    pre_indent: int = 0
+    list_indent: int | None = None
+    block_id: int = 0
+
+
+def _next_fence_state(
+    line: str,
+    active_fence: tuple[str, int] | None,
+) -> tuple[tuple[str, int] | None, bool]:
+    """Update CommonMark fenced code block state for a single line.
+
+    Returns ``(new_fence_state, is_fence_or_inside)`` where the boolean is
+    True for opening/closing fence lines and any lines inside a fence.
+    """
+    if active_fence is None:
+        match = _FENCE_OPEN_RE.match(line)
+        if not match:
+            return None, False
+        marker, info = match.group(1), match.group(2)
+        fence_char = marker[0]
+        if fence_char == "`" and "`" in info:
+            return None, False
+        return (fence_char, len(marker)), True
+
+    fence_char, min_len = active_fence
+    if re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{min_len},}}[ \t]*$", line):
+        return None, True
+    return active_fence, True
+
+
+def _split_leading_whitespace(line: str) -> tuple[int, str]:
+    """Return leading indentation width in columns (4-space tab stops) and remainder."""
+    cols = 0
+    for i, ch in enumerate(line):
+        if ch == " ":
+            cols += 1
+        elif ch == "\t":
+            cols += 4 - (cols % 4)
+        else:
+            return cols, line[i:]
+    return cols, ""
+
+
+def _list_content_indent(
+    lead: str,
+    marker: str,
+    sep: str | None,
+    rest: str | None,
+) -> int:
+    """Return CommonMark list item content column offset."""
+    marker_end = len(lead) + len(marker)
+    if not sep or not rest:
+        return marker_end + 1
+    col = marker_end
+    for ch in sep:
+        col += 4 - (col % 4) if ch == "\t" else 1
+    sep_cols = col - marker_end
+    return marker_end + (1 if sep_cols > 4 else sep_cols)
+
+
+def _reindent_for_matching(line: str, strip_cols: int) -> str:
+    """Rebuild leading indentation as spaces after stripping ``strip_cols`` columns."""
+    leading_cols, content = _split_leading_whitespace(line)
+    if not content:
+        return ""
+    residual = max(0, leading_cols - strip_cols)
+    return (" " * residual) + content
+
+
+def _advance_block_state(
+    line: str,
+    state: _BlockState,
+) -> tuple[bool, re.Match[str] | None]:
+    """Advance markdown block state across fences, ``<pre>`` blocks, and lists.
+
+    Returns ``(is_verbatim_block, top_level_atx_heading_match)``.
+    """
+    stripped = line.strip()
+    leading, _ = _split_leading_whitespace(line)
+
+    if state.fence is not None:
+        next_fence, _ = _next_fence_state(
+            _reindent_for_matching(line, state.fence_indent),
+            state.fence,
+        )
+        if next_fence is None:
+            state.fence = None
+            state.fence_indent = 0
+            return True, None
+        if stripped and leading < state.fence_indent:
+            # Dedented non-blank line closes the enclosing list item and its fence.
+            state.fence = None
+            state.fence_indent = 0
+            state.list_indent = None
+        else:
+            return True, None
+
+    if state.in_pre:
+        if stripped and leading < state.pre_indent:
+            # Dedented non-blank line closes the enclosing list item and its <pre> block.
+            state.in_pre = False
+            state.pre_indent = 0
+            state.list_indent = None
+        else:
+            if _PRE_CLOSE_RE.search(line):
+                state.in_pre = False
+                state.pre_indent = 0
+            return True, None
+
+    if state.list_indent is not None and stripped and leading < state.list_indent:
+        state.list_indent = None
+
+    if state.list_indent is None and not _THEMATIC_BREAK_RE.match(line):
+        list_match = _LIST_ITEM_RE.match(line)
+        if list_match:
+            state.list_indent = _list_content_indent(
+                list_match.group(1),
+                list_match.group(2),
+                list_match.group(3),
+                list_match.group(4),
+            )
+
+    container_indent = (
+        state.list_indent if (state.list_indent is not None and leading >= state.list_indent) else 0
+    )
+    inner_line = _reindent_for_matching(line, container_indent) if container_indent else line
+
+    if _PRE_OPEN_RE.match(inner_line):
+        state.block_id += 1
+        state.in_pre = not bool(_PRE_CLOSE_RE.search(inner_line))
+        state.pre_indent = container_indent if state.in_pre else 0
+        return True, None
+
+    next_fence, in_fence = _next_fence_state(inner_line, None)
+    if in_fence:
+        state.block_id += 1
+        state.fence = next_fence
+        state.fence_indent = container_indent
+        return True, None
+
+    header_match = _ATX_HEADING_RE.match(line) if state.list_indent is None else None
+    return False, header_match
 
 
 def detect_format(content: str) -> str:
@@ -224,21 +380,29 @@ def detect_format(content: str) -> str:
     if not lines:
         return "generic"
 
+    has_headers = False
     has_h2_headers = False
     has_bullets = False
+    has_block = False
     short_line_count = 0
     total_lines = 0
+    block_state = _BlockState()
 
     for line in lines:
+        in_block, header_match = _advance_block_state(line, block_state)
+        has_block = has_block or in_block
         stripped = line.strip()
         if not stripped:
             continue
         total_lines += 1
 
-        if stripped.startswith("## "):
-            has_h2_headers = True
-        if stripped.startswith("- "):
-            has_bullets = True
+        if not in_block:
+            if header_match:
+                has_headers = True
+                if len(header_match.group(1)) == 2:
+                    has_h2_headers = True
+            if stripped.startswith("- "):
+                has_bullets = True
         if len(stripped) < 120:
             short_line_count += 1
 
@@ -246,8 +410,8 @@ def detect_format(content: str) -> str:
     if has_h2_headers and has_bullets:
         return "claude_code"
 
-    # ChatGPT: mostly short lines, no headers, looks like flat facts
-    if total_lines > 0 and not has_h2_headers:
+    # ChatGPT: mostly short lines, no headers or fenced/preformatted code, looks like flat facts
+    if total_lines > 0 and not has_headers and not has_block:
         short_ratio = short_line_count / total_lines
         if short_ratio > 0.8 and total_lines >= 2:
             return "chatgpt"
@@ -295,7 +459,11 @@ def parse_claude_code_memory(content: str, file_path: str = "") -> ParsedFile:
             return
 
         facts = []
+        fact_state = _BlockState()
         for line in current_lines:
+            in_block, _ = _advance_block_state(line, fact_state)
+            if in_block:
+                continue
             stripped = line.strip()
             if stripped.startswith("- "):
                 fact = stripped[2:].strip()
@@ -315,12 +483,13 @@ def parse_claude_code_memory(content: str, file_path: str = "") -> ParsedFile:
             )
         )
 
+    block_state = _BlockState()
     for line in content.splitlines():
-        header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
-        if header_match:
+        in_block, header_match = _advance_block_state(line, block_state)
+        if not in_block and header_match:
             flush_section()
             current_level = len(header_match.group(1))
-            current_heading = header_match.group(2).strip()
+            current_heading = (header_match.group(2) or "").strip()
             current_lines = []
         else:
             current_lines.append(line)
@@ -406,16 +575,35 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
         if not section_content and not current_heading:
             return
 
-        facts = []
+        facts: list[str] = []
+        fact_state = _BlockState()
+        block_buf: list[str] = []
+        active_block_id = 0
         for line in current_lines:
+            in_block, _ = _advance_block_state(line, fact_state)
+            if in_block:
+                if block_buf and fact_state.block_id != active_block_id:
+                    facts.append("\n".join(block_buf))
+                    block_buf = []
+                active_block_id = fact_state.block_id
+                block_buf.append(line)
+                if fact_state.fence is None and not fact_state.in_pre:
+                    facts.append("\n".join(block_buf))
+                    block_buf = []
+                continue
+            if block_buf:
+                facts.append("\n".join(block_buf))
+                block_buf = []
             stripped = line.strip()
             if stripped.startswith("- "):
                 fact = stripped[2:].strip()
                 if fact:
                     facts.append(fact)
-            elif stripped and not stripped.startswith("#"):
-                # Non-bullet, non-empty lines are also facts in generic mode
+            elif stripped:
+                # Non-bullet, non-empty lines (including #tags/#123) are also facts in generic mode
                 facts.append(stripped)
+        if block_buf:
+            facts.append("\n".join(block_buf))
 
         entities = extract_entities_from_text(section_content) if section_content else []
 
@@ -430,12 +618,13 @@ def parse_generic_markdown(content: str, file_path: str = "") -> ParsedFile:
             )
         )
 
+    block_state = _BlockState()
     for line in content.splitlines():
-        header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
-        if header_match:
+        in_block, header_match = _advance_block_state(line, block_state)
+        if not in_block and header_match:
             flush_section()
             current_level = len(header_match.group(1))
-            current_heading = header_match.group(2).strip()
+            current_heading = (header_match.group(2) or "").strip()
             current_lines = []
         else:
             current_lines.append(line)

@@ -150,6 +150,31 @@ class TestClaudeCodeParser:
         assert parsed.file_hash
         assert len(parsed.file_hash) == 64
 
+    @pytest.mark.parametrize(
+        "fence",
+        ["```", "~~~", "````"],
+        ids=["backticks", "tildes", "four_backticks"],
+    )
+    def test_ignores_headings_and_bullets_inside_fenced_code_blocks(self, fence):
+        inner_fence = "\n```yaml\n## nested\n- nested_item\n```" if fence == "````" else ""
+        content = (
+            "# Project Memory\n\n"
+            "## Deploy\n"
+            f"{fence}bash\n"
+            "# Restart service\n"
+            "systemctl restart headroom\n"
+            "- not a bullet\n"
+            f"{inner_fence}\n"
+            f"{fence}\n"
+            "- Check logs after restart\n"
+        )
+        parsed = parse_claude_code_memory(content)
+        headings = [s.heading for s in parsed.sections if s.heading]
+        assert headings == ["Project Memory", "Deploy"]
+        deploy = parsed.sections[1]
+        assert "# Restart service" in deploy.content
+        assert deploy.facts == ["Check logs after restart"]
+
 
 class TestChatGPTParser:
     def test_parse_flat_facts(self):
@@ -187,6 +212,134 @@ class TestGenericParser:
         # "The system uses FastAPI..." and bullets should all be facts
         assert len(arch.facts) >= 3
 
+    def test_ignores_headings_and_fence_lines_inside_fenced_code_blocks(self):
+        content = (
+            "# Notes\n\n"
+            "## Deploy\n"
+            "Run the deploy script:\n"
+            "```bash\n"
+            "# Restart service\n"
+            "systemctl restart headroom\n"
+            "```\n"
+            "- Verify health endpoint\n"
+        )
+        parsed = parse_generic_markdown(content)
+        headings = [s.heading for s in parsed.sections if s.heading]
+        assert headings == ["Notes", "Deploy"]
+        deploy = parsed.sections[1]
+        assert "# Restart service" in deploy.content
+        assert deploy.facts == [
+            "Run the deploy script:",
+            "```bash\n# Restart service\nsystemctl restart headroom\n```",
+            "Verify health endpoint",
+        ]
+
+    def test_detect_format_keeps_short_fenced_notes_in_generic_mode(self):
+        content = "Quick script:\n```bash\n# comment inside fence\necho ok\n```\nDone.\n"
+        assert detect_format(content) == "generic"
+
+    def test_recognizes_indented_and_empty_atx_headings_without_dropping_hash_facts(self):
+        content = (
+            "## Operations\nOverview\n  ### Deploy\nRestart app\n###\n#123 tracks deployment\n"
+        )
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections if s.heading] == ["Operations", "Deploy"]
+        assert parsed.sections[0].facts == ["Overview"]
+        assert parsed.sections[1].facts == ["Restart app"]
+        assert parsed.sections[2].heading == ""
+        assert parsed.sections[2].heading_level == 3
+        assert parsed.sections[2].facts == ["#123 tracks deployment"]
+
+    def test_preserves_pre_block_with_hash_lines_and_fence_delimiters(self):
+        content = "## Deployment\n<pre>\n  ###\n```bash\n</pre>\n## Next\n- Done\n"
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections] == ["Deployment", "Next"]
+        assert parsed.sections[0].content == "<pre>\n  ###\n```bash\n</pre>"
+        assert parsed.sections[0].facts == ["<pre>\n  ###\n```bash\n</pre>"]
+        assert parsed.sections[1].facts == ["Done"]
+
+    def test_keeps_list_contained_headings_and_dedented_siblings_in_enclosing_section(self):
+        content = "## Deployment\n- Primary\n  ### Details\n  - Restart the app\n- Secondary\n"
+        claude_parsed = parse_claude_code_memory(content)
+        assert [s.heading for s in claude_parsed.sections] == ["Deployment"]
+        assert claude_parsed.sections[0].facts == ["Primary", "Restart the app", "Secondary"]
+
+        generic_parsed = parse_generic_markdown(content)
+        assert [s.heading for s in generic_parsed.sections] == ["Deployment"]
+        assert "Secondary" in generic_parsed.sections[0].facts
+
+    def test_detect_format_treats_empty_heading_note_as_generic(self):
+        content = "##\nShort note\n"
+        assert detect_format(content) == "generic"
+        parsed = parse_markdown(content)
+        assert parsed.format == "generic"
+        assert parsed.sections[0].facts == ["Short note"]
+
+    def test_dedenting_out_of_list_pre_block_restores_following_headings(self):
+        content = "## Deployment\n- Example\n  <pre>\n  sample\n## Next\n- Done\n"
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections] == ["Deployment", "Next"]
+        assert parsed.sections[1].facts == ["Done"]
+
+    def test_thematic_break_does_not_hide_following_indented_heading(self):
+        content = "## First\n* * *\n  ## Second\n- Kept\n"
+        parsed = parse_generic_markdown(content)
+        assert [s.heading for s in parsed.sections] == ["First", "Second"]
+        assert parsed.sections[1].facts == ["Kept"]
+
+    def test_dedented_fence_following_unclosed_list_fence_stays_separate_fact(self):
+        content = "- Item\n  ```bash\n  echo 1\n```python\nprint(2)\n```\n"
+        parsed = parse_generic_markdown(content)
+        assert parsed.sections[0].facts == [
+            "Item",
+            "  ```bash\n  echo 1",
+            "```python\nprint(2)\n```",
+        ]
+
+    def test_tab_indented_lines_stay_inside_space_indented_list_pre_and_fence(self):
+        content = "- Example\n  <pre>\n\t- sample output\n  </pre>\n"
+        claude_parsed = parse_claude_code_memory(content)
+        assert claude_parsed.sections[0].facts == ["Example"]
+
+        generic_parsed = parse_generic_markdown(content)
+        assert generic_parsed.sections[0].facts == [
+            "Example",
+            "  <pre>\n\t- sample output\n  </pre>",
+        ]
+
+        fenced_content = "- Example\n  ```bash\n\t- inner bullet\n  ```\n"
+        fenced_claude = parse_claude_code_memory(fenced_content)
+        assert fenced_claude.sections[0].facts == ["Example"]
+
+        fenced_generic = parse_generic_markdown(fenced_content)
+        assert fenced_generic.sections[0].facts == [
+            "Example",
+            "  ```bash\n\t- inner bullet\n  ```",
+        ]
+
+    def test_mixed_indent_fence_closer_keeps_following_list_facts(self):
+        content = "- Example\n\t```bash\n\t- inside code\n  \t```\n  - Remember this\n"
+        claude_parsed = parse_claude_code_memory(content)
+        assert claude_parsed.sections[0].facts == ["Example", "Remember this"]
+
+        generic_parsed = parse_generic_markdown(content)
+        assert generic_parsed.sections[0].facts == [
+            "Example",
+            "\t```bash\n\t- inside code\n  \t```",
+            "Remember this",
+        ]
+
+    def test_empty_and_overpadded_tab_list_markers_keep_nested_headings_in_section(self):
+        empty_tab_item = "# Notes\n-\t\n  ## Nested\n  - Keep this\n"
+        parsed_empty = parse_claude_code_memory(empty_tab_item)
+        assert [s.heading for s in parsed_empty.sections] == ["Notes"]
+        assert parsed_empty.sections[0].facts == ["Keep this"]
+
+        overpadded_tab_item = "# Notes\n-\t\tExample\n   ## Nested\n   - Keep this\n"
+        parsed_overpadded = parse_claude_code_memory(overpadded_tab_item)
+        assert [s.heading for s in parsed_overpadded.sections] == ["Notes"]
+        assert parsed_overpadded.sections[0].facts == ["Keep this"]
+
 
 class TestFormatDetection:
     def test_detect_claude_code(self):
@@ -202,6 +355,16 @@ class TestFormatDetection:
     def test_empty_content(self):
         assert detect_format("") == "generic"
 
+    def test_ignores_fenced_code_when_detecting_claude_code(self):
+        content = (
+            "```markdown\n"
+            "## Heading Inside Code\n"
+            "- bullet inside code\n"
+            "```\n"
+            "This is a long prose explanation that continues for more than one hundred and twenty characters to avoid looking like ChatGPT facts."
+        )
+        assert detect_format(content) == "generic"
+
 
 class TestAutoParser:
     def test_auto_parses_claude_code(self):
@@ -215,6 +378,16 @@ class TestAutoParser:
     def test_force_format(self):
         parsed = parse_markdown(CLAUDE_CODE_MEMORY, format="generic")
         assert parsed.format == "generic"
+
+    def test_auto_parses_short_fenced_note_with_hash_prefixed_fact(self):
+        content = "#123 tracks deployment\n```bash\n# comment\necho ok\n```\n"
+        parsed = parse_markdown(content)
+        assert parsed.format == "generic"
+        assert len(parsed.sections) == 1
+        assert parsed.sections[0].facts == [
+            "#123 tracks deployment",
+            "```bash\n# comment\necho ok\n```",
+        ]
 
 
 class TestEntityExtraction:
