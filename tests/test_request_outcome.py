@@ -310,6 +310,9 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # Whether the positional tokens_sent is the provider's billed count.
         # This outcome carries no provider_input_tokens, so it is an estimate.
         "provider_reported": False,
+        # Places a model its name does not identify in a cache-pricing family
+        # when the tool savings are priced, as metrics.record_request does.
+        "provider": "anthropic",
     }
 
 

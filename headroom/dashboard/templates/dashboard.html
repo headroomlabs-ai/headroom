@@ -2409,6 +2409,8 @@
                             return 'list-priced (no cache data) — real saving likely lower';
                         case 'provider-ratio':
                             return 'provider ratio (model publishes no cache pricing)';
+                        case 'fallback+provider-ratio':
+                            return 'default rate with provider cache ratios (model not in price table)';
                         case 'unpriced':
                             return 'partly unpriced';
                         default:

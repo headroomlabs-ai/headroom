@@ -30,8 +30,10 @@ importorskip_no_env_leak("litellm")
 from headroom.pricing.counterfactual import (  # noqa: E402
     BASIS_CATALOG,
     BASIS_CATALOG_TTL_RATIO,
+    BASIS_FALLBACK_PROVIDER_RATIO,
     BASIS_LIST,
     BASIS_NO_MIX,
+    BASIS_PROVIDER_RATIO,
     BASIS_UNPRICED,
     CacheMix,
     Region,
@@ -285,6 +287,160 @@ def test_unknown_model_with_a_fallback_uses_the_blended_rate():
 
     assert priced.basis == BASIS_LIST
     assert priced.usd == pytest.approx(0.024)
+
+
+_FALLBACK = 3.0 / 1_000_000
+
+
+def _warm_gpt() -> CacheMix:
+    """OpenAI reports reads and uncached input; it bills no cache writes."""
+    return CacheMix.from_usage(cache_read_tokens=180_000, uncached_input_tokens=2_500)
+
+
+@pytest.mark.parametrize(
+    ("model", "provider", "mix", "read_multiplier"),
+    [
+        # Claude Code on a model newer than the bundled price table.
+        ("claude-not-yet-in-catalog-9", "anthropic", _warm_anthropic, 0.1),
+        # Claude reached over the OpenAI wire: the model decides, not the wire.
+        ("claude-not-yet-in-catalog-9", "openai", _warm_anthropic, 0.1),
+        # Codex speaks the Responses API, which is not a CACHE_ECONOMICS key.
+        ("gpt-not-yet-in-catalog-9", "openai_responses", _warm_gpt, 0.5),
+    ],
+)
+def test_unknown_model_with_a_cache_breakdown_prices_reads_at_its_family_ratio(
+    model, provider, mix, read_multiplier
+):
+    """A warm turn's deferred tool schemas were cache reads, not list-price input."""
+    priced = price_savings(
+        8_000,
+        model=model,
+        mix=mix(),
+        region=Region.PREFIX,
+        provider=provider,
+        fallback_rate_per_token=_FALLBACK,
+    )
+
+    assert priced.basis == BASIS_FALLBACK_PROVIDER_RATIO
+    assert priced.usd == pytest.approx(8_000 * _FALLBACK * read_multiplier)
+    assert priced.usd_list == pytest.approx(8_000 * _FALLBACK)
+
+
+def test_unknown_anthropic_model_prices_cold_writes_at_the_write_premium():
+    """Removed content on a cold turn would have been written to the cache."""
+    priced = price_savings(
+        8_000,
+        model="claude-not-yet-in-catalog-9",
+        mix=_cold_anthropic(),
+        region=Region.LIVE_ZONE,
+        provider="anthropic",
+        fallback_rate_per_token=_FALLBACK,
+    )
+
+    assert priced.basis == BASIS_FALLBACK_PROVIDER_RATIO
+    assert priced.usd == pytest.approx(8_000 * _FALLBACK * 1.25)
+
+
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        ("not-a-real-model-xyz", "copilot"),
+        # Open-weights gpt-oss is not billed by OpenAI, whatever serves it.
+        ("ollama/gpt-oss:20b", "ollama"),
+        # An OpenAI-compatible server labels every request "openai".
+        ("gpt-oss-120b", "openai"),
+        ("qwen3-coder-next", "openai"),
+    ],
+)
+def test_unknown_model_of_an_unknown_family_stays_at_the_labelled_blended_rate(model, provider):
+    priced = price_savings(
+        8_000,
+        model=model,
+        mix=_warm_anthropic(),
+        region=Region.PREFIX,
+        provider=provider,
+        fallback_rate_per_token=_FALLBACK,
+    )
+
+    assert priced.basis == BASIS_LIST
+    assert priced.usd == pytest.approx(0.024)
+
+
+@pytest.mark.parametrize(
+    ("model", "alias_map", "catalog_key", "catalog_provider", "read_multiplier"),
+    [
+        # An opaque gateway alias: the family comes from the catalog key it maps to.
+        (
+            "production-chat",
+            '{"production-chat": "openrouter/openai/gpt-headroom-test"}',
+            "openrouter/openai/gpt-headroom-test",
+            "openrouter",
+            0.5,
+        ),
+        # A vendor-looking alias follows its target, not the name the client sends.
+        (
+            "claude-team-default",
+            '{"claude-team-default": "openrouter/openai/gpt-headroom-test"}',
+            "openrouter/openai/gpt-headroom-test",
+            "openrouter",
+            0.5,
+        ),
+        # A priced model behind the OpenAI wire: the catalog row names the vendor.
+        ("headroom-test-model", "", "headroom-test-model", "anthropic", 0.1),
+    ],
+)
+def test_catalogued_model_without_cache_rates_behind_the_openai_wire(
+    monkeypatch, model, alias_map, catalog_key, catalog_provider, read_multiplier
+):
+    import litellm
+
+    from headroom.pricing import litellm_pricing
+
+    row = {"input_cost_per_token": 2.5e-06, "litellm_provider": catalog_provider}
+    monkeypatch.setattr(litellm, "model_cost", {**litellm.model_cost, catalog_key: row})
+    monkeypatch.setenv("HEADROOM_MODEL_ALIAS_MAP", alias_map)
+    litellm_pricing._resolved_model_cache.clear()
+    resolve_rates.cache_clear()
+    try:
+        priced = price_savings(
+            3_650, model=model, mix=_warm_gpt(), region=Region.PREFIX, provider="openai"
+        )
+    finally:
+        litellm_pricing._resolved_model_cache.clear()
+        resolve_rates.cache_clear()
+
+    assert priced.basis == BASIS_PROVIDER_RATIO
+    assert priced.usd == pytest.approx(3_650 * 2.5e-06 * read_multiplier)
+
+
+def test_alias_to_an_unlisted_model_takes_its_targets_cache_family(monkeypatch):
+    """A vendor-looking alias for an unlisted Claude model gets Claude's read discount."""
+    from headroom.pricing import litellm_pricing
+
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_ALIAS_MAP", '{"gpt-team-default": "claude-not-yet-in-catalog-9"}'
+    )
+    litellm_pricing._resolved_model_cache.clear()
+    resolve_rates.cache_clear()
+    mix = CacheMix.from_usage(cache_read_tokens=15_000, uncached_input_tokens=500)
+    try:
+        by_name, by_alias = (
+            price_savings(
+                3_650,
+                model=model,
+                mix=mix,
+                region=Region.PREFIX,
+                provider="openai",
+                fallback_rate_per_token=_FALLBACK,
+            )
+            for model in ("claude-not-yet-in-catalog-9", "gpt-team-default")
+        )
+    finally:
+        litellm_pricing._resolved_model_cache.clear()
+        resolve_rates.cache_clear()
+
+    assert by_alias.basis == by_name.basis == BASIS_FALLBACK_PROVIDER_RATIO
+    assert by_alias.usd == pytest.approx(by_name.usd) == pytest.approx(0.001095)
 
 
 def test_a_total_reports_its_weakest_contributing_basis():
