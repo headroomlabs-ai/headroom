@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -40,6 +41,84 @@ from headroom.proxy.tool_schema_savings_policy import (
 )
 
 logger = logging.getLogger("headroom.proxy")
+
+
+# CCR proxy proactive-expansion drawback, bound per-request via a ContextVar so
+# the outcome funnel can debit it WITHOUT threading a parameter through every
+# streaming/non-streaming handler (mirrors project_context). Set at re-injection
+# time; consumed only in emit's success section, so a failed forward books nothing.
+_pending_proactive_retrieval: ContextVar[tuple[int, int] | None] = ContextVar(
+    "headroom_ccr_proactive_pending", default=None
+)
+
+
+def set_pending_proactive_retrieval(value: tuple[int, int] | None) -> None:
+    """Bind a proxy proactive-expansion retrieval drawback to this request."""
+    _pending_proactive_retrieval.set(value)
+
+
+def consume_pending_proactive_retrieval() -> tuple[int, int] | None:
+    """Read and clear the pending proactive drawback for this request."""
+    value = _pending_proactive_retrieval.get()
+    if value is not None:
+        _pending_proactive_retrieval.set(None)
+    return value
+
+
+# CCR reactive-continuation overhead (the dropped rounds' real billed usage),
+# bound per-request via a ContextVar for the same reason as the proactive one:
+# the outcome funnel can fold it into the billed token totals WITHOUT threading
+# a parameter through every handler. handle_response publishes the per-call sum
+# (kept in locals, so it is safe across concurrent requests on a shared handler);
+# consumed only in emit's success section, so a failed forward books nothing.
+# The payload is cache-split (uncached_input, cache_read, cache_write, output) so
+# cost_with_headroom prices continuation cache at the right rate rather than
+# folding cached tokens into uncached input at full list price.
+_pending_ccr_continuation_usage: ContextVar[list[tuple[int, int, int, int]] | None] = ContextVar(
+    "headroom_ccr_continuation_pending", default=None
+)
+
+
+def set_pending_ccr_continuation_usage(
+    value: tuple[int, int, int, int] | None,
+) -> None:
+    """Append the dropped continuation rounds' (uncached_in, cache_read, cache_write, output) to this request.
+
+    Additive: each call appends to a list so batch processing (multiple
+    handle_response calls before a single emit) accumulates all items.
+    consume_pending_ccr_continuation_usage sums the list.
+    """
+    if value is None:
+        return
+    items = _pending_ccr_continuation_usage.get()
+    if items is None:
+        items = []
+        _pending_ccr_continuation_usage.set(items)
+    items.append(value)
+
+
+def consume_pending_ccr_continuation_usage() -> tuple[int, int, int, int] | None:
+    """Read, sum, and clear all pending continuation usage for this request."""
+    items = _pending_ccr_continuation_usage.get()
+    _pending_ccr_continuation_usage.set(None)
+    if not items:
+        return None
+    return tuple(sum(group) for group in zip(*items))
+
+
+def clear_pending_outcome_side_channels() -> None:
+    """Drop both pending side-channel values in the CALLER's context.
+
+    ``emit_request_outcome`` consumes them itself, but production reaches it
+    through ``asyncio.shield`` (``HeadroomProxy._record_request_outcome``), which
+    runs the funnel in a child task holding a *copy* of the caller's context —
+    so the funnel's ``set(None)`` never reaches the caller. Any call site that
+    shields must clear here afterwards; otherwise a second outcome emitted from
+    the same context (a batch item, a re-driven turn) books the same continuation
+    usage and proactive drawback a second time.
+    """
+    _pending_proactive_retrieval.set(None)
+    _pending_ccr_continuation_usage.set(None)
 
 
 @dataclass(frozen=True)
@@ -538,6 +617,17 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
 
         outcome = dataclasses.replace(outcome, provider="copilot")
 
+    # Consume (read + clear) any pending CCR proactive-expansion drawback for
+    # this request now, but only RECORD it in the success section below -- a
+    # >=500 short-circuit must never book a retrieval that was never billed.
+    _pending_proactive = consume_pending_proactive_retrieval()
+
+    # Consume (read + clear) the dropped CCR continuation rounds' usage for this
+    # request. Folded into the cost view only in the success section below —
+    # a >=500 short-circuit must never book continuation tokens that, by the
+    # account-after-success rule in handle_response, were never billed.
+    _pending_continuation = consume_pending_ccr_continuation_usage()
+
     # 0. Anonymous session beacon. Opt-in and a no-op unless HEADROOM_TELEMETRY
     #    is explicitly on, in which case it folds this outcome into an in-memory
     #    per-session aggregate and POSTs one content-free event when the session
@@ -588,6 +678,37 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         else:
             await handler.metrics.record_failed(provider=outcome.provider)
         return
+
+    # Success section (status < 500, no exception): book the CCR proactive-
+    # expansion drawback now, gated exactly like the gross tokens_saved below,
+    # mirroring the reactive account-after-the-continuation-succeeds rule.
+    if _pending_proactive is not None:
+        _proactive_rec = getattr(handler, "_record_proactive_retrieval_drawback", None)
+        if _proactive_rec is not None:
+            _proactive_rec(*_pending_proactive)
+
+    # The dropped continuation rounds were really billed, so they belong in the
+    # cost view — and ONLY there, which is why they are added at the
+    # ``cost_tracker.record_tokens`` call below instead of onto ``outcome``:
+    #
+    # * ``metrics.record_request`` forwards ``cache_read_tokens`` to
+    #   SavingsTracker, which credits it as cache *savings*
+    #   (``_estimate_cache_savings_usd`` -> ``lifetime.cache_savings_usd`` ->
+    #   ``SavingsSnapshot.total_savings``). Folding there would let CCR retrieval
+    #   overhead RAISE the reported savings.
+    # * the output-shaper estimator below reads ``outcome.output_tokens`` as the
+    #   observed completion length of *this* turn; continuation output would bias
+    #   the per-arm counterfactual.
+    # * the RequestLog row and the PERF line describe the one round the client
+    #   received, so they stay on the final round's numbers.
+    #
+    # ``cost_tracker.record_tokens`` is where the billed input breakdown lands
+    # (``_api_{uncached,cache_read,cache_write}_by_model`` -> the per-category
+    # pricing behind ``cost_with_headroom_usd``) and where ``_costs`` is appended
+    # for budget enforcement, so the fold reaches both of the surfaces that are
+    # meant to reflect real spend. ``/stats`` ``cost.ccr_overhead`` keeps the
+    # token-level attribution view.
+    _ct_uin, _ct_cr, _ct_cw, _ct_out = _pending_continuation or (0, 0, 0, 0)
 
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
@@ -761,20 +882,24 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         input_provider_reported=input_provider_reported,
     )
 
-    # 2. Cost tracker (optional).
+    # 2. Cost tracker (optional). The dropped CCR continuation rounds are folded
+    #    in here — see the comment above the ``_ct_*`` unpack. The 5m/1h split is
+    #    left alone: the provider does not report a TTL for a continuation round,
+    #    so only the cache-write total moves and the TTL attribution view stays
+    #    honest about what it actually observed.
     cost_tracker = getattr(handler, "cost_tracker", None)
     if cost_tracker is not None:
         cost_tracker.record_tokens(
             outcome.model,
             novel_tokens_saved,
             billed_input_tokens,
-            cache_read_tokens=outcome.cache_read_tokens,
-            cache_write_tokens=outcome.cache_write_tokens,
+            cache_read_tokens=outcome.cache_read_tokens + _ct_cr,
+            cache_write_tokens=outcome.cache_write_tokens + _ct_cw,
             cache_write_5m_tokens=outcome.cache_write_5m_tokens,
             cache_write_1h_tokens=outcome.cache_write_1h_tokens,
-            uncached_tokens=outcome.uncached_input_tokens,
+            uncached_tokens=outcome.uncached_input_tokens + _ct_uin,
             cache_inferred=outcome.cache_inferred,
-            output_tokens=outcome.output_tokens,
+            output_tokens=outcome.output_tokens + _ct_out,
             # Same figure already handed to metrics.record_request above. The
             # cost tracker feeds the dashboard's per-model table, which read
             # compression only while its own headline counted both layers.

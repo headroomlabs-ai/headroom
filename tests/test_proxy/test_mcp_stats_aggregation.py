@@ -31,8 +31,8 @@ def test_aggregates_compress_and_retrieve_events() -> None:
     events = [
         {"type": "compress", "input_tokens": 1000, "output_tokens": 400},
         {"type": "compress", "input_tokens": 500, "output_tokens": 300},
-        {"type": "retrieve", "hash": "abc123"},
-        {"type": "retrieve", "hash": "def456"},
+        {"type": "retrieve", "hash": "abc123", "tokens": 700},
+        {"type": "retrieve", "hash": "def456", "tokens": 300},
         {"type": "retrieve", "hash": "ghi789"},
     ]
     with _mock_events(events):
@@ -42,6 +42,8 @@ def test_aggregates_compress_and_retrieve_events() -> None:
         # (1000-400) + (500-300) = 600 + 200 = 800
         "tokens_removed": 800,
         "retrievals": 3,
+        # 700 + 300 + 0 (third retrieve carries no token count)
+        "tokens_retrieved": 1000,
     }
 
 
@@ -51,6 +53,7 @@ def test_returns_zeros_when_no_events() -> None:
             "compressions": 0,
             "tokens_removed": 0,
             "retrievals": 0,
+            "tokens_retrieved": 0,
         }
 
 
@@ -63,7 +66,12 @@ def test_unknown_event_types_are_ignored() -> None:
     ]
     with _mock_events(events):
         result = _aggregate_mcp_events()
-    assert result == {"compressions": 1, "tokens_removed": 60, "retrievals": 1}
+    assert result == {
+        "compressions": 1,
+        "tokens_removed": 60,
+        "retrievals": 1,
+        "tokens_retrieved": 0,
+    }
 
 
 def test_missing_token_fields_default_to_zero_without_raising() -> None:
@@ -92,4 +100,5 @@ def test_read_failure_yields_zeros() -> None:
             "compressions": 0,
             "tokens_removed": 0,
             "retrievals": 0,
+            "tokens_retrieved": 0,
         }

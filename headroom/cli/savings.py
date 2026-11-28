@@ -52,10 +52,15 @@ def _window_line(label: str, window: dict[str, Any]) -> str:
     money = _money(cost)
     if ceiling > 0 and abs(ceiling - cost) / ceiling >= 0.01:
         money = f"{money} (list {_money(ceiling)})"
+    retrieved = int(window.get("tokens_retrieved", 0) or 0)
+    net = int(window.get("net_tokens_saved", saved - retrieved) or 0)
     line = (
         f"{label:<12} {_bar(pct)} {pct:5.1f}%  "
         f"saved {_tokens(saved)} / {_tokens(before)} tokens  {money}"
     )
+    if retrieved:
+        # net uses {:,} so a negative net renders honestly (e.g. -1,234).
+        line += f"  \u00b7 retrieved-back {_tokens(retrieved)}  net {_tokens(net)}"
     # Second basis, only when the window has provider cache data: the share of
     # tokens that newly entered context. The bar's ratio counts a session's
     # cached history on every turn, so a long session reads near 0% there

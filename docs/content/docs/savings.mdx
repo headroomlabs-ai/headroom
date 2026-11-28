@@ -60,3 +60,17 @@ Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [l
 <Callout type="info">
   `headroom savings` is distinct from `headroom_stats` (a per-session, in-memory snapshot) and from the proxy's live `/stats` endpoint (backed by `proxy_savings.json`). The savings ledger is the durable, cross-process source of truth.
 </Callout>
+
+## Net savings (retrieval drawback)
+
+Compression savings are a *gross* figure. CCR retrievals re-inject original content back into context (plus a small tool-call wrapper overhead, ~50 tokens per retrieval) — real, billed tokens that offset what compression saved. `headroom savings` also reports **net** savings per window:
+
+- **gross** — tokens removed by compression
+- **retrieved-back** — tokens re-injected by CCR retrieval: model-invoked `headroom_retrieve` calls *and* proxy proactive expansion (relevant compressed content the proxy re-injects before the model asks)
+- **net** = gross − retrieved-back − per-retrieval overhead
+
+Net is never clamped to zero: if retrievals outweigh compression, it renders **negative**, an honest signal that compression is dropping data the model keeps asking for.
+
+<Callout type="info">
+  The durable *lifetime* view (`/stats-lifetime`) remains a **gross** figure by design; the net figures above are per-window `headroom savings` / per-session dashboard values.
+</Callout>

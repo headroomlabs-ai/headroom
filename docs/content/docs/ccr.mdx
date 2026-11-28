@@ -214,3 +214,7 @@ Check the effective setting at `/v1/retrieve/stats` under
 | CCR compression | None (reversible) | Same range as traditional compression -- CCR changes the risk, not the ratio |
 
 CCR gives you the savings of aggressive compression with zero risk: SmartCrusher, LogCompressor, SearchCompressor, and Kompress can all compress as aggressively as their configuration allows, because the original is always one retrieval away. See [How Compression Works](/docs/how-compression-works#content-type-detection) for measured savings ranges per compressor.
+
+## Retrieval cost accounting
+
+Retrieval isn't free. Each `headroom_retrieve` call re-injects the full original payload plus tool-call wrappers (about 50 tokens of overhead per retrieval) — that's real, billed cost that CCR's retrieved-back tokens must account for, so a retrieval never gets double-counted as pure savings. All three retrieval channels are debited into the net figure — the `headroom_retrieve` MCP tool, the proxy's in-process `headroom_retrieve` handler, and **proxy proactive expansion** (the proxy re-injecting relevant compressed content before the model asks). The dashboard surfaces a **CCR Retrievals** card (labelled "net (session)") showing retrieval count, retrieval rate, tokens retrieved back, estimated retrieval cost, and net tokens saved, plus a list of the tools with the highest retrieval rates — a load-bearing signal for when the compressor is dropping data the model needs.

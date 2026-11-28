@@ -326,6 +326,7 @@ class SessionStats:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_tokens_saved: int = 0
+    tokens_retrieved: int = 0
     started_at: float = field(default_factory=time.time)
     events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -355,11 +356,13 @@ class SessionStats:
         if len(self.events) > 50:
             self.events = self.events[-50:]
 
-    def record_retrieval(self, hash_key: str) -> None:
+    def record_retrieval(self, hash_key: str, retrieved_tokens: int = 0) -> None:
         self.retrievals += 1
+        self.tokens_retrieved += int(retrieved_tokens or 0)
         event = {
             "type": "retrieve",
             "hash": hash_key[:12],
+            "tokens": int(retrieved_tokens or 0),
             "timestamp": time.time(),
         }
         self.events.append(event)
@@ -376,6 +379,16 @@ class SessionStats:
         # Rough cost estimate (blended rate ~$3/1M input tokens)
         cost_saved = round(self.total_tokens_saved * 3.0 / 1_000_000, 4)
 
+        # Net = gross savings minus what retrievals re-injected (payload + a
+        # fixed per-retrieval overhead). Never clamped; negative is honest.
+        from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
+
+        net_tokens_saved = (
+            self.total_tokens_saved
+            - self.tokens_retrieved
+            - self.retrievals * CCR_RETRIEVAL_OVERHEAD_TOKENS
+        )
+
         return {
             "session_duration_seconds": round(time.time() - self.started_at),
             "compressions": self.compressions,
@@ -383,6 +396,8 @@ class SessionStats:
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tokens_saved": self.total_tokens_saved,
+            "tokens_retrieved": self.tokens_retrieved,
+            "net_tokens_saved": net_tokens_saved,
             "savings_percent": savings_pct,
             "estimated_cost_saved_usd": cost_saved,
             "recent_events": self.events[-10:],
@@ -614,7 +629,11 @@ class HeadroomMCPServer:
         entry = store.retrieve(hash_key)
         expired_entry_status = None
         if entry:
-            self._stats.record_retrieval(hash_key)
+            retrieved_tokens = (
+                getattr(entry, "original_tokens", 0) or len(entry.original_content) // 4
+            )
+            self._stats.record_retrieval(hash_key, retrieved_tokens)
+            self._record_retrieval_savings(retrieved_tokens)
             return {
                 "hash": hash_key,
                 "source": "local",
@@ -643,7 +662,12 @@ class HeadroomMCPServer:
                 result = await self._retrieve_via_proxy(hash_key)
                 if "error" not in result:
                     result["source"] = "proxy"
-                    self._stats.record_retrieval(hash_key)
+                    retrieved_tokens = int(
+                        result.get("original_tokens", 0)
+                        or len(result.get("original_content", "")) // 4
+                    )
+                    self._stats.record_retrieval(hash_key, retrieved_tokens)
+                    self._record_retrieval_savings(retrieved_tokens)
                     return result
             except Exception as exc:
                 # Proxy unavailable is expected; log so a bug here is not silent.
@@ -968,6 +992,32 @@ class HeadroomMCPServer:
             model=os.environ.get("HEADROOM_MCP_MODEL"),
         )
 
+    def _record_retrieval_savings(self, retrieved_tokens: int) -> None:
+        """Append a durable retrieve event so `headroom savings` debits net.
+
+        Best-effort: retrieval must never fail because ledger bookkeeping did.
+        """
+        try:
+            payload = int(retrieved_tokens or 0)
+        except (TypeError, ValueError):
+            return
+        if payload <= 0:
+            return
+        from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
+
+        try:
+            savings_ledger.record_savings_event(
+                tokens_before=0,
+                tokens_after=0,
+                kind="retrieve",
+                tokens_retrieved=payload + CCR_RETRIEVAL_OVERHEAD_TOKENS,
+                model=os.environ.get("HEADROOM_MCP_MODEL"),
+                client=self._current_client(),
+                source="mcp",
+            )
+        except Exception:
+            logger.debug("durable retrieval recording failed", exc_info=True)
+
     def _current_client(self) -> str:
         """Name of the MCP client driving this session (best-effort)."""
         override = os.environ.get("HEADROOM_MCP_CLIENT")
@@ -1031,22 +1081,32 @@ class HeadroomMCPServer:
         other_events = [e for e in shared_events if e.get("pid") != my_pid]
         if other_events:
             other_compressions = [e for e in other_events if e.get("type") == "compress"]
+            other_retrievals = [e for e in other_events if e.get("type") == "retrieve"]
+            other_retrieved_tokens = sum(int(e.get("tokens", 0) or 0) for e in other_retrievals)
             other_input = sum(e.get("input_tokens", 0) for e in other_compressions)
             other_output = sum(e.get("output_tokens", 0) for e in other_compressions)
             other_saved = max(0, other_input - other_output)
             stats["sub_agents"] = {
                 "compressions": len(other_compressions),
-                "retrievals": sum(1 for e in other_events if e.get("type") == "retrieve"),
+                "retrievals": len(other_retrievals),
                 "tokens_saved": other_saved,
+                "tokens_retrieved": other_retrieved_tokens,
                 "total_input_tokens": other_input,
                 "total_output_tokens": other_output,
             }
             # Combined totals
+            from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
+
             all_input = self._stats.total_input_tokens + other_input
             all_saved = self._stats.total_tokens_saved + other_saved
+            all_retrievals = self._stats.retrievals + len(other_retrievals)
+            all_retrieved = self._stats.tokens_retrieved + other_retrieved_tokens
+            all_net = all_saved - all_retrieved - all_retrievals * CCR_RETRIEVAL_OVERHEAD_TOKENS
             stats["combined"] = {
                 "total_compressions": self._stats.compressions + len(other_compressions),
                 "total_tokens_saved": all_saved,
+                "total_tokens_retrieved": all_retrieved,
+                "net_tokens_saved": all_net,
                 "savings_percent": round(all_saved / all_input * 100, 1) if all_input > 0 else 0,
                 "estimated_cost_saved_usd": round(all_saved * 3.0 / 1_000_000, 4),
             }

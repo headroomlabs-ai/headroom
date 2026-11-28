@@ -79,6 +79,11 @@ from .tool_injection import (
     parse_tool_call,
 )
 
+# Per-retrieval wrapper overhead (tool_use + tool_result envelopes), in tokens.
+# The retrieved payload dominates; a fixed constant is fine because precision is
+# irrelevant next to it (measured ~28 tok tool_use + ~19 tok tool_result).
+CCR_RETRIEVAL_OVERHEAD_TOKENS = 50
+
 # MCP server is optional (requires mcp package)
 try:
     from .mcp_server import HeadroomMCPServer, create_ccr_mcp_server
@@ -129,4 +134,5 @@ __all__ = [
     "HeadroomMCPServer",
     "create_ccr_mcp_server",
     "MCP_SERVER_AVAILABLE",
+    "CCR_RETRIEVAL_OVERHEAD_TOKENS",
 ]
