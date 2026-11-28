@@ -4447,9 +4447,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:
             logger.debug("record_inbound_request failed", exc_info=True)
         try:
-            from headroom.proxy.helpers import redact_for_wire_debug
+            from headroom.proxy.loggable_headers import loggable_headers
 
-            safe_headers = redact_for_wire_debug(headers)
+            safe_headers = loggable_headers(headers)
         except Exception:
             safe_headers = {"redaction_error": True}
         # A desktop or orchestrator polls these every few seconds; at INFO they

@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from headroom.log_safety import content_logging_enabled, redact_url
-from headroom.proxy.wire_debug_redaction_policy import WIRE_DEBUG_REDACTED, redact_for_wire_debug
+from headroom.proxy.loggable_headers import loggable_headers
+from headroom.proxy.wire_debug_redaction_policy import WIRE_DEBUG_REDACTED
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +71,16 @@ def _decode_sent_body(body: Any) -> Any:
 def redact_dump_headers(
     headers: Mapping[str, str], extra_secret_names: Iterable[str] = ()
 ) -> dict[str, Any]:
-    """Return ``headers`` for a dump with every credential header fully masked.
+    """Return the allow-listed ``headers`` for a dump, credentials fully masked.
+
+    Headers not in ``LOGGABLE_HEADER_NAMES`` are dropped (see ``loggable_headers``).
 
     ``extra_secret_names`` are header names the operator configured to carry
     a credential (``*_extra_headers``), masked whatever their name looks like.
     """
     extra = {name.lower() for name in extra_secret_names}
-    redacted = redact_for_wire_debug(dict(headers))
+    # Allow-list first: unknown headers are dropped, the rest redacted again.
+    redacted = loggable_headers(headers)
     return {k: WIRE_DEBUG_REDACTED if k.lower() in extra else v for k, v in redacted.items()}
 
 

@@ -86,6 +86,9 @@ from headroom.proxy.internal_header_policy import (
     resolve_strip_internal_headers_mode,
     strip_internal_headers,
 )
+from headroom.proxy.loggable_headers import (
+    loggable_headers,
+)
 from headroom.proxy.memory_golden_policy import (
     replay_golden_memory_tool_definition,
     serialize_memory_tool_definition_canonical,
@@ -209,7 +212,7 @@ def capture_codex_wire_debug(
             "method": method,
             "url": url,
             "status_code": status_code,
-            "headers": redact_for_wire_debug(headers or {}),
+            "headers": loggable_headers(headers),
             "body": redact_for_wire_debug(body),
             "raw_text": raw_text,
             "metadata": redact_for_wire_debug(metadata or {}),

@@ -91,3 +91,45 @@ def test_wire_debug_redacts_codex_attestation_header() -> None:
     )
 
     assert redacted == {"x-oai-attestation": WIRE_DEBUG_REDACTED, "x-codex-window-id": "w:1"}
+
+
+def test_wire_debug_redacts_any_name_with_a_secret_word() -> None:
+    for key in (
+        "x-internal-ops-key",
+        "x-functions-key",
+        "Ocp-Apim-Subscription-Key",
+        "apikey",
+        "x-apikey",
+        "X-Auth-Token-Id",
+        "x-amz-signature",
+        "x-claude-code-session-id",
+        "client_secret_value",
+        "xauthtoken",
+        "x-ms-client-principal",
+        "X-Forwarded-Client-Cert",
+    ):
+        assert should_redact_key(key), key
+
+
+def test_wire_debug_keeps_routing_and_identity_headers_readable() -> None:
+    for key in (
+        "anthropic-version",
+        "anthropic-beta",
+        "x-headroom-user",
+        "x-headroom-principal",
+        "x-headroom-app",
+        "content-type",
+        "author",
+        "model",
+    ):
+        assert not should_redact_key(key), key
+
+
+def test_wire_debug_keeps_codex_auth_routing_metadata_readable() -> None:
+    metadata = {"auth_mode": "chatgpt", "is_chatgpt_auth": True, "x-auth-token": "t"}
+
+    assert redact_for_wire_debug(metadata) == {
+        "auth_mode": "chatgpt",
+        "is_chatgpt_auth": True,
+        "x-auth-token": WIRE_DEBUG_REDACTED,
+    }
