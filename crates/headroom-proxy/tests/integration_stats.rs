@@ -909,3 +909,33 @@ async fn hostile_usage_counts_are_clamped_before_recording() {
         "clamped pricing stays sane: {cost}"
     );
 }
+
+/// Each AppState prices llm-prices fallbacks at its own upstream's
+/// rate, even with two upstreams built in one process.
+#[test]
+fn fallback_spend_follows_each_app_states_upstream() {
+    use headroom_proxy::observability::ledger::{provider, RequestEvent};
+    use headroom_proxy::{AppState, Config};
+    let spend = |upstream: &str| {
+        let state = AppState::new(Config::for_test(Url::parse(upstream).unwrap())).unwrap();
+        let mut ev = RequestEvent::new(provider::OPENAI_CHAT, "qwen/qwen3.8-27b", "req-1");
+        ev.usage.input_tokens = 1_000_000;
+        ev.usage.output_tokens = 1_000_000;
+        state.stats.record(ev);
+        let s = state.stats.stats_payload(false)["session"].clone();
+        (
+            s["input_cost_usd"].as_f64().unwrap(),
+            s["output_cost_usd"].as_f64().unwrap(),
+        )
+    };
+    let openrouter = spend("https://openrouter.ai/api/");
+    let groq = spend("https://api.groq.com/openai/");
+    assert!(
+        (openrouter.0 - 0.06).abs() < 1e-9 && (openrouter.1 - 2.2).abs() < 1e-9,
+        "{openrouter:?}"
+    );
+    assert!(
+        (groq.0 - 0.8).abs() < 1e-9 && (groq.1 - 4.0).abs() < 1e-9,
+        "{groq:?}"
+    );
+}

@@ -136,10 +136,11 @@ impl AppState {
             crate::vertex::adc::GcpAdcTokenSource::with_scope(config.vertex_adc_scope.clone()),
         );
 
+        let host = config.upstream.host_str();
         let stats = if config.stats {
             match config.stats_path.clone() {
-                Some(path) => Arc::new(ledger::Ledger::load(path)),
-                None => Arc::new(ledger::Ledger::in_memory()),
+                Some(path) => Arc::new(ledger::Ledger::load(path).with_upstream_host(host)),
+                None => Arc::new(ledger::Ledger::in_memory().with_upstream_host(host)),
             }
         } else {
             Arc::new(ledger::Ledger::in_memory())
