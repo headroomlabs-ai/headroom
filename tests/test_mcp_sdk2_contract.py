@@ -74,6 +74,17 @@ def test_list_tools_returns_typed_result() -> None:
     assert {COMPRESS_TOOL_NAME, CCR_TOOL_NAME, STATS_TOOL_NAME} <= names
 
 
+def test_stats_tool_hidden_and_refused_when_disabled(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.ccr.mcp_server._STATS_ENABLED", False)
+    srv = _server()
+    names = {t.name for t in asyncio.run(srv._on_list_tools(None, None)).tools}
+    assert STATS_TOOL_NAME not in names
+    assert {COMPRESS_TOOL_NAME, CCR_TOOL_NAME} <= names
+    params = mcp_types.CallToolRequestParams(name=STATS_TOOL_NAME, arguments={})
+    result = asyncio.run(srv._on_call_tool(None, params))
+    assert f"Unknown tool: {STATS_TOOL_NAME}" in result.content[0].text
+
+
 def test_call_tool_returns_typed_result_and_dispatches_on_params_name() -> None:
     params = mcp_types.CallToolRequestParams(name="nope", arguments={})
     result = asyncio.run(_server()._on_call_tool(None, params))
