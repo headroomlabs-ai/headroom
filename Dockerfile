@@ -1,12 +1,17 @@
+# Base images are written as literal tag@digest FROM lines so a re-pushed tag
+# cannot change what CI and release builds run, and Dependabot (which does not
+# expand ARGs) can refresh the digests. PYTHON_VERSION must match the python
+# base images; the builder stage fails if it does not.
 ARG PYTHON_VERSION=3.13
-ARG UV_VERSION=0.11.18
-ARG DISTROLESS_IMAGE=gcr.io/distroless/python3-debian13
 ARG PYTHON_SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 
 # ---- Build stage: compile native extensions, build wheel ----
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS builder
 
-ARG UV_VERSION
+ARG PYTHON_VERSION
+RUN actual="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')" && \
+    [ "$actual" = "${PYTHON_VERSION}" ] || { echo "PYTHON_VERSION=${PYTHON_VERSION} but the base image has Python $actual; update the FROM lines and PYTHON_VERSION together" >&2; exit 1; }
+
 ARG PYTHON_SITE_PACKAGES
 ARG HEADROOM_BUILD_VERSION=""
 
@@ -25,7 +30,8 @@ RUN apt-get update && \
     patchelf \
   && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir uv==${UV_VERSION}
+COPY docker/uv.txt /tmp/uv.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary :all: -r /tmp/uv.txt
 
 # Rust toolchain for the headroom._core extension. With single-wheel
 # architecture (post-#355), `pip install -e .` invokes maturin via
@@ -53,6 +59,9 @@ COPY headroom/ headroom/
 # [redis] backs the replica-shared stores: without it HEADROOM_COMPRESS_SESSION_STORE
 # stops startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store.
 ARG HEADROOM_EXTRAS=proxy,code,bedrock,redis
+# Install the exact versions uv.lock resolved, not whatever the ranges in
+# pyproject.toml allow today; the build backend is pinned the same way.
+ARG MATURIN_VERSION=1.16.0
 # `uv pip install` ignores [tool.uv] override-dependencies (uv.lock only), so
 # pass them explicitly: the image gets the security overrides the lock has
 # (pillow 13 over fastembed's <13 cap).
@@ -61,7 +70,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     python -c "exec('try: import tomllib\\nexcept ImportError: from pip._vendor import tomli as tomllib'); print('\\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['uv']['override-dependencies']))" > /tmp/overrides.txt && \
-    uv pip install --system --overrides /tmp/overrides.txt ".[${HEADROOM_EXTRAS}]"
+    uv export --frozen --no-dev --no-emit-project --no-hashes --format requirements-txt \
+      $(printf '%s' "${HEADROOM_EXTRAS}" | tr ',' '\n' | sed 's/^/--extra /') > /tmp/constraints.txt && \
+    printf 'maturin==%s\n' "${MATURIN_VERSION}" > /tmp/build-constraints.txt && \
+    uv pip install --system --overrides /tmp/overrides.txt --constraints /tmp/constraints.txt \
+      --build-constraints /tmp/build-constraints.txt ".[${HEADROOM_EXTRAS}]"
 
 RUN --mount=type=bind,source=.,target=/context,readonly \
     HEADROOM_BUILD_VERSION="${HEADROOM_BUILD_VERSION}" PYTHON_SITE_PACKAGES="${PYTHON_SITE_PACKAGES}" python - <<'PY'
@@ -164,7 +177,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/headroom-proxy /usr/local/bin/headroom-proxy
 
 # ---- Runtime stage (python-slim): supports root/nonroot via build arg ----
-FROM python:${PYTHON_VERSION}-slim AS runtime-slim-base
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS runtime-slim-base
 
 ARG RUNTIME_USER=nonroot
 ARG RUNTIME_HOME=/home/nonroot
@@ -217,10 +230,10 @@ ENTRYPOINT ["headroom", "proxy"]
 
 # Distroless has no shell, so the ~/.headroom state directory cannot be made
 # with RUN there. Build it here and COPY it in with the right owner (#4443).
-FROM python:${PYTHON_VERSION}-slim AS runtime-slim-state
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS runtime-slim-state
 RUN mkdir -p /state/.headroom
 
-FROM ${DISTROLESS_IMAGE} AS runtime-slim
+FROM gcr.io/distroless/python3-debian13@sha256:60faad2efce94a847f32e2adbcaefeb2e4fd3e3a78075a3abb600904a5e010e9 AS runtime-slim
 
 ARG RUNTIME_USER=nonroot
 ARG RUNTIME_HOME=/home/nonroot

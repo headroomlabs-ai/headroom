@@ -81,6 +81,7 @@ jobs:
               - 'e2e/**'
               - 'scripts/install*'
               - 'pyproject.toml'
+              - 'uv.lock'
               - '.github/workflows/**'
             dashboard:
               - 'headroom/dashboard/**'

@@ -1,0 +1,3 @@
+# pip for the e2e/init and e2e/wrap runtime venvs, installed with
+# --require-hashes. The hash is PyPI's sha256 for the wheel.
+pip==26.3 --hash=sha256:f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13

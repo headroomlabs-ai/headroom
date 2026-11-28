@@ -2,7 +2,18 @@ version: 2
 updates:
   # Docker base image digest updates
   - package-ecosystem: docker
-    directory: /
+    directories:
+      - /
+      - /e2e/init
+      - /e2e/wrap
+    # Digest refreshes only. A Python minor bump breaks the e2e images (aider
+    # needs <3.12, the wheel is built for cp311) and must move PYTHON_VERSION
+    # with the root FROM lines; Node 25 is outside OpenClaw's supported range.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
     schedule:
       interval: weekly
     commit-message:

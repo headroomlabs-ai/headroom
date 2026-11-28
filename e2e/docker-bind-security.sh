@@ -155,7 +155,7 @@ request() {
   local port="$1" path="$2" token="${3:-}"; local -a args=(--silent --output /dev/null --write-out '%{http_code}' --connect-timeout 3)
   [[ -n "$token" ]] && args+=(-H "Authorization: Bearer ${token}")
   [[ "$path" == "$upstream_path" ]] && args+=(-H 'Content-Type: application/json' --data '{"model":"fixture","messages":[]}')
-  docker run --rm --name "$attacker_container" --network "$network" curlimages/curl:8.12.1 \
+  docker run --rm --name "$attacker_container" --network "$network" curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6 \
     "${args[@]}" "http://${host_ip}:${port}${path}"
 }
 first_path="${request_paths[0]//$'\r'/}"
@@ -188,7 +188,7 @@ for path in "${request_paths[@]}"; do
   test "$(request 18785 "$path" "$token")" = "$correct_status"
 done
 ws_key="$(printf '%s' 'the sample nonce' | base64 | tr -d '\n')"
-ws_status="$(docker run --rm --name "$attacker_container" --network "$network" curlimages/curl:8.12.1 --silent --output /dev/null --write-out '%{http_code}' --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H "Sec-WebSocket-Key: ${ws_key}" "http://${host_ip}:18785/v1/live")"
+ws_status="$(docker run --rm --name "$attacker_container" --network "$network" curlimages/curl:8.12.1@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6 --silent --output /dev/null --write-out '%{http_code}' --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H "Sec-WebSocket-Key: ${ws_key}" "http://${host_ip}:18785/v1/live")"
 test "$ws_status" = "$ws_status_expected"
 printf 'base_ref=%s base_digest=%s head_digest=%s slim_digest=%s runtime_slim_config=loopback rust_core=loaded local_completion=200 attacker_loopback=000 ws_status=%s\n' "$base_ref" "$(docker image inspect --format='{{.Id}}' "$base_image")" "$(docker image inspect --format='{{.Id}}' "$head_image")" "$(docker image inspect --format='{{.Id}}' "$slim_image")" "$ws_status"
 echo "docker bind security: fixture forwarding, loopback isolation, open-bind refusal, built-image health, slim-image loopback config, and token controls passed"
