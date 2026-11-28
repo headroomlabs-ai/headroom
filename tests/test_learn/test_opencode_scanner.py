@@ -762,3 +762,42 @@ def test_opencode_plugin_mixed_schema_falls_back_to_legacy_tables(
     assert len(sessions) == 1
     assert sessions[0].tool_calls[0].tool_call_id == "call-ms-1"
     assert sessions[0].tool_calls[0].is_error is True
+
+
+def test_opencode_plugin_keeps_legacy_only_sessions_after_v2_upgrade(tmp_path: Path) -> None:
+    legacy_project = tmp_path / "legacy-project"
+    modern_project = tmp_path / "modern-project"
+    legacy_project.mkdir()
+    modern_project.mkdir()
+    db_path = tmp_path / "opencode.db"
+    modern_db = tmp_path / "modern.db"
+    _create_opencode_db(db_path, legacy_project, project_name="Legacy", session_id="legacy-only")
+    _create_opencode_db_v2(modern_db, modern_project, project_name="Modern")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("ATTACH DATABASE ? AS modern", (str(modern_db),))
+        conn.executescript(
+            """
+            INSERT INTO project (id, name, worktree) SELECT id, name, worktree FROM modern.project;
+            CREATE TABLE session_v2 AS SELECT * FROM modern.session_v2;
+            CREATE TABLE session_message AS SELECT * FROM modern.session_message;
+
+            INSERT INTO session VALUES ('session-v2', 'project-v2', 1700000000000);
+            INSERT INTO session VALUES ('unmigrated', 'project-v2', 1690000000000);
+            INSERT INTO message VALUES ('message-unmigrated', 'unmigrated');
+            INSERT INTO part
+                SELECT 'part-unmigrated', 'message-unmigrated', data, time_created FROM part
+                WHERE id = 'part-1';
+            """
+        )
+
+    plugin = OpenCodePlugin(db_path=db_path)
+    projects = {project.name: project for project in plugin.discover_projects()}
+    assert set(projects) == {"Legacy", "Modern"}
+    assert [session.session_id for session in plugin.scan_project(projects["Legacy"])] == [
+        "legacy-only"
+    ]
+    assert [session.session_id for session in plugin.scan_project(projects["Modern"])] == [
+        "session-v2",
+        "unmigrated",
+    ]

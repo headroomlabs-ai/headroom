@@ -60,14 +60,18 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
         return set()
 
 
-def _session_table(tables: set[str]) -> str | None:
-    # Prefer the v2 schema used by current opencode releases, fall back to
-    # the legacy table name.
-    if "session_v2" in tables:
-        return "session_v2"
-    if "session" in tables:
-        return "session"
-    return None
+def _session_rows_query(tables: set[str]) -> str | None:
+    modern = "SELECT id, project_id, time_created, 1 AS prefer_v2 FROM session_v2"
+    legacy = "SELECT id, project_id, time_created, 0 AS prefer_v2 FROM session"
+    if "session_v2" not in tables:
+        return legacy if "session" in tables else None
+    if "session" not in tables:
+        return modern
+    # Upgraded databases retain legacy sessions, including rows not copied to v2.
+    return (
+        f"{modern} UNION ALL {legacy} AS old "
+        "WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE session_v2.id = old.id)"
+    )
 
 
 def _worktree_key(value: str | Path) -> str:
@@ -178,8 +182,8 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
 
         try:
             tables = _tables(conn)
-            sess_tbl = _session_table(tables)
-            if sess_tbl is None:
+            session_rows = _session_rows_query(tables)
+            if session_rows is None:
                 logger.warning("OpenCode DB %s has no session table", self._db_path)
                 return []
             cursor = conn.cursor()
@@ -187,14 +191,14 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
                 cursor.execute(
                     f"SELECT p.id, p.name, p.worktree "
                     f"FROM project p "
-                    f"WHERE EXISTS (SELECT 1 FROM {sess_tbl} s WHERE s.project_id = p.id)"
+                    f"WHERE EXISTS (SELECT 1 FROM ({session_rows}) s WHERE s.project_id = p.id)"
                 )
                 rows = cursor.fetchall()
             except sqlite3.OperationalError:
                 cursor.execute(
                     f"SELECT p.id, NULL, p.worktree "
                     f"FROM project p "
-                    f"WHERE EXISTS (SELECT 1 FROM {sess_tbl} s WHERE s.project_id = p.id)"
+                    f"WHERE EXISTS (SELECT 1 FROM ({session_rows}) s WHERE s.project_id = p.id)"
                 )
                 rows = cursor.fetchall()
             projects: list[ProjectInfo] = []
@@ -245,8 +249,8 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
     ) -> list[SessionData]:
         cursor = conn.cursor()
         tables = _tables(conn)
-        sess_tbl = _session_table(tables)
-        if sess_tbl is None:
+        session_query = _session_rows_query(tables)
+        if session_query is None:
             return []
 
         cursor.execute("SELECT id, worktree FROM project")
@@ -260,20 +264,17 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
             return []
 
         cursor.execute(
-            f"SELECT id, time_created FROM {sess_tbl} WHERE project_id = ? ORDER BY time_created DESC LIMIT 200",
+            f"SELECT id, time_created, prefer_v2 FROM ({session_query}) "
+            "WHERE project_id = ? ORDER BY time_created DESC LIMIT 200",
             (project_db_id,),
         )
         session_rows = cursor.fetchall()
 
         sessions: list[SessionData] = []
-        # The message layout follows the session schema: v2 sessions live in
-        # session_message, legacy ones in part/message. Resolve once per scan
-        # instead of per session (up to 200 sqlite_master lookups per project).
-        prefer_v2 = sess_tbl == "session_v2"
-        for session_id, time_created in session_rows:
+        for session_id, time_created, prefer_v2 in session_rows:
             try:
                 session = self._scan_session(
-                    conn, session_id, time_created, tables=tables, prefer_v2=prefer_v2
+                    conn, session_id, time_created, tables=tables, prefer_v2=bool(prefer_v2)
                 )
             except sqlite3.Error as exc:
                 logger.warning("Cannot scan OpenCode session %s: %s", session_id, exc)
