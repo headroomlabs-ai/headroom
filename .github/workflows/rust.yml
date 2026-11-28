@@ -211,6 +211,11 @@ jobs:
         # runtime integration tests pin, so run the full suite there.
         if: matrix.features == ''
         run: cargo test -p headroom-core --no-default-features --tests
+      - name: cargo test (ml-only build runtime coverage)
+        # Verify ML-only fallback behavior (source-code blocks must never
+        # route to Kompress even when ML is enabled).
+        if: matrix.features == 'ml'
+        run: cargo test -p headroom-core --no-default-features --features ml --test live_zone_dispatch
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
