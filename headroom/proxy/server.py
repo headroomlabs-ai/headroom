@@ -140,6 +140,7 @@ from headroom.proxy.cost import (
     merge_cost_stats,
     request_cost_usd,
 )
+from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.helpers import (
     COMPRESSION_CACHE_MAX_ENTRIES,
     COMPRESSION_CACHE_TTL_SECONDS,
@@ -212,6 +213,7 @@ from headroom.proxy.ssl_context import (
 )
 from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+from headroom.proxy.upstream_guard import bind_upstream_client, upstream_client_key
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.workspace_registry import resolve_registered_cwd
@@ -4426,6 +4428,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         set_registered_cwd(
             resolve_registered_cwd(config.port, headers.get("x-headroom-session-token"))
         )
+        # Upstream-name lookups are limited per client network, so one caller
+        # cannot take the resolver capacity every other caller needs.
+        bind_upstream_client(upstream_client_key(resolve_client_ip(request)))
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it

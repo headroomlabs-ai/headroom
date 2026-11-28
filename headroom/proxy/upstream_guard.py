@@ -37,15 +37,21 @@ import from any handler without risking an import cycle.
 from __future__ import annotations
 
 import asyncio
+import functools
 import ipaddress
+import logging
 import os
 import socket
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
 from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_BASE_URLS_ENV = "HEADROOM_ALLOWED_BASE_URLS"
 
@@ -57,7 +63,157 @@ ALLOWED_BASE_URLS_ENV = "HEADROOM_ALLOWED_BASE_URLS"
 # wait off the loop entirely.
 RESOLVE_TIMEOUT_ENV = "HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S"
 _DEFAULT_RESOLVE_TIMEOUT_S = 3.0
-_RESOLVER_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="hr-upstream-dns")
+_RESOLVER_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="hr-upstream-dns")
+
+# An overrun lookup is abandoned, not cancelled: `getaddrinfo` keeps its worker
+# until the system resolver gives up, so slow names could occupy the resolver
+# and get every other client's upstream refused. Hence: one shared lookup per
+# name; each charged to the caller's network (never a credential), with a few
+# in flight per network and all of them below the worker count (a small extra
+# reserve is for refreshes); and a memory of hosts judged public. A remembered
+# host is answered from memory, pinned like a fresh answer, and refreshed in
+# the background once its answer is a minute old. Only a refresh can drop it:
+# one that comes back internal or NXDOMAIN does; one that is slow, fails or
+# cannot start leaves the old public answer serving. A network may fill only a
+# small share of the memory.
+#
+# Not covered: many networks together can fill the lookup cap, so a name not
+# already remembered is refused while that lasts; evicting remembered hosts
+# takes about `_REMEMBER_MAX_ENTRIES / _REMEMBER_MAX_PER_CLIENT` networks.
+_MAX_LOOKUPS_PER_CLIENT = 4
+_MAX_LOOKUPS_IN_FLIGHT = 12
+_REFRESH_RESERVE = 2
+_REFRESH_AFTER_S = 60.0
+_REMEMBER_MAX_ENTRIES = 8192
+_REMEMBER_MAX_PER_CLIENT = 32
+# Answers that say the name has no address, as opposed to a resolver that is
+# slow or failing (EAI_AGAIN, EAI_FAIL): these drop a remembered host.
+_NO_ADDRESS_ERRORS = frozenset(
+    code for code in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", None)) if code is not None
+)
+
+# Lookups made outside any request are charged here, apart from every client.
+_INTERNAL_CLIENT = "internal"
+_UPSTREAM_CLIENT: ContextVar[str] = ContextVar("headroom_upstream_client", default=_INTERNAL_CLIENT)
+
+
+def upstream_client_key(client_ip: str) -> str:
+    """The network a request's upstream lookups are charged to.
+
+    IPv4 by address; IPv6 by /48, the usual end-site allocation, so rotating
+    addresses inside one allocation does not mint new allowances.
+    """
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return f"peer:{client_ip[:64]}"
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return f"peer:{addr.ipv4_mapped}"
+        return f"peer:{ipaddress.IPv6Network((int(addr) >> 80 << 80, 48))}"
+    return f"peer:{addr}"
+
+
+def bind_upstream_client(client: str) -> None:
+    """Charge this context's upstream lookups to ``client`` (see ``upstream_client_key``)."""
+    _UPSTREAM_CLIENT.set(client)
+
+
+@dataclass
+class _Remembered:
+    addresses: tuple[str, ...]
+    judged_at: float
+    owner: str
+
+
+class _Resolver:
+    """Shared lookups, their limits, and the remembered answers."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, tuple[Future[list], str]] = {}
+        self._per_client: dict[str, int] = {}
+        self._memory: OrderedDict[str, _Remembered] = OrderedDict()
+        self._remembered_by: dict[str, int] = {}
+
+    def remembered(self, host: str) -> tuple[tuple[str, ...], bool] | None:
+        """Return ``(addresses, due_for_refresh)`` for a remembered host, else ``None``."""
+        with self._lock:
+            entry = self._memory.get(host)
+            if entry is None:
+                return None
+            self._memory.move_to_end(host)
+            return entry.addresses, time.monotonic() - entry.judged_at >= _REFRESH_AFTER_S
+
+    def start(self, host: str, client: str, *, refresh: bool) -> Future[list] | None:
+        """Return the in-flight lookup for ``host``, starting one if allowed."""
+        with self._lock:
+            running = self._in_flight.get(host)
+            if running is not None:
+                return running[0]
+            limit = _MAX_LOOKUPS_IN_FLIGHT + (_REFRESH_RESERVE if refresh else 0)
+            if (
+                len(self._in_flight) >= limit
+                or self._per_client.get(client, 0) >= _MAX_LOOKUPS_PER_CLIENT
+            ):
+                return None
+            future = _RESOLVER_POOL.submit(socket.getaddrinfo, host, None, 0, 0, socket.IPPROTO_TCP)
+            self._in_flight[host] = (future, client)
+            self._per_client[client] = self._per_client.get(client, 0) + 1
+        future.add_done_callback(lambda done: self._finished(host, done))
+        return future
+
+    def _finished(self, host: str, done: Future[list]) -> None:
+        with self._lock:
+            running = self._in_flight.get(host)
+            if running is None or running[0] is not done:
+                return
+            del self._in_flight[host]
+            owner = running[1]
+            _decrement(self._per_client, owner)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is None:
+                addresses = _addresses(done.result())
+                if addresses and not any(_is_internal_address(a) for a in addresses):
+                    self._remember(host, addresses, owner)
+                    return
+                self._forget(host)
+            elif isinstance(error, socket.gaierror) and error.errno in _NO_ADDRESS_ERRORS:
+                self._forget(host)
+
+    def _remember(self, host: str, addresses: tuple[str, ...], owner: str) -> None:
+        existing = self._memory.get(host)
+        if existing is not None:
+            existing.addresses, existing.judged_at = addresses, time.monotonic()
+            self._memory.move_to_end(host)
+            return
+        if self._remembered_by.get(owner, 0) >= _REMEMBER_MAX_PER_CLIENT:
+            self._forget(next(h for h, e in self._memory.items() if e.owner == owner))
+        while len(self._memory) >= _REMEMBER_MAX_ENTRIES:
+            self._forget(next(iter(self._memory)))
+        self._memory[host] = _Remembered(addresses, time.monotonic(), owner)
+        self._remembered_by[owner] = self._remembered_by.get(owner, 0) + 1
+
+    def _forget(self, host: str) -> None:
+        entry = self._memory.pop(host, None)
+        if entry is not None:
+            _decrement(self._remembered_by, entry.owner)
+
+
+def _decrement(counts: dict[str, int], key: str) -> None:
+    if counts[key] > 1:
+        counts[key] -= 1
+    else:
+        del counts[key]
+
+
+_RESOLVER = _Resolver()
+
+
+def _addresses(infos: list) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(info[4][0]) for info in infos))
 
 
 def _resolve_timeout_seconds() -> float:
@@ -227,37 +383,54 @@ def clear_validated_addresses() -> None:
 
 def allowlisted_destinations(
     env: str = ALLOWED_BASE_URLS_ENV,
-) -> tuple[set[str], set[tuple[str, str, int]]] | None:
-    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset."""
+) -> tuple[frozenset[str], frozenset[tuple[str, str, int]]] | None:
+    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset.
+
+    Hosts are kept as the name the connection dials (lower-case IDNA A-label),
+    so every spelling of a host matches the same entry.
+    """
     raw = os.environ.get(env)
     if not raw or not raw.strip():
         return None
+    return _parse_destinations(env, raw)
+
+
+@functools.lru_cache(maxsize=16)
+def _parse_destinations(
+    env: str, raw: str
+) -> tuple[frozenset[str], frozenset[tuple[str, str, int]]]:
     hosts: set[str] = set()
     origins: set[tuple[str, str, int]] = set()
-    for item in raw.split(","):
+    # Entries can carry credentials (``https://user:pass@host``), so a rejected
+    # one is reported by its position, never by its text.
+    for position, item in enumerate(raw.split(","), start=1):
         item = item.strip()
         if not item:
             continue
-        if "://" not in item:
-            parsed = urlparse(f"//{item}")
-            if parsed.hostname:
-                hosts.add(parsed.hostname.lower())
-            continue
-        parsed = urlparse(item)
-        if parsed.scheme.lower() not in _SAFE_SCHEMES or not parsed.hostname:
-            continue
         try:
+            parsed = urlparse(item if "://" in item else f"//{item}")
             port = parsed.port
         except ValueError:
+            parsed = None
+        host = _connect_name(parsed.hostname or "") if parsed is not None else None
+        if parsed is None or not host:
+            logger.warning("ignoring %s entry %d: not a valid host, port or URL", env, position)
+            continue
+        if "://" not in item:
+            hosts.add(host)
+            continue
+        scheme = parsed.scheme.lower()
+        if scheme not in _SAFE_SCHEMES:
+            logger.warning("ignoring %s entry %d: unsupported scheme", env, position)
             continue
         if port is None:
-            port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
-        origins.add((parsed.scheme.lower(), parsed.hostname.lower(), port))
-    return hosts, origins
+            port = 443 if scheme in {"https", "wss"} else 80
+        origins.add((scheme, host, port))
+    return frozenset(hosts), frozenset(origins)
 
 
 def destination_listed(
-    allow: tuple[set[str], set[tuple[str, str, int]]],
+    allow: tuple[frozenset[str], frozenset[tuple[str, str, int]]],
     scheme: str,
     host: str,
     port: int | None,
@@ -268,12 +441,13 @@ def destination_listed(
     origin, with the scheme's default port filled in when ``port`` is ``None``.
     """
     hosts, origins = allow
-    if host.lower() in hosts:
+    host = _connect_name(host) or ""
+    if host in hosts:
         return True
     scheme = scheme.lower()
     if port is None:
         port = 443 if scheme in {"https", "wss"} else 80
-    return (scheme, host.lower(), port) in origins
+    return (scheme, host, port) in origins
 
 
 # RFC 6052 well-known prefix. A DNS64 resolver answers a host that has only an
@@ -338,23 +512,10 @@ def _is_internal_address(ip: str) -> bool:
     return False
 
 
-def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = None) -> bool:
-    """Return True if ``url`` is a safe client-chosen upstream destination.
+def _check_before_lookup(url: str) -> bool | str:
+    """Decide ``url`` without DNS where possible.
 
-    In allowlist mode only allowlisted hosts pass. Otherwise the host is
-    resolved and rejected if any resolved address is internal/metadata, which
-    also catches DNS names that point at private space.
-
-    A destination accepted on its addresses also has them pinned against the
-    calling request, so the connection that follows cannot be re-pointed by a
-    second DNS answer. Allowlist mode pins nothing: it admits a host by name
-    without resolving it at all, precisely so split-horizon and on-prem
-    endpoints -- whose addresses are the operator's business, and may
-    legitimately move or round-robin -- keep working.
-
-    ``scope`` is the pin mapping to write into; it defaults to the calling
-    context's. :func:`is_safe_upstream_url_async` passes its caller's mapping
-    explicitly because the check itself runs on a worker thread.
+    Returns the verdict, or the name to resolve when only an answer can decide.
     """
     parsed = urlparse((url or "").strip())
     if parsed.scheme.lower() not in _SAFE_SCHEMES:
@@ -377,17 +538,11 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
     connect_host = _connect_name(host)
     if not connect_host:
         return False
-    try:
-        infos = _RESOLVER_POOL.submit(
-            socket.getaddrinfo, connect_host, None, 0, 0, socket.IPPROTO_TCP
-        ).result(timeout=_resolve_timeout_seconds())
-    except (OSError, _FutureTimeout):
-        # Resolution and connection are separate operations, so allowing a DNS
-        # miss here would fail open if the name resolves on the later lookup.
-        # A lookup that overruns the budget is treated the same way.
-        # Operators can explicitly allowlist split-horizon/internal endpoints.
-        return False
-    addresses = tuple(dict.fromkeys(str(info[4][0]) for info in infos))
+    return connect_host
+
+
+def _judge_answer(connect_host: str, infos: list, scope: dict[str, UpstreamPin] | None) -> bool:
+    addresses = _addresses(infos)
     if any(_is_internal_address(address) for address in addresses):
         return False
     # Every address in this answer passed, so pin them all: the connection may
@@ -403,17 +558,116 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
     return _record_validated_addresses(connect_host, addresses, scope)
 
 
+PROXIED_BASE_URLS_ENV = "HEADROOM_PROXIED_BASE_URLS"
+
+
+def proxied_destination_listed(url: str) -> bool:
+    """Whether ``url``'s destination is listed in ``HEADROOM_PROXIED_BASE_URLS``.
+
+    The one matcher for that list: the guard asks it whether a host may be
+    answered from memory, and the outbound transport asks it whether a guarded
+    request may leave through the proxy by name, so the two cannot disagree
+    about a destination.
+    """
+    allow = allowlisted_destinations(PROXIED_BASE_URLS_ENV)
+    if allow is None:
+        return False
+    parsed = urlparse((url or "").strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return destination_listed(allow, parsed.scheme, parsed.hostname or "", port)
+
+
+def _from_memory(url: str, connect_host: str, scope: dict[str, UpstreamPin] | None) -> bool | None:
+    """Answer a remembered host at once; refresh it in the background when due.
+
+    ``None`` when the host is not remembered and has to be looked up. A
+    destination listed in ``HEADROOM_PROXIED_BASE_URLS`` is always looked up:
+    its connection leaves through the outbound proxy by name, so no pin binds
+    it, and only an answer from this request keeps the check current.
+    """
+    if proxied_destination_listed(url):
+        return None
+    remembered = _RESOLVER.remembered(connect_host)
+    if remembered is None:
+        return None
+    addresses, due_for_refresh = remembered
+    if due_for_refresh:
+        _RESOLVER.start(connect_host, _UPSTREAM_CLIENT.get(), refresh=True)
+    return _record_validated_addresses(connect_host, addresses, scope)
+
+
+def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = None) -> bool:
+    """Return True if ``url`` is a safe client-chosen upstream destination.
+
+    In allowlist mode only allowlisted hosts pass. Otherwise the host is
+    resolved and rejected if any resolved address is internal/metadata, which
+    also catches DNS names that point at private space.
+
+    A destination accepted on its addresses also has them pinned against the
+    calling request, so the connection that follows cannot be re-pointed by a
+    second DNS answer. Allowlist mode pins nothing: it admits a host by name
+    without resolving it at all, precisely so split-horizon and on-prem
+    endpoints -- whose addresses are the operator's business, and may
+    legitimately move or round-robin -- keep working.
+
+    ``scope`` is the pin mapping to write into; it defaults to the calling
+    context's.
+    """
+    decided = _check_before_lookup(url)
+    if isinstance(decided, bool):
+        return decided
+    remembered = _from_memory(url, decided, scope)
+    if remembered is not None:
+        return remembered
+    lookup = _RESOLVER.start(decided, _UPSTREAM_CLIENT.get(), refresh=False)
+    if lookup is None:
+        return False
+    try:
+        infos = lookup.result(timeout=_resolve_timeout_seconds())
+    except (OSError, _FutureTimeout):
+        # Resolution and connection are separate operations, so allowing a
+        # DNS miss here would fail open if the name resolves on the later
+        # lookup. Operators can allowlist split-horizon/internal endpoints.
+        return False
+    return _judge_answer(decided, infos, scope)
+
+
+def _consume_outcome(future: asyncio.Future[list]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
 async def is_safe_upstream_url_async(url: str) -> bool:
     """Async form of :func:`is_safe_upstream_url` for event-loop callers.
 
-    Same policy; the blocking resolution runs off the loop so a hostile or
-    slow-resolving hostname cannot stall unrelated in-flight requests.
+    Same policy; the lookup is awaited rather than waited on, so a hostile or
+    slow-resolving hostname neither stalls the event loop nor holds one of its
+    worker threads for the length of the budget.
 
-    The pin scope is opened *here*, on the caller's task, and handed to the
-    worker to fill in. Letting the worker open it instead would bind the
-    contextvar in the thread's throwaway copy of the context, so the pin would
-    vanish before the request it authorises ever reached a socket -- and a
-    guarded destination with no pin is a denied one.
+    The pin scope is opened *here*, on the caller's task: the mapping object
+    is what the check fills in, so it has to belong to the request's context.
     """
     scope = begin_pin_scope()
-    return await asyncio.to_thread(is_safe_upstream_url, url, scope=scope)
+    decided = _check_before_lookup(url)
+    if isinstance(decided, bool):
+        return decided
+    remembered = _from_memory(url, decided, scope)
+    if remembered is not None:
+        return remembered
+    lookup = _RESOLVER.start(decided, _UPSTREAM_CLIENT.get(), refresh=False)
+    if lookup is None:
+        return False
+    try:
+        # Shielded: the lookup may be shared with other callers, and timing out
+        # or being cancelled here must not cancel it for them.
+        # The wrapper is consumed when it settles, so a failure that lands
+        # after this caller gave up is not reported as never retrieved.
+        waited = asyncio.wrap_future(lookup)
+        waited.add_done_callback(_consume_outcome)
+        infos = await asyncio.wait_for(asyncio.shield(waited), _resolve_timeout_seconds())
+    except (OSError, asyncio.TimeoutError):
+        return False
+    return _judge_answer(decided, infos, scope)

@@ -6,6 +6,7 @@ All cases use IP literals or ``localhost`` so no external network is required.
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 import socket
 import ssl
@@ -1218,3 +1219,622 @@ async def test_a_non_ascii_host_is_resolved_and_pinned_under_its_connect_name(
     inner, stream, error = await _connect(connect_name)
     assert error is None and stream is not None
     assert inner.targets == ["8.8.8.8"], f"the name was resolved again: {inner.targets}"
+
+
+# ---------------------------------------------------------------------------
+# A slow DNS zone must not lock every client out of its upstream.
+#
+# An overrun lookup keeps its resolver worker until the system resolver gives
+# up, so a caller naming many hosts under a slow zone used to occupy every
+# worker and an unbounded queue; every other caller's upstream then timed out.
+# ---------------------------------------------------------------------------
+
+
+class _SlowZone:
+    """`getaddrinfo` where names under ``slow.example`` hang until released.
+
+    Released names, and every other name, answer with a public address; names
+    in ``internal`` answer with loopback.
+    """
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.slow_calls = 0
+        self.calls: list[str] = []
+        self.internal: set[str] = set()
+        self._lock = threading.Lock()
+
+    def __call__(self, host: object, *args: object, **kwargs: object) -> list[object]:
+        with self._lock:
+            self.calls.append(str(host))
+        if str(host).endswith(".slow.example"):
+            with self._lock:
+                self.slow_calls += 1
+            self.release.wait(10)
+        address = "127.0.0.1" if host in self.internal else "20.10.10.10"
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 0))]
+
+
+@pytest.fixture
+def slow_zone(monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
+    from headroom.proxy.upstream_guard import _RESOLVER_POOL
+
+    zone = _SlowZone()
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    monkeypatch.setattr(socket, "getaddrinfo", zone)
+    yield zone
+    zone.release.set()
+    _RESOLVER_POOL.submit(lambda: None).result(timeout=10)
+
+
+def _as_peer(ip: str) -> None:
+    from headroom.proxy.upstream_guard import bind_upstream_client, upstream_client_key
+
+    bind_upstream_client(upstream_client_key(ip))
+
+
+_LEGIT = "198.51.100.7"
+
+
+def _rotating_peers(count: int) -> list[str]:
+    """Distinct addresses inside one /48, as one IPv6 end site can mint them."""
+    return [f"2001:db8:1:{index:x}::1" for index in range(count)]
+
+
+def _flood(names: int, prefix: str = "n") -> None:
+    for index in range(names):
+        assert is_safe_upstream_url(f"https://{prefix}{index}.slow.example/v1") is False
+
+
+def _drain() -> None:
+    """Wait until every lookup in flight has finished and been recorded."""
+    from headroom.proxy import upstream_guard
+
+    _wait_for(lambda: not upstream_guard._RESOLVER._in_flight)
+
+
+class _Clock:
+    """Stands in for the guard's ``time`` module, so a test can skip ahead."""
+
+    def __init__(self) -> None:
+        import time as _time
+
+        self._real = _time.monotonic
+        self.offset = 0.0
+
+    def monotonic(self) -> float:
+        return self._real() + self.offset
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    from headroom.proxy import upstream_guard
+
+    fake = _Clock()
+    monkeypatch.setattr(upstream_guard, "time", fake)
+    return fake
+
+
+def _remember_names(peer: str, names: list[str]) -> None:
+    from headroom.proxy import upstream_guard
+
+    _as_peer(peer)
+    for name in names:
+        upstream_guard.clear_validated_addresses()  # one request per name
+        assert is_safe_upstream_url(f"https://{name}/v1") is True
+    _drain()
+
+
+def test_a_sustained_flood_does_not_lock_out_another_client(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    """Hundreds of addresses from one /48 keep flooding slow names for an hour."""
+    _as_peer(_LEGIT)
+    assert is_safe_upstream_url("https://api.legit.example/v1") is True
+    _drain()
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+
+    for index, peer in enumerate(_rotating_peers(300)):
+        _as_peer(peer)
+        assert is_safe_upstream_url(f"https://n{index}.slow.example/v1") is False
+    clock.offset = 3600.0
+    _as_peer(_LEGIT)
+
+    assert is_safe_upstream_url("https://api.legit.example/v1") is True
+    assert is_safe_upstream_url("https://new.legit.example/v1") is True
+
+
+def test_a_few_networks_cannot_evict_remembered_hosts_then_flood(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy import upstream_guard
+
+    _remember_names(_LEGIT, ["a.legit.example", "b.legit.example", "c.legit.example"])
+    quota = upstream_guard._REMEMBER_MAX_PER_CLIENT
+    for network in range(8):
+        _remember_names(f"192.0.2.{network}", [f"w{network}-{i}.example" for i in range(quota)])
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+    for network in range(3):
+        _as_peer(f"198.18.0.{network}")
+        for index in range(upstream_guard._MAX_LOOKUPS_PER_CLIENT):
+            is_safe_upstream_url(f"https://f{network}-{index}.slow.example/v1")
+    _as_peer(_LEGIT)
+
+    assert [
+        is_safe_upstream_url(f"https://{name}.legit.example/v1") for name in ("a", "b", "c")
+    ] == [True, True, True]
+
+
+def test_a_remembered_host_keeps_serving_when_its_refresh_is_starved(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    """Four networks hold every lookup slot refreshing their own slow names."""
+    from headroom.proxy import upstream_guard
+
+    _remember_names(_LEGIT, ["victim.legit.example"])
+    slow_zone.release.set()
+    per_network = upstream_guard._MAX_LOOKUPS_PER_CLIENT
+    attackers = {
+        f"203.0.113.{n}": [f"r{n}-{i}.slow.example" for i in range(per_network)] for n in range(4)
+    }
+    for peer, names in attackers.items():
+        _remember_names(peer, names)
+    slow_zone.release.clear()
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+    clock.offset = 3600.0
+
+    for peer, names in attackers.items():
+        _as_peer(peer)
+        for name in names:
+            upstream_guard.clear_validated_addresses()
+            is_safe_upstream_url(f"https://{name}/v1")
+    _as_peer(_LEGIT)
+
+    assert is_safe_upstream_url("https://victim.legit.example/v1") is True
+
+
+def test_many_addresses_cannot_evict_another_clients_upstreams(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One name per address from one /48 fills the memory, then a slow flood."""
+    from headroom.proxy import upstream_guard
+
+    _as_peer(_LEGIT)
+    for name in ("a", "b", "c"):
+        assert is_safe_upstream_url(f"https://{name}.legit.example/v1") is True
+    _drain()
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+
+    for index, peer in enumerate(_rotating_peers(300)):
+        _as_peer(peer)
+        upstream_guard.clear_validated_addresses()  # one request per name
+        assert is_safe_upstream_url(f"https://w{index}.attacker.example/v1") is True
+        _drain()
+    for index, peer in enumerate(_rotating_peers(100)):
+        _as_peer(peer)
+        is_safe_upstream_url(f"https://n{index}.slow.example/v1")
+    _as_peer(_LEGIT)
+
+    for name in ("a", "b", "c"):
+        assert is_safe_upstream_url(f"https://{name}.legit.example/v1") is True
+
+
+def test_refreshes_of_many_remembered_names_leave_room_for_others(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remembered names that turn slow, refreshed from many addresses at once."""
+    from headroom.proxy import upstream_guard
+
+    slow_zone.release.set()
+    for index, peer in enumerate(_rotating_peers(40)):
+        _as_peer(peer)
+        upstream_guard.clear_validated_addresses()
+        assert is_safe_upstream_url(f"https://r{index}.slow.example/v1") is True
+    _drain()
+    slow_zone.release.clear()
+    monkeypatch.setattr(upstream_guard, "_REFRESH_AFTER_S", 0.0)
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+
+    for index, peer in enumerate(_rotating_peers(40)):
+        _as_peer(peer)
+        upstream_guard.clear_validated_addresses()
+        is_safe_upstream_url(f"https://r{index}.slow.example/v1")
+    _as_peer(_LEGIT)
+
+    assert is_safe_upstream_url("https://fresh.legit.example/v1") is True
+
+
+def test_one_clients_lookups_stay_bounded(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+    _flood(100)
+    slow_zone.release.set()
+    _drain()
+
+    assert slow_zone.slow_calls <= upstream_guard._MAX_LOOKUPS_PER_CLIENT
+
+
+def test_concurrent_checks_of_one_name_share_one_lookup(slow_zone: _SlowZone) -> None:
+    results: list[bool] = []
+    callers = [
+        threading.Thread(
+            target=lambda: results.append(is_safe_upstream_url("https://one.slow.example/v1"))
+        )
+        for _ in range(5)
+    ]
+    for caller in callers:
+        caller.start()
+    _wait_for(lambda: slow_zone.slow_calls >= 1)
+    slow_zone.release.set()
+    for caller in callers:
+        caller.join(10)
+
+    assert results == [True] * 5
+    assert slow_zone.slow_calls == 1
+
+
+def _wait_for(condition) -> None:  # noqa: ANN001
+    import time as _time
+
+    deadline = _time.monotonic() + 5
+    while not condition():
+        assert _time.monotonic() < deadline, "condition never became true"
+        _time.sleep(0.01)
+
+
+async def test_an_async_caller_that_gives_up_does_not_cancel_the_shared_lookup(
+    slow_zone: _SlowZone,
+) -> None:
+    import asyncio
+
+    from headroom.proxy.upstream_guard import is_safe_upstream_url_async
+
+    first = asyncio.create_task(is_safe_upstream_url_async("https://shared.slow.example/v1"))
+    second = asyncio.create_task(is_safe_upstream_url_async("https://shared.slow.example/v1"))
+    while slow_zone.slow_calls < 1:
+        await asyncio.sleep(0.01)
+    first.cancel()
+    slow_zone.release.set()
+
+    assert await second is True
+    assert first.cancelled()
+    assert slow_zone.slow_calls == 1
+
+
+async def test_a_remembered_host_is_answered_while_its_lookup_is_slow(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy.upstream_guard import is_safe_upstream_url_async
+
+    slow_zone.release.set()
+    assert await is_safe_upstream_url_async("https://known.slow.example/v1") is True
+    _drain()
+    slow_zone.release.clear()
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+
+    assert await is_safe_upstream_url_async("https://known.slow.example/v1") is True
+    assert await is_safe_upstream_url_async("https://unknown.slow.example/v1") is False
+
+
+def test_a_refresh_that_turns_internal_drops_the_remembered_answer(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy import upstream_guard
+    from headroom.proxy.upstream_guard import guarded_pin
+
+    monkeypatch.setattr(upstream_guard, "_REFRESH_AFTER_S", 0.0)
+    assert is_safe_upstream_url("https://moving.example/v1") is True
+    _drain()
+    slow_zone.internal.add("moving.example")
+
+    # Answered from memory, pinned to the public address it was judged on,
+    # while the refresh learns the name now points inward ...
+    assert is_safe_upstream_url("https://moving.example/v1") is True
+    pin = guarded_pin("moving.example")
+    assert pin is not None and pin.addresses == ("20.10.10.10",)
+    _drain()
+
+    # ... after which the name is judged on its new answer.
+    assert is_safe_upstream_url("https://moving.example/v1") is False
+
+
+def test_a_name_that_no_longer_exists_is_dropped_from_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answers = iter([None, socket.gaierror(socket.EAI_NONAME, "no such name"), None])
+
+    def resolve(*args: object, **kwargs: object) -> list[object]:
+        answer = next(answers)
+        if isinstance(answer, BaseException):
+            raise answer
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("20.10.10.10", 0))]
+
+    def failing(*args: object, **kwargs: object) -> list[object]:
+        raise socket.gaierror(socket.EAI_NONAME, "no such name")
+
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setattr(upstream_guard, "_REFRESH_AFTER_S", 0.0)
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    assert is_safe_upstream_url("https://deleted.example/v1") is True
+    _drain()
+    # Served from memory; the refresh is told the name is gone.
+    assert is_safe_upstream_url("https://deleted.example/v1") is True
+    _drain()
+    monkeypatch.setattr(socket, "getaddrinfo", failing)
+
+    assert is_safe_upstream_url("https://deleted.example/v1") is False
+
+
+def test_lookups_are_charged_to_the_network_not_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rotating a credential must not mint a new allowance."""
+    from headroom.proxy import upstream_guard
+
+    charged: list[str] = []
+    real_start = upstream_guard._Resolver.start
+
+    def recording_start(self, host, client, *, refresh):  # type: ignore[no-untyped-def]
+        charged.append(client)
+        return real_start(self, host, client, refresh=refresh)
+
+    monkeypatch.setattr(upstream_guard._Resolver, "start", recording_start)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("20.10.10.10", 0))],
+    )
+    # A loopback caller counts as trusted, which is where a credential used to
+    # become part of the key.
+    with TestClient(_app(), client=("127.0.0.1", 50000)) as client:
+        for index in range(2):
+            client.get(
+                "/v1/models",
+                headers={
+                    "x-headroom-base-url": f"https://gw{index}.example",
+                    "Authorization": f"Bearer rotated-{index}",
+                },
+            )
+
+    assert len(charged) == 2
+    assert charged[0] == charged[1]
+    assert charged[0].startswith("peer:")
+
+
+def test_lookups_outside_a_request_are_not_charged_to_a_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.proxy import upstream_guard
+
+    charged: list[str] = []
+    real_start = upstream_guard._Resolver.start
+
+    def recording_start(self, host, client, *, refresh):  # type: ignore[no-untyped-def]
+        charged.append(client)
+        return real_start(self, host, client, refresh=refresh)
+
+    monkeypatch.setattr(upstream_guard._Resolver, "start", recording_start)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("20.10.10.10", 0))],
+    )
+
+    assert is_safe_upstream_url("https://batch.example/v1") is True
+    assert charged == [upstream_guard._INTERNAL_CLIENT]
+    assert not charged[0].startswith("peer:")
+
+
+def _answers(monkeypatch: pytest.MonkeyPatch, host: str, outcomes: list[object]) -> None:
+    """Make ``host`` resolve to each outcome in turn: an address, or an error to raise."""
+    real_getaddrinfo = socket.getaddrinfo
+    pending = iter(outcomes)
+
+    def resolve(name: object, *args: object, **kwargs: object) -> list[object]:
+        if name != host:
+            return real_getaddrinfo(name, *args, **kwargs)  # type: ignore[arg-type]
+        outcome = next(pending)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (outcome, 0))]
+
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+
+
+async def test_a_lookup_failing_after_the_caller_gave_up_is_not_left_unretrieved(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import gc
+
+    from headroom.proxy.upstream_guard import is_safe_upstream_url_async
+
+    def slow_then_unavailable(*args: object, **kwargs: object) -> list[object]:
+        slow_zone.release.wait(5)
+        raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_then_unavailable)
+    loop = asyncio.get_running_loop()
+    reports: list[object] = []
+    loop.set_exception_handler(lambda _loop, context: reports.append(context.get("message")))
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+    assert await is_safe_upstream_url_async("https://flaky.example/v1") is False
+
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "5")
+    other = asyncio.create_task(is_safe_upstream_url_async("https://flaky.example/v1"))
+    await asyncio.sleep(0.05)
+    slow_zone.release.set()
+    assert await other is False
+    await asyncio.sleep(0.05)
+    gc.collect()
+    await asyncio.sleep(0.05)
+
+    assert reports == []
+
+
+@pytest.mark.parametrize(
+    ("error", "still_served"),
+    [
+        pytest.param(getattr(socket, "EAI_NODATA", socket.EAI_NONAME), False, id="no-address"),
+        pytest.param(socket.EAI_AGAIN, True, id="temporary-failure"),
+    ],
+)
+def test_only_a_definitive_answer_drops_a_remembered_host(
+    monkeypatch: pytest.MonkeyPatch, error: int, still_served: bool
+) -> None:
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setattr(upstream_guard, "_REFRESH_AFTER_S", 0.0)
+    _answers(
+        monkeypatch,
+        "gw.example",
+        ["20.10.10.10", socket.gaierror(error, "refresh"), socket.gaierror(error, "lookup")],
+    )
+    assert is_safe_upstream_url("https://gw.example/v1") is True
+    _drain()
+    assert is_safe_upstream_url("https://gw.example/v1") is True  # served; refresh runs
+    _drain()
+
+    assert is_safe_upstream_url("https://gw.example/v1") is still_served
+
+
+def test_a_destination_left_to_the_outbound_proxy_is_never_answered_from_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The proxy resolves it by name, so only this request's own answer may admit it."""
+    monkeypatch.setenv("HEADROOM_PROXIED_BASE_URLS", "gw.example")
+    _answers(monkeypatch, "gw.example", ["20.10.10.10", "10.0.0.5"])
+    assert is_safe_upstream_url("https://gw.example/v1") is True
+    _drain()
+
+    assert is_safe_upstream_url("https://gw.example/v1") is False
+
+
+def test_a_network_at_its_quota_replaces_its_own_oldest_name(
+    slow_zone: _SlowZone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy import upstream_guard
+
+    monkeypatch.setattr(upstream_guard, "_REMEMBER_MAX_PER_CLIENT", 2)
+    _remember_names(_LEGIT, ["old.legit.example", "mid.legit.example", "new.legit.example"])
+    slow_zone.calls.clear()
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.05")
+
+    assert is_safe_upstream_url("https://new.legit.example/v1") is True
+    assert is_safe_upstream_url("https://mid.legit.example/v1") is True
+    assert slow_zone.calls == [], "remembered names should be answered without a lookup"
+    is_safe_upstream_url("https://old.legit.example/v1")
+    assert slow_zone.calls == ["old.legit.example"]
+
+
+_IDN_SPELLINGS = ("faß.example", "xn--fa-hia.example")
+
+
+@pytest.mark.parametrize("listed", _IDN_SPELLINGS)
+@pytest.mark.parametrize("requested", _IDN_SPELLINGS)
+async def test_guard_and_transport_agree_on_every_spelling_of_a_proxied_idn(
+    monkeypatch: pytest.MonkeyPatch, listed: str, requested: str
+) -> None:
+    """A name forwarded by the proxy is never answered from memory, in any spelling."""
+    from headroom.proxy.upstream_pinning import GuardedUpstreamRefusingTransport
+
+    monkeypatch.setenv("HEADROOM_PROXIED_BASE_URLS", listed)
+    _answers(monkeypatch, "xn--fa-hia.example", ["20.10.10.10", "10.0.0.5"])
+    url = f"https://{requested}/v1"
+    assert is_safe_upstream_url(url) is True
+
+    # The transport lets the guarded request leave through the proxy by name ...
+    forwarded: list[str] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        forwarded.append(str(request.url))
+        return httpx.Response(200)
+
+    transport = GuardedUpstreamRefusingTransport(
+        httpx.MockTransport(upstream), "proxy route", via_proxy=True
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        assert (await client.get(url)).status_code == 200
+    assert forwarded == ["https://xn--fa-hia.example/v1"]
+
+    # ... so the guard must look the name up again rather than reuse its answer.
+    _drain()
+    assert is_safe_upstream_url(url) is False
+
+
+@pytest.mark.parametrize("env", ["HEADROOM_PROXIED_BASE_URLS", "HEADROOM_ALLOWED_BASE_URLS"])
+def test_a_malformed_destination_entry_is_skipped_not_fatal(
+    monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    from headroom.proxy.upstream_guard import allowlisted_destinations, destination_listed
+
+    _answers(monkeypatch, "public.example", ["20.10.10.10"])
+    monkeypatch.setenv(env, "[::1, gw.example")
+
+    allow = allowlisted_destinations(env)
+    assert allow is not None and destination_listed(allow, "https", "gw.example", None)
+    if env == "HEADROOM_PROXIED_BASE_URLS":
+        assert is_safe_upstream_url("https://public.example/v1") is True
+
+
+class _Records(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@pytest.mark.parametrize("env", ["HEADROOM_ALLOWED_BASE_URLS", "HEADROOM_PROXIED_BASE_URLS"])
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        ("https://demo:dummy-password@gateway.example:bad", "not a valid host, port or URL"),
+        ("ftp://demo:dummy-password@gateway.example", "unsupported scheme"),
+    ],
+)
+def test_a_rejected_destination_entry_is_logged_without_its_text(
+    monkeypatch: pytest.MonkeyPatch, env: str, entry: str, reason: str
+) -> None:
+    """Entries can carry credentials; the warning names the setting and position only."""
+    from headroom.proxy import upstream_guard
+
+    # Attached to the module's own logger: caplog misses `headroom.*` records
+    # once the proxy's logging setup has run elsewhere in the session.
+    records = _Records()
+    upstream_guard.logger.addHandler(records)
+    previous_level = upstream_guard.logger.level
+    upstream_guard.logger.setLevel(logging.WARNING)
+    try:
+        monkeypatch.setenv(env, f"{entry}, backup.example")
+        upstream_guard._parse_destinations.cache_clear()  # parse, and log, now
+        allow = upstream_guard.allowlisted_destinations(env)
+    finally:
+        upstream_guard.logger.removeHandler(records)
+        upstream_guard.logger.setLevel(previous_level)
+
+    assert allow is not None
+    assert upstream_guard.destination_listed(allow, "https", "backup.example", None)
+    assert any(f"{env} entry 1: {reason}" in message for message in records.messages)
+    assert not any("dummy-password" in m or "demo:" in m for m in records.messages)
+
+
+@pytest.mark.parametrize("listed", _IDN_SPELLINGS)
+@pytest.mark.parametrize("requested", _IDN_SPELLINGS)
+def test_the_allowlist_matches_every_spelling_of_an_idn(
+    monkeypatch: pytest.MonkeyPatch, listed: str, requested: str
+) -> None:
+    def no_lookup(*args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("allowlist mode must not resolve")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_lookup)
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", listed)
+
+    assert is_safe_upstream_url(f"https://{requested}/v1") is True

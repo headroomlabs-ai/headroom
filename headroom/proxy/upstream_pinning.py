@@ -82,22 +82,9 @@ import httpcore
 import httpx
 
 from headroom.proxy.upstream_guard import (
-    allowlisted_destinations,
-    destination_listed,
     guarded_pin,
+    proxied_destination_listed,
 )
-
-PROXIED_BASE_URLS_ENV = "HEADROOM_PROXIED_BASE_URLS"
-
-
-def proxied_upstream_listed(url: httpx.URL) -> bool:
-    """Whether the operator listed ``url``'s destination in HEADROOM_PROXIED_BASE_URLS.
-
-    Read per request, like the guard's own allowlist, so a test or an operator
-    changing the environment does not need a new client.
-    """
-    allow = allowlisted_destinations(PROXIED_BASE_URLS_ENV)
-    return allow is not None and destination_listed(allow, url.scheme, url.host, url.port)
 
 
 class UnpinnableUpstreamError(RuntimeError):
@@ -220,7 +207,7 @@ class GuardedUpstreamRefusingTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
         if guarded_pin(host) is not None and not (
-            self._via_proxy and proxied_upstream_listed(request.url)
+            self._via_proxy and proxied_destination_listed(str(request.url))
         ):
             raise _refusal(host, self._reason)
         return await self._inner.handle_async_request(request)
