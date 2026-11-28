@@ -114,6 +114,24 @@ These are **two different variables** with different semantics, both retained fo
 
 The official Docker bootstrap (compose file, `scripts/install.sh`, and the Python `install` command) sets `HEADROOM_WORKSPACE_DIR` and `HEADROOM_CONFIG_DIR` inside the container so the proxy resolves state to the bind-mounted path without any user action.
 
+### Containers and shared volumes
+
+The CCR retrieval store (`${WORKSPACE_DIR}/ccr_store.db`, `HEADROOM_CCR_SQLITE_PATH`) and the
+compression result cache (`${WORKSPACE_DIR}/compression_cache.db`,
+`HEADROOM_COMPRESSION_CACHE_PATH`) are SQLite files in WAL mode, which needs a local filesystem.
+Keep both on local disk (for example a path under `/tmp` or an `emptyDir` volume) even when the
+rest of `HEADROOM_WORKSPACE_DIR` sits on a network volume (NFS, SMB, Azure Files): on a network
+volume, and especially during a rolling deploy where the new replica starts while the old one
+still holds the files, opening them fails with `database is locked` or `locking protocol`.
+Headroom then runs without the file and retries the open with backoff, but nothing is persisted
+until it succeeds.
+
+On ephemeral local disk you lose only what a restart already costs: CCR originals stored before
+the restart (a `headroom_retrieve` for an older marker misses) and cached compression results
+(they are recomputed). Replicas on different hosts cannot share these files safely anyway (WAL
+shares memory between processes on one host); use `HEADROOM_CCR_BACKEND=redis` for a CCR store
+shared across replicas.
+
 ## Project-scoped `.headroom/` directories
 
 A few code paths deliberately use **project-local** `.headroom/` paths resolved relative to the current working directory rather than the canonical workspace root:

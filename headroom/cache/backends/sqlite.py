@@ -63,6 +63,12 @@ _MAX_REPORTED_UNREADABLE = 1000
 # hammering a still-broken path on every call.
 _REOPEN_BACKOFF_INITIAL = 1.0
 _REOPEN_BACKOFF_MAX = 60.0
+#: How long an operation waits on another writer's lock (``busy_timeout``).
+_BUSY_TIMEOUT_MS = 5000
+#: The same wait for a reopen. It runs inline in whatever read or write found
+#: the retry due, possibly on the event loop, so it gives up quickly and the
+#: store stays down until the next attempt instead of stalling the caller.
+_REOPEN_BUSY_TIMEOUT_MS = 250
 
 
 class StoreUnavailableError(sqlite3.OperationalError):
@@ -71,6 +77,14 @@ class StoreUnavailableError(sqlite3.OperationalError):
     Subclasses ``sqlite3.OperationalError`` so every existing
     ``except sqlite3.DatabaseError`` path degrades it to a miss.
     """
+
+
+def is_lock_error(error: BaseException) -> bool:
+    """``database is locked`` (SQLITE_BUSY/LOCKED) or ``locking protocol``
+    (SQLITE_PROTOCOL): another process holds the file. Transient, unlike a
+    permission or path error, so opening it again later can succeed."""
+    msg = str(error).lower()
+    return "locked" in msg or "locking protocol" in msg
 
 
 def default_db_path() -> Path:
@@ -106,9 +120,26 @@ class SQLiteBackend:
         self._unreadable_warned = WarnOnce(
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
-        self._conn: sqlite3.Connection | None = self._open()
         self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
         self._next_reopen_at = 0.0
+        self._conn: sqlite3.Connection | None = None
+        try:
+            self._conn = self._open()
+        except sqlite3.OperationalError as e:
+            if not is_lock_error(e):
+                raise
+            # Another process holds the file (typically the previous revision
+            # during a rolling deploy). Start down and let ``_connection()``
+            # retry with backoff instead of giving up on disk for the life of
+            # the process; writes report False meanwhile, so producers keep
+            # their originals.
+            logger.warning(
+                "CCR SQLite store %s is locked by another process (%s); starting "
+                "without it and retrying the open with backoff.",
+                self._path,
+                e,
+            )
+            self._schedule_reopen(time.monotonic())
 
     @staticmethod
     def _ensure_private(path: Path) -> None:
@@ -124,25 +155,32 @@ class SQLiteBackend:
         """
         ensure_private_file(path, what="CCR store")
 
-    def _open(self) -> sqlite3.Connection:
+    def _open(self, busy_timeout_ms: int = _BUSY_TIMEOUT_MS) -> sqlite3.Connection:
         self._ensure_private(self._path)
         conn = sqlite3.connect(self._path, check_same_thread=False)
-        # Wait for competing writers instead of failing with SQLITE_BUSY —
-        # multiple proxy workers share this file, and writes are frequent
-        # but tiny, so contention resolves in milliseconds.
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.executescript(_SCHEMA)
-        # Startup hygiene: expired rows are only purged opportunistically
-        # on writes, so a quiet store could otherwise hold expired
-        # originals (which may contain sensitive tool output) on disk
-        # indefinitely. Sweep them on every open.
-        conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (time.time(),),
-        )
-        conn.commit()
+        try:
+            # Wait for competing writers instead of failing with SQLITE_BUSY —
+            # multiple proxy workers share this file, and writes are frequent
+            # but tiny, so contention resolves in milliseconds.
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(_SCHEMA)
+            # Startup hygiene: expired rows are only purged opportunistically
+            # on writes, so a quiet store could otherwise hold expired
+            # originals (which may contain sensitive tool output) on disk
+            # indefinitely. Sweep them on every open.
+            conn.execute(
+                "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
+                (time.time(),),
+            )
+            conn.commit()
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        except BaseException:
+            # Close a half-set-up handle now, not at GC: a locked store is
+            # retried with backoff, and each failed open would leak one.
+            conn.close()
+            raise
         # Originals can contain sensitive tool output (file contents,
         # command output) — keep the database private to the user.
         for suffix in ("", "-wal", "-shm"):
@@ -167,9 +205,18 @@ class SQLiteBackend:
         if now < self._next_reopen_at:
             raise StoreUnavailableError(f"CCR SQLite store {self._path} is unavailable")
         try:
-            self._conn = self._open()
+            self._conn = self._open(_REOPEN_BUSY_TIMEOUT_MS)
         except Exception as e:  # noqa: BLE001 - any open failure keeps the store down
-            self._schedule_reopen(now)
+            delay = self._reopen_backoff
+            # From when the open gave up, not when it started: it can wait out
+            # busy_timeout first, which would leave a deadline already past.
+            self._schedule_reopen(time.monotonic())
+            logger.warning(
+                "CCR SQLite store %s reopen failed (%s); next attempt in %.0fs.",
+                self._path,
+                e,
+                delay,
+            )
             raise StoreUnavailableError(f"CCR SQLite store {self._path} reopen failed: {e}") from e
         self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
         self._next_reopen_at = 0.0

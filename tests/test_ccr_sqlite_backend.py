@@ -522,7 +522,7 @@ class TestMultiWorkerSafety:
         clock = [1000.0]
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
 
-        def broken_open():
+        def broken_open(*_args):
             raise sqlite3.OperationalError("unable to open database file")
 
         monkeypatch.setattr(b, "_open", broken_open)
@@ -555,7 +555,7 @@ class TestMultiWorkerSafety:
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
         attempts = []
 
-        def broken_open():
+        def broken_open(*_args):
             attempts.append(clock[0])
             raise sqlite3.OperationalError("unable to open database file")
 
@@ -588,7 +588,7 @@ class TestMultiWorkerSafety:
         clock = [1000.0]
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
 
-        def broken_open():
+        def broken_open(*_args):
             raise sqlite3.OperationalError("unable to open database file")
 
         monkeypatch.setattr(b, "_open", broken_open)
@@ -750,7 +750,7 @@ class TestProducerDuringOutage:
         clock = [1000.0]
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
 
-        def broken_open():
+        def broken_open(*_args):
             raise sqlite3.OperationalError("unable to open database file")
 
         monkeypatch.setattr(backend, "_open", broken_open)
@@ -822,3 +822,145 @@ class TestProducerDuringOutage:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestLockedAtStartup:
+    """Another process (the previous revision in a rolling deploy) holds the
+    file when the backend is built: it starts down and retries the open with
+    backoff, instead of the factory falling back to memory for good."""
+
+    @pytest.fixture
+    def locked(self, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        clock = [1000.0]
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+        real_open = SQLiteBackend._open
+        state = {"failures_left": 0, "calls": 0, "open_seconds": 0}
+
+        def flaky_open(self, *args):
+            state["calls"] += 1
+            if state["failures_left"]:
+                state["failures_left"] -= 1
+                clock[0] += state["open_seconds"]  # waited on busy_timeout
+                raise sqlite3.OperationalError("database is locked")
+            return real_open(self, *args)
+
+        monkeypatch.setattr(SQLiteBackend, "_open", flaky_open)
+        return clock, state
+
+    def test_open_succeeds_after_lock_is_released(self, db_path, locked):
+        clock, state = locked
+        state["failures_left"] = 3
+        backend = SQLiteBackend(db_path)
+        # Down: writes refused (the producer keeps the original), reads miss.
+        assert backend.set("h1", make_entry()) is False
+        assert backend.get("h1") is None
+        # Retries happen only when due (1s, 2s, ...): no busy loop.
+        calls = state["calls"]
+        for _ in range(50):
+            backend.get("h1")
+        assert state["calls"] == calls
+        for _ in range(3):
+            clock[0] += 60
+            backend.get("h1")
+        assert backend.set("h1", make_entry()) is True
+        assert backend.get("h1") is not None
+        assert state["calls"] == 4
+
+    def test_backoff_is_bounded_while_lock_is_held(self, db_path, locked):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        clock, state = locked
+        state["failures_left"] = 10**6
+        backend = SQLiteBackend(db_path)
+        start = state["calls"]
+        # Ten minutes of traffic, one op per second: attempts follow the
+        # doubling backoff capped at _REOPEN_BACKOFF_MAX, not one per op.
+        for _ in range(600):
+            clock[0] += 1
+            assert backend.set("h1", make_entry()) is False
+        attempts = state["calls"] - start
+        assert 600 / sqlite_mod._REOPEN_BACKOFF_MAX <= attempts <= 20
+
+    def test_backoff_runs_from_the_end_of_a_slow_open(self, db_path, locked):
+        clock, state = locked
+        state["failures_left"] = 10**6
+        backend = SQLiteBackend(db_path)  # first retry due in 1s
+        state["open_seconds"] = 5  # each retry waits out busy_timeout
+        clock[0] += 1
+        backend.get("h1")  # fails 5s later; the next one is due 2s after that
+        calls = state["calls"]
+        clock[0] += 1
+        backend.get("h1")
+        assert state["calls"] == calls
+        clock[0] += 1
+        backend.get("h1")
+        assert state["calls"] == calls + 1
+
+    def test_retry_gives_up_fast_on_a_held_write_lock(self, db_path):
+        # A real lock: the retry runs inline in a read or write, so it must not
+        # wait out the full busy_timeout (5s) the way ordinary operations do.
+        backend = SQLiteBackend(db_path)
+        backend._conn.close()
+        backend._conn = None  # down, with a retry due now
+        holder = sqlite3.connect(db_path, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            start = time.monotonic()
+            assert backend.get("h1") is None
+            assert backend.set("h1", make_entry()) is False
+            assert time.monotonic() - start < 2
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        backend._next_reopen_at = 0.0
+        assert backend.set("h1", make_entry()) is True
+        # The short wait covers the reopen only; operations wait as before.
+        assert backend._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+    def test_non_lock_error_still_raises(self, db_path, monkeypatch):
+        def broken_open(self):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(SQLiteBackend, "_open", broken_open)
+        with pytest.raises(sqlite3.OperationalError):
+            SQLiteBackend(db_path)
+
+    def test_factory_keeps_sqlite_backend_when_locked(self, db_path, locked, monkeypatch):
+        from headroom.cache.compression_store import _create_default_ccr_backend
+
+        _, state = locked
+        state["failures_left"] = 1
+        monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.delenv("HEADROOM_COMPRESS_SESSION_STORE", raising=False)
+        monkeypatch.setenv("HEADROOM_CCR_SQLITE_PATH", str(db_path))
+        assert isinstance(_create_default_ccr_backend(), SQLiteBackend)
+
+    def test_failed_open_closes_its_connection(self, db_path, monkeypatch):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        class LockedConnection(sqlite3.Connection):
+            closed = False
+
+            def execute(self, sql, *args):
+                if sql.startswith("PRAGMA journal_mode"):
+                    raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *args)
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        opened = []
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            conn = real_connect(*args, factory=LockedConnection, **kwargs)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(sqlite_mod.sqlite3, "connect", connect)
+        SQLiteBackend(db_path)
+        assert len(opened) == 1
+        assert opened[0].closed

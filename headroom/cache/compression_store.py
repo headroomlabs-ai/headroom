@@ -292,6 +292,11 @@ class CompressionStore:
         self._own_totals = [0, 0, 0]
         self._backend_revision = self._read_backend_revision()
         self._write_seq: int = 0
+        # Imported entries the backend refused (a store that is down, e.g. a
+        # SQLite file another process holds): served from here and written back
+        # once the backend accepts writes again. Dict ops are atomic under the GIL.
+        self._deferred: dict[str, CompressionEntry] = {}
+        self._deferred_retry = threading.Lock()
 
     @property
     def write_seq(self) -> int:
@@ -437,6 +442,7 @@ class CompressionStore:
         # This ensures feedback from entries about to be evicted is captured.
         if self._enable_feedback:
             self.process_pending_feedback()
+        self._retry_deferred()
 
         with self._lock:
             # Decide whether this is a NEW key before evicting. Evicting to make
@@ -509,8 +515,9 @@ class CompressionStore:
         Returns:
             CompressionEntry if found and not expired, None otherwise.
         """
+        self._retry_deferred()
         with self._lock:
-            entry = self._backend.get(hash_key)
+            entry = self._lookup(hash_key)
 
             if entry is None:
                 return None
@@ -578,8 +585,9 @@ class CompressionStore:
         Returns:
             Dict with metadata if found and not expired, None otherwise.
         """
+        self._retry_deferred()
         with self._lock:
-            entry = self._backend.get(hash_key)
+            entry = self._lookup(hash_key)
 
             if entry is None:
                 return None
@@ -645,8 +653,9 @@ class CompressionStore:
         Returns:
             True if the entry exists and is not expired.
         """
+        self._retry_deferred()
         with self._lock:
-            entry = self._backend.get(hash_key)
+            entry = self._lookup(hash_key)
             if entry is None:
                 return False
             if entry.is_expired():
@@ -667,8 +676,9 @@ class CompressionStore:
     ) -> dict[str, Any]:
         """Return availability and TTL metadata for a stored entry."""
         now = time.time()
+        self._retry_deferred()
         with self._lock:
-            entry = self._backend.get(hash_key)
+            entry = self._lookup(hash_key)
             if entry is None:
                 return {
                     "hash": hash_key,
@@ -804,6 +814,24 @@ class CompressionStore:
 
         return list(reversed(events_copy[-limit:]))
 
+    def _lookup(self, hash_key: str) -> CompressionEntry | None:
+        """The backend's entry, else one :meth:`import_entries` is holding back."""
+        entry = self._backend.get(hash_key)
+        return entry if entry is not None else self._deferred.get(hash_key)
+
+    def _retry_deferred(self) -> None:
+        """Offer the held-back entries to the backend again; keep those it refuses."""
+        if not self._deferred or not self._deferred_retry.acquire(blocking=False):
+            return  # nothing held, or another thread is already retrying
+        try:
+            held = list(self._deferred.values())
+            self._deferred.clear()
+            self.import_entries(held)
+        except Exception:  # a retry must never break the read or write that triggered it
+            logger.debug("CCR deferred entries retry failed", exc_info=True)
+        finally:
+            self._deferred_retry.release()
+
     def export_entries(self, hashes: list[str]) -> list[dict[str, Any]]:
         """The live entries for ``hashes`` as JSON-safe dicts, without counting
         a retrieval. ``SessionTrackerStore.save_state`` carries them across a
@@ -816,7 +844,10 @@ class CompressionStore:
         """Re-store :meth:`export_entries` output, each with its original expiry.
 
         An entry the backend still holds (a persistent backend kept it) is left
-        as it is. Raises on a malformed entry. Returns the entries stored.
+        as it is. One it refuses (:class:`StorageError`, a store that is down) is
+        held in memory, served from there, and written once the backend accepts
+        writes again; it is not counted as stored. Raises on a malformed entry.
+        Returns the entries stored.
         """
         now = time.time()
         stored = 0
@@ -826,23 +857,28 @@ class CompressionStore:
             ):
                 raise ValueError(f"malformed CCR entry {e.hash!r}")
             ttl = int(e.created_at + e.ttl - now)
-            if ttl <= 0 or self.exists(e.hash):
+            held = self._backend.get(e.hash)
+            if ttl <= 0 or (held is not None and not held.is_expired()):
                 continue
-            self.store(
-                e.original_content,
-                e.compressed_content,
-                original_tokens=e.original_tokens,
-                compressed_tokens=e.compressed_tokens,
-                original_item_count=e.original_item_count,
-                compressed_item_count=e.compressed_item_count,
-                tool_name=e.tool_name,
-                tool_call_id=e.tool_call_id,
-                query_context=e.query_context,
-                tool_signature_hash=e.tool_signature_hash,
-                compression_strategy=e.compression_strategy,
-                ttl=ttl,
-                explicit_hash=e.hash,
-            )
+            try:
+                self.store(
+                    e.original_content,
+                    e.compressed_content,
+                    original_tokens=e.original_tokens,
+                    compressed_tokens=e.compressed_tokens,
+                    original_item_count=e.original_item_count,
+                    compressed_item_count=e.compressed_item_count,
+                    tool_name=e.tool_name,
+                    tool_call_id=e.tool_call_id,
+                    query_context=e.query_context,
+                    tool_signature_hash=e.tool_signature_hash,
+                    compression_strategy=e.compression_strategy,
+                    ttl=ttl,
+                    explicit_hash=e.hash,
+                )
+            except StorageError:
+                self._deferred[e.hash] = e
+                continue
             stored += 1
         return stored
 
