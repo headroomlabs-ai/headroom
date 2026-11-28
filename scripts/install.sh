@@ -371,6 +371,10 @@ write_persistent_state() {
   local proxy_mode="$7"
   local memory_enabled="$8"
   local telemetry_enabled="$9"
+  local learn_enabled="${10}"
+  local memory_storage="${11}"
+  local min_evidence="${12}"
+  local project_root="${13}"
 
   local root
   root="$(persistent_profile_root "${profile}")"
@@ -385,6 +389,10 @@ write_persistent_state() {
     printf 'REGION=%s\n' "${region}"
     printf 'PROXY_MODE=%s\n' "${proxy_mode}"
     printf 'MEMORY_ENABLED=%s\n' "${memory_enabled}"
+    printf 'LEARN_ENABLED=%s\n' "${learn_enabled}"
+    printf 'MEMORY_STORAGE=%s\n' "${memory_storage}"
+    printf 'MIN_EVIDENCE=%s\n' "${min_evidence}"
+    printf 'MEMORY_PROJECT_ROOT=%s\n' "${project_root}"
     printf 'TELEMETRY_ENABLED=%s\n' "${telemetry_enabled}"
     printf 'CONTAINER_NAME=%s\n' "$(persistent_container_name "${profile}")"
     printf 'HEALTH_URL=%s\n' "http://127.0.0.1:${port}/readyz"
@@ -402,12 +410,17 @@ write_persistent_manifest() {
   local memory_enabled="$8"
   local telemetry_enabled="$9"
   local -n proxy_args_ref=${10}
+  local learn_enabled="${11}"
+  local memory_storage="${12}"
+  local min_evidence="${13}"
+  local project_root="${14}"
 
   local root
   local manifest_path
   local anyllm_json="null"
   local region_json="null"
   local memory_json="false"
+  local learn_json="null"
   local telemetry_json="true"
 
   root="$(persistent_profile_root "${profile}")"
@@ -423,6 +436,10 @@ write_persistent_manifest() {
   if [[ "${memory_enabled}" -eq 1 ]]; then
     memory_json="true"
   fi
+  case "${learn_enabled}" in
+    1) learn_json="true" ;;
+    0) learn_json="false" ;;
+  esac
   if [[ "${telemetry_enabled}" -eq 0 ]]; then
     telemetry_json="false"
   fi
@@ -443,6 +460,10 @@ write_persistent_manifest() {
   "region": ${region_json},
   "proxy_mode": "$(json_escape "${proxy_mode}")",
   "memory_enabled": ${memory_json},
+  "learn_enabled": ${learn_json},
+  "memory_storage_mode": "${memory_storage:-project}",
+  "traffic_learning_min_evidence": ${min_evidence:-null},
+  "memory_project_root": "$(json_escape "${project_root}")",
   "memory_db_path": "$(json_escape "${HEADROOM_CONTAINER_HOME}/.headroom/memory.db")",
   "telemetry_enabled": ${telemetry_json},
   "image": "$(json_escape "${image}")",
@@ -466,6 +487,7 @@ EOF
 load_persistent_state() {
   local profile="$1"
   local state_path
+  local line key
   validate_profile_name "${profile}"
   state_path="$(persistent_state_path "${profile}")"
   [[ -f "${state_path}" ]] || die "No docker-native persistent deployment profile named '${profile}'"
@@ -477,13 +499,19 @@ load_persistent_state() {
   REGION=""
   PROXY_MODE=""
   MEMORY_ENABLED=""
+  LEARN_ENABLED=""
+  MEMORY_STORAGE=""
+  MIN_EVIDENCE=""
+  MEMORY_PROJECT_ROOT=""
   TELEMETRY_ENABLED=""
   CONTAINER_NAME=""
   HEALTH_URL=""
-  while IFS='=' read -r key value; do
+  while IFS= read -r line; do
+    [[ "${line}" == *=* ]] || continue
+    key="${line%%=*}"
     case "${key}" in
-      PROFILE|IMAGE|PORT|BACKEND|ANYLLM_PROVIDER|REGION|PROXY_MODE|MEMORY_ENABLED|TELEMETRY_ENABLED|CONTAINER_NAME|HEALTH_URL)
-        printf -v "${key}" '%s' "${value}"
+      PROFILE|IMAGE|PORT|BACKEND|ANYLLM_PROVIDER|REGION|PROXY_MODE|MEMORY_ENABLED|LEARN_ENABLED|MEMORY_STORAGE|MIN_EVIDENCE|MEMORY_PROJECT_ROOT|TELEMETRY_ENABLED|CONTAINER_NAME|HEALTH_URL)
+        printf -v "${key}" '%s' "${line#*=}"
         ;;
     esac
   done <"${state_path}"
@@ -499,6 +527,10 @@ start_persistent_docker_install() {
   local proxy_mode="$7"
   local memory_enabled="$8"
   local telemetry_enabled="$9"
+  local learn_enabled="${10}"
+  local memory_storage="${11}"
+  local min_evidence="${12}"
+  local project_root="${13}"
 
   local container_name
   local proxy_args=()
@@ -507,6 +539,19 @@ start_persistent_docker_install() {
   validate_profile_name "${profile}"
   container_name="$(persistent_container_name "${profile}")"
   build_manifest_proxy_args proxy_args "${port}" "${proxy_mode}" "${backend}" "${anyllm}" "${region}" "${memory_enabled}" "${telemetry_enabled}"
+  case "${learn_enabled}" in
+    1) proxy_args+=(--learn) ;;
+    0) proxy_args+=(--no-learn) ;;
+  esac
+  if [[ -n "${memory_storage}" ]]; then
+    proxy_args+=(--memory-storage "${memory_storage}")
+  fi
+  if [[ -n "${min_evidence}" ]]; then
+    proxy_args+=(--min-evidence "${min_evidence}")
+  fi
+  if [[ -n "${project_root}" ]]; then
+    proxy_args+=(--memory-project-root "${project_root}")
+  fi
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
@@ -529,8 +574,8 @@ start_persistent_docker_install() {
     die "Headroom persistent Docker deployment failed to start on port ${port}"
   fi
 
-  write_persistent_state "${profile}" "${image}" "${port}" "${backend}" "${anyllm}" "${region}" "${proxy_mode}" "${memory_enabled}" "${telemetry_enabled}"
-  write_persistent_manifest "${profile}" "${image}" "${port}" "${backend}" "${anyllm}" "${region}" "${proxy_mode}" "${memory_enabled}" "${telemetry_enabled}" proxy_args
+  write_persistent_state "${profile}" "${image}" "${port}" "${backend}" "${anyllm}" "${region}" "${proxy_mode}" "${memory_enabled}" "${telemetry_enabled}" "${learn_enabled}" "${memory_storage}" "${min_evidence}" "${project_root}"
+  write_persistent_manifest "${profile}" "${image}" "${port}" "${backend}" "${anyllm}" "${region}" "${proxy_mode}" "${memory_enabled}" "${telemetry_enabled}" proxy_args "${learn_enabled}" "${memory_storage}" "${min_evidence}" "${project_root}"
 }
 
 stop_persistent_docker_install() {
@@ -620,6 +665,11 @@ Options:
   --region TEXT                 Cloud region for Bedrock / Vertex style backends.
   --mode TEXT                   Proxy optimization mode.  [default: token]
   --memory                      Enable persistent memory in the runtime.
+  --learn / --no-learn          Enable or disable traffic learning. --learn implies --memory.
+                                Project-scoped Codex turns skip learning.
+  --memory-storage MODE         Memory storage mode: project, user, or global.
+  --min-evidence INTEGER        Minimum observations before a pattern is saved.
+  --memory-project-root PATH    Override the project root for project memory.
   --no-telemetry                Disable anonymous telemetry in the runtime.
   --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/headroomlabs-ai/headroom:latest]
   -?, --help                    Show this message and exit.
@@ -656,7 +706,11 @@ parse_install_apply_args() {
   local -n out_memory=$7
   local -n out_telemetry=$8
   local -n out_image=$9
-  shift 9
+  local -n out_learn=${10}
+  local -n out_memory_storage=${11}
+  local -n out_min_evidence=${12}
+  local -n out_project_root=${13}
+  shift 13
 
   out_profile="default"
   out_port=8787
@@ -665,6 +719,10 @@ parse_install_apply_args() {
   out_region=""
   out_mode="token"
   out_memory=0
+  out_learn=""
+  out_memory_storage=""
+  out_min_evidence=""
+  out_project_root=""
   out_telemetry=1
   out_image="${HEADROOM_IMAGE}"
 
@@ -752,6 +810,52 @@ parse_install_apply_args() {
         out_memory=1
         shift
         ;;
+      --learn)
+        out_learn=1
+        shift
+        ;;
+      --no-learn)
+        out_learn=0
+        shift
+        ;;
+      --memory-storage|--memory-storage=*)
+        if [[ "$1" == --memory-storage ]]; then
+          require_option_value "$@"
+          out_memory_storage="$2"
+          shift 2
+        else
+          out_memory_storage="${1#*=}"
+          shift
+        fi
+        out_memory_storage="${out_memory_storage,,}"
+        case "${out_memory_storage}" in
+          project|user|global) ;;
+          *) die "Invalid memory storage '${out_memory_storage}'" ;;
+        esac
+        ;;
+      --min-evidence|--min-evidence=*)
+        if [[ "$1" == --min-evidence ]]; then
+          require_option_value "$@"
+          out_min_evidence="$2"
+          shift 2
+        else
+          out_min_evidence="${1#*=}"
+          shift
+        fi
+        validate_positive_integer "${out_min_evidence}"
+        # JSON numbers cannot begin with a leading zero.
+        out_min_evidence="${out_min_evidence#"${out_min_evidence%%[!0]*}"}"
+        ;;
+      --memory-project-root|--memory-project-root=*)
+        if [[ "$1" == --memory-project-root ]]; then
+          require_option_value "$@"
+          out_project_root="$2"
+          shift 2
+        else
+          out_project_root="${1#*=}"
+          shift
+        fi
+        ;;
       --no-telemetry)
         out_telemetry=0
         shift
@@ -776,6 +880,23 @@ parse_install_apply_args() {
   done
 
   validate_port "${out_port}"
+  if [[ "${out_learn}" == 1 ]]; then
+    out_memory=1
+  fi
+  case "${out_project_root}" in
+    '~'|'~/'*) out_project_root="${HEADROOM_HOST_HOME}${out_project_root:1}" ;;
+  esac
+  if [[ -n "${out_project_root}" && "${out_project_root}" != /* ]]; then
+    local absolute_root
+    if [[ -d "${out_project_root}" ]]; then
+      absolute_root="$(cd -P -- "./${out_project_root}" && printf '%s/' "${PWD}")"
+      out_project_root="${absolute_root%/}"
+    else
+      absolute_root="$(cd -P . && printf '%s/' "${PWD%/}")"
+      out_project_root="${absolute_root}${out_project_root}"
+    fi
+  fi
+  [[ "${out_project_root}" != *[[:cntrl:]]* ]] || die "Invalid memory project root: control characters are not supported"
 }
 
 parse_install_profile_arg() {
@@ -1405,8 +1526,9 @@ main() {
       case "${install_command}" in
         apply)
           local profile port backend anyllm region proxy_mode memory_enabled telemetry_enabled image
-          parse_install_apply_args profile port backend anyllm region proxy_mode memory_enabled telemetry_enabled image "$@"
-          start_persistent_docker_install "${profile}" "${image}" "${port}" "${backend}" "${anyllm}" "${region}" "${proxy_mode}" "${memory_enabled}" "${telemetry_enabled}"
+          local learn_enabled memory_storage min_evidence project_root
+          parse_install_apply_args profile port backend anyllm region proxy_mode memory_enabled telemetry_enabled image learn_enabled memory_storage min_evidence project_root "$@"
+          start_persistent_docker_install "${profile}" "${image}" "${port}" "${backend}" "${anyllm}" "${region}" "${proxy_mode}" "${memory_enabled}" "${telemetry_enabled}" "${learn_enabled}" "${memory_storage}" "${min_evidence}" "${project_root}"
           printf "Installed docker-native persistent deployment '%s' on port %s.\n" "${profile}" "${port}"
           ;;
         status)
@@ -1418,7 +1540,7 @@ main() {
           local profile
           parse_install_profile_arg profile "$@"
           load_persistent_state "${profile}"
-          start_persistent_docker_install "${PROFILE}" "${IMAGE}" "${PORT}" "${BACKEND}" "${ANYLLM_PROVIDER}" "${REGION}" "${PROXY_MODE}" "${MEMORY_ENABLED}" "${TELEMETRY_ENABLED}"
+          start_persistent_docker_install "${PROFILE}" "${IMAGE}" "${PORT}" "${BACKEND}" "${ANYLLM_PROVIDER}" "${REGION}" "${PROXY_MODE}" "${MEMORY_ENABLED}" "${TELEMETRY_ENABLED}" "${LEARN_ENABLED}" "${MEMORY_STORAGE}" "${MIN_EVIDENCE}" "${MEMORY_PROJECT_ROOT}"
           printf "Started docker-native persistent deployment '%s'.\n" "${profile}"
           ;;
         stop)
@@ -1431,7 +1553,7 @@ main() {
           local profile
           parse_install_profile_arg profile "$@"
           load_persistent_state "${profile}"
-          start_persistent_docker_install "${PROFILE}" "${IMAGE}" "${PORT}" "${BACKEND}" "${ANYLLM_PROVIDER}" "${REGION}" "${PROXY_MODE}" "${MEMORY_ENABLED}" "${TELEMETRY_ENABLED}"
+          start_persistent_docker_install "${PROFILE}" "${IMAGE}" "${PORT}" "${BACKEND}" "${ANYLLM_PROVIDER}" "${REGION}" "${PROXY_MODE}" "${MEMORY_ENABLED}" "${TELEMETRY_ENABLED}" "${LEARN_ENABLED}" "${MEMORY_STORAGE}" "${MIN_EVIDENCE}" "${MEMORY_PROJECT_ROOT}"
           printf "Restarted docker-native persistent deployment '%s'.\n" "${profile}"
           ;;
         remove)

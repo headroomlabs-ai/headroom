@@ -359,7 +359,8 @@ function Write-Utf8NoBomFile {
         [string]$Content
     )
 
-    [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+    $lfContent = $Content.Replace("`r`n", "`n").Replace("`r", "`n")
+    [System.IO.File]::WriteAllText($Path, $lfContent, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Get-PersistentDockerArgs {
@@ -460,7 +461,11 @@ function Write-PersistentState {
         [string]$Region,
         [string]$Mode,
         [bool]$Memory,
-        [bool]$TelemetryEnabled
+        [bool]$TelemetryEnabled,
+        [Nullable[bool]]$LearnEnabled,
+        [string]$MemoryStorage,
+        [Nullable[int]]$MinEvidence,
+        [string]$MemoryProjectRoot
     )
 
     $root = Get-PersistentProfileRoot -Profile $Profile
@@ -474,6 +479,10 @@ function Write-PersistentState {
         region = $Region
         proxy_mode = $Mode
         memory_enabled = $Memory
+        learn_enabled = $LearnEnabled
+        memory_storage_mode = $MemoryStorage
+        traffic_learning_min_evidence = $MinEvidence
+        memory_project_root = $MemoryProjectRoot
         telemetry_enabled = $TelemetryEnabled
         container_name = Get-PersistentContainerName -Profile $Profile
         health_url = "http://127.0.0.1:$Port/readyz"
@@ -492,7 +501,11 @@ function Write-PersistentManifest {
         [string]$Mode,
         [bool]$Memory,
         [bool]$TelemetryEnabled,
-        [string[]]$ProxyArgs
+        [string[]]$ProxyArgs,
+        [Nullable[bool]]$LearnEnabled,
+        [string]$MemoryStorage,
+        [Nullable[int]]$MinEvidence,
+        [string]$MemoryProjectRoot
     )
 
     $root = Get-PersistentProfileRoot -Profile $Profile
@@ -520,6 +533,10 @@ function Write-PersistentManifest {
         region = if ($Region) { $Region } else { $null }
         proxy_mode = $Mode
         memory_enabled = $Memory
+        learn_enabled = $LearnEnabled
+        memory_storage_mode = if ($MemoryStorage) { $MemoryStorage } else { 'project' }
+        traffic_learning_min_evidence = $MinEvidence
+        memory_project_root = $MemoryProjectRoot
         memory_db_path = "$ContainerHome/.headroom/memory.db"
         telemetry_enabled = $TelemetryEnabled
         image = $Image
@@ -557,12 +574,28 @@ function Start-PersistentDockerInstall {
         [string]$Region,
         [string]$Mode,
         [bool]$Memory,
-        [bool]$TelemetryEnabled
+        [bool]$TelemetryEnabled,
+        [Nullable[bool]]$LearnEnabled,
+        [string]$MemoryStorage,
+        [Nullable[int]]$MinEvidence,
+        [string]$MemoryProjectRoot
     )
 
     Assert-ValidProfileName -Profile $Profile
     $containerName = Get-PersistentContainerName -Profile $Profile
     $proxyArgs = Get-ManifestProxyArgs -Port $Port -Backend $Backend -AnyllmProvider $AnyllmProvider -Region $Region -Mode $Mode -Memory $Memory -TelemetryEnabled $TelemetryEnabled
+    if ($null -ne $LearnEnabled) {
+        $proxyArgs += $(if ($LearnEnabled) { '--learn' } else { '--no-learn' })
+    }
+    if ($MemoryStorage) {
+        $proxyArgs += @('--memory-storage', $MemoryStorage)
+    }
+    if ($null -ne $MinEvidence) {
+        $proxyArgs += @('--min-evidence', "$MinEvidence")
+    }
+    if ($MemoryProjectRoot) {
+        $proxyArgs += @('--memory-project-root', $MemoryProjectRoot)
+    }
 
     docker rm -f $containerName | Out-Null 2>$null
 
@@ -596,8 +629,14 @@ function Start-PersistentDockerInstall {
         docker rm -f $containerName | Out-Null 2>$null
         throw
     }
-    Write-PersistentState -Profile $Profile -Image $Image -Port $Port -Backend $Backend -AnyllmProvider $AnyllmProvider -Region $Region -Mode $Mode -Memory $Memory -TelemetryEnabled $TelemetryEnabled
-    Write-PersistentManifest -Profile $Profile -Image $Image -Port $Port -Backend $Backend -AnyllmProvider $AnyllmProvider -Region $Region -Mode $Mode -Memory $Memory -TelemetryEnabled $TelemetryEnabled -ProxyArgs $proxyArgs
+    $learningOptions = @{
+        LearnEnabled = $LearnEnabled
+        MemoryStorage = $MemoryStorage
+        MinEvidence = $MinEvidence
+        MemoryProjectRoot = $MemoryProjectRoot
+    }
+    Write-PersistentState -Profile $Profile -Image $Image -Port $Port -Backend $Backend -AnyllmProvider $AnyllmProvider -Region $Region -Mode $Mode -Memory $Memory -TelemetryEnabled $TelemetryEnabled @learningOptions
+    Write-PersistentManifest -Profile $Profile -Image $Image -Port $Port -Backend $Backend -AnyllmProvider $AnyllmProvider -Region $Region -Mode $Mode -Memory $Memory -TelemetryEnabled $TelemetryEnabled -ProxyArgs $proxyArgs @learningOptions
 }
 
 function Stop-PersistentDockerInstall {
@@ -687,6 +726,11 @@ function Show-InstallApplyHelp {
         '  --region TEXT                 Cloud region for Bedrock / Vertex style backends.',
         '  --mode TEXT                   Proxy optimization mode.  [default: token]',
         '  --memory                      Enable persistent memory in the runtime.',
+        '  --learn / --no-learn          Enable or disable traffic learning. --learn implies --memory.',
+        '                                Project-scoped Codex turns skip learning.',
+        '  --memory-storage MODE         Memory storage mode: project, user, or global.',
+        '  --min-evidence INTEGER        Minimum observations before a pattern is saved.',
+        '  --memory-project-root PATH    Override the project root for project memory.',
         '  --no-telemetry                Disable anonymous telemetry in the runtime.',
         '  --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/headroomlabs-ai/headroom:latest]',
         '  -?, --help                    Show this message and exit.'
@@ -724,6 +768,10 @@ function Parse-InstallApplyArgs {
     $region = $null
     $mode = 'token'
     $memory = $false
+    $learnEnabled = $null
+    $memoryStorage = ''
+    $minEvidence = $null
+    $memoryProjectRoot = ''
     $telemetryEnabled = $true
     $image = $HeadroomImage
 
@@ -826,6 +874,36 @@ function Parse-InstallApplyArgs {
                 $i += 1
                 continue
             }
+            '^--(learn|no-learn)$' {
+                $learnEnabled = $arg -eq '--learn'
+                $i += 1
+                continue
+            }
+            '^--(memory-storage|min-evidence|memory-project-root)(=|$)' {
+                $option, $value = $arg -split '=', 2
+                if ($null -eq $value) {
+                    Require-OptionValue -Arguments $Arguments -Index $i -Option $option
+                    $value = $Arguments[$i + 1]
+                    $i += 1
+                }
+                switch ($option) {
+                    '--memory-storage' {
+                        if ($value -notin @('project', 'user', 'global')) {
+                            Fail "Invalid memory storage '$value'"
+                        }
+                        $memoryStorage = $value.ToLowerInvariant()
+                    }
+                    '--min-evidence' {
+                        if ($value -notmatch '^[0-9]+$') { Fail "Invalid value '$value'" }
+                        $minEvidence = Parse-PositiveIntegerValue -Value $value
+                    }
+                    '--memory-project-root' {
+                        $memoryProjectRoot = $value
+                    }
+                }
+                $i += 1
+                continue
+            }
             '^--no-telemetry$' {
                 $telemetryEnabled = $false
                 $i += 1
@@ -852,6 +930,14 @@ function Parse-InstallApplyArgs {
         }
     }
 
+    if ($learnEnabled) { $memory = $true }
+    if ($memoryProjectRoot) {
+        $memoryProjectRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($memoryProjectRoot)
+        if ($memoryProjectRoot -match '\p{Cc}') {
+            Fail 'Invalid memory project root: control characters are not supported'
+        }
+    }
+
     return [pscustomobject]@{
         Profile = $profile
         Port = $port
@@ -860,6 +946,10 @@ function Parse-InstallApplyArgs {
         Region = $region
         Mode = $mode
         Memory = $memory
+        LearnEnabled = $learnEnabled
+        MemoryStorage = $memoryStorage
+        MinEvidence = $minEvidence
+        MemoryProjectRoot = $memoryProjectRoot
         TelemetryEnabled = $telemetryEnabled
         Image = $image
     }
@@ -1587,7 +1677,7 @@ switch ($args[0]) {
         switch ($installCommand) {
             'apply' {
                 $parsed = Parse-InstallApplyArgs -Arguments $installArgs
-                Start-PersistentDockerInstall -Profile $parsed.Profile -Image $parsed.Image -Port $parsed.Port -Backend $parsed.Backend -AnyllmProvider $parsed.AnyllmProvider -Region $parsed.Region -Mode $parsed.Mode -Memory $parsed.Memory -TelemetryEnabled $parsed.TelemetryEnabled
+                Start-PersistentDockerInstall -Profile $parsed.Profile -Image $parsed.Image -Port $parsed.Port -Backend $parsed.Backend -AnyllmProvider $parsed.AnyllmProvider -Region $parsed.Region -Mode $parsed.Mode -Memory $parsed.Memory -TelemetryEnabled $parsed.TelemetryEnabled -LearnEnabled $parsed.LearnEnabled -MemoryStorage $parsed.MemoryStorage -MinEvidence $parsed.MinEvidence -MemoryProjectRoot $parsed.MemoryProjectRoot
                 Write-Host "Installed docker-native persistent deployment '$($parsed.Profile)' on port $($parsed.Port)."
                 exit 0
             }
@@ -1599,7 +1689,7 @@ switch ($args[0]) {
             'start' {
                 $profile = Parse-InstallProfileArgs -Arguments $installArgs
                 $state = Read-PersistentState -Profile $profile
-                Start-PersistentDockerInstall -Profile $state.profile -Image $state.image -Port $state.port -Backend $state.backend -AnyllmProvider $state.anyllm_provider -Region $state.region -Mode $state.proxy_mode -Memory ([bool]$state.memory_enabled) -TelemetryEnabled ([bool]$state.telemetry_enabled)
+                Start-PersistentDockerInstall -Profile $state.profile -Image $state.image -Port $state.port -Backend $state.backend -AnyllmProvider $state.anyllm_provider -Region $state.region -Mode $state.proxy_mode -Memory ([bool]$state.memory_enabled) -TelemetryEnabled ([bool]$state.telemetry_enabled) -LearnEnabled $state.learn_enabled -MemoryStorage $state.memory_storage_mode -MinEvidence $state.traffic_learning_min_evidence -MemoryProjectRoot $state.memory_project_root
                 Write-Host "Started docker-native persistent deployment '$profile'."
                 exit 0
             }
@@ -1612,7 +1702,7 @@ switch ($args[0]) {
             'restart' {
                 $profile = Parse-InstallProfileArgs -Arguments $installArgs
                 $state = Read-PersistentState -Profile $profile
-                Start-PersistentDockerInstall -Profile $state.profile -Image $state.image -Port $state.port -Backend $state.backend -AnyllmProvider $state.anyllm_provider -Region $state.region -Mode $state.proxy_mode -Memory ([bool]$state.memory_enabled) -TelemetryEnabled ([bool]$state.telemetry_enabled)
+                Start-PersistentDockerInstall -Profile $state.profile -Image $state.image -Port $state.port -Backend $state.backend -AnyllmProvider $state.anyllm_provider -Region $state.region -Mode $state.proxy_mode -Memory ([bool]$state.memory_enabled) -TelemetryEnabled ([bool]$state.telemetry_enabled) -LearnEnabled $state.learn_enabled -MemoryStorage $state.memory_storage_mode -MinEvidence $state.traffic_learning_min_evidence -MemoryProjectRoot $state.memory_project_root
                 Write-Host "Restarted docker-native persistent deployment '$profile'."
                 exit 0
             }
