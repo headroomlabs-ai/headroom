@@ -8,6 +8,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from sqlite3 import IntegrityError
 from typing import Any
 
 import click
@@ -381,7 +382,7 @@ def _export_all(store: SQLiteMemoryStore) -> list[dict[str, Any]]:
     return [m.to_dict() for m in memories]
 
 
-def _import_memories(store: SQLiteMemoryStore, memories: list[dict[str, Any]]) -> int:
+def _import_memories(store: SQLiteMemoryStore, memories: list[Any]) -> int:
     """Import memories from a list of dictionaries."""
     if not memories:
         return 0
@@ -389,6 +390,8 @@ def _import_memories(store: SQLiteMemoryStore, memories: list[dict[str, Any]]) -
     imported_count = 0
     with store._get_conn() as conn:
         for mem_dict in memories:
+            if not isinstance(mem_dict, dict):
+                continue
             try:
                 memory = Memory.from_dict(mem_dict)
                 row = store._memory_to_row(memory)
@@ -413,7 +416,7 @@ def _import_memories(store: SQLiteMemoryStore, memories: list[dict[str, Any]]) -
                     row,
                 )
                 imported_count += 1
-            except (KeyError, ValueError, TypeError):
+            except (KeyError, ValueError, TypeError, IntegrityError):
                 # Skip malformed entries
                 continue
 

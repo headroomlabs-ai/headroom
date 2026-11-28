@@ -439,6 +439,33 @@ class TestMemoryPurge:
 
 
 class TestMemoryExportImport:
+    @pytest.mark.parametrize("invalid_kind", ["non_objects", "invalid_row"])
+    def test_import_keeps_valid_rows_around_malformed_records(
+        self, runner: CliRunner, temp_db: str, tmp_path: Path, invalid_kind: str
+    ) -> None:
+        first = Memory(id="first", content="First restored memory", user_id="test-user")
+        last = Memory(id="last", content="Last restored memory", user_id="test-user")
+        malformed = (
+            [None, ["not a record"]]
+            if invalid_kind == "non_objects"
+            else [{**first.to_dict(), "content": None}]
+        )
+        backup = tmp_path / "mixed-backup.json"
+        backup.write_text(
+            json.dumps([first.to_dict(), *malformed, last.to_dict()]),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            main, ["memory", "import", "--db-path", temp_db, str(backup), "--force"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Imported 2 memory(ies)" in result.output
+        assert f"Skipped {len(malformed)} malformed entries" in result.output
+        store = SQLiteMemoryStore(temp_db)
+        assert asyncio.run(store.get("first")).content == first.content
+        assert asyncio.run(store.get("last")).content == last.content
+
     """Tests for export/import commands."""
 
     def test_export_to_stdout(self, runner: CliRunner, populated_db: str) -> None:
