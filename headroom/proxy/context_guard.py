@@ -240,8 +240,12 @@ def reset_learned_limits() -> None:
 
 
 def _data_line(payload: dict[str, Any], original: bytes) -> bytes:
-    """A rewritten ``data:`` line keeping the original's CRLF ending."""
-    eol = b"\r" if original.endswith(b"\r") else b""
+    """A rewritten ``data:`` line keeping the original's whole EOL run.
+
+    A CR-only frame ends in two CRs (line ending + blank line). Keeping just
+    one merges consecutive rewritten events into a single SSE event (#4252).
+    """
+    eol = original[len(original.rstrip(b"\r")) :]
     return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + eol
 
 
