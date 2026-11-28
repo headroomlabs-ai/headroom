@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -35,6 +36,7 @@ from headroom.log_safety import describe_exception, log_token
 from headroom.proxy.conversation_savings import get_conversation_savings
 from headroom.proxy.savings import ItemMeasure, get_item_ledger
 from headroom.proxy.tool_schema_savings_policy import (
+    TOOL_SCHEMA_SAVINGS_TAGS,
     headline_tokens_saved,
     tool_schema_saved_from_tags,
 )
@@ -230,6 +232,12 @@ class RequestOutcome:
     tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
+    # Attribution labels (``{dimension: label}``) a handler knows beyond what
+    # the request middleware bound (see :mod:`headroom.proxy.attribution`).
+    # Merged over the context's labels, for dimensions the operator enabled.
+    # ``client`` / ``project`` above win their own dimensions while those are
+    # enabled and resolved by their built-ins (see ``emit_request_outcome``).
+    attribution: Mapping[str, str] | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -481,6 +489,30 @@ def _warn_estimated_input(provider: str, model: str) -> None:
     )
 
 
+#: Request-log tags that name the harness in ``/stats``' ``agent_usage``
+#: (``server._classify_agent_from_log``). That section is shown to every
+#: caller, network ones included, so a label never writes these tags: a
+#: replaced ``client`` resolver or a ``stack`` label could name a machine or a
+#: person there. Labels reach ``by_dimension``, which the stats gate hides.
+_AGENT_USAGE_TAGS: frozenset[str] = frozenset({"client", "stack", "headroom-stack"})
+
+
+def _discovered_project(project: str, resolved: str | None) -> bool:
+    """Whether the legacy ``project`` names a project the resolved label does not.
+
+    The legacy value passes through :func:`set_current_project`, which
+    percent-decodes once more than the header resolver does, so a directory
+    named ``release%41`` arrives there as ``releaseA``. That is the same
+    project, already labelled correctly; only a handler that found a different
+    one (Codex project context) should replace the label.
+    """
+    if resolved is None:
+        return True
+    from headroom.proxy.project_name_policy import sanitize_project_name
+
+    return project != resolved and project != sanitize_project_name(resolved)
+
+
 async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """Single funnel for per-request bookkeeping. The contract.
 
@@ -514,6 +546,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if/when another contract surface emerges, but YAGNI.
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
+    from headroom.proxy.attribution import (
+        _builtin_label_applies,
+        booking_attribution,
+        dimension_enabled,
+        enabled_dimensions,
+        get_current_attribution,
+        get_current_conversation,
+        merge_attribution,
+        normalize_attribution,
+    )
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
@@ -630,6 +672,34 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Every attribution label for this request: what the middleware resolved,
+    # then what the handler knew, then the two legacy fields, so a project the
+    # handler identified late (Codex project context) wins over the header.
+    # The legacy fields win because ``projects`` and the ledger's ``client``
+    # key book them too, and the two spellings must not disagree. A dimension
+    # the operator turned off (``-client``) is still left out, and one whose
+    # resolver an extension replaced keeps the label that resolver gave. The
+    # legacy ``projects`` map and ledger ``client`` key still book what the
+    # proxy detected.
+    # What a handler supplies obeys the same switches as what it binds: a
+    # dimension that is off, or removed with ``-name``, is not booked from it.
+    handler_labels = {
+        name: label
+        for name, label in normalize_attribution(outcome.attribution).items()
+        if dimension_enabled(name)
+    }
+    bound_labels = get_current_attribution()
+    attribution = merge_attribution(
+        bound_labels,
+        handler_labels,
+        {"project": project}
+        if project
+        and _discovered_project(project, bound_labels.get("project"))
+        and _builtin_label_applies("project")
+        else None,
+        {"client": outcome.client} if outcome.client and _builtin_label_applies("client") else None,
+    )
+
     # Savings that are new to this conversation. Per-request descriptions
     # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
     # while everything that accumulates across turns uses this, so a removed
@@ -680,12 +750,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     transforms_applied=tuple(str(t) for t in (outcome.transforms_applied or ())),
                     tokens_saved=outcome.tokens_saved,
                     novel_tokens_saved=novel_tokens_saved,
-                    attribution={
-                        dimension: label
-                        for dimension, label in (("project", project), ("client", outcome.client))
-                        if label
-                    },
-                    conversation_key=outcome.conversation_key,
+                    attribution=attribution,
+                    # The handler's key when it derived one; else the conversation
+                    # the client named (Claude Code's session id), for reporting.
+                    conversation_key=outcome.conversation_key or get_current_conversation(),
                     original_tokens=outcome.original_tokens,
                     output_tokens_saved=output_tokens_saved_est,
                 ),
@@ -726,40 +794,43 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if not input_provider_reported and billed_input_tokens > 0:
         _warn_estimated_input(outcome.provider, outcome.model)
 
-    # 1. Prometheus / SavingsTracker.
-    await handler.metrics.record_request(
-        provider=outcome.provider,
-        model=outcome.model,
-        input_tokens=billed_input_tokens,
-        output_tokens=outcome.output_tokens,
-        tokens_saved=novel_tokens_saved,
-        latency_ms=outcome.total_latency_ms,
-        cached=outcome.cache_hit,
-        overhead_ms=outcome.overhead_ms,
-        ttfb_ms=outcome.ttfb_ms,
-        pipeline_timing=pipeline_timing,
-        waste_signals=outcome.waste_signals,
-        cache_read_tokens=outcome.cache_read_tokens,
-        cache_write_tokens=outcome.cache_write_tokens,
-        cache_write_5m_tokens=outcome.cache_write_5m_tokens,
-        cache_write_1h_tokens=outcome.cache_write_1h_tokens,
-        uncached_input_tokens=outcome.uncached_input_tokens,
-        attempted_input_tokens=outcome.attempted_input_tokens,
-        output_tokens_saved=output_tokens_saved_est,
-        output_tokens_saved_high=output_tokens_saved_high_est,
-        project=project,
-        client=outcome.client,
-        tool_search_saved=tool_search_saved,
-        local_input_tokens=outcome.optimized_tokens,
-        savings_attribution=savings_breakdown,
-        # Already handed to the cost tracker below; the metrics path needs it
-        # too now that it prices savings cache-aware. An inferred write is the
-        # same tokens as `uncached_input_tokens` and carries no write premium,
-        # so counting it as a write would both double it and apply a premium
-        # OpenAI never charges.
-        cache_inferred=outcome.cache_inferred,
-        input_provider_reported=input_provider_reported,
-    )
+    # 1. Prometheus / SavingsTracker. OpenTelemetry attributes read the labels
+    #    booked here, late discoveries included (see booking_attribution).
+    with booking_attribution(attribution):
+        await handler.metrics.record_request(
+            provider=outcome.provider,
+            model=outcome.model,
+            input_tokens=billed_input_tokens,
+            output_tokens=outcome.output_tokens,
+            tokens_saved=novel_tokens_saved,
+            latency_ms=outcome.total_latency_ms,
+            cached=outcome.cache_hit,
+            overhead_ms=outcome.overhead_ms,
+            ttfb_ms=outcome.ttfb_ms,
+            pipeline_timing=pipeline_timing,
+            waste_signals=outcome.waste_signals,
+            cache_read_tokens=outcome.cache_read_tokens,
+            cache_write_tokens=outcome.cache_write_tokens,
+            cache_write_5m_tokens=outcome.cache_write_5m_tokens,
+            cache_write_1h_tokens=outcome.cache_write_1h_tokens,
+            uncached_input_tokens=outcome.uncached_input_tokens,
+            attempted_input_tokens=outcome.attempted_input_tokens,
+            output_tokens_saved=output_tokens_saved_est,
+            output_tokens_saved_high=output_tokens_saved_high_est,
+            project=project,
+            client=outcome.client,
+            attribution=attribution,
+            tool_search_saved=tool_search_saved,
+            local_input_tokens=outcome.optimized_tokens,
+            savings_attribution=savings_breakdown,
+            # Already handed to the cost tracker below; the metrics path needs it
+            # too now that it prices savings cache-aware. An inferred write is the
+            # same tokens as `uncached_input_tokens` and carries no write premium,
+            # so counting it as a write would both double it and apply a premium
+            # OpenAI never charges.
+            cache_inferred=outcome.cache_inferred,
+            input_provider_reported=input_provider_reported,
+        )
 
     # 2. Cost tracker (optional).
     cost_tracker = getattr(handler, "cost_tracker", None)
@@ -790,10 +861,35 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
         log_tags = public_tags(outcome.tags)
-        if outcome.client:
-            log_tags["client"] = outcome.client
-        if project:
-            log_tags["project"] = project
+        # The ``project`` tag is what the proxy detected, as it always was,
+        # except for a dimension the operator listed: there the tag is its
+        # resolver's label, so a replaced resolver shows here too. A label a
+        # client merely named through ``labels`` does not. The ``client`` tag
+        # is always the harness the proxy detected (see _AGENT_USAGE_TAGS).
+        listed = enabled_dimensions()
+        detected_client = (
+            attribution.get("client")
+            if "client" in listed and _builtin_label_applies("client")
+            else None
+        )
+        client_tag = outcome.client or detected_client
+        if client_tag:
+            log_tags["client"] = client_tag
+        project_tag = (attribution.get("project") if "project" in listed else None) or project
+        if project_tag:
+            log_tags["project"] = project_tag
+        for dimension, label in attribution.items():
+            # The stats reader sums these tags as savings, so only the proxy
+            # writes them: a label of the same name never reaches them.
+            if dimension in TOOL_SCHEMA_SAVINGS_TAGS or dimension in _AGENT_USAGE_TAGS:
+                continue
+            # A listed dimension's label is its resolver's, which outranks the
+            # ``X-Headroom-<name>`` tag a client sent under the same key,
+            # whatever the dimension's spelling (``user_id`` included).
+            if dimension in listed:
+                log_tags[dimension] = label
+            else:
+                log_tags.setdefault(dimension, label)
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,
