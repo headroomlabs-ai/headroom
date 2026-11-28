@@ -22,7 +22,7 @@ from headroom.transforms.content_router import (
     _bash_command_is_search,
     _bash_program,
 )
-from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_compaction import expand_runs, search_unheading
 
 SEARCH = frozenset({"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"})
 GREP = "".join(
@@ -88,8 +88,8 @@ def test_bash_program_peels_wrappers():
 # --- end-to-end through the router (both wire formats) ---
 
 
-def _openai(command: str, content: str, tokenizer):
-    router = ContentRouter(ContentRouterConfig())
+def _openai(command: str, content: str, tokenizer, config=None):
+    router = ContentRouter(config or ContentRouterConfig())
     messages = [
         {
             "role": "assistant",
@@ -106,8 +106,8 @@ def _openai(command: str, content: str, tokenizer):
     return result.messages[1]["content"], result.transforms_applied
 
 
-def _anthropic(command: str, content: str, tokenizer):
-    router = ContentRouter(ContentRouterConfig())
+def _anthropic(command: str, content: str, tokenizer, config=None):
+    router = ContentRouter(config or ContentRouterConfig())
     messages = [
         {
             "role": "assistant",
@@ -167,6 +167,141 @@ def test_go_log_keeps_its_timestamps(command, tokenizer):
     assert "router:bash:lossless_search" not in transforms
     assert "router:tool_result:lossless_search" not in transforms
     assert "2026/09/02 14" not in out.split("\n")
+
+
+TOMCAT_LOG = "\n".join(
+    f"02-Sep-2026 14:{i // 60:02d}:{i % 60:02d}.123 INFO [main] "
+    f"org.apache.catalina.core.ContainerBase response resource_{i:04d} handled successfully"
+    for i in range(240)
+)
+
+
+# `grep -A1`: 12 groups of 19 matches plus one context row, with an unmatched
+# row skipped between groups and grep's `--` separator printed there.
+TOMCAT_CONTEXT = "\n--\n".join(
+    "\n".join(TOMCAT_LOG.split("\n")[g * 20 : g * 20 + 20]) for g in range(12)
+)
+
+JAVA_FRAME = (
+    "\tat org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:199)"
+)
+
+# Same `grep -A1` output, but one context row is a stack frame, not a log row.
+_context_rows = TOMCAT_CONTEXT.split("\n")
+_context_rows[19] = JAVA_FRAME
+TOMCAT_FRAME_CONTEXT = "\n".join(_context_rows)
+
+
+def _openai_text_blocks(command: str, content: str, tokenizer, config=None):
+    # Some OpenAI-compatible clients send tool output as a list of text blocks.
+    out, transforms = _openai(command, [{"type": "text", "text": content}], tokenizer, config)
+    return out[0]["text"], transforms
+
+
+def _openai_split_text_blocks(command: str, content: str, tokenizer, config=None):
+    # Two text blocks, the second starting halfway through the second row.
+    cut = content.index("\n") + 1 + 20
+    blocks = [{"type": "text", "text": content[:cut]}, {"type": "text", "text": content[cut:]}]
+    out, transforms = _openai(command, blocks, tokenizer, config)
+    return "".join(block["text"] for block in out), transforms
+
+
+@pytest.mark.parametrize(
+    "send", [_openai, _anthropic, _openai_text_blocks, _openai_split_text_blocks]
+)
+@pytest.mark.parametrize(
+    "command, output",
+    [
+        pytest.param("grep INFO logs/catalina.out", TOMCAT_LOG, id="matches"),
+        pytest.param("grep -A1 matched logs/catalina.out", TOMCAT_CONTEXT, id="context"),
+        pytest.param(
+            "grep -A1 matched logs/catalina.out", TOMCAT_FRAME_CONTEXT, id="context-stack-frame"
+        ),
+        pytest.param(
+            "grep -A1 matched logs/catalina.out",
+            TOMCAT_CONTEXT.replace("\n", "\r\n"),
+            id="context-crlf",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(lambda: ContentRouterConfig(ccr_inject_marker=False), id="no-ccr"),
+        pytest.param(
+            lambda: ContentRouterConfig(ccr_enabled=False, ccr_inject_marker=False),
+            id="ccr-disabled",
+        ),
+    ],
+)
+def test_timestamped_search_stays_whole_without_ccr(send, command, output, config, tokenizer):
+    # Timestamp rows are not path:line:content, so the search fold leaves them
+    # to the log compressor. Without a retrieval marker the dropped rows could
+    # not be fetched back, so the matches must reach the model as they are.
+    out, transforms = send(command, output, tokenizer, config())
+    assert "router:bash:search_verbatim" in transforms
+    assert out == output
+
+
+@pytest.mark.parametrize("ccr_enabled", [True, False], ids=["no-ccr", "ccr-disabled"])
+@pytest.mark.parametrize(
+    "tail",
+    # An unindented throwable header fails the whole-result check, so the
+    # second block must still qualify on its own.
+    [JAVA_FRAME, "java.lang.IllegalStateException: unexpected state"],
+    ids=["stack-frame", "throwable-header"],
+)
+def test_text_blocks_with_stack_frame_stay_whole_without_ccr(tail, ccr_enabled, tokenizer):
+    # First block: one log row and its stack frame. Second block: the other
+    # 240 matches. Neither block may be shrunk on its own.
+    first = TOMCAT_LOG.split("\n")[0] + "\n" + tail + "\n"
+    blocks = [{"type": "text", "text": first}, {"type": "text", "text": TOMCAT_LOG}]
+    config = ContentRouterConfig(ccr_enabled=ccr_enabled, ccr_inject_marker=False)
+    out, transforms = _openai("grep INFO logs/catalina.out", blocks, tokenizer, config)
+    assert "router:bash:search_verbatim" in transforms
+    assert [block["text"] for block in out] == [first, TOMCAT_LOG]
+
+
+@pytest.mark.parametrize("ccr_enabled", [True, False], ids=["no-ccr", "ccr-disabled"])
+def test_text_block_starting_mid_row_after_throwable_header_stays_whole(ccr_enabled, tokenizer):
+    # The throwable header fails the whole-result check, and the second block
+    # starts inside a row, so only its complete rows can be judged.
+    first_row, rest = TOMCAT_LOG.split("\n", 1)
+    first = first_row + "\njava.lang.IllegalStateException: unexpected state\n" + rest[:20]
+    blocks = [{"type": "text", "text": first}, {"type": "text", "text": rest[20:]}]
+    config = ContentRouterConfig(ccr_enabled=ccr_enabled, ccr_inject_marker=False)
+    out, transforms = _openai("grep INFO logs/catalina.out", blocks, tokenizer, config)
+    assert "router:bash:search_verbatim" in transforms
+    assert [block["text"] for block in out] == [first, rest[20:]]
+
+
+@pytest.mark.parametrize("ccr_enabled", [True, False], ids=["no-ccr", "ccr-disabled"])
+def test_text_block_starting_on_a_row_after_unterminated_block_stays_whole(ccr_enabled, tokenizer):
+    # The first block ends without a newline, but the second starts on a whole
+    # row, so its first row must not be skipped as the tail of another row.
+    rows = TOMCAT_LOG.split("\n")
+    first = rows[0] + "\njava.lang.IllegalStateException: unexpected state"
+    second = "\n".join([rows[1], JAVA_FRAME, *rows[2:]])
+    blocks = [{"type": "text", "text": first}, {"type": "text", "text": second}]
+    config = ContentRouterConfig(ccr_enabled=ccr_enabled, ccr_inject_marker=False)
+    out, transforms = _openai("grep INFO logs/catalina.out", blocks, tokenizer, config)
+    assert "router:bash:search_verbatim" in transforms
+    assert [block["text"] for block in out] == [first, second]
+
+
+def test_lossless_mode_still_folds_repeated_timestamped_matches(tokenizer):
+    # Lossless mode has no markers either, but it never compresses lossily,
+    # so its reversible run fold must still get the chance to shrink repeats.
+    repeated = "\n".join(
+        "02-Sep-2026 14:00:00.123 INFO [main] org.apache.catalina.core.ContainerBase handled"
+        for _ in range(100)
+    )
+    out, transforms = _openai(
+        "grep INFO logs/catalina.out", repeated, tokenizer, ContentRouterConfig(lossless=True)
+    )
+    assert "router:bash:search_verbatim" not in transforms
+    assert len(out) < len(repeated)
+    assert expand_runs(out) == repeated
 
 
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----

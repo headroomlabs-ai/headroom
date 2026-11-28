@@ -80,6 +80,8 @@ _TIMESTAMP_ROW_RE = re.compile(
     r"|\d{4}/\d{2}/\d{2}[ T]\d{1,2}:\d{2}"  # Go log, nginx error log: 2026/09/02 14:30
     r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
     r"|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2}"  # syslog: Aug 16 11:02
+    r"|[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}"  # ctime, Apache error log: Wed Sep 02 14:30
+    r"|\d{2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}"  # Tomcat OneLineFormatter: 02-Sep-2026 14:30
     r"|[IWEF]\d{4}\s+\d{1,2}:\d{2}"  # klog/glog: E0902 14:30
     r"|[DIWEFA], \[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}"  # Ruby Logger: I, [2026-09-02T14:30
     # Common/combined access log: 10.0.0.7 - - [02/Sep/2026:14:30:00. The
