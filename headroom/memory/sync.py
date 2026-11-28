@@ -84,6 +84,10 @@ class AgentMemoryAdapter(ABC):
 
     agent_name: str = "unknown"
 
+    def memory_content_hash(self, content: str) -> str:
+        """Hash a note as this adapter represents it on disk."""
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
     @abstractmethod
     async def read_memories(self) -> list[AgentMemory]:
         """Read memories from the agent's native format.
@@ -268,7 +272,7 @@ async def sync_import(
         if h:
             existing_hashes.add(h)
         # Also hash the content directly for safety
-        existing_hashes.add(hashlib.sha256(mem.content.encode()).hexdigest()[:16])
+        existing_hashes.add(adapter.memory_content_hash(mem.content))
 
     imported = 0
     for am in agent_memories:
@@ -317,7 +321,7 @@ async def sync_export(
     # Find memories to export (not already in agent, not imported FROM this agent)
     to_export: list[dict[str, Any]] = []
     for mem in existing_memories:
-        content_hash = hashlib.sha256(mem.content.encode()).hexdigest()[:16]
+        content_hash = adapter.memory_content_hash(mem.content)
 
         # Skip if agent already has it
         if content_hash in agent_hashes:

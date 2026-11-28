@@ -9,8 +9,11 @@ Codex has key memories even without explicit tool calls.
 
 Format in AGENTS.md:
     <!-- headroom:memory:start -->
+    <!-- headroom:memory:format:2 -->
+
     ## Headroom Shared Memory
     - fact 1
+      continuation of fact 1
     - fact 2
     <!-- headroom:memory:end -->
 """
@@ -26,10 +29,30 @@ from headroom.memory.sync import AgentMemory, AgentMemoryAdapter
 
 _MARKER_START = "<!-- headroom:memory:start -->"
 _MARKER_END = "<!-- headroom:memory:end -->"
+_MULTILINE_FORMAT = "<!-- headroom:memory:format:2 -->"
 _MARKER_PATTERN = re.compile(
     re.escape(_MARKER_START) + r"(.*?)" + re.escape(_MARKER_END),
     re.DOTALL,
 )
+
+
+def _parse_facts(section: str) -> list[str]:
+    """Read top-level bullets and the continuations of new-format bullets."""
+    lines = section.split("\n")
+    multiline = _MULTILINE_FORMAT in lines
+    facts: list[list[str]] = []
+    for line in lines:
+        if not multiline:
+            line = line.strip()
+        if line.startswith("- "):
+            facts.append([line[2:]])
+        elif multiline and facts and (not line or line.startswith("  ")):
+            facts[-1].append(line[2:])
+    return [fact for parts in facts if (fact := "\n".join(parts).strip())]
+
+
+def _normalize_note(content: str) -> str:
+    return content.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 class CodexAdapter(AgentMemoryAdapter):
@@ -39,6 +62,10 @@ class CodexAdapter(AgentMemoryAdapter):
 
     def __init__(self, agents_md_path: Path | str | None = None) -> None:
         self._path = Path(agents_md_path) if agents_md_path else Path.cwd() / "AGENTS.md"
+
+    def memory_content_hash(self, content: str) -> str:
+        """Match both the original note and its LF-normalized file form."""
+        return super().memory_content_hash(_normalize_note(content))
 
     async def read_memories(self) -> list[AgentMemory]:
         """Read memories from the headroom section of AGENTS.md."""
@@ -50,22 +77,10 @@ class CodexAdapter(AgentMemoryAdapter):
         if not match:
             return []
 
-        section = match.group(1).strip()
-        memories: list[AgentMemory] = []
-
-        for line in section.split("\n"):
-            line = line.strip()
-            if line.startswith("- "):
-                fact = line[2:].strip()
-                if fact:
-                    memories.append(
-                        AgentMemory(
-                            content=fact,
-                            source_file=self._path.name,
-                        )
-                    )
-
-        return memories
+        return [
+            AgentMemory(content=fact, source_file=self._path.name)
+            for fact in _parse_facts(match.group(1))
+        ]
 
     async def write_memories(self, memories: list[dict[str, Any]]) -> int:
         """Merge memories into the headroom section of AGENTS.md.
@@ -82,30 +97,25 @@ class CodexAdapter(AgentMemoryAdapter):
 
         existing_content = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
 
-        # Facts already in the managed section — preserve them (dedup by the
-        # rendered first-line, matching how read_memories reconstructs them).
-        facts: list[str] = []
-        seen: set[str] = set()
+        # The reader reconstructs the complete text, so two facts with the
+        # same first line remain distinct.
         existing_match = _MARKER_PATTERN.search(existing_content)
-        if existing_match:
-            for line in existing_match.group(1).split("\n"):
-                stripped = line.strip()
-                if stripped.startswith("- "):
-                    fact = stripped[2:].strip()
-                    if fact and fact not in seen:
-                        seen.add(fact)
-                        facts.append(fact)
+        facts = dict.fromkeys(_parse_facts(existing_match.group(1))) if existing_match else {}
 
         added = 0
         for mem in memories:
-            fact = mem["content"].split("\n")[0].strip()  # First line only
-            if fact and fact not in seen:
-                seen.add(fact)
-                facts.append(fact)
+            fact = _normalize_note(mem["content"])
+            if fact and fact not in facts:
+                facts[fact] = None
                 added += 1
 
-        lines = ["## Headroom Shared Memory", ""]
-        lines.extend(f"- {fact}" for fact in facts)
+        if not added:
+            return 0
+        lines = [_MULTILINE_FORMAT, "", "## Headroom Shared Memory", ""]
+        for fact in facts:
+            first, *continuations = fact.split("\n")
+            lines.append(f"- {first}")
+            lines.extend(f"  {line}" if line else "" for line in continuations)
         lines.append("")
         section = f"{_MARKER_START}\n" + "\n".join(lines) + f"{_MARKER_END}"
 
@@ -130,6 +140,10 @@ class CodexAdapter(AgentMemoryAdapter):
             return "empty"
         try:
             hasher = hashlib.sha256()
+            # Recheck once after an upgrade so previously abbreviated notes
+            # can be exported even when the database and file did not change.
+            hasher.update(_MULTILINE_FORMAT.encode())
+            hasher.update(b"\0")
             hasher.update(self._path.name.encode())
             hasher.update(b"\0")
             hasher.update(self._path.read_bytes())

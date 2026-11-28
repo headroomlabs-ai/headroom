@@ -24,6 +24,7 @@ import pytest
 
 from headroom.memory.sync import (
     _build_sync_backend,
+    _db_fingerprint,
     _save_sync_state,
     sync,
     sync_export,
@@ -646,6 +647,83 @@ class TestCodexAdapter:
         adapter = CodexAdapter(agents_md)
         mems = await adapter.read_memories()
         assert mems == []
+
+    @pytest.mark.asyncio
+    async def test_multiline_facts_with_the_same_first_line_round_trip(self, agents_md):
+        agents_md.write_text(
+            "# Existing instructions\n\n"
+            "<!-- headroom:memory:start -->\n"
+            "## Headroom Shared Memory\n\n"
+            "- Legacy one-line fact\n"
+            "<!-- headroom:memory:end -->\n",
+            encoding="utf-8",
+        )
+        adapter = CodexAdapter(agents_md)
+        first = "Deployment checklist\nUse the blue pool.\n\n- Verify the health endpoint."
+        second = "Deployment checklist\nKeep the green pool ready for rollback."
+        assert await adapter.write_memories([{"content": first}, {"content": second}]) == 2
+        assert [m.content for m in await adapter.read_memories()] == [
+            "Legacy one-line fact",
+            first,
+            second,
+        ]
+        assert await adapter.write_memories([{"content": first}]) == 0
+        assert agents_md.read_text(encoding="utf-8").startswith("# Existing instructions\n")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    async def test_sync_keeps_blank_lines_after_editor_save(self, agents_md, tmp_path, newline):
+        backend = FakeBackend()
+        note = newline.join(["Deployment checklist", "", "Keep the green pool ready."])
+        backend.add_memory(note)
+        adapter = CodexAdapter(agents_md)
+        state = tmp_path / "state.json"
+        assert (await sync(backend, adapter, "tcms", state)).exported == 1
+
+        text = agents_md.read_text(encoding="utf-8")
+        agents_md.write_text(
+            "\n".join(line.rstrip() for line in text.split("\n")),
+            encoding="utf-8",
+            newline="\n",
+        )
+        result = await sync(backend, adapter, "tcms", state)
+        assert (result.imported, result.exported) == (0, 0)
+        assert len(await backend.get_user_memories("tcms")) == 1
+        assert (await adapter.read_memories())[0].content == note.replace("\r\n", "\n")
+
+    @pytest.mark.asyncio
+    async def test_ordinary_sync_rechecks_state_written_by_legacy_renderer(
+        self, agents_md, tmp_path
+    ):
+        backend = FakeBackend()
+        heading = "Deployment checklist"
+        full = f"{heading}\nKeep the green pool ready."
+        backend.add_memory(full)
+        backend.add_memory(heading)
+        agents_md.write_text(
+            "<!-- headroom:memory:start -->\n"
+            "## Headroom Shared Memory\n\n"
+            f"- {heading}\n"
+            "<!-- headroom:memory:end -->\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        old_fingerprint = hashlib.sha256(
+            agents_md.name.encode() + b"\0" + agents_md.read_bytes()
+        ).hexdigest()[:16]
+        state = tmp_path / "state.json"
+        _save_sync_state(
+            state,
+            {
+                "codex:tcms": {
+                    "agent_fingerprint": old_fingerprint,
+                    "db_fingerprint": _db_fingerprint(await backend.get_user_memories("tcms")),
+                }
+            },
+        )
+        result = await sync(backend, CodexAdapter(agents_md), "tcms", state)
+        assert (result.imported, result.exported) == (0, 1)
+        assert full in [m.content for m in await CodexAdapter(agents_md).read_memories()]
 
     @pytest.mark.asyncio
     async def test_read_nonexistent_file(self, tmp_path):
