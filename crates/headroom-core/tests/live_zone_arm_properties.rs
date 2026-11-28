@@ -656,12 +656,12 @@ fn byte_fidelity_outside_compressed_source_block() {
     assert_eq!(parsed["system"], "you are a helpful assistant");
 }
 
-/// In the minimal build (no `code`, no `ml`) the SourceCode arm is a
+/// In builds without the `code` feature the SourceCode arm is a
 /// deterministic no-op: the dispatcher must report `NoChange` so the
 /// caller forwards the original body byte-for-byte.
-#[cfg(all(not(feature = "code"), not(feature = "ml")))]
+#[cfg(not(feature = "code"))]
 #[test]
-fn source_code_arm_without_code_or_ml_is_no_change() {
+fn source_code_arm_without_code_is_no_change() {
     let code = python_module_source(10);
     assert!(
         code.len() > 2048,
@@ -686,7 +686,7 @@ fn source_code_arm_without_code_or_ml_is_no_change() {
             }
         }
         LiveZoneOutcome::Modified { manifest, .. } => panic!(
-            "no SourceCode compressor is compiled in (neither `code` nor `ml`); \
+            "without the `code` feature source code must never be rewritten; \
              expected NoChange, got Modified. manifest: {manifest:?}"
         ),
     }

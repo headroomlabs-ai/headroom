@@ -1743,10 +1743,14 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        // Without the `code` feature there is no AST compressor; use the
-        // same Kompress/no-op fallback as the passthrough path above.
+        // Without the `code` feature there is no AST compressor. Source-code
+        // blocks are preserved untouched rather than falling back to Kompress:
+        // Kompress is a prose model that drops keywords like `func`, `if`,
+        // and `for` (#4214). Mirrors the declined code compressor path above.
         #[cfg(not(feature = "code"))]
-        ContentType::SourceCode => kompress_or_noop(text, content_type),
+        ContentType::SourceCode => DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+        },
         // Cache-only EXTRACTIVE prose compressor (PR-B4): Kompress drops
         // low-salience words and rejoins on single spaces — lossy by
         // design. `kompress_or_noop` degrades to a deterministic no-op
