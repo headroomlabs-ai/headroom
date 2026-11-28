@@ -41,6 +41,7 @@ import ipaddress
 import os
 import socket
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
 from contextvars import ContextVar
@@ -227,9 +228,13 @@ def clear_validated_addresses() -> None:
 
 def allowlisted_destinations(
     env: str = ALLOWED_BASE_URLS_ENV,
+    environ: Mapping[str, str] | None = None,
 ) -> tuple[set[str], set[tuple[str, str, int]]] | None:
-    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset."""
-    raw = os.environ.get(env)
+    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset.
+
+    ``environ`` defaults to ``os.environ``.
+    """
+    raw = (os.environ if environ is None else environ).get(env)
     if not raw or not raw.strip():
         return None
     hosts: set[str] = set()

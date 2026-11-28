@@ -244,6 +244,7 @@ from headroom.providers.zcode import (
     upstream_to_proxy_urls as _zcode_upstream_to_urls,
 )
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
+from headroom.proxy.upstream_guard import allowlisted_destinations, destination_listed
 
 from .main import main
 
@@ -3316,6 +3317,37 @@ def _codex_dotted_key(*parts: str) -> str:
     )
 
 
+_CODEX_GENERATED_PROXY_PATH_RE = re.compile(r"^(?:/p/[^/]+)?/v1$")
+
+
+def _is_generated_codex_proxy_url(url: str, environ: Mapping[str, str]) -> bool:
+    """Whether ``url`` is the route Headroom writes for its own Codex provider.
+
+    ``headroom init codex``, persistent installs and ``wrap codex`` all write
+    ``http://127.0.0.1:<port>/v1`` (``/p/<project>/v1`` with a project). Any
+    other URL is not ours, and neither is one whose origin the operator listed
+    in ``HEADROOM_ALLOWED_BASE_URLS``: a local gateway such as vLLM's default
+    ``http://127.0.0.1:8000/v1`` has the same shape, but the proxy only admits
+    a loopback upstream when it is allowlisted.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return False
+    if not (
+        parts.scheme == "http"
+        and parts.hostname == "127.0.0.1"
+        and parts.username is None
+        and not parts.query
+        and not parts.fragment
+        and _CODEX_GENERATED_PROXY_PATH_RE.fullmatch(parts.path.rstrip("/")) is not None
+    ):
+        return False
+    allow = allowlisted_destinations(environ=environ)
+    return allow is None or not destination_listed(allow, "http", "127.0.0.1", port)
+
+
 _CODEX_EMBEDDED_MODE_NOTE = (
     "Note: session-scoped routing runs Codex without its shared background server "
     "(embedded mode). To keep the shared server, route through Codex config instead: "
@@ -3373,12 +3405,18 @@ def _codex_session_launch_settings(
                 f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
             )
         )
-        env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
-        display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
-        overrides.append(
-            f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
-            f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
-        )
+        # Headroom's own table (left by `headroom init codex` or a persistent
+        # install) points at the local proxy, not at a real upstream. Sending
+        # it as X-Headroom-Base-Url makes the proxy reject every request as an
+        # unsafe loopback upstream (#5025). A user's gateway that is merely
+        # named `headroom`, remote or local, is still a real upstream and keeps it.
+        if provider != "headroom" or not _is_generated_codex_proxy_url(upstream, environ):
+            env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
+            display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
+            overrides.append(
+                f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
+                f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
+            )
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project

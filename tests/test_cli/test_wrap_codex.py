@@ -1664,6 +1664,190 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
+def test_codex_session_launch_settings_do_not_send_headroom_provider_as_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #5025: `headroom init codex` leaves Headroom's own provider selected. Its
+    # base_url is the local proxy, so it must not become X-Headroom-Base-Url.
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    config_file = codex_home / "config.toml"
+    original_config = (
+        'model_provider = "headroom"\n'
+        'openai_base_url = "http://127.0.0.1:8787/v1"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "http://127.0.0.1:8787/v1"\n'
+        "requires_openai_auth = true\n"
+        "supports_websockets = true\n"
+    )
+    config_file.write_text(original_config, encoding="utf-8")
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("resume", "session-id"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert args == (
+        "--config",
+        'model_providers.headroom.base_url="http://127.0.0.1:9898/v1"',
+        "--config",
+        "model_providers.headroom.supports_websockets=true",
+        "resume",
+        "session-id",
+    )
+    assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+    assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:9898/v1"
+    assert display == [
+        "OPENAI_BASE_URL=http://127.0.0.1:9898/v1",
+        wrap_mod._CODEX_EMBEDDED_MODE_NOTE,
+    ]
+    assert config_file.read_text(encoding="utf-8") == original_config
+
+
+def test_codex_session_launch_settings_keep_remote_provider_named_headroom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A user's own remote gateway may also be named `headroom` (recovery keeps
+    # it); only the local proxy route drops the upstream header, not this one.
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "headroom"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "https://gateway.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("resume", "session-id"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert args == (
+        "--config",
+        'model_providers.headroom.base_url="http://127.0.0.1:9898/v1"',
+        "--config",
+        "model_providers.headroom.supports_websockets=true",
+        "--config",
+        'model_providers.headroom.env_http_headers.X-Headroom-Base-Url="HEADROOM_CODEX_UPSTREAM_BASE_URL"',
+        "resume",
+        "session-id",
+    )
+    assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://gateway.example/v1"
+    assert "HEADROOM_CODEX_UPSTREAM_BASE_URL=https://gateway.example/v1" in display
+
+
+def test_codex_session_launch_settings_keep_local_gateway_named_headroom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A separately allowlisted local gateway named `headroom` is a real
+    # upstream too; only Headroom's generated proxy route drops the header.
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "headroom"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "http://localhost:8000/openai/v1"\n',
+        encoding="utf-8",
+    )
+
+    args, env, _ = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("resume", "session-id"),
+        environ={
+            "CODEX_HOME": str(codex_home),
+            "HEADROOM_ALLOWED_BASE_URLS": "http://localhost:8000",
+        },
+    )
+
+    assert (
+        'model_providers.headroom.env_http_headers.X-Headroom-Base-Url="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+        in args
+    )
+    assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "http://localhost:8000/openai/v1"
+
+
+@pytest.mark.parametrize(
+    ("url", "generated"),
+    [
+        ("http://127.0.0.1:8787/v1", True),
+        ("http://127.0.0.1:8787/v1/", True),
+        ("http://127.0.0.1/v1", True),
+        ("http://127.0.0.1:8787/p/my-app/v1", True),
+        ("http://localhost:8000/openai/v1", False),
+        ("http://127.0.0.1:8000/openai/v1", False),
+        ("https://gateway.example/v1", False),
+        ("http://127.0.0.1.example/v1", False),
+        ("http://user@127.0.0.1:8787/v1", False),
+        ("http://127.0.0.1:notaport/v1", False),
+    ],
+)
+def test_is_generated_codex_proxy_url(url: str, generated: bool) -> None:
+    assert wrap_mod._is_generated_codex_proxy_url(url, {}) is generated
+
+
+@pytest.mark.parametrize(
+    ("allowed", "generated"),
+    [
+        ("http://127.0.0.1:8000", False),
+        ("127.0.0.1", False),
+        ("http://127.0.0.1:8001", True),
+        ("https://127.0.0.1:8000", True),
+        ("", True),
+    ],
+)
+def test_is_generated_codex_proxy_url_excludes_allowlisted_origin(
+    allowed: str, generated: bool
+) -> None:
+    environ = {"HEADROOM_ALLOWED_BASE_URLS": allowed}
+    assert wrap_mod._is_generated_codex_proxy_url("http://127.0.0.1:8000/v1", environ) is generated
+
+
+def test_codex_session_launch_settings_keep_allowlisted_loopback_gateway_named_headroom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # vLLM's default `http://127.0.0.1:8000/v1` has the generated route's shape;
+    # allowlisting its origin marks it as the user's gateway, not Headroom's proxy.
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "headroom"\n\n'
+        "[model_providers.headroom]\n"
+        'base_url = "http://127.0.0.1:8000/v1"\n',
+        encoding="utf-8",
+    )
+
+    args, env, _ = wrap_mod._codex_session_launch_settings(
+        port=8787,
+        codex_args=("resume", "s"),
+        environ={
+            "CODEX_HOME": str(codex_home),
+            "HEADROOM_ALLOWED_BASE_URLS": "http://127.0.0.1:8000",
+        },
+    )
+
+    assert (
+        'model_providers.headroom.env_http_headers.X-Headroom-Base-Url="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+        in args
+    )
+    assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "http://127.0.0.1:8000/v1"
+
+
 def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
     """#2358: quoted segments are silently ignored by Codex's --config parser."""
     assert (
