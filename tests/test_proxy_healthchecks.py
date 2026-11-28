@@ -1,3 +1,4 @@
+import logging
 import os
 from types import SimpleNamespace
 
@@ -309,7 +310,101 @@ def test_readyz_upstream_check_failure_returns_503(monkeypatch):
     data = response.json()
     assert data["ready"] is False
     assert data["checks"]["upstream"]["ready"] is False
-    assert "connection refused" in data["checks"]["upstream"]["error"]
+    assert data["checks"]["upstream"]["error"] == "ConnectError"
+
+
+@pytest.mark.parametrize(
+    ("openai_url", "anthropic_url", "expected_probe"),
+    [
+        (None, None, "https://api.anthropic.com"),
+        ("https://llm.example/v1", None, "https://llm.example"),
+        ("https://llm.example/v1", "https://claude.example/v1", "https://claude.example"),
+    ],
+)
+def test_readyz_probes_the_configured_primary_upstream(
+    monkeypatch, openai_url, anthropic_url, expected_probe
+):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
+    monkeypatch.delenv("ANTHROPIC_TARGET_API_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_FOUNDRY_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        openai_api_url=openai_url,
+        anthropic_api_url=anthropic_url,
+    )
+    with TestClient(create_app(config)) as client:
+        probe = AsyncMock(return_value=SimpleNamespace(status_code=200))
+        monkeypatch.setattr(client.app.state.proxy.http_client, "head", probe)
+        response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["checks"]["upstream"]["url"] == expected_probe
+    probe.assert_awaited_once_with(expected_probe, timeout=5.0)
+
+
+def test_readiness_probe_uses_its_own_diagnostics(monkeypatch, caplog):
+    import asyncio
+
+    import httpx
+
+    monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
+    config = ProxyConfig(openai_api_url="https://llm.example", optimize=False)
+    requests = []
+
+    def upstream(request):
+        requests.append(request.method)
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(upstream)
+
+    def ordinary_get():
+        with httpx.Client(transport=transport) as client:
+            client.get("https://llm.example")
+
+    async def head(url, **kwargs):
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await client.head(url, **kwargs)
+        # The probe is still active while unrelated traffic logs independently.
+        await asyncio.get_running_loop().run_in_executor(None, ordinary_get)
+        return result
+
+    with TestClient(create_app(config)) as client:
+        with caplog.at_level(logging.INFO, logger="httpx"):
+            monkeypatch.setattr(client.app.state.proxy.http_client, "head", head)
+            response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["checks"]["upstream"]["ready"] is True
+    assert requests == ["HEAD", "GET"]
+    httpx_logs = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    assert any("HTTP Request: GET https://llm.example" in message for message in httpx_logs)
+    assert all("HTTP Request: HEAD" not in message for message in httpx_logs)
+
+
+def test_readyz_does_not_expose_upstream_url_details(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    url = "https://test-user:test-password@llm.example/test-route?token=test-query"
+    config = ProxyConfig(openai_api_url=url, optimize=False)
+    with TestClient(create_app(config)) as client:
+        probe = AsyncMock(side_effect=httpx.ConnectError("Could not reach " + url))
+        monkeypatch.setattr(client.app.state.proxy.http_client, "head", probe)
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["upstream"]["url"] == "https://llm.example/<path>?<redacted>"
+    assert response.json()["checks"]["upstream"]["error"] == "ConnectError"
+    probe.assert_awaited_once_with(url, timeout=5.0)
 
 
 def test_health_includes_upstream_check_result(monkeypatch):
