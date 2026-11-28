@@ -524,6 +524,22 @@ def _infer_model_tier(model: str) -> str | None:
     return None
 
 
+def _warn_no_client_once(stacklevel: int) -> None:
+    """Advise SDK callers once per process that counting is approximate."""
+    global _FALLBACK_WARNING_SHOWN
+
+    if _FALLBACK_WARNING_SHOWN:
+        return
+    warnings.warn(
+        "AnthropicProvider: No client provided, using tiktoken approximation. "
+        "For accurate counting, pass an Anthropic client: "
+        "AnthropicProvider(client=Anthropic())",
+        UserWarning,
+        stacklevel=stacklevel,
+    )
+    _FALLBACK_WARNING_SHOWN = True
+
+
 class AnthropicTokenCounter(TokenCounter):
     """Token counter for Anthropic models.
 
@@ -546,23 +562,14 @@ class AnthropicTokenCounter(TokenCounter):
             warn: If False, suppresses the no-client UserWarning (useful for
                   internal proxy usage where approximation is intentional).
         """
-        global _FALLBACK_WARNING_SHOWN
-
         self.model = model
         self._client = client
         self._encoding: Any = None
         self._count_cache = TokenCountCache()
         self._use_api = client is not None
 
-        if not self._use_api and warn and not _FALLBACK_WARNING_SHOWN:
-            warnings.warn(
-                "AnthropicProvider: No client provided, using tiktoken approximation. "
-                "For accurate counting, pass an Anthropic client: "
-                "AnthropicProvider(client=Anthropic())",
-                UserWarning,
-                stacklevel=4,
-            )
-            _FALLBACK_WARNING_SHOWN = True
+        if not self._use_api and warn:
+            _warn_no_client_once(stacklevel=5)
 
         # Load tiktoken as fallback — bounded, so a stalled vocab download can't
         # hang token counting inside a request (tiktoken's downloader has no
@@ -797,7 +804,7 @@ class AnthropicProvider(Provider):
         """
         self._client = client
         self._warn = warn
-        self._token_counters: dict[str, AnthropicTokenCounter] = {}
+        self._token_counters: dict[str, TokenCounter] = {}
 
         # Build context limits: defaults -> config file -> env var -> explicit
         self._context_limits = {**ANTHROPIC_CONTEXT_LIMITS}
@@ -823,16 +830,35 @@ class AnthropicProvider(Provider):
     def get_token_counter(self, model: str) -> TokenCounter:
         """Get token counter for a model.
 
-        If a client was provided to the provider, uses the Token Count API.
-        Otherwise falls back to tiktoken approximation.
+        With a client, counts through Anthropic's Token Count API
+        (``AnthropicTokenCounter``): that is Claude's real tokenizer, so it
+        stays distinct from every local approximation.
+
+        Without a client, defers to the tokenizer registry
+        (``headroom.tokenizers.get_tokenizer``), which prices Claude against
+        tiktoken ``o200k_base`` (see ``TokenizerRegistry._create_anthropic``).
+        Proxy handlers count with the registry, and the proxy pipeline counts
+        with this provider, so a second local approximation here
+        (``cl100k_base`` x 1.1) made ``tokens_saved`` a difference of two
+        rulers, about 10% apart on identical messages (#5037). This mirrors
+        ``OpenAIProvider.get_token_counter`` (#2761): one local ruler per model.
         """
         model = sanitize_anthropic_model_id(model)
         if model not in self._token_counters:
-            self._token_counters[model] = AnthropicTokenCounter(
-                model=model,
-                client=self._client,
-                warn=self._warn,
-            )
+            if self._client is not None:
+                self._token_counters[model] = AnthropicTokenCounter(
+                    model=model,
+                    client=self._client,
+                    warn=self._warn,
+                )
+            else:
+                if self._warn:
+                    # Same frame the AnthropicTokenCounter path reports: the
+                    # caller of whoever asked for the counter.
+                    _warn_no_client_once(stacklevel=4)
+                from headroom.tokenizers import get_tokenizer
+
+                self._token_counters[model] = cast(Any, get_tokenizer(model))
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:

@@ -7,16 +7,15 @@ Cost estimates are APPROXIMATE - always verify against your actual billing.
 from __future__ import annotations
 
 import importlib.util
-import json
 import logging
-import os
 import warnings
 from datetime import date
 from functools import lru_cache
 from typing import Any, cast
 
-from headroom import paths as _paths
 from headroom.log_safety import describe_exception, safe_id
+from headroom.model_limits import configured_encoding, load_openai_encodings
+from headroom.model_limits import load_openai_model_config as _load_custom_model_config
 from headroom.offline import pin_litellm_cost_map_local
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
@@ -184,86 +183,6 @@ _UNKNOWN_OPENAI_DEFAULT = {
 }
 
 
-def _load_custom_model_config() -> dict[str, Any]:
-    """Load custom model configuration from environment or config file.
-
-    Checks (in order):
-    1. HEADROOM_MODEL_LIMITS environment variable (JSON string or file path)
-    2. ~/.headroom/models.json config file
-
-    Returns:
-        Dict with 'context_limits' and 'pricing' keys.
-    """
-    config: dict[str, Any] = {"context_limits": {}, "pricing": {}, "encodings": {}}
-
-    # Check environment variable
-    env_config = os.environ.get("HEADROOM_MODEL_LIMITS", "")
-    if env_config:
-        try:
-            # Check if it's a file path
-            if os.path.isfile(env_config):
-                with open(env_config, encoding="utf-8") as f:
-                    loaded = json.load(f)
-            else:
-                # Try to parse as JSON string
-                loaded = json.loads(env_config)
-
-            if not isinstance(loaded, dict):
-                raise ValueError(
-                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
-                )
-
-            openai_config = loaded.get("openai", loaded)
-            if "context_limits" in openai_config:
-                config["context_limits"].update(openai_config["context_limits"])
-            if "pricing" in openai_config:
-                config["pricing"].update(openai_config["pricing"])
-            if "encodings" in openai_config:
-                config["encodings"].update(openai_config["encodings"])
-
-            logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
-        except (ValueError, OSError) as e:
-            # ValueError covers json.JSONDecodeError (a subclass) and the
-            # non-object guard above, so a malformed value warns and falls back
-            # to defaults instead of crashing provider init.
-            logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
-
-    # Check config file. Prefer the canonical config-dir location, then fall
-    # back to the legacy workspace-root location for backward compatibility.
-    config_file = _paths.models_config_path()
-    if not config_file.exists():
-        legacy_models = _paths.workspace_dir() / "models.json"
-        if legacy_models.exists():
-            config_file = legacy_models
-    if config_file.exists():
-        try:
-            with open(config_file, encoding="utf-8") as f:
-                loaded = json.load(f)
-
-            if not isinstance(loaded, dict):
-                raise ValueError(f"{config_file} must contain a JSON object")
-
-            openai_config = loaded.get("openai", {})
-            if "context_limits" in openai_config:
-                for model, limit in openai_config["context_limits"].items():
-                    if model not in config["context_limits"]:
-                        config["context_limits"][model] = limit
-            if "pricing" in openai_config:
-                for model, pricing in openai_config["pricing"].items():
-                    if model not in config["pricing"]:
-                        config["pricing"][model] = pricing
-            if "encodings" in openai_config:
-                for model, encoding in openai_config["encodings"].items():
-                    if model not in config["encodings"]:
-                        config["encodings"][model] = encoding
-
-            logger.debug(f"Loaded custom OpenAI model config from {config_file}")
-        except (ValueError, OSError) as e:
-            logger.warning(f"Failed to load {config_file}: {e}")
-
-    return config
-
-
 def _infer_model_family(model: str) -> str | None:
     """Infer the model family from model name for pattern-based defaults."""
     model_lower = model.lower()
@@ -325,8 +244,11 @@ def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = 
     reach a better tokenizer should use it rather than guess an encoding.
     """
     # Check custom encodings first
-    if custom_encodings and model in custom_encodings:
-        return custom_encodings[model]
+    if custom_encodings:
+        # The same lookup the tokenizer registry uses (case-insensitive).
+        encoding = configured_encoding(model, custom_encodings)
+        if encoding is not None:
+            return encoding
 
     # Direct match
     if model in _MODEL_ENCODINGS:
@@ -500,7 +422,10 @@ class OpenAIProvider(Provider):
         # Load from config file and env var
         custom_config = _load_custom_model_config()
         self._context_limits.update(custom_config["context_limits"])
-        self._encodings.update(custom_config["encodings"])
+        # Encodings come from the encodings-only loader the tokenizer registry
+        # reads, so a malformed pricing or context-limit section cannot drop
+        # the mapping here while the registry keeps it (two rulers).
+        self._encodings.update(load_openai_encodings())
 
         # Handle pricing (can be tuple or list from JSON). Tracked separately as
         # well: an explicitly configured price is a user decision and must beat
@@ -564,7 +489,10 @@ class OpenAIProvider(Provider):
                     self._token_counters[model] = OpenAITokenCounter(
                         model=model, custom_encodings=self._encodings
                     )
-                except TiktokenLoadError as exc:
+                except (TiktokenLoadError, ValueError) as exc:
+                    # ValueError: tiktoken does not know the encoding name, e.g.
+                    # a typo in a configured mapping. Estimate for this model
+                    # only, as the tokenizer registry does.
                     logger.warning(
                         "tiktoken unavailable for %s (%s); using estimation.", model, exc
                     )

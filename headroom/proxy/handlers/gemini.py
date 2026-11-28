@@ -776,6 +776,9 @@ class GeminiHandlerMixin:
                     lambda: self.openai_pipeline.apply(
                         messages=messages,
                         model=model,
+                        # The handler's ruler: the replay recount below and
+                        # the inflation guard compare against it (#5037).
+                        token_counter=tokenizer,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         frozen_message_count=gemini_frozen_count,
@@ -1395,6 +1398,9 @@ class GeminiHandlerMixin:
                     lambda: self.openai_pipeline.apply(
                         messages=messages,
                         model=model,
+                        # The handler's ruler: the replay recount below and
+                        # the inflation guard compare against it (#5037).
+                        token_counter=tokenizer,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         frozen_message_count=gemini_frozen_count,
@@ -1620,6 +1626,9 @@ class GeminiHandlerMixin:
                     lambda: self.openai_pipeline.apply(
                         messages=messages,
                         model=model,
+                        # The handler's ruler: the replay recount below and
+                        # the inflation guard compare against it (#5037).
+                        token_counter=tokenizer,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         frozen_message_count=gemini_frozen_count,

@@ -2491,8 +2491,13 @@ class OpenAIHandlerMixin:
         timing: dict[str, float] | None = None,
         deadline_started_at: float | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        resolve_token_counter: Any = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
+
+        ``resolve_token_counter`` returns the counter the caller counts this
+        request with; pass it so the router's savings share the caller's unit
+        (#5037). It is called only once the router actually needs a counter.
 
         This is the Responses provider scaffold: it extracts text-bearing
         request slots into provider-neutral ``CompressionUnit`` objects, lets
@@ -2540,7 +2545,11 @@ class OpenAIHandlerMixin:
         compress_user_units = profile_kwargs.get("compress_user_messages") is not False
 
         try:
-            tokenizer = self.openai_provider.get_token_counter(model)
+            tokenizer = (
+                resolve_token_counter()
+                if resolve_token_counter is not None
+                else self.openai_provider.get_token_counter(model)
+            )
         except Exception as exc:
             logger.debug(
                 "[%s] OpenAI Responses ContentRouter tokenizer unavailable: %s",
@@ -3167,6 +3176,7 @@ class OpenAIHandlerMixin:
         deadline_started_at: float | None = None,
         conversation: str | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        token_counter: Any = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -3174,6 +3184,11 @@ class OpenAIHandlerMixin:
         function is envelope-agnostic: it extracts Responses text slots into
         provider-neutral compression units, lets ContentRouter choose the
         compressor, then splices accepted replacements back into the payload.
+
+        ``token_counter`` is the counter the caller counted this request
+        with. A caller that subtracts the returned ``tokens_saved`` from its
+        own count must pass it (#5037); without it one counter is looked up
+        for the whole payload.
         """
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
@@ -3192,6 +3207,18 @@ class OpenAIHandlerMixin:
         transforms: list[str] = []
         reason: str | None = None
 
+        # One counter for the whole payload. Every before/after pair below is
+        # subtracted, and the pairs are summed into tokens_saved, so they must
+        # share one ruler; a fresh provider lookup per count does not promise
+        # that (#5037). Resolved lazily so a payload that counts nothing does
+        # not pay for a lookup, and a failed lookup still fails each count.
+        _resolved_counter: list[Any] = [token_counter] if token_counter is not None else []
+
+        def _counter() -> Any:
+            if not _resolved_counter:
+                _resolved_counter.append(self.openai_provider.get_token_counter(model))
+            return _resolved_counter[0]
+
         tool_compaction_started = time.perf_counter()
         compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
             _compact_openai_responses_tools(working)
@@ -3204,7 +3231,7 @@ class OpenAIHandlerMixin:
             transforms.append("openai:responses:tool_schema_compaction")
             try:
                 tool_token_started = time.perf_counter()
-                tokenizer = self.openai_provider.get_token_counter(model)
+                tokenizer = _counter()
                 tokens_saved += max(
                     0,
                     tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
@@ -3238,7 +3265,7 @@ class OpenAIHandlerMixin:
                     modified = True
                     transforms.append("openai:responses:tool_desc_compaction")
                     try:
-                        tokenizer = self.openai_provider.get_token_counter(model)
+                        tokenizer = _counter()
                         tokens_saved += max(
                             0,
                             tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
@@ -3291,9 +3318,7 @@ class OpenAIHandlerMixin:
                 record_savings(
                     savings_tags if savings_tags is not None else {},
                     "tool_search",
-                    tokens=self.openai_provider.get_token_counter(model).count_text(
-                        _json_debug_dumps(deferred)
-                    ),
+                    tokens=_counter().count_text(_json_debug_dumps(deferred)),
                     realized=False,
                     estimated=True,
                 )
@@ -3326,9 +3351,7 @@ class OpenAIHandlerMixin:
             _mt_before = 0
             if _msg_key:
                 try:
-                    _mt_before = self.openai_provider.get_token_counter(model).count_text(
-                        _json_debug_dumps(_msgs_before)
-                    )
+                    _mt_before = _counter().count_text(_json_debug_dumps(_msgs_before))
                 except Exception:
                     _mt_before = 0
             _req_ctx = TurnContext(
@@ -3338,15 +3361,9 @@ class OpenAIHandlerMixin:
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
                 tags=savings_tags if savings_tags is not None else {},
-                count_messages=lambda value: self.openai_provider.get_token_counter(
-                    model
-                ).count_text(_json_debug_dumps(value)),
+                count_messages=lambda value: _counter().count_text(_json_debug_dumps(value)),
                 count_tools=lambda value: (
-                    self.openai_provider.get_token_counter(model).count_text(
-                        _json_debug_dumps(value)
-                    )
-                    if value
-                    else 0
+                    _counter().count_text(_json_debug_dumps(value)) if value else 0
                 ),
                 conversation=conversation,
             )
@@ -3372,7 +3389,7 @@ class OpenAIHandlerMixin:
                 working[_msg_key] = _req_ctx.messages
             if _msg_key and _mt_before:
                 try:
-                    _mt_after = self.openai_provider.get_token_counter(model).count_text(
+                    _mt_after = _counter().count_text(
                         _json_debug_dumps(working.get(_msg_key) or [])
                     )
                     if _mt_after < _mt_before:
@@ -3402,6 +3419,7 @@ class OpenAIHandlerMixin:
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
             tool_names_by_call_id=tool_names_by_call_id,
+            resolve_token_counter=_counter,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -3424,7 +3442,7 @@ class OpenAIHandlerMixin:
         if tools_modified:
             try:
                 attempted_token_started = time.perf_counter()
-                tokenizer = self.openai_provider.get_token_counter(model)
+                tokenizer = _counter()
                 attempted_input_tokens += tokenizer.count_text(
                     _json_debug_dumps(payload.get("tools"))
                 )
@@ -3471,10 +3489,12 @@ class OpenAIHandlerMixin:
         savings_tags: dict[str, Any] | None = None,
         conversation: str | None = None,
         tool_names_by_call_id: dict[str, str] | None = None,
+        token_counter: Any = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         """``conversation`` is the caller's ``turn_conversation_key``,
         derived before compression rewrites the body; turn hooks see it as
-        ``TurnContext.conversation``."""
+        ``TurnContext.conversation``. ``token_counter``: see
+        ``_compress_openai_responses_payload``."""
         timing: dict[str, float] = {}
 
         # Codex >= 0.149.0 nests tool definitions in `input` items of type
@@ -3527,6 +3547,8 @@ class OpenAIHandlerMixin:
                 compression_kwargs["conversation"] = conversation
             if tool_names_by_call_id:
                 compression_kwargs["tool_names_by_call_id"] = tool_names_by_call_id
+            if token_counter is not None:
+                compression_kwargs["token_counter"] = token_counter
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -3544,6 +3566,7 @@ class OpenAIHandlerMixin:
                                 "timing",
                                 "deadline_started_at",
                                 "conversation",
+                                "token_counter",
                             )
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
@@ -4375,6 +4398,9 @@ class OpenAIHandlerMixin:
                         lambda: self.openai_pipeline.apply(
                             messages=working_messages,
                             model=model,
+                            # original_tokens was counted with `tokenizer`; the
+                            # pipeline's counts are compared with it (#5037).
+                            token_counter=tokenizer,
                             model_limit=context_limit,
                             context=extract_user_query(working_messages),
                             frozen_message_count=(
@@ -4425,6 +4451,7 @@ class OpenAIHandlerMixin:
                         lambda: self.openai_pipeline.apply(
                             messages=messages,
                             model=model,
+                            token_counter=tokenizer,
                             model_limit=context_limit,
                             context=extract_user_query(messages),
                             frozen_message_count=apply_frozen_count,
@@ -7027,6 +7054,9 @@ class OpenAIHandlerMixin:
                     client=client,
                     savings_tags=tags,
                     conversation=_turn_conversation,
+                    # tokens_saved is subtracted from original_tokens, which
+                    # was counted with `tokenizer` (#5037).
+                    token_counter=tokenizer,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:

@@ -27,7 +27,8 @@ from .cache_aligner import CacheAligner
 from .content_router import ContentRouter, ContentRouterConfig
 
 if TYPE_CHECKING:
-    from ..providers.base import Provider
+    from ..providers.base import Provider, TokenCounter
+    from ..tokenizers.base import TokenCounter as RegistryTokenCounter
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ class TransformPipeline:
         Uses provider's tokenizer if available, otherwise falls back to
         the tokenizer registry which auto-detects the best backend per model:
         - OpenAI models: tiktoken (exact)
-        - Anthropic models: calibrated estimation (~3.5 chars/token)
+        - Anthropic models: tiktoken o200k_base as a proxy for Claude's tokenizer
         - Open models: HuggingFace tokenizer (if installed)
         - Unknown models: character-based estimation
         """
@@ -264,6 +265,8 @@ class TransformPipeline:
         self,
         messages: list[dict[str, Any]],
         model: str,
+        *,
+        token_counter: Tokenizer | TokenCounter | RegistryTokenCounter | None = None,
         **kwargs: Any,
     ) -> TransformResult:
         """
@@ -272,6 +275,12 @@ class TransformPipeline:
         Args:
             messages: List of messages to transform.
             model: Model name for token counting.
+            token_counter: The counter the caller already resolved for this
+                request. A caller that compares its own count with
+                ``tokens_before`` / ``tokens_after`` must pass the counter it
+                counted with, so both sides of the comparison come from one
+                ruler (#5037). When omitted, the pipeline resolves one itself
+                (see ``_get_tokenizer``).
             **kwargs: Additional arguments passed to transforms.
                 - model_limit: Context limit override.
                 - output_buffer: Output buffer override.
@@ -288,7 +297,14 @@ class TransformPipeline:
         waste_signal_token_limit = int(
             kwargs.pop("waste_signal_token_limit", MAX_WASTE_SIGNAL_DETECTION_TOKENS)
         )
-        tokenizer = self._get_tokenizer(model)
+        if isinstance(token_counter, Tokenizer):
+            tokenizer = token_counter
+        elif token_counter is not None:
+            # Registry counters and provider counters share the counting
+            # interface but are distinct Protocol types (see _get_tokenizer).
+            tokenizer = Tokenizer(token_counter, model)  # type: ignore[arg-type]
+        else:
+            tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()
 
         # Get model limit from kwargs (should be set by client)
@@ -590,6 +606,8 @@ class TransformPipeline:
         self,
         messages: list[dict[str, Any]],
         model: str,
+        *,
+        token_counter: Tokenizer | TokenCounter | RegistryTokenCounter | None = None,
         **kwargs: Any,
     ) -> TransformResult:
         """
@@ -600,10 +618,13 @@ class TransformPipeline:
         Args:
             messages: List of messages.
             model: Model name.
+            token_counter: The caller's counter for this request; see ``apply``.
             **kwargs: Additional arguments.
 
         Returns:
             TransformResult with simulated changes.
         """
         # apply() already works on a copy, so this is safe
-        return self.apply(messages, model, record_metrics=False, **kwargs)
+        return self.apply(
+            messages, model, token_counter=token_counter, record_metrics=False, **kwargs
+        )

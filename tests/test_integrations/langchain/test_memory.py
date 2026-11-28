@@ -511,3 +511,40 @@ class TestLangChainNotAvailable:
             _check_langchain_available()
         except ImportError:
             pytest.fail("Should not raise when LangChain is available")
+
+
+class TestOneCounterPerRead:
+    """Both sides of tokens_saved come from one counter (#5037)."""
+
+    def test_untouched_history_reports_no_savings(self, mock_base_history):
+        """A provider may hand out a different counter per lookup (an uncached
+        fallback, #4990). The before and after counts of one read must not
+        come from two lookups, or an untouched history reports savings."""
+        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
+
+        lookups = {"n": 0}
+
+        def _counter(model):
+            lookups["n"] += 1
+            words_per_token = 1 if lookups["n"] % 2 else 2
+            counter = MagicMock()
+            counter.count_text = MagicMock(
+                side_effect=lambda text: len(text.split()) // words_per_token
+            )
+            return counter
+
+        provider = MagicMock()
+        provider.get_token_counter = MagicMock(side_effect=_counter)
+        mock_base_history.messages = [
+            SystemMessage(content="Word " * 50),
+            HumanMessage(content="Word " * 50),
+        ]
+        history = HeadroomChatMessageHistory(
+            mock_base_history, compress_threshold_tokens=10, provider=provider
+        )
+
+        with patch.object(history, "_apply_compression", side_effect=lambda m, *a: list(m)):
+            _ = history.messages
+
+        assert history._compression_count == 1
+        assert history._total_tokens_saved == 0
