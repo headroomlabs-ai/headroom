@@ -3766,6 +3766,7 @@ class AnthropicHandlerMixin:
             from headroom.proxy.helpers import (
                 strip_first_party_tool_search_tools_for_third_party_upstream,
             )
+            from headroom.proxy.route_advice import resolver_for
 
             # _third_party_anthropic_upstream is decided before the lineage key.
             if _third_party_anthropic_upstream:
@@ -3805,6 +3806,16 @@ class AnthropicHandlerMixin:
                 provider_name == "anthropic"
                 and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
                 and getattr(self, "anthropic_backend", None) is None
+                # Route advice may send this one request to a translating
+                # backend (see the dispatch below); another vendor cannot run
+                # Anthropic's server-side tool search.
+                and (
+                    force_direct
+                    or resolver_for(self).for_request(
+                        request, upstream_url=_anthropic_target_base_url
+                    )
+                    is None
+                )
                 and os.environ.get("HEADROOM_TOOL_SEARCH", "1").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
             ):
