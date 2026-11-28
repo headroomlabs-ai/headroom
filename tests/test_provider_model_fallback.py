@@ -136,6 +136,27 @@ class TestAnthropicModelFallback:
         assert pricing["input"] == 0.80
         assert pricing["output"] == 4.00
 
+    def test_pattern_based_inference_fable(self, monkeypatch):
+        """A future Fable model gets the 1M window and the latest Fable rates.
+
+        Every Fable release so far has a 1M window; before the fable tier an
+        unlisted one fell back to the 200K, Sonnet-priced Claude default.
+        LiteLLM is switched off because its ``get_model_info`` answers 200K for
+        any unknown ``claude-*`` id, which would mask the tier.
+        """
+        import headroom.providers.anthropic as anthropic_module
+
+        monkeypatch.setattr(anthropic_module, "_get_litellm_clients", lambda: (None, None))
+        provider = AnthropicProvider()
+
+        limit = provider.get_context_limit("claude-fable-6-20270101")
+        assert limit == 1_000_000
+
+        pricing = provider._get_pricing("claude-fable-6-20270101")
+        assert pricing["input"] == 8.00
+        assert pricing["output"] == 40.00
+        assert pricing["cached_input"] == 0.20
+
     def test_unknown_claude_model_fallback(self):
         """Test fallback for unknown Claude models."""
         provider = AnthropicProvider()
@@ -161,6 +182,7 @@ class TestAnthropicModelFallback:
         assert _infer_model_tier("claude-sonnet-4-20250514") == "sonnet"
         assert _infer_model_tier("claude-haiku-4-5-20251001") == "haiku"
         assert _infer_model_tier("claude-3-5-sonnet-latest") == "sonnet"
+        assert _infer_model_tier("claude-fable-6-20270101") == "fable"
         assert _infer_model_tier("CLAUDE-OPUS-FUTURE") == "opus"  # Case insensitive
         assert _infer_model_tier("some-other-model") is None
 
