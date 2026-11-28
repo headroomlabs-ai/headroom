@@ -46,9 +46,13 @@ def _parse_facts(section: str) -> list[str]:
             line = line.strip()
         if line.startswith("- "):
             facts.append([line[2:]])
-        elif multiline and facts and line.startswith("  "):
+        elif multiline and facts and (not line or line.startswith("  ")):
             facts[-1].append(line[2:])
     return [fact for parts in facts if (fact := "\n".join(parts).strip())]
+
+
+def _normalize_note(content: str) -> str:
+    return content.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 class CodexAdapter(AgentMemoryAdapter):
@@ -58,6 +62,10 @@ class CodexAdapter(AgentMemoryAdapter):
 
     def __init__(self, agents_md_path: Path | str | None = None) -> None:
         self._path = Path(agents_md_path) if agents_md_path else Path.cwd() / "AGENTS.md"
+
+    def memory_content_hash(self, content: str) -> str:
+        """Match both the original note and its LF-normalized file form."""
+        return super().memory_content_hash(_normalize_note(content))
 
     async def read_memories(self) -> list[AgentMemory]:
         """Read memories from the headroom section of AGENTS.md."""
@@ -96,7 +104,7 @@ class CodexAdapter(AgentMemoryAdapter):
 
         added = 0
         for mem in memories:
-            fact = mem["content"].replace("\r\n", "\n").replace("\r", "\n").strip()
+            fact = _normalize_note(mem["content"])
             if fact and fact not in facts:
                 facts[fact] = None
                 added += 1
@@ -107,7 +115,7 @@ class CodexAdapter(AgentMemoryAdapter):
         for fact in facts:
             first, *continuations = fact.split("\n")
             lines.append(f"- {first}")
-            lines.extend(f"  {line}" for line in continuations)
+            lines.extend(f"  {line}" if line else "" for line in continuations)
         lines.append("")
         section = f"{_MARKER_START}\n" + "\n".join(lines) + f"{_MARKER_END}"
 
@@ -132,6 +140,10 @@ class CodexAdapter(AgentMemoryAdapter):
             return "empty"
         try:
             hasher = hashlib.sha256()
+            # Recheck once after an upgrade so previously abbreviated notes
+            # can be exported even when the database and file did not change.
+            hasher.update(_MULTILINE_FORMAT.encode())
+            hasher.update(b"\0")
             hasher.update(self._path.name.encode())
             hasher.update(b"\0")
             hasher.update(self._path.read_bytes())
