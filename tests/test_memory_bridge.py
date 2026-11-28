@@ -12,6 +12,8 @@ import functools
 import json
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -549,6 +551,110 @@ class TestMemoryBridgeSync:
         assert "Rust" in updated_content
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("markdown", "topic", "expected"),
+        [
+            pytest.param(
+                "## Facts\n- a\n```sh\n# Description\necho hi\n```\n",
+                "Facts",
+                b"## Facts\n- a\n```sh\n# Description\necho hi\n```\n- new\n",
+                id="F1-fence-hash-line-6008077252",
+            ),
+            pytest.param(
+                "## Facts\n- one\u2028two\n",
+                "Facts",
+                "## Facts\n- one\u2028two\n- new\n".encode(),
+                id="F2-u2028-6008077252",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n",
+                "Facts",
+                b"## Facts\n- a\n\n<!--\nMaintenance notes\n## Hidden\n-->\n- new\n",
+                id="F3-html-comment-6027567395",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n",
+                "Facts",
+                b"## Facts\n- a\n\n<pre>\nSample notes\n## Example\n</pre>\n- new\n",
+                id="F4-pre-6028319242",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<div>\n## Example\n</div>\n\n## Updates\n- b\n",
+                "Facts",
+                b"## Facts\n- a\n\n<div>\n## Example\n</div>\n\n## Updates\n- b\n- new\n",
+                id="F5-div-blank-line-6028809147",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F6-span-6030452224",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n  <span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n  <span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F7-indented-span-6031791335",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\nBackground\n==========\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\nBackground\n==========\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F8-setext-span-6032654557",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n[ref]:\n  /url\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F9-multiline-link-ref-6033361292",
+            ),
+            pytest.param(
+                "## Facts\n- a\n\n##\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n",
+                "Facts",
+                b"## Facts\n- a\n\n##\n<span>\nExample text\n## Example\n</span>\n\nNotes resume here.\n- new\n",
+                id="F10-empty-heading-span-7148484411",
+            ),
+            pytest.param(
+                "# General\n- To check the version:\n  ```sh\n  version\n    ```\n",
+                "General",
+                b"# General\n- To check the version:\n  ```sh\n  version\n    ```\n\n## General\n- new\n",
+                id="F11-list-item-fence-6049668617",
+            ),
+            pytest.param(
+                "## General\n- original item\n  <pre>\n  sample text\n",
+                "General",
+                b"## General\n- original item\n  <pre>\n  sample text\n- new\n",
+                id="F12-list-item-pre-7150259492",
+            ),
+            pytest.param(
+                "## General\n- existing\n\n- - -\n\n  ```text\n## Example output\n  ```\n",
+                "General",
+                b"## General\n- existing\n\n- - -\n\n  ```text\n## Example output\n  ```\n- new\n",
+                id="F13-thematic-break-indented-fence-7150363442",
+            ),
+            pytest.param(
+                "## General\nRead this first:\n> Existing note\n---\n- existing\n",
+                "General",
+                b"## General\nRead this first:\n> Existing note\n---\n- existing\n- new\n",
+                id="F14-quote-then-setext-like-break-7150363442",
+            ),
+        ],
+    )
+    async def test_sync_appends_export_without_editing_existing_markdown(
+        self, bridge, tmp_dir, backend, markdown, topic, expected
+    ):
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text(markdown, encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+
+        await backend.save_memory(content="new", user_id="test_user", metadata={"topic": topic})
+        await bridge.sync(user_id="test_user")
+
+        assert md_path.read_bytes() == expected
+
+    @pytest.mark.asyncio
     async def test_source_tag_prevents_reexport(self, bridge, tmp_dir, backend):
         """Memories imported via bridge should not be re-exported."""
         md_path = tmp_dir / "MEMORY.md"
@@ -561,6 +667,137 @@ class TestMemoryBridgeSync:
         # Sync again - nothing should be exported (all memories have source tag)
         stats = await bridge.sync(user_id="test_user")
         assert stats.memories_exported == 0
+
+    @pytest.mark.asyncio
+    async def test_sync_exports_organic_memory_when_markdown_changes(
+        self, bridge, tmp_dir, backend
+    ):
+        """Importing edits must not replace the export's previous watermark."""
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+
+        organic = await backend.save_memory(
+            content="Release label is cobalt-47", user_id="test_user", metadata={}
+        )
+        created_at = organic.created_at.replace(tzinfo=timezone.utc)
+        bridge._sync_state["last_sync"] = (created_at - timedelta(minutes=1)).isoformat()
+        bridge._save_sync_state()
+        md_path.write_text(
+            "## Facts\n- User likes Python\n\n## Updates\n- Project uses SQLite\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = created_at + timedelta(minutes=1)
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported > 0
+        assert stats.memories_exported == 1
+        content = md_path.read_text(encoding="utf-8")
+        assert content.count("Release label is cobalt-47") == 1
+        assert content.count("Project uses SQLite") == 1
+        expected = (
+            b"## Facts\n- User likes Python\n\n## Updates\n- Project uses SQLite\n\n"
+            b"## General\n- Release label is cobalt-47\n"
+        )
+        assert md_path.read_bytes() == expected
+
+        # A restarted bridge reloads the saved cutoff and file hash, so nothing replays.
+        from headroom.memory.bridge import MemoryBridge
+
+        restarted = MemoryBridge(bridge._config, backend)
+        repeat = await restarted.sync(user_id="test_user")
+
+        assert repeat.import_stats.files_skipped_unchanged == 1
+        assert repeat.import_stats.sections_imported == 0
+        assert repeat.memories_exported == 0
+        assert md_path.read_bytes() == expected
+
+    @pytest.mark.asyncio
+    async def test_first_sync_exports_existing_organic_memory(self, bridge, tmp_dir, backend):
+        """An initial import must not hide memories saved before the first sync."""
+        organic = await backend.save_memory(
+            content="Guitar lessons are scheduled for Thursday", user_id="test_user", metadata={}
+        )
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        assert bridge._sync_state.get("last_sync") is None
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = organic.created_at.replace(tzinfo=timezone.utc) + timedelta(
+                minutes=1
+            )
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported > 0
+        assert stats.memories_exported == 1
+        content = md_path.read_text(encoding="utf-8")
+        assert content.count("Guitar lessons are scheduled for Thursday") == 1
+        assert content.count("User likes Python") == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_still_excludes_organic_memory_before_watermark(
+        self, bridge, tmp_dir, backend
+    ):
+        organic = await backend.save_memory(
+            content="Deployment region is eu-west-2", user_id="test_user", metadata={}
+        )
+        created_at = organic.created_at.replace(tzinfo=timezone.utc)
+        bridge._sync_state["last_sync"] = (created_at + timedelta(minutes=1)).isoformat()
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+
+        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
+            clock.now.return_value = created_at + timedelta(minutes=2)
+            stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported > 0
+        assert stats.memories_exported == 0
+        assert "Deployment region" not in md_path.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("watermark", [None, "not-a-timestamp"])
+    async def test_sync_keeps_watermark_fallback_for_unchanged_file(
+        self, bridge, tmp_dir, backend, watermark
+    ):
+        md_path = tmp_dir / "MEMORY.md"
+        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
+        bridge._config.md_paths = [md_path]
+        initial = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(initial.import_stats)
+        await backend.save_memory(
+            content="Release label is cobalt-47", user_id="test_user", metadata={}
+        )
+        bridge._sync_state["last_sync"] = watermark
+
+        stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.files_skipped_unchanged == 1
+        assert stats.memories_exported == 1
+        assert md_path.read_text(encoding="utf-8").count("Release label is cobalt-47") == 1
+
+    @pytest.mark.asyncio
+    async def test_first_sync_without_import_exports_existing_memory(
+        self, bridge, tmp_dir, backend
+    ):
+        await backend.save_memory(
+            content="Release label is cobalt-47", user_id="test_user", metadata={}
+        )
+        md_path = tmp_dir / "MEMORY.md"
+        bridge._config.md_paths = [md_path]
+        assert not md_path.exists()
+
+        stats = await bridge.sync(user_id="test_user")
+
+        assert stats.import_stats.sections_imported == 0
+        assert stats.memories_exported == 1
+        assert "Release label is cobalt-47" in md_path.read_text(encoding="utf-8")
 
 
 @decorate_async_test_methods
