@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from headroom import _core
 from headroom.transforms.content_detector import ContentType, detect_content_type
 from headroom.transforms.log_compressor import LogCompressor, LogCompressorConfig
 
@@ -70,6 +71,21 @@ def java_chained_trace(runtime_frames: int = 30) -> str:
     return "\n".join(lines)
 
 
+def test_native_log_config_requires_explicit_frame_collapse() -> None:
+    content = java_chained_trace()
+    omitted = _core.LogCompressor(_core.LogCompressorConfig(enable_ccr=False)).compress(content)
+    disabled = _core.LogCompressor(
+        _core.LogCompressorConfig(enable_ccr=False, collapse_runtime_frames=False)
+    ).compress(content)
+    enabled = _core.LogCompressor(
+        _core.LogCompressorConfig(enable_ccr=False, collapse_runtime_frames=True)
+    ).compress(content)
+
+    assert omitted.compressed == disabled.compressed
+    assert "com.example.Disk.read" not in disabled.compressed
+    assert "com.example.Disk.read" in enabled.compressed
+
+
 def dotnet_trace() -> str:
     return "\n".join(
         [
@@ -120,7 +136,7 @@ def test_node_async_frames_count_toward_log_detection() -> None:
 
 
 def test_go_dump_collapses_runtime_frames_keeps_panic_and_app_frame() -> None:
-    compressor = LogCompressor(LogCompressorConfig(enable_ccr=False))
+    compressor = LogCompressor(LogCompressorConfig(enable_ccr=False, collapse_runtime_frames=True))
     content = go_panic_dump()
     result = compressor.compress(content)
     assert result.compressed_line_count < result.original_line_count
@@ -132,7 +148,13 @@ def test_go_dump_collapses_runtime_frames_keeps_panic_and_app_frame() -> None:
 
 
 def test_java_chain_heads_survive_collapse() -> None:
-    compressor = LogCompressor(LogCompressorConfig(enable_ccr=False, min_lines_for_ccr=10))
+    compressor = LogCompressor(
+        LogCompressorConfig(
+            enable_ccr=False,
+            min_lines_for_ccr=10,
+            collapse_runtime_frames=True,
+        )
+    )
     result = compressor.compress(java_chained_trace())
     assert "Caused by: java.io.IOException" in result.compressed
     assert "com.example.Disk.read" in result.compressed
@@ -146,10 +168,23 @@ def test_collapse_can_be_disabled() -> None:
     assert "frames collapsed]" not in result.compressed
 
 
+def test_collapse_default_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_STACK_TRACE_COLLAPSE", raising=False)
+    assert LogCompressorConfig().collapse_runtime_frames is False
+
+    monkeypatch.setenv("HEADROOM_STACK_TRACE_COLLAPSE", "1")
+    assert LogCompressorConfig().collapse_runtime_frames is True
+
+
 def test_collapse_config_plumbs_through() -> None:
     # Constructor accepts the new knobs and forwards them to Rust without error.
     compressor = LogCompressor(
-        LogCompressorConfig(trace_head_frames=1, trace_app_frames=2, enable_ccr=False)
+        LogCompressorConfig(
+            trace_head_frames=1,
+            trace_app_frames=2,
+            enable_ccr=False,
+            collapse_runtime_frames=True,
+        )
     )
     result = compressor.compress(go_panic_dump())
     assert result.compressed  # smoke: no TypeError from the PyO3 signature

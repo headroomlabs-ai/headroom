@@ -248,15 +248,11 @@ impl TransformComparator for LogCompressorComparator {
                 .get("min_compression_ratio_for_ccr")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.5),
-            // Rust's `true` collapses runtime frames where Python truncates the
-            // tail — a deliberate upgrade, and the one place these two
-            // implementations are known to disagree. Kept at the Rust default
-            // anyway: measured both ways, all 20 fixtures match either setting,
-            // because every recorded traceback is 3 lines and the collapse path
-            // only opens above `stack_trace_max_lines` (20). Leaving it `true`
-            // means a future fixture with a deep traceback will surface the
-            // divergence instead of having it configured away here.
-            collapse_runtime_frames: bool_or("collapse_runtime_frames", true),
+            // Collapsing runtime frames is opt-in: Rust's collapse differs from
+            // Python's tail truncation. Kept at the Rust default (`false`) so
+            // implicit-config fixtures exercise the shipped default; fixtures
+            // can still set `collapse_runtime_frames` explicitly.
+            collapse_runtime_frames: bool_or("collapse_runtime_frames", false),
             trace_head_frames: usize_or("trace_head_frames", 3),
             trace_app_frames: usize_or("trace_app_frames", 5),
         };
