@@ -981,6 +981,9 @@ class CostTracker:
         self._tool_saved_write_1h_by_model: dict[str, float] = {}
         self._tool_saved_list_by_model: dict[str, float] = {}
         self._tokens_sent_by_model: dict[str, int] = {}
+        # Count fallback input per request: an estimate can differ from the
+        # provider's usage, so it cannot be recovered from aggregate buckets.
+        self._no_usage_input_by_model: dict[str, int] = {}
         # Of _tokens_sent_by_model: the part that is the provider's own billed
         # count (the rest is Headroom's tokenizer estimate), and how many
         # requests it came from. The licence usage report sends both so the
@@ -1026,6 +1029,7 @@ class CostTracker:
         self._tool_saved_write_1h_by_model.clear()
         self._tool_saved_list_by_model.clear()
         self._tokens_sent_by_model.clear()
+        self._no_usage_input_by_model.clear()
         self._provider_tokens_sent_by_model.clear()
         self._provider_requests_by_model.clear()
         self._output_tokens_by_tier.clear()
@@ -1185,6 +1189,10 @@ class CostTracker:
         write_5m_eff = 0 if cache_inferred else max(0, cache_write_5m_tokens)
         write_1h_eff = 0 if cache_inferred else max(0, cache_write_1h_tokens)
         billed_prompt = max(0, cache_read_tokens) + write_eff + max(0, uncached_tokens)
+        if billed_prompt == 0:
+            self._no_usage_input_by_model[key] = self._no_usage_input_by_model.get(key, 0) + max(
+                0, tokens_sent
+            )
         threshold = _long_context_threshold(model)
         forwarded_prompt = max(billed_prompt, tokens_sent)
         long_context = forwarded_prompt > threshold
@@ -1656,21 +1664,18 @@ class CostTracker:
         for model in self._tokens_saved_by_model:
             sent = self._tokens_sent_by_model.get(model, 0)
             cr = self._api_cache_read_by_model.get(model, 0)
-            cw = self._api_cache_write_by_model.get(model, 0)
             uncached = self._api_uncached_by_model.get(model, 0)
+            fallback = self._no_usage_input_by_model.get(model, 0)
             total_input_tokens += sent
 
             prices = self._get_cache_prices(model)
             if prices:
                 cr_price, cw5_price, cw1h_price, uncached_price = prices
-                if cr + cw + uncached > 0:
-                    cost_with_headroom += (
-                        cr * cr_price
-                        + self._write_cost_usd(model, cw5_price, cw1h_price)
-                        + uncached * uncached_price
-                    )
-                else:
-                    cost_with_headroom += sent * uncached_price
+                cost_with_headroom += (
+                    cr * cr_price
+                    + self._write_cost_usd(model, cw5_price, cw1h_price)
+                    + (uncached + fallback) * uncached_price
+                )
         return total_input_tokens, round(cost_with_headroom + self._folded_input_usd, 4)
 
     def stats(self) -> dict:
@@ -1727,24 +1732,18 @@ class CostTracker:
             cr = self._api_cache_read_by_model.get(model, 0)
             cw = self._api_cache_write_by_model.get(model, 0)
             uncached = self._api_uncached_by_model.get(model, 0)
+            fallback = self._no_usage_input_by_model.get(model, 0)
             total_input_tokens += sent
 
             prices = self._get_cache_prices(model)
             if prices:
                 cr_price, cw5_price, cw1h_price, uncached_price = prices
-                if cr + cw + uncached > 0:
-                    # Use API's real cache breakdown with LiteLLM pricing,
-                    # writes split by the TTL they were actually written at.
-                    model_cost = (
-                        cr * cr_price
-                        + self._write_cost_usd(model, cw5_price, cw1h_price)
-                        + uncached * uncached_price
-                    )
-                    billed_tokens = cr + cw + uncached
-                else:
-                    # No cache data from API — fall back to list price
-                    model_cost = sent * uncached_price
-                    billed_tokens = sent
+                model_cost = (
+                    cr * cr_price
+                    + self._write_cost_usd(model, cw5_price, cw1h_price)
+                    + (uncached + fallback) * uncached_price
+                )
+                billed_tokens = cr + cw + uncached + fallback
                 cost_with_headroom += model_cost
                 total_billed_input_tokens += billed_tokens
 
