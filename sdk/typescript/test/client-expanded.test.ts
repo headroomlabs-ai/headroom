@@ -307,6 +307,46 @@ describe("HeadroomClient.clearCache()", () => {
   });
 });
 
+describe("HeadroomClient.statsHistory()", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns the CSV body verbatim when format is csv", async () => {
+    const csv =
+      "timestamp,tokens_saved,total_tokens_saved\r\n" +
+      "2026-01-01T00:00:00Z,40,40\r\n" +
+      "2026-01-02T00:00:00Z,10,50\r\n";
+    mockFetch.mockResolvedValue(
+      new Response(csv, {
+        status: 200,
+        headers: {
+          "content-type": "text/csv; charset=utf-8",
+          "content-disposition": 'attachment; filename="headroom-stats-history-daily.csv"',
+        },
+      }),
+    );
+
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+    const result = await client.statsHistory({ format: "csv", series: "daily" });
+
+    expect(result).toBe(csv);
+    expect(mockFetch.mock.calls[0][0]).toBe(
+      "http://test:8787/stats-history?format=csv&series=daily",
+    );
+  });
+
+  it("returns parsed JSON without key conversion by default", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResponse({ series: { daily: [{ tokens_saved: 40 }] } }),
+    );
+
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+    const result = await client.statsHistory();
+
+    expect(result).toEqual({ series: { daily: [{ tokens_saved: 40 }] } });
+    expect(mockFetch.mock.calls[0][0]).toBe("http://test:8787/stats-history");
+  });
+});
+
 describe("HeadroomClient.close()", () => {
   it("is a no-op (HTTP client is stateless)", () => {
     const client = new HeadroomClient();
