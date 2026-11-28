@@ -423,6 +423,13 @@ class TestClaudeCodeAdapter:
         assert "john-doe" not in rendered
         assert rendered.endswith("memory")
 
+    def test_get_claude_memory_dir_honors_claude_config_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+
+        memory_dir = get_claude_memory_dir(Path("/home/dev/proj"))
+
+        assert memory_dir == tmp_path / "claude-config" / "projects" / "-home-dev-proj" / "memory"
+
     @pytest.mark.asyncio
     async def test_read_memories_skips_memory_md(self, memory_dir):
         (memory_dir / "MEMORY.md").write_text("# Index\n- entry")
