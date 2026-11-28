@@ -105,4 +105,4 @@ def test_user_cache_control_text_block_stays_protected_when_enabled() -> None:
 
     assert calls == []
     assert result.messages[0]["content"][0]["text"] == text
-    assert result.transforms_applied == ["router:noop"]
+    assert result.transforms_applied == ["router:protected:cache_control"]
