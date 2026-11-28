@@ -1,0 +1,11 @@
+# HTTPS in front of Headroom. Used by docker/docker-compose.https.yml.
+{$HEADROOM_DOMAIN} {
+	# Certificate: a public name gets one from Let's Encrypt automatically.
+	# For an internal name, uncomment one of these:
+	#   your company's certificate (mount the files into the caddy service):
+	# tls /certs/headroom.crt /certs/headroom.key
+	#   Caddy's own CA (install its root, /data/caddy/pki/authorities/local/root.crt, on clients):
+	# tls internal
+
+	reverse_proxy headroom:8787
+}
