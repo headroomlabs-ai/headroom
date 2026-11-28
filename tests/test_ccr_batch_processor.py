@@ -266,6 +266,45 @@ class TestResultUpdate:
         assert updated["result"]["type"] == "succeeded"
         assert updated["custom_id"] == "req_1"
 
+    def test_update_does_not_mutate_original_result(self, processor):
+        """A replayed raw result must survive each continuation (#4185).
+
+        The old in-place nested write destroyed the caller's tool_use evidence,
+        so the second replay saw an already-succeeded result and skipped it.
+        """
+        raw = {
+            "custom_id": "req_replay",
+            "result": {
+                "type": "tool_use",
+                "message": {"content": [{"type": "tool_use", "name": CCR_TOOL_NAME}]},
+            },
+        }
+        before = json.loads(json.dumps(raw))
+        final_response = {"content": [{"type": "text", "text": "Final answer"}]}
+
+        first = processor._update_result(raw, final_response, "anthropic")
+        second = processor._update_result(raw, final_response, "anthropic")
+
+        assert raw == before, "raw batch result was mutated in place"
+        assert first == second, "replay produced a different result"
+        assert first["result"]["type"] == "succeeded"
+        assert raw["result"]["type"] == "tool_use"
+
+    def test_update_openai_does_not_mutate_original_result(self, processor):
+        """OpenAI branch must leave the caller's raw body intact too (#4185)."""
+        raw = {
+            "custom_id": "req_replay",
+            "response": {"status_code": 200, "body": {"choices": [{"tool_calls": []}]}},
+        }
+        before = json.loads(json.dumps(raw))
+        final_response = {"choices": [{"message": {"content": "Final answer"}}]}
+
+        first = processor._update_result(raw, final_response, "openai")
+        second = processor._update_result(raw, final_response, "openai")
+
+        assert raw == before, "raw OpenAI batch result was mutated in place"
+        assert first == second, "replay produced a different result"
+
     def test_update_openai_result(self, processor):
         """Update OpenAI batch result with final response."""
         original = {
