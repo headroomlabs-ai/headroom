@@ -169,6 +169,53 @@ def test_go_log_keeps_its_timestamps(command, tokenizer):
     assert "2026/09/02 14" not in out.split("\n")
 
 
+def _ansi_tracing_log(count: int = 2000) -> str:
+    lines = []
+    for i in range(count):
+        ts = (
+            f"\x1b[2m2026-11-17T22:{40 + i // 600:02d}:{(i // 10) % 60:02d}."
+            f"{(i * 40) % 1000:03d}000Z\x1b[0m"
+        )
+        if i % 50 == 17:
+            lines.append(
+                f"{ts} \x1b[33m WARN\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m "
+                f"slow upstream response req_id={i}"
+            )
+        elif i % 50 == 49:
+            lines.append(
+                f"{ts} \x1b[31mERROR\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m "
+                f"upstream timeout after 30000ms req_id={i}"
+            )
+        else:
+            lines.append(
+                f"{ts} \x1b[32m INFO\x1b[0m \x1b[2mtlog\x1b[0m\x1b[2m:\x1b[0m "
+                f"request handled req_id={i} status=200"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def test_ansi_tracing_log_routes_as_log_and_keeps_errors(tokenizer):
+    log = _ansi_tracing_log(2000)
+    out, transforms = _anthropic("cat service.log", log, tokenizer)
+    assert "router:tool_result:log" in transforms
+    assert "router:tool_result:search" not in transforms
+    kept_errors = [
+        line for line in out.splitlines() if "ERROR" in line and not line.startswith("[")
+    ]
+    assert len(kept_errors) == 10
+
+
+def test_ansi_tracing_grep_error_keeps_full_timestamps(tokenizer):
+    error_lines = "".join(
+        line + "\n" for line in _ansi_tracing_log(2000).splitlines() if "ERROR" in line
+    )
+    out, transforms = _anthropic("grep ERROR service.log", error_lines, tokenizer)
+    assert "router:bash:lossless_search" not in transforms
+    assert "router:tool_result:lossless_search" not in transforms
+    assert "\x1b[2m2026-11-17T22" not in out.splitlines()
+    assert sum(1 for line in out.splitlines() if "ERROR" in line) == 40
+
+
 # ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----
 from headroom.transforms.lossless_compaction import (
     compact_lossless as _cl,

@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from .lossless_compaction import _TIMESTAMP_ROW_RE
+from .lossless_compaction import _TIMESTAMP_ROW_RE, strip_ansi
 
 
 class ContentType(Enum):
@@ -652,8 +652,9 @@ def _try_detect_log(content: str) -> DetectionResult | None:
     error_matches = 0
 
     for line in lines:
+        clean = strip_ansi(line) if "\x1b[" in line else line
         for i, pattern in enumerate(_LOG_PATTERNS):
-            if pattern.search(line):
+            if pattern.search(clean):
                 pattern_matches += 1
                 if i < 2:  # ERROR or WARN patterns
                     error_matches += 1
