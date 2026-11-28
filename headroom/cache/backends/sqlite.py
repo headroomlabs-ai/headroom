@@ -107,6 +107,7 @@ class SQLiteBackend:
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
         self._conn: sqlite3.Connection | None = self._open()
+        self._closed = False
         self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
         self._next_reopen_at = 0.0
 
@@ -161,6 +162,8 @@ class SQLiteBackend:
         store is down: reads degrade to a miss and ``set()`` returns ``False``
         to the producer.
         """
+        if self._closed:
+            raise StoreUnavailableError(f"CCR SQLite store {self._path} is closed")
         if self._conn is not None:
             return self._conn
         now = time.monotonic()
@@ -175,6 +178,14 @@ class SQLiteBackend:
         self._next_reopen_at = 0.0
         logger.warning("CCR SQLite store %s reopened; storage is available again.", self._path)
         return self._conn
+
+    def close(self) -> None:
+        """Release this instance's handle without changing the stored entries."""
+        with self._lock:
+            self._closed = True
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     def _schedule_reopen(self, now: float) -> None:
         self._next_reopen_at = now + self._reopen_backoff
@@ -196,6 +207,9 @@ class SQLiteBackend:
     def _handle_db_error(self, error: sqlite3.DatabaseError, op: str) -> None:
         """Corruption → fail closed (loud). Anything else (busy/locked/io) →
         log and treat the operation as a miss; never destroy data."""
+        if self._closed:
+            logger.debug("CCR SQLite %s skipped: store is closed", op)
+            return
         if isinstance(error, StoreUnavailableError):
             logger.warning(
                 "CCR SQLite %s skipped: %s (nothing was read or persisted; "
