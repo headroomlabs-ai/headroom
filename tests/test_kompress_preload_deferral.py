@@ -6,6 +6,8 @@ the cached Kompress native stack on the blocking startup/lifespan path.
 
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +15,7 @@ import pytest
 from headroom import onnx_runtime
 from headroom.transforms import kompress_compressor as kc
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.kompress_compressor import KompressModelNotCached
+from headroom.transforms.kompress_compressor import KompressModelBusy, KompressModelNotCached
 
 
 def test_local_first_no_network_when_disallowed(monkeypatch):
@@ -83,7 +85,7 @@ def test_load_kompress_auto_does_not_pytorch_download_on_cache_miss(monkeypatch)
     monkeypatch.setattr(kc, "_is_onnx_available", lambda: True)
     monkeypatch.setattr(kc, "_is_pytorch_available", lambda: True)
 
-    def onnx_not_cached(model_id, *, use_coreml=False, allow_download=True):
+    def onnx_not_cached(model_id, *, use_coreml=False, allow_download=True, deadline=None):
         raise KompressModelNotCached(model_id)
 
     def pytorch_should_not_run(*args, **kwargs):
@@ -384,4 +386,60 @@ async def test_startup_background_warm_failure_detail_is_bounded(monkeypatch):
         assert proxy.warmup.kompress.status == "null"
         assert proxy.warmup.kompress.info["detail"] == "warm failed"
     finally:
+        await proxy.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_background_warm_waits_out_a_busy_import_and_finishes_the_load(monkeypatch):
+    """A warm-up that hits a busy import must finish the load, not defer it.
+
+    ``KompressModelBusy`` subclasses ``KompressModelNotCached``, so the warm
+    callback used to record ``not_cached`` and exit while the first-touch import
+    was still running -- leaving the model unloaded until a request paid for the
+    load. The callback now waits the import out and retries once.
+    """
+    pytest.importorskip("httpx")
+    _enable_startup_warm(monkeypatch)
+    from headroom.transforms import kompress_compressor as kc
+
+    released = threading.Event()
+    import_done = threading.Event()
+
+    def stalled_import_worker() -> None:
+        released.wait(30.0)
+        import_done.set()
+
+    worker = threading.Thread(target=stalled_import_worker, daemon=True)
+    worker.start()
+    monkeypatch.setitem(kc._inflight_imports, "torch+transformers", (worker, {"stall": True}))
+
+    class _BusyThenReadyCompressor(_StubCompressor):
+        def __init__(self) -> None:
+            super().__init__(cached=True)
+
+        def preload(self, *, allow_download: bool = True) -> str:
+            self.preload_calls.append(allow_download)
+            if len(self.preload_calls) == 1:
+                raise KompressModelBusy("org/model")
+            assert import_done.is_set(), "warm-up retried before the import finished"
+            return "onnx"
+
+    stub = _BusyThenReadyCompressor()
+    proxy = _kompress_proxy(monkeypatch, stub)
+    await proxy.startup()
+    try:
+        thread = proxy._kompress_warm_thread
+        assert thread is not None
+        time.sleep(0.3)
+        # Still waiting on the import: not exited as not_cached, not loaded.
+        assert thread.is_alive()
+        assert proxy.warmup.kompress.status != "loaded"
+        released.set()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert stub.preload_calls == [True, True]
+        assert proxy.warmup.kompress.status == "loaded"
+        assert proxy.warmup.kompress.info["source_status"] == "background"
+    finally:
+        released.set()
         await proxy.shutdown()

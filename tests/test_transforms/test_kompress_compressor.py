@@ -35,16 +35,14 @@ class TestLazyImports:
             sys.modules,
             {"torch": None, "torch.nn": None, "onnxruntime": None},
         ):
-            from headroom.transforms.kompress_compressor import (
-                _is_pytorch_available,
-            )
+            from headroom.transforms import kompress_compressor as kmod
 
             # The probe memoises, so a real answer from an earlier call would
             # otherwise mask the patch above.
-            _is_pytorch_available.cache_clear()
+            kmod._reset_availability_cache()
             # Without both torch and onnxruntime, should return False
-            assert _is_pytorch_available() is False
-            _is_pytorch_available.cache_clear()
+            assert kmod._is_pytorch_available() is False
+            kmod._reset_availability_cache()
             # Note: is_kompress_available() may still return True if onnxruntime
             # was already imported before patching. Test the individual checkers.
 
@@ -62,8 +60,7 @@ class TestLazyImports:
 
         from headroom.transforms import kompress_compressor as kmod
 
-        kmod._is_onnx_available.cache_clear()
-        kmod._is_pytorch_available.cache_clear()
+        kmod._reset_availability_cache()
 
         real_import = builtins.__import__
         attempts = {"torch": 0}
@@ -89,8 +86,7 @@ class TestLazyImports:
                 assert kmod.is_kompress_available() is False
             assert attempts["torch"] == 1
 
-        kmod._is_onnx_available.cache_clear()
-        kmod._is_pytorch_available.cache_clear()
+        kmod._reset_availability_cache()
 
     def test_dataclasses_importable_without_torch(self) -> None:
         """KompressConfig, KompressResult, KompressCompressor are importable without torch."""
@@ -165,7 +161,7 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_pytorch",
-            lambda model_id, device, *, allow_download=True: (
+            lambda model_id, device, *, allow_download=True, deadline=None: (
                 calls.append((model_id, device)) or ("model", "tokenizer", "pytorch")
             ),
         )
@@ -182,7 +178,7 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False, allow_download=True: (
+            lambda model_id, *, use_coreml=False, allow_download=True, deadline=None: (
                 calls.append((model_id, use_coreml)) or ("model", "tokenizer", "onnx_coreml")
             ),
         )
@@ -201,14 +197,14 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False, allow_download=True: (
+            lambda model_id, *, use_coreml=False, allow_download=True, deadline=None: (
                 calls.append("onnx") or ("model", "tokenizer", "onnx")
             ),
         )
         monkeypatch.setattr(
             kmod,
             "_load_kompress_pytorch",
-            lambda model_id, device, *, allow_download=True: (
+            lambda model_id, device, *, allow_download=True, deadline=None: (
                 calls.append("pytorch") or ("model", "tokenizer", "pytorch")
             ),
         )

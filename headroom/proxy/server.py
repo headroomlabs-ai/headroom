@@ -516,6 +516,10 @@ logger = logging.getLogger("headroom.proxy")
 # Liveness/readiness probe routes: auth-exempt, and logged at DEBUG.
 _HEALTH_PROBE_PATHS = frozenset({"/health", "/livez", "/readyz"})
 
+# How long the background warm-up waits out an in-flight first-touch import
+# before giving up on its one retry (see _warm).
+_WARM_BUSY_WAIT_SECONDS = 300.0
+
 
 def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
     """/stats payload for the output-shaping layer.
@@ -2238,27 +2242,40 @@ class HeadroomProxy(
             time.sleep(max(0.0, delay))
             started = time.monotonic()
             try:
-                from headroom.transforms.kompress_compressor import KompressModelNotCached
+                from headroom.transforms.kompress_compressor import (
+                    KompressModelBusy,
+                    KompressModelNotCached,
+                    wait_for_inflight_imports,
+                )
 
                 not_cached: tuple[type[BaseException], ...] = (KompressModelNotCached,)
             except Exception:  # ML extras absent; every failure is just "failed"
                 not_cached = ()
-            try:
-                backend = compressor.preload(allow_download=True)
-            except not_cached:
-                # The local loader only raises this when downloads are off, so
-                # with allow_download=True a cold cache downloads instead. This
-                # covers compressors that report a cache miss on their own.
-                slot.info["detail"] = KOMPRESS_DETAIL_NOT_CACHED
-                logger.debug("Kompress background warm-up: model not cached")
-                return
-            except Exception:
-                # The detail lands on the auth-exempt /health payload, so it
-                # stays a bounded token; loader failures embed paths, model
-                # ids and URLs. The real cause goes to the log only.
-                slot.info["detail"] = KOMPRESS_DETAIL_WARM_FAILED
-                logger.warning("Kompress background warm-up failed", exc_info=True)
-                return
+            backend: str | None = None
+            for attempt in range(2):
+                try:
+                    backend = compressor.preload(allow_download=True)
+                    break
+                except not_cached as exc:
+                    # KompressModelBusy subclasses NotCached, but for the warm-up
+                    # it means "someone is mid-load" -- usually the first-touch
+                    # transformers import, which the loader's budget cut short.
+                    # Giving up here would leave the model unloaded until a
+                    # request pays for the load; wait the import out and retry
+                    # once, so an idle proxy still ends up ready.
+                    if attempt == 0 and not_cached and isinstance(exc, KompressModelBusy):
+                        wait_for_inflight_imports(timeout=_WARM_BUSY_WAIT_SECONDS)
+                        continue
+                    slot.info["detail"] = KOMPRESS_DETAIL_NOT_CACHED
+                    logger.debug("Kompress background warm-up: model not cached")
+                    return
+                except Exception:
+                    # The detail lands on the auth-exempt /health payload, so it
+                    # stays a bounded token; loader failures embed paths, model
+                    # ids and URLs. The real cause goes to the log only.
+                    slot.info["detail"] = KOMPRESS_DETAIL_WARM_FAILED
+                    logger.warning("Kompress background warm-up failed", exc_info=True)
+                    return
             if not backend:
                 return
             slot.info.pop("detail", None)
@@ -3707,44 +3724,65 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         start_hard_watchdog()
 
-        # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
-        # traffic if the Rust extension is missing unless the operator
-        # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
-        # Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md.
-        # `_check_rust_core` either returns ("loaded"|"disabled", _) or
-        # calls `sys.exit(78)` — execution past this line implies the
-        # rust_core_status is recorded.
-        _rust_core_status, _rust_core_error = _check_rust_core()
-        app.state.rust_core_status = _rust_core_status
-        app.state.rust_core_error = _rust_core_error
+        # Complement, not duplicate: the hard watchdog only fires when native
+        # code seizes the GIL, so it stays silent when the loop thread is parked
+        # inside a GIL-*releasing* call -- every asyncio timeout is then dead
+        # too, and the proxy freezes with no log line at all (#4967). This one
+        # watches the loop's own heartbeat and dumps the stacks that name the
+        # culprit, without ever exiting.
+        from headroom.proxy.loop_watchdog import start_loop_watchdog
 
-        # Degraded mode has to mean something. Every compressor reaches
-        # `headroom._core` eventually, so leaving `optimize` on while the
-        # extension is unloadable turns each request into an ImportError
-        # instead of a proxied response. Drop to the same passthrough path
-        # `--no-optimize` uses: no savings, but the client keeps working
-        # rather than getting a connection refused (issue #2918).
-        #
-        # Safe to mutate here: `HeadroomProxy` holds this exact config
-        # object, its compressors are built lazily on first use, and
-        # `proxy.startup()` has not run yet.
-        if _rust_core_status == "disabled" and config.optimize:
-            config.optimize = False
-            logger.warning(
-                "event=proxy_optimization_disabled reason=rust_core_unavailable "
-                "detail=%r mode=passthrough; traffic is forwarded unmodified, "
-                "restore `headroom._core` to re-enable compression",
-                _rust_core_error,
-            )
+        start_loop_watchdog()
 
-        _configure_observability_or_refuse()
+        # Everything between arming and the startup try/finally below has to
+        # run the watchdog's cleanup on failure. A raise here -- a rust-core
+        # refusal, the observability gate -- otherwise leaves the monitor armed
+        # on a loop that is about to close, and a retry in the same process
+        # would inherit a heartbeat that can never tick on its new loop.
+        from headroom.proxy.loop_watchdog import stop_loop_watchdog
 
-        app.state.started_at = time.time()
-        app.state.ready = False
-        app.state.startup_error = None
-        app.state.periodic_toin_stats_task = None
-        app.state.periodic_malloc_trim_task = None
-        app.state.orphan_watchdog_task = None
+        try:
+            # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
+            # traffic if the Rust extension is missing unless the operator
+            # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
+            # Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md.
+            # `_check_rust_core` either returns ("loaded"|"disabled", _) or
+            # calls `sys.exit(78)` — execution past this line implies the
+            # rust_core_status is recorded.
+            _rust_core_status, _rust_core_error = _check_rust_core()
+            app.state.rust_core_status = _rust_core_status
+            app.state.rust_core_error = _rust_core_error
+
+            # Degraded mode has to mean something. Every compressor reaches
+            # `headroom._core` eventually, so leaving `optimize` on while the
+            # extension is unloadable turns each request into an ImportError
+            # instead of a proxied response. Drop to the same passthrough path
+            # `--no-optimize` uses: no savings, but the client keeps working
+            # rather than getting a connection refused (issue #2918).
+            #
+            # Safe to mutate here: `HeadroomProxy` holds this exact config
+            # object, its compressors are built lazily on first use, and
+            # `proxy.startup()` has not run yet.
+            if _rust_core_status == "disabled" and config.optimize:
+                config.optimize = False
+                logger.warning(
+                    "event=proxy_optimization_disabled reason=rust_core_unavailable "
+                    "detail=%r mode=passthrough; traffic is forwarded unmodified, "
+                    "restore `headroom._core` to re-enable compression",
+                    _rust_core_error,
+                )
+
+            _configure_observability_or_refuse()
+
+            app.state.started_at = time.time()
+            app.state.ready = False
+            app.state.startup_error = None
+            app.state.periodic_toin_stats_task = None
+            app.state.periodic_malloc_trim_task = None
+            app.state.orphan_watchdog_task = None
+        except BaseException:
+            stop_loop_watchdog()
+            raise
 
         try:
             try:
@@ -3820,6 +3858,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         timeout,
                         exc,
                     )
+
+            stop_loop_watchdog()
 
             periodic_toin_stats_task = app.state.periodic_toin_stats_task
             if periodic_toin_stats_task is not None:
@@ -4146,7 +4186,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "active_sessions": ws_active_sessions,
                 "active_relay_tasks": ws_active_relay_tasks,
             },
+            # A wedged loop and a wedged compression worker look identical from
+            # the client's side (both freeze a request past every timeout) and
+            # nothing distinguishes them in the log while the loop is stalled.
+            # These counters make the difference observable after the fact
+            # (#4967): a non-zero ``current_stall_seconds`` means the loop is
+            # blocked *now*, so no asyncio deadline in the proxy can fire.
+            "event_loop_watchdog": _loop_watchdog_snapshot(),
         }
+
+    def _loop_watchdog_snapshot() -> dict[str, Any]:
+        """Read the event-loop watchdog counters without ever failing /health."""
+        try:
+            from headroom.proxy.loop_watchdog import snapshot as _loop_snapshot
+
+            return _loop_snapshot()
+        except Exception:  # pragma: no cover - diagnostics must not break /health
+            logger.debug("event-loop watchdog snapshot failed", exc_info=True)
+            return {"enabled": False}
 
     def _loop_callback_payload() -> LoopHealthState:
         return {

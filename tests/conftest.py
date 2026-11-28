@@ -154,6 +154,10 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path, tmp_path_factory):
     # production watchdog inside pytest; it hard-exits the process with code 1
     # and no summary. Tests of the watchdog set the variable themselves.
     monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
+    # Same reasoning for the event-loop watchdog: it only ever logs and dumps,
+    # but a test that parks the loop on purpose would spray thread stacks into
+    # every other test's captured output. Tests of the watchdog set it back.
+    monkeypatch.setenv("HEADROOM_LOOP_WATCHDOG_SECS", "0")
 
 
 # The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
