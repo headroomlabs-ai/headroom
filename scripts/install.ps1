@@ -60,6 +60,18 @@ function Ensure-PathEntry {
 function Ensure-ProfileBlock {
     param([string]$PathEntry)
 
+    # Write the PATH block to $PROFILE by default. $PROFILE comes from the
+    # Documents known folder (often OneDrive-redirected), NOT from HOME or
+    # USERPROFILE, and `-NoProfile` only stops it being loaded, not resolved. So
+    # a caller that must not touch the real profile (the installer test suite,
+    # which runs this against a throwaway fake home) sets
+    # HEADROOM_INSTALL_PROFILE_PATH to a file of its own; the block goes there
+    # instead of into the developer's actual profile.
+    $profilePath = $PROFILE
+    if ($env:HEADROOM_INSTALL_PROFILE_PATH) {
+        $profilePath = $env:HEADROOM_INSTALL_PROFILE_PATH
+    }
+
     # $PROFILE is empty when PowerShell cannot resolve the profile path for the
     # current user (a fresh account with no Documents folder, a service/CI
     # context, a redirected profile). Split-Path below would then throw
@@ -68,14 +80,17 @@ function Ensure-ProfileBlock {
     # AFTER the wrapper and persistent User PATH were already written. Skip the
     # profile convenience block instead: Ensure-PathEntry has already persisted
     # the PATH for new sessions.
-    if ([string]::IsNullOrEmpty($PROFILE)) {
+    if ([string]::IsNullOrEmpty($profilePath)) {
         Write-Info 'Skipping PowerShell profile update: $PROFILE is not set in this environment (PATH was still updated for new sessions).'
         return
     }
 
     $markerStart = '# >>> headroom docker-native >>>'
     $markerEnd = '# <<< headroom docker-native <<<'
-    $escapedPathEntry = $PathEntry.Replace("'", "''")
+    # EscapeSingleQuotedStringContent also doubles the typographic single quotes
+    # PowerShell accepts as string delimiters (a home like O<U+2019>Connor), which a
+    # plain .Replace("'", "''") misses, leaving a profile that does not parse.
+    $escapedPathEntry = [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($PathEntry)
     $block = @"
 $markerStart
 if (-not ((`$env:Path -split ';') -contains '$escapedPathEntry')) {
@@ -84,17 +99,23 @@ if (-not ((`$env:Path -split ';') -contains '$escapedPathEntry')) {
 $markerEnd
 "@
 
-    $profileDir = Split-Path -Parent $PROFILE
-    if (-not (Test-Path $profileDir)) {
+    $profileDir = Split-Path -Parent $profilePath
+    # -LiteralPath: a profile name may hold [ ], which -Path treats as wildcards.
+    # A bare filename (profile.ps1) has an empty parent: it lives in the current
+    # directory, which already exists, and New-Item rejects an empty -Path.
+    if ($profileDir -and -not (Test-Path -LiteralPath $profileDir)) {
         New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
     }
-    if (-not (Test-Path $PROFILE)) {
-        New-Item -ItemType File -Force -Path $PROFILE | Out-Null
+    if (-not (Test-Path -LiteralPath $profilePath)) {
+        New-Item -ItemType File -Force -Path $profilePath | Out-Null
     }
 
-    $existing = Get-Content -Raw -Path $PROFILE
+    # Get-Content -Raw yields AutomationNull for an empty file (the one just
+    # created above on a first install), and `AutomationNull -notmatch` returns
+    # an empty, falsy array, so the block was never written. Cast to [string].
+    $existing = [string](Get-Content -Raw -LiteralPath $profilePath)
     if ($existing -notmatch [regex]::Escape($markerStart)) {
-        Add-Content -Path $PROFILE -Value "`n$block"
+        Add-Content -LiteralPath $profilePath -Value "`n$block"
     }
 }
 
