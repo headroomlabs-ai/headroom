@@ -600,6 +600,13 @@ class BaseTokenizer(ABC):
                     # counted ~907K tokens, against the ~1,600 an image of the
                     # same bytes gets.
                     total += self._count_document_block(part)
+                elif part_type == "input_file" or (
+                    part_type == "file" and isinstance(part.get("file"), dict)
+                ):
+                    # OpenAI file input (a PDF), priced like the document block above
+                    # rather than as base64 text. Chat Completions nests the fields
+                    # under "file"; Responses puts them on the input_file part.
+                    total += self._count_openai_file(part["file"] if part_type == "file" else part)
                 elif part_type in ("input_audio", "audio"):
                     # Audio has fixed token cost, not tokenized as text
                     total += 200
@@ -758,6 +765,20 @@ class BaseTokenizer(ABC):
             if isinstance(value, str):
                 total += self.count_text(value)
         return total
+
+    def _count_openai_file(self, file: dict[str, Any]) -> int:
+        """Price an OpenAI file by its ``file_data`` (a base64 data URL), the way
+        ``_count_document_block`` prices a base64 document."""
+        data = file.get("file_data")
+        if not isinstance(data, str) or not data:
+            # file_id / file_url: the bytes live with the provider; one nominal page.
+            return _DOCUMENT_TOKENS_PER_PAGE
+        _, comma, encoded = data.partition(",")
+        try:
+            doc_bytes = base64.b64decode(encoded if comma else data)
+        except (binascii.Error, ValueError):
+            doc_bytes = b""
+        return self._estimate_document_tokens(doc_bytes)
 
     @staticmethod
     def _estimate_document_tokens(doc_bytes: bytes) -> int:
