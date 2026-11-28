@@ -8,6 +8,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from sqlite3 import IntegrityError
 from typing import Any
 
 import click
@@ -381,7 +382,7 @@ def _export_all(store: SQLiteMemoryStore) -> list[dict[str, Any]]:
     return [m.to_dict() for m in memories]
 
 
-def _import_memories(store: SQLiteMemoryStore, memories: list[dict[str, Any]]) -> int:
+def _import_memories(store: SQLiteMemoryStore, memories: list[Any]) -> int:
     """Import memories from a list of dictionaries."""
     if not memories:
         return 0
@@ -389,9 +390,17 @@ def _import_memories(store: SQLiteMemoryStore, memories: list[dict[str, Any]]) -
     imported_count = 0
     with store._get_conn() as conn:
         for mem_dict in memories:
+            if not isinstance(mem_dict, dict):
+                continue
             try:
                 memory = Memory.from_dict(mem_dict)
                 row = store._memory_to_row(memory)
+                # A JSON array/object in a scalar field cannot bind to SQLite.
+                if any(
+                    value is not None and not isinstance(value, (str, int, float, bytes))
+                    for value in row.values()
+                ):
+                    continue
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO memories (
@@ -413,7 +422,7 @@ def _import_memories(store: SQLiteMemoryStore, memories: list[dict[str, Any]]) -
                     row,
                 )
                 imported_count += 1
-            except (KeyError, ValueError, TypeError):
+            except (KeyError, ValueError, TypeError, OverflowError, IntegrityError):
                 # Skip malformed entries
                 continue
 
@@ -1383,10 +1392,14 @@ def import_memories(ctx: click.Context, db_path: str, file: str, force: bool) ->
 
         store = get_store(db_path)
         imported = _import_memories(store, memories_data)
-        print_success(f"Imported {imported} memory(ies).")
+        if imported:
+            print_success(f"Imported {imported} memory(ies).")
 
         if imported < count:
             print_warning(f"Skipped {count - imported} malformed entries.")
+        if not imported:
+            print_error("No valid memories to import.")
+            sys.exit(1)
 
     except json.JSONDecodeError as e:
         print_error(f"Invalid JSON file: {e}")
