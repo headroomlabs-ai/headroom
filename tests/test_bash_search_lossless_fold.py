@@ -11,6 +11,7 @@ compression. Non-search bash commands (cat/build/mutate) are untouched.
 from __future__ import annotations
 
 import json
+import tracemalloc
 
 import pytest
 
@@ -20,6 +21,7 @@ from headroom.transforms.content_router import (
     ContentRouter,
     ContentRouterConfig,
     _bash_command_is_search,
+    _bash_command_lists_files,
     _bash_program,
 )
 from headroom.transforms.lossless_compaction import search_unheading
@@ -303,6 +305,7 @@ def test_experimental_read_keep_ratio_flag_and_gating(monkeypatch):
 
 # --- directory-prefix fold: grep -rn across many distinct files ---
 from headroom.transforms.lossless_compaction import (  # noqa: E402
+    _ExpansionLimitExceeded,
     compact_lossless,
     search_dir_heading,
     search_dir_unheading,
@@ -429,3 +432,298 @@ def test_windows_search_output_takes_the_lossless_dir_fold(name, tool_input, lab
     out = result.messages[1]["content"][0]["content"]
     assert label in result.transforms_applied
     assert search_dir_unheading(out, backslash=True) == windows
+
+
+# --- Windows separators in path listings: rg --files, rg -l, PowerShell ---
+_DEEP_FILES = "".join(
+    f"crates/headroom-core/src/{folder}/{name}.rs\n"
+    for folder, names in (
+        ("transforms", ("anchor", "content", "diff", "log", "search", "smart")),
+        ("ccr", ("store", "marker", "resolve", "batch")),
+        ("signals", ("keyword", "tokens", "budget", "error")),
+    )
+    for name in names
+)
+
+
+@pytest.mark.parametrize("root", ["", "./"])  # rg --files / PowerShell Resolve-Path -Relative
+def test_path_fold_handles_windows_backslash_paths(root) -> None:
+    posix = "".join(root + row for row in _DEEP_FILES.splitlines(keepends=True))
+    windows = posix.replace("/", chr(92))
+    folded = compact_lossless(windows, "paths", listing=True)
+    assert len(folded) == len(compact_lossless(posix, "paths")) < len(windows)
+    first_header = f"{root}crates/headroom-core/src/transforms/".replace("/", chr(92))
+    assert folded.split("\n")[0] == first_header
+    assert _puh(folded, backslash=True) == windows
+
+
+def test_mixed_separator_listing_takes_the_smaller_fold() -> None:
+    # `rg --files headroom/cli headroom/proxy` on Windows prints headroom/cli\x.py.
+    grouped = "".join(
+        f"headroom/{folder}{chr(92)}mod_{i}.py\n" for folder in ("cli", "proxy") for i in range(12)
+    )
+    assert compact_lossless(grouped, "paths", listing=True) == _ph(grouped, backslash=True)
+    assert compact_lossless(grouped, "paths") == _ph(grouped)
+    # Interleaved folders: factoring headroom/ beats a header per row, so the
+    # "/" fold has to stay a candidate, and its bases may hold a "\".
+    interleaved = "".join(
+        f"headroom/{folder}{chr(92)}mod_{i}.py\n" for i in range(12) for folder in ("cli", "proxy")
+    )
+    assert compact_lossless(interleaved, "paths", listing=True) == _ph(interleaved)
+
+
+_REGEX_LISTS = {
+    "anchored": ["^invoice@A@d$", "^invoice@A@w$"],
+    "star": ["^invoice@A@d*$", "^invoice@A@w*$"],
+    "quantified": ["invoice@A@d{2}@A@tvalue", "invoice@A@d{2}@A@tstatus"],
+    "bracket": ["invoice@A@d[0-9].pdf", "invoice@A@d[0-9].csv"],
+    "tab-and-extension": ["foo@A@tday.txt", "foo@A@tnight.txt"],
+    "escaped-dots": ["ads@A@.example@A@.com", "ads@A@.example@A@.net"],
+    "looks-like-a-listing": ["src@A@services@A@service_1.py", "src@A@services@A@service_2.py"],
+}
+
+
+@pytest.mark.parametrize("rows", _REGEX_LISTS.values(), ids=_REGEX_LISTS)
+def test_backslash_rows_stay_whole_unless_known_to_be_a_listing(rows) -> None:
+    text = "".join(row.replace("@A@", chr(92)) + "\n" for row in rows)
+    assert compact_lossless(text, "paths") == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A lone leading "\" is not a path root.
+        f"{chr(92)}home{chr(92)}a.py\n{chr(92)}home{chr(92)}b.py\n",
+        # The "/" fold's markup rule holds with "\" as a separator too.
+        f"{{{{/if}}}}{chr(92)}x.py\n{{{{/if}}}}{chr(92)}y.py\n",
+        f"app{chr(92)}a.py\nnot a path\napp{chr(92)}b.py\n",
+    ],
+    ids=["lone-root", "template-closers", "not-pure"],
+)
+def test_backslash_path_fold_skips_rows_that_are_not_paths(text) -> None:
+    assert _ph(text, backslash=True) == text
+
+
+@pytest.mark.parametrize("sep", ["/", chr(92)], ids=["slash", "backslash"])
+def test_paths_fold_does_not_decode_text_that_is_not_a_listing(sep) -> None:
+    # A long line ending in a separator is not a header here. Decoding the text
+    # anyway would copy it onto every following row: 5000 * 500 characters.
+    text = "h" * 5000 + sep + "\n" + "".join(f"f{i}.py\n" for i in range(500))
+    tracemalloc.start()
+    try:
+        assert compact_lossless(text, "paths", listing=True) == text
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 20 * len(text)
+
+
+@pytest.mark.parametrize("sep", ["/", chr(92)], ids=["slash", "backslash"])
+@pytest.mark.parametrize("end", ["", "\n"], ids=["no-newline", "newline"])
+def test_path_unheading_stops_at_its_limit(sep, end) -> None:
+    # The blank line ends the listing, so "note" is passed through.
+    text = "\n".join(["src" + sep, "a.py", "b.py", "c.py", "", "note"]) + end
+    decoded = "\n".join([f"src{sep}{name}.py" for name in "abc"] + ["", "note"]) + end
+    assert _puh(text, len(decoded), backslash=True) == decoded
+    with pytest.raises(_ExpansionLimitExceeded):
+        _puh(text, len(decoded) - 1, backslash=True)
+
+
+def test_paths_fold_bounds_its_verification(monkeypatch) -> None:
+    # A candidate smaller than the content that would decode to 2000 * 1000 characters.
+    content = "x" * 8000
+    bomb = "h" * 2000 + "/\n" + "f\n" * 1000
+    monkeypatch.setattr(
+        "headroom.transforms.lossless_compaction.path_heading", lambda text, **_: bomb
+    )
+    tracemalloc.start()
+    try:
+        assert compact_lossless(content, "paths") == content
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 20 * len(content)
+
+
+_LISTING_COMMANDS = [
+    "rg --files",
+    "rg --files src tests",
+    "rg -l HashMap crates",
+    "rg -il 'import re' headroom",
+    "rg -g '*.py' -l x",
+    "rg -tpy -l x",
+    "rg -e pat -l src",
+    "rg --files-with-matches x",
+    "rg --files-without-match x",
+    "rg.exe --files",
+    ".\\rg.exe --files tests",
+    "C:\\tools\\rg.exe -l x",
+    "rg --regexp pat -l src",
+    "rg --glob=*.py -l x",
+    "rg 'a # b' -l src",  # a quoted # starts no comment
+    "rg C# -l src",  # nor does one inside a word
+    "rg --files  # every file",
+    "rg --files .\\",  # PowerShell: the trailing backslash is part of the path
+    "rg --files .\\headroom\\ | sort",
+    "rg --files 'C:\\src\\'",  # single quotes: "\" is a character in both shells
+    "grep -rl 'foo\\|bar' .",
+    'grep -rl "foo\\|bar" .',
+    "grep -rl foo .",
+    "grep -rL foo .",
+    "grep -r --files-with-matches foo .",
+    "fd",
+    "fd -e py",
+    "fdfind -H rs crates",
+    "cd repo && rg --files",
+    "sudo rg --files",
+    "rg --files 2>/dev/null",
+    "rg --files | sort",
+    "rg -l 'a|b' src | sort | uniq | head -n 40",
+    "rg --files | tail -20",
+    'bash -lc "rg --files | head -20"',
+    "bash -c 'rg --files' | sort",
+    "pwsh -Command 'rg --files'",
+    "powershell.exe -c 'Get-ChildItem -Recurse -Name'",
+    "Get-ChildItem -Recurse -File -Name headroom",
+    "gci -r -name",
+    "Get-ChildItem -Recurse -File headroom | Resolve-Path -Relative",
+    "Get-ChildItem -Recurse -Name | Sort-Object | Select-Object -First 50",
+    "Resolve-Path -Relative .\\headroom\\proxy\\*.py",
+    "Resolve-Path -Relative .\\src\\*.rs | Sort-Object",
+]
+_OTHER_COMMANDS = [
+    "",
+    "cat rules.txt",
+    "type rules.txt",
+    "rg -n foo src",
+    "rg -INtlua foo",  # -t takes "lua": the l is not -l
+    "rg -e -l src",  # -e takes "-l": the pattern
+    "rg --no-filename --regexp -legacy rules.txt",  # so does --regexp
+    "rg --replace -l foo rules.txt",
+    "rg --context-separator -l -C1 foo rules.txt",
+    "grep --regexp -l rules.txt",
+    "grep --label -l foo",
+    "rg --no-filename legacy rules.txt # -l",  # a comment is not an argument
+    "rg -n foo src  # --files",
+    "rg 'a -l b' rules.txt",  # a quoted pattern is one argument
+    "rg -l 'unclosed",
+    "rg -A l foo",
+    "rg -- --files rules.txt",
+    "rg -L foo src",  # follow symlinks, not a listing
+    "rg --no-filename foo rules",
+    "grep -h foo rules.txt",
+    "grep -e -l rules.txt",
+    "grep -f l rules.txt",
+    "fd -x cat",
+    "fd --exec-batch cat",
+    "fd -HX cat",
+    "rg --files | xargs cat",
+    "rg --files | xargs -n1 head -5",
+    "rg --files | head rules.txt",
+    "rg --files | sed 's/a/b/'",
+    "rg --files | wc -l",
+    "rg --files | cut -c1-20",
+    "bash -c 'rg --files' | xargs cat",
+    "rg --files | grep -o x",
+    "rg --files; cat rules.txt",
+    "rg --files && cat rules.txt",
+    "rg --files || cat rules.txt",
+    "cat rules.txt | sort",
+    "cat files.txt | xargs rg -l x",
+    'bash -lc "cat rules.txt"',
+    "bash list_files.sh",
+    "Get-ChildItem -Recurse",
+    "Get-ChildItem | Resolve-Path",
+    "Get-Content rules.txt | Resolve-Path -Relative",
+    "Resolve-Path .\\src\\*.rs",  # absolute paths in a table
+    "Resolve-Path -Relative x | Get-Content",
+    "git show HEAD:rules.txt",
+    "rg --files\ncat rules.txt",
+    # Bash reads "\" as an escape, PowerShell as a character; where that moves a
+    # pipe or line break the shell decides, and it is not known.
+    "rg --no-filename --regexp \\\n  -legacy rules.txt",  # Bash: -legacy is the pattern
+    "rg \\\n  --files crates",  # PowerShell: two commands
+    "rg --files .\\\nGet-Content rules.txt",
+    'rg --files ".\\crates\\" | ForEach-Object { Get-Content -LiteralPath $_ }',
+    "rg --files .\\| xargs cat",
+    "rg --files .\\; Get-Content rules.txt",
+    "rg --files .\\&& Get-Content rules.txt",
+    # The same inside bash -c: the script keeps its line breaks.
+    "bash -c 'rg --no-filename --regexp \\\n  -legacy rules.txt'",
+    "bash -c 'rg --files\ncat rules.txt'",
+    'pwsh -Command "rg --files\nGet-Content rules.txt"',
+]
+
+
+@pytest.mark.parametrize("command", _LISTING_COMMANDS)
+def test_detects_commands_that_list_files(command) -> None:
+    assert _bash_command_lists_files(command)
+
+
+@pytest.mark.parametrize("command", _OTHER_COMMANDS)
+def test_ignores_commands_that_do_not_list_files(command) -> None:
+    assert not _bash_command_lists_files(command)
+
+
+@pytest.mark.parametrize("send", [_openai, _anthropic], ids=["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg --files crates",
+        "rg -l HashMap crates",
+        "fd -e rs | sort",
+        ".\\rg.exe --files crates",
+        "Resolve-Path -Relative .\\crates\\*\\src\\*\\*.rs",
+        "rg --files .\\crates\\",
+    ],
+)
+def test_windows_listing_takes_the_lossless_paths_fold(command, send, tokenizer) -> None:
+    posix = "".join(
+        f"crates/headroom-core/src/{folder}/module_{i:02}.rs\n"
+        for folder in ("transforms", "ccr", "signals")
+        for i in range(20)
+    )
+    windows = posix.replace("/", chr(92))
+    out, transforms = send(command, windows, tokenizer)
+    assert "router:bash:lossless_paths" in transforms
+    assert out == _ph(windows, backslash=True)
+    assert _puh(out, backslash=True) == windows
+
+
+@pytest.mark.parametrize("send", [_openai, _anthropic], ids=["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat rules.txt",
+        "rg --no-filename foo rules",
+        "rg --files | xargs cat",
+        "rg --no-filename --regexp -legacy rules",
+        "rg --no-filename foo rules # -l",
+        "rg --no-filename --regexp \\\n  -legacy rules",
+        'rg --files ".\\rules\\" | ForEach-Object { Get-Content -LiteralPath $_ }',
+        "bash -c 'rg --no-filename --regexp \\\n  -legacy rules'",
+        "bash -c 'rg --files\ncat rules.txt'",
+    ],
+)
+def test_router_keeps_regex_rules_whole(command, send, tokenizer) -> None:
+    # Every rule is also a valid Windows path; only the command tells them apart.
+    rules = "".join(f"foo{chr(92)}tday_{i:03}.txt\n" for i in range(120))
+    out, transforms = send(command, rules, tokenizer)
+    assert "router:bash:lossless_paths" not in transforms
+    assert "router:tool_result:lossless_paths" not in transforms
+    assert "foo" + chr(92) not in out.split("\n")
+
+
+def test_windows_listing_that_does_not_fold_takes_the_general_path(tokenizer) -> None:
+    # One folder per file: a header per row would only add bytes.
+    listing = "".join(f"crate_{i:03}{chr(92)}lib.rs\n" for i in range(120))
+    out, transforms = _anthropic("rg --files", listing, tokenizer)
+    assert "router:bash:lossless_paths" not in transforms
+
+
+def test_posix_listing_is_left_to_the_general_path(tokenizer) -> None:
+    posix = "".join(f"crates/core/src/module_{i:03}.rs\n" for i in range(120))
+    out, transforms = _anthropic("rg --files crates", posix, tokenizer)
+    assert "router:bash:lossless_paths" not in transforms
+    assert "router:tool_result:lossless_paths" in transforms
+    assert _puh(out) == posix
