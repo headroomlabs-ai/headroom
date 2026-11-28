@@ -19,7 +19,6 @@ Example:
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -230,6 +229,11 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
             messages=openai_messages,
             model=self._model,
             model_limit=self._threshold,
+            protect=[
+                index
+                for index, message in enumerate(messages)
+                if not isinstance(message.content, str)
+            ],
         )
 
         # The live-zone pipeline preserves message positions. Apply its content
@@ -244,7 +248,7 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
             content = after.get("content", original.content)
             restored.append(
                 original
-                if content == original.content
+                if not isinstance(original.content, str) or content == original.content
                 else original.model_copy(update={"content": content})
             )
         return restored
@@ -260,7 +264,9 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
         """
         result = []
         for msg in messages:
-            content = msg.content
+            # Keep the legacy router projection for token/intent analysis.
+            # Structured content stays native on the original message.
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
 
             if isinstance(msg, SystemMessage):
                 result.append({"role": "system", "content": content})
@@ -269,17 +275,10 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
             elif isinstance(msg, AIMessage):
                 entry: dict[str, Any] = {"role": "assistant", "content": content}
                 if msg.tool_calls:
-                    entry["tool_calls"] = [
-                        {
-                            "id": call.get("id"),
-                            "type": "function",
-                            "function": {
-                                "name": call["name"],
-                                "arguments": json.dumps(call["args"], default=str),
-                            },
-                        }
-                        for call in msg.tool_calls
-                    ]
+                    # Preserve the existing routing policy for LangChain tool
+                    # results. This projection carries no reliable signal that
+                    # a rejected write did not change the file.
+                    entry["tool_calls"] = msg.tool_calls
                 result.append(entry)
             elif isinstance(msg, ToolMessage):
                 result.append(

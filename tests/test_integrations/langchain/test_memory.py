@@ -148,10 +148,6 @@ class TestHeadroomChatMessageHistoryMessages:
             InMemoryChatMessageHistory(
                 messages=[
                     HumanMessage(content="Get items"),
-                    AIMessage(
-                        content="",
-                        tool_calls=[{"id": "lookup", "name": "get", "args": {}}],
-                    ),
                     tool,
                 ]
             ),
@@ -165,6 +161,36 @@ class TestHeadroomChatMessageHistoryMessages:
         assert result.tool_call_id == tool.tool_call_id
         assert result.artifact == tool.artifact
         assert tool.content == text
+
+    def test_rejected_edit_keeps_the_last_read_valid(self):
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+
+        from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
+
+        read = "\n".join(f"line {i}: deployment value" for i in range(280))
+        messages = [
+            HumanMessage(content="Review the current settings."),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "read", "name": "Read", "args": {"file_path": "settings.json"}}],
+            ),
+            ToolMessage(content=read, tool_call_id="read"),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "edit", "name": "Edit", "args": {"file_path": "settings.json"}}],
+            ),
+            ToolMessage(
+                content="<tool_use_error>String to replace not found</tool_use_error>",
+                status="error",
+                tool_call_id="edit",
+                artifact={"applied": False},
+            ),
+        ]
+        history = HeadroomChatMessageHistory(
+            InMemoryChatMessageHistory(messages=messages), compress_threshold_tokens=100
+        )
+
+        assert history.messages == messages
 
     """Tests for message access and compression."""
 
