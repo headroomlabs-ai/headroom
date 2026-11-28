@@ -73,6 +73,50 @@ def test_baseline_not_advanced_on_exception():
     assert r._last_requests_by_model == {}
 
 
+def test_baseline_pins_sent_tokens():
+    r = _make_reporter(200)
+    anyio.run(r._report_usage)
+    assert r._last_tokens_sent_by_model == {"m": 400}
+
+
+def _make_racing_reporter(sent_payloads: list) -> UsageReporter:
+    """Reporter whose POST records requests while it is awaited (in-flight)."""
+    r = _make_reporter(200)
+    ct = r._proxy.cost_tracker
+    ct._provider_requests_by_model = {"m": 5}
+
+    class _Client:
+        async def post(self, *args, **kwargs):
+            sent_payloads.append(kwargs["json"])
+            if len(sent_payloads) == 1:
+                ct._requests_by_model["m"] += 3
+                ct._tokens_saved_by_model["m"] += 30
+                ct._tokens_sent_by_model["m"] += 120
+                ct._provider_requests_by_model["m"] += 3
+            return _Resp(200)
+
+    async def _get_client():
+        return _Client()
+
+    r._get_client = _get_client
+    return r
+
+
+def test_request_recorded_during_post_is_reported_next_time():
+    sent: list = []
+    r = _make_racing_reporter(sent)
+    anyio.run(r._report_usage)
+    # Baseline is what the first report covered, not the live counters.
+    assert r._last_requests_by_model == {"m": 5}
+    assert r._last_tokens_sent_by_model == {"m": 400}
+    anyio.run(r._report_usage)
+    assert [p["requests"] for p in sent] == [5, 3]
+    assert [p["tokens_saved"] for p in sent] == [100, 30]
+    assert [p["tokens_after"] for p in sent] == [400, 120]
+    assert [p["requests_provider_reported"] for p in sent] == [5, 3]
+    assert sent[1]["models"] == {"m": 3}
+
+
 @pytest.mark.windows_newline
 def test_license_cache_is_written_with_lf(tmp_path, monkeypatch):
     """The cache is indented JSON; pin LF so Windows does not write CRLF (#3698).
