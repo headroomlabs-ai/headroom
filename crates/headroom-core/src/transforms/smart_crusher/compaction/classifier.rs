@@ -121,6 +121,13 @@ fn classify_string(s: &str, cfg: &ClassifyConfig) -> CellClass {
             if matches!(parsed, Value::Object(_) | Value::Array(_)) {
                 return CellClass::StringifiedJson(parsed);
             }
+        } else if serde_json::from_str::<&serde_json::value::RawValue>(trimmed).is_ok() {
+            // Syntactically valid JSON container that `Value` cannot represent
+            // (e.g. numeric token exceeding `f64` range like `1e400` when the
+            // `arbitrary-precision` feature is disabled). Keep the full string
+            // verbatim as a Scalar so it is preserved and not replaced by an
+            // opaque CCR marker without a retrieval store.
+            return CellClass::Scalar;
         }
     }
 

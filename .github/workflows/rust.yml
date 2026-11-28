@@ -215,7 +215,9 @@ jobs:
         # Verify ML-only fallback behavior (source-code blocks must never
         # route to Kompress even when ML is enabled).
         if: matrix.features == 'ml'
-        run: cargo test -p headroom-core --no-default-features --features ml --test live_zone_dispatch
+        run: |
+          cargo test -p headroom-core --no-default-features --features ml --test live_zone_dispatch
+          cargo test -p headroom-core --no-default-features --features ml --test live_zone_source_code_decline
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})

@@ -431,6 +431,24 @@ mod tests {
         );
     }
 
+    /// Without `arbitrary-precision`, a number exceeding `f64` range (like `1e400`)
+    /// cannot be parsed as a `Value`. If the stringified JSON container is longer
+    /// than `opaque_min_bytes` (256 bytes) and the default compactor has no retrieval
+    /// store, it must not be replaced by a CCR marker; it must be preserved verbatim.
+    #[cfg(not(feature = "arbitrary-precision"))]
+    #[test]
+    fn unrepresentable_number_in_stringified_json_preserved_without_store() {
+        let cell = format!("{{\"amount\":1e400}}{}", " ".repeat(300));
+        assert!(cell.len() > 256, "must clear opaque_min_bytes");
+        let doc = json!({"payload": cell});
+        let out = dc().compact(doc.clone());
+        assert_eq!(
+            out.pointer("/payload").and_then(|v| v.as_str()),
+            Some(cell.as_str()),
+            "valid embedded JSON with out-of-range number must not be turned into an opaque marker"
+        );
+    }
+
     /// Compactable stringified JSON must still be walked/compacted; the
     /// byte-preserving branch only applies when recursion changed nothing.
     #[cfg(not(feature = "arbitrary-precision"))]
