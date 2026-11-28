@@ -18,6 +18,10 @@ import json
 from typing import Any
 
 import click
+from rich.console import Console
+from rich.table import Table
+
+from headroom.telemetry.surfaces import list_telemetry_surface_dicts
 
 from .main import main
 
@@ -64,7 +68,7 @@ def _sample_payload() -> dict[str, Any]:
     return rows[-1]
 
 
-@main.command()
+@main.group(invoke_without_command=True)
 @click.option(
     "--show",
     "show",
@@ -77,7 +81,8 @@ def _sample_payload() -> dict[str, Any]:
     is_flag=True,
     help="Print JSON only, with no explanatory footer. Implies --show.",
 )
-def telemetry(show: bool, as_json: bool) -> None:
+@click.pass_context
+def telemetry(ctx: click.Context, show: bool, as_json: bool) -> None:
     """Show what Headroom's telemetry beacon collects, and whether it is on.
 
     \b
@@ -85,6 +90,13 @@ def telemetry(show: bool, as_json: bool) -> None:
         headroom telemetry           Current state and the two switches
         headroom telemetry --show    The exact payload, field by field
     """
+    if ctx.invoked_subcommand is not None:
+        if show or as_json:
+            raise click.UsageError(
+                "Use --show/--json without a subcommand, or telemetry list --json."
+            )
+        return
+
     from headroom.telemetry.beacon import beacon_off_reason, is_telemetry_enabled
     from headroom.telemetry.session import (
         DEFAULT_ENDPOINT,
@@ -149,3 +161,37 @@ def telemetry(show: bool, as_json: bool) -> None:
             "Turn the beacon off:   HEADROOM_BEACON=off   (or HEADROOM_TELEMETRY=off, DO_NOT_TRACK=1)"
         )
     click.echo("See the exact payload: headroom telemetry --show")
+
+
+telemetry_group = telemetry
+
+
+@telemetry_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def list_surfaces(as_json: bool) -> None:
+    """List every known telemetry/observability surface."""
+
+    surfaces = list_telemetry_surface_dicts()
+    if as_json:
+        click.echo(json.dumps(surfaces, indent=2, sort_keys=True))
+        return
+
+    table = Table(title="Headroom Telemetry Surfaces")
+    table.add_column("Surface", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Leaves Host", no_wrap=True)
+    table.add_column("Prompt Content", no_wrap=True)
+    table.add_column("Observe")
+    table.add_column("Retention")
+
+    for surface in surfaces:
+        table.add_row(
+            surface["surface"],
+            surface["status"],
+            "yes" if surface["leaves_host_by_default"] else "no",
+            "yes" if surface["includes_prompt_content"] else "no",
+            surface["observe"],
+            surface["retention"],
+        )
+
+    Console().print(table)
