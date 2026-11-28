@@ -67,7 +67,7 @@ pub fn median(values: &[f64]) -> Option<f64> {
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let n = sorted.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         // Mean of the two middle elements.
         let lo = sorted[n / 2 - 1];
         let hi = sorted[n / 2];

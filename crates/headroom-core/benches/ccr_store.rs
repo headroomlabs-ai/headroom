@@ -91,9 +91,9 @@ impl CcrStore for LegacyMutexStore {
 
     fn get(&self, hash: &str) -> Option<String> {
         let mut g = self.inner.lock().unwrap();
-        let expired = match g.map.get(hash) {
-            Some(e) => e.inserted.elapsed() > self.ttl,
-            None => return None,
+        let expired = {
+            let e = g.map.get(hash)?;
+            e.inserted.elapsed() > self.ttl
         };
         if expired {
             g.map.remove(hash);
