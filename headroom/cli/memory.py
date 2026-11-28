@@ -751,7 +751,7 @@ def edit_memory(
 
         # Try partial match if not found
         if mem is None:
-            all_memories = asyncio.run(store.query(MemoryFilter(limit=1000)))
+            all_memories = asyncio.run(store.query(MemoryFilter()))
             matches = [m for m in all_memories if m.id.startswith(memory_id)]
 
             if len(matches) == 0:
@@ -911,7 +911,7 @@ def delete_memories(
             else:
                 # Try partial match
                 if all_memories is None:
-                    all_memories = asyncio.run(store.query(MemoryFilter(limit=10000)))
+                    all_memories = asyncio.run(store.query(MemoryFilter()))
 
                 matches = [m for m in all_memories if m.id.startswith(memory_id)]
 

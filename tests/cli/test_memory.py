@@ -114,6 +114,43 @@ def populated_db(temp_db: str) -> str:
     return temp_db
 
 
+def _seed_old_prefix_memories(db_path: str, fillers: int) -> SQLiteMemoryStore:
+    """Seed ``fillers`` newer rows plus an older memory outside the newest-first window.
+
+    Two memories share the ``shared-prefix-`` prefix: the newer one sits inside
+    the newest-first window, the older one far outside it. ``legacy-target-memory``
+    is a unique old prefix outside the window.
+    """
+    store = SQLiteMemoryStore(db_path)
+    filler_start = datetime(2024, 1, 1)
+    memories = [
+        Memory(
+            id=f"filler-{index:05d}",
+            content=f"Filler memory {index}",
+            user_id="test-user",
+            created_at=filler_start + timedelta(minutes=index),
+            valid_from=filler_start + timedelta(minutes=index),
+        )
+        for index in range(fillers)
+    ]
+    for mem_id, content, year in (
+        ("shared-prefix-old", "Older matching memory", 2020),
+        ("shared-prefix-new", "Newer matching memory", 2026),
+        ("legacy-target-memory", "Legacy target outside the window", 2020),
+    ):
+        memories.append(
+            Memory(
+                id=mem_id,
+                content=content,
+                user_id="test-user",
+                created_at=datetime(year, 1, 1),
+                valid_from=datetime(year, 1, 1),
+            )
+        )
+    asyncio.run(store.save_batch(memories))
+    return store
+
+
 class TestMemoryList:
     """Tests for 'headroom memory list' command."""
 
@@ -322,6 +359,36 @@ class TestMemoryEdit:
         )
         assert result.exit_code != 0 or "not found" in result.output.lower()
 
+    def test_edit_partial_id_beyond_default_query_limit(
+        self, runner: CliRunner, temp_db: str
+    ) -> None:
+        """Edit a unique partial ID whose match is older than 1,000 rows."""
+        store = _seed_old_prefix_memories(temp_db, 1000)
+
+        result = runner.invoke(
+            main,
+            ["memory", "edit", "--db-path", temp_db, "legacy-target-", "--content", "Edited"],
+        )
+
+        assert result.exit_code == 0
+        assert asyncio.run(store.get("legacy-target-memory")).content == "Edited"
+
+    def test_edit_partial_id_reports_ambiguity_beyond_default_query_limit(
+        self, runner: CliRunner, temp_db: str
+    ) -> None:
+        """An older match outside the old window must not be silently skipped."""
+        store = _seed_old_prefix_memories(temp_db, 1000)
+
+        result = runner.invoke(
+            main,
+            ["memory", "edit", "--db-path", temp_db, "shared-prefix-", "--content", "Edited"],
+        )
+
+        assert result.exit_code != 0
+        assert "Ambiguous ID 'shared-prefix-'" in result.output
+        assert asyncio.run(store.get("shared-prefix-new")).content == "Newer matching memory"
+        assert asyncio.run(store.get("shared-prefix-old")).content == "Older matching memory"
+
 
 class TestMemoryDelete:
     """Tests for 'headroom memory delete' command."""
@@ -370,6 +437,34 @@ class TestMemoryDelete:
         )
         # Memory should still exist since we said no
         assert "Tool output" in show_result.output or show_result.exit_code == 0
+
+    def test_delete_partial_id_beyond_default_query_limit(
+        self, runner: CliRunner, temp_db: str
+    ) -> None:
+        """Delete a unique partial ID whose match is older than 10,000 rows."""
+        store = _seed_old_prefix_memories(temp_db, 10000)
+
+        result = runner.invoke(
+            main, ["memory", "delete", "--db-path", temp_db, "legacy-target-", "--force"]
+        )
+
+        assert result.exit_code == 0
+        assert asyncio.run(store.get("legacy-target-memory")) is None
+
+    def test_delete_partial_id_reports_ambiguity_beyond_default_query_limit(
+        self, runner: CliRunner, temp_db: str
+    ) -> None:
+        """An older match outside the old window must not be silently skipped."""
+        store = _seed_old_prefix_memories(temp_db, 10000)
+
+        result = runner.invoke(
+            main, ["memory", "delete", "--db-path", temp_db, "shared-prefix-", "--force"]
+        )
+
+        assert result.exit_code != 0
+        assert "Ambiguous ID 'shared-prefix-'" in result.output
+        assert asyncio.run(store.get("shared-prefix-new")) is not None
+        assert asyncio.run(store.get("shared-prefix-old")) is not None
 
 
 class TestMemoryPrune:
