@@ -561,6 +561,15 @@ def unwrap_tool_call(name: str, arguments: Any) -> tuple[str, Any]:
     open and return ``(name, arguments)`` unchanged (caller decides what that
     means).
     """
+    if name == "mcp_daemon":
+        raw = _load_json_value(arguments)
+        if isinstance(raw, dict):
+            selector = raw.get("selector")
+            if raw.get("action") == "call" and isinstance(selector, str):
+                parts = selector.split(".")
+                if len(parts) == 2 and all(parts):
+                    return f"mcp__{parts[0]}__{parts[1]}", arguments
+        return name, arguments
     if name != _HERMES_TOOL_CALL_WRAPPER:
         if _orchestrator_invokes_retrieve(name, arguments):
             return _CCR_RETRIEVE_TOOL_NAME, arguments
@@ -601,7 +610,7 @@ def unwrap_tool_call(name: str, arguments: Any) -> tuple[str, Any]:
 
 
 def unwrap_tool_call_name(name: str, arguments: Any) -> str:
-    """Extract the real tool name from a Hermes deferred ``tool_call`` wrapper.
+    """Extract the real tool name from a Hermes or Pi wrapper.
 
     See :func:`unwrap_tool_call`; this returns only the name.
     """

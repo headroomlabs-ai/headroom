@@ -779,6 +779,8 @@ def test_openai_responses_adapter_accepts_empty_input_list():
             "tool_call",
             '{"calls": [{"name": "headroom_retrieve", "arguments": {"hash": "abc"}}]}',
         ),
+        # Pi mcp_daemon wrapper: selector "server.tool" unwraps to the MCP name.
+        ("mcp_daemon", '{"action":"call","selector":"headroom.headroom_retrieve"}'),
     ],
 )
 def test_openai_responses_adapter_preserves_headroom_retrieve_outputs(name, arguments):

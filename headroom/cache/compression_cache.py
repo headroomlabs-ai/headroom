@@ -15,6 +15,11 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from headroom.ccr.retrieval_content import is_retrieval_result
+from headroom.config import DEFAULT_VERBATIM_EXCLUDE_TOOLS, is_tool_excluded, unwrap_tool_call_name
+
+from .compression_store import cached_references_available
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +45,52 @@ def _is_tool_result_message(msg: dict) -> bool:
     return False
 
 
+def _verbatim_tool_call_ids(messages: list[dict]) -> set[str]:
+    protected = set()
+    for message in messages:
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            calls = []
+        content = message.get("content")
+        if isinstance(content, list):
+            calls = [
+                *calls,
+                *(
+                    block
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                ),
+            ]
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or call
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str):
+                continue
+            name = unwrap_tool_call_name(name, function.get("arguments", call.get("input")))
+            if isinstance(call.get("id"), str) and is_tool_excluded(
+                name, DEFAULT_VERBATIM_EXCLUDE_TOOLS
+            ):
+                protected.add(call["id"])
+    return protected
+
+
+def _is_verbatim_result(message: dict, protected: set[str]) -> bool:
+    name = message.get("name")
+    if isinstance(name, str) and is_tool_excluded(name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+        return True
+    if message.get("tool_call_id") in protected:
+        return True
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("tool_use_id") in protected
+        for block in content
+    )
 def _tool_result_units(msg: dict) -> list[tuple[int | None, dict]]:
     """Expose each parallel result to the single-result shape/replay helpers.
 
@@ -67,6 +118,8 @@ def _extract_text_from_blocks(blocks: list) -> str | None:
     string.  This helper extracts text from ``type == "text"`` blocks and
     joins them.
     """
+    if any(not isinstance(block, dict) or block.get("type") != "text" for block in blocks):
+        return None
     texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
     return "\n".join(t for t in texts if t != "") or None
 
@@ -231,6 +284,10 @@ class CompressionCache:
         """Retrieve compressed content by hash, refreshing LRU position on hit."""
         with self._lock:
             entry = self._cache.get(hash)
+            if entry is not None and not cached_references_available(entry.compressed):
+                self._total_tokens_saved -= entry.tokens_saved
+                del self._cache[hash]
+                entry = None
             if entry is None:
                 self._misses += 1
                 return None
@@ -401,7 +458,7 @@ class CompressionCache:
                     content = _extract_tool_result_content(unit)
                     if content is not None:
                         h = self.content_hash(content)
-                        if h not in self._cache and h not in self._stable_hashes:
+                        if self.get_compressed(h) is None and h not in self._stable_hashes:
                             break
                     elif _carries_tool_result_text(unit):
                         break
@@ -430,13 +487,16 @@ class CompressionCache:
         # `_cache` mid-iteration.
         with self._lock:
             result: list[dict] = []
+            protected = _verbatim_tool_call_ids(messages)
             for msg in messages:
                 replacement = msg
                 for index, unit in _tool_result_units(msg):
-                    if not _can_swap_tool_result_content(unit):
+                    if not _can_swap_tool_result_content(unit) or _is_verbatim_result(
+                        unit, protected
+                    ):
                         continue
                     content = _extract_tool_result_content(unit)
-                    if content is not None:
+                    if content is not None and not is_retrieval_result(content):
                         h = self.content_hash(content)
                         compressed = self.get_compressed(h)
                         if compressed is not None:
