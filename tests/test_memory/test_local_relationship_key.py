@@ -75,3 +75,89 @@ async def test_relationship_type_is_read_from_relation_or_type(
     add_relationship.assert_awaited_once()
     stored = add_relationship.await_args.args[0]
     assert stored.relation_type == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_relationships",
+    [
+        ["Alice works_with Bob"],
+        [{"source": None, "target": "Bob", "relation": "knows"}],
+        [{"source": "Alice", "target": ["Bob"]}],
+        [None, 7],
+    ],
+)
+async def test_malformed_relationships_are_skipped_before_the_row_is_stored(
+    bad_relationships: list[object],
+) -> None:
+    """LLM junk must not raise after the write (a retry would duplicate the row)."""
+    backend, add_relationship = _backend()
+
+    memory = await backend.save_memory(
+        content="Alice works with Bob",
+        user_id="alice",
+        entities=["Alice", "Bob"],
+        relationships=bad_relationships,  # type: ignore[arg-type]
+    )
+
+    assert memory.id == "m1"
+    assert backend._hierarchical_memory.add.await_count == 1
+    add_relationship.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_malformed_item_does_not_drop_the_well_formed_ones() -> None:
+    backend, add_relationship = _backend()
+
+    await backend.save_memory(
+        content="Alice works with Bob",
+        user_id="alice",
+        entities=["Alice", "Bob"],
+        relationships=[
+            "Alice works_with Bob",  # type: ignore[list-item]
+            {"source": "Alice", "relation": "works_with", "target": "Bob"},
+        ],
+    )
+
+    add_relationship.assert_awaited_once()
+    assert add_relationship.await_args.args[0].relation_type == "works_with"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_entities",
+    [[{"entity": ["X"]}], [{"entity": 7}], ["X"], [None]],
+)
+async def test_malformed_extracted_entities_are_skipped(bad_entities: list[object]) -> None:
+    backend, _ = _backend()
+
+    memory = await backend.save_memory(
+        content="x",
+        user_id="alice",
+        extracted_entities=bad_entities,  # type: ignore[arg-type]
+        extracted_relationships=["junk"],  # type: ignore[arg-type]
+    )
+
+    assert memory.entity_refs == []
+    assert backend._hierarchical_memory.add.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_well_formed_extracted_entities_and_relationships_unchanged() -> None:
+    backend, add_relationship = _backend()
+
+    memory = await backend.save_memory(
+        content="x",
+        user_id="alice",
+        extracted_entities=[
+            {"entity": "Alice", "entity_type": "person"},
+            {"entity": "Bob", "entity_type": "person"},
+        ],
+        extracted_relationships=[
+            {"source": "Alice", "relationship": "manages", "destination": "Bob"}
+        ],
+    )
+
+    assert memory.entity_refs == ["Alice", "Bob"]
+    add_relationship.assert_awaited_once()
+    assert add_relationship.await_args.args[0].relation_type == "manages"
