@@ -7163,12 +7163,18 @@ class OpenAIHandlerMixin:
         # pipeline never runs here (compression goes through CompressionUnits),
         # so parse a telemetry-only message conversion directly, behind the
         # same >100 saved-token gate as TransformPipeline.apply.
+        #
+        # Off the event loop: parse_messages tokenizes, regex-scans and hashes
+        # the whole re-sent conversation (~40 ms/MB), and Codex re-sends
+        # multi-MB inputs every turn. Inline, that stalled every other
+        # in-flight request on the process for the duration of a statistic.
         waste_signals_dict: dict[str, int] | None = None
         if tokens_saved > 100:
             try:
                 from headroom.parser import parse_messages
 
-                _, _, _waste = parse_messages(
+                _, _, _waste = await asyncio.to_thread(
+                    parse_messages,
                     _responses_input_to_waste_messages(instructions, input_data),
                     tokenizer,
                 )

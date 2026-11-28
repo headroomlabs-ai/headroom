@@ -155,3 +155,111 @@ class TestResponsesWasteParsing:
         messages = _responses_input_to_waste_messages(None, items)
         _, _, waste = parse_messages(messages, tokenizer)
         assert waste.reread_tokens > 0
+
+
+class TestResponsesWasteParsingOffLoop:
+    """The handler's waste-signal parse must not run on the event loop.
+
+    ``parse_messages`` is CPU-bound over the whole re-sent conversation, and
+    Codex re-sends multi-MB inputs every turn. Run inline, it stalled every
+    other in-flight request on the proxy for the duration of a telemetry-only
+    statistic. The parse must run on a worker thread, and its result must
+    still reach the ``RequestOutcome``.
+    """
+
+    def test_parse_runs_off_loop_and_still_reports(self, monkeypatch):
+        import threading
+
+        import httpx
+        from fastapi.testclient import TestClient
+
+        import headroom.parser as parser_module
+        from headroom.proxy.loopback_guard import require_loopback
+        from headroom.proxy.server import ProxyConfig, create_app
+
+        app = create_app(
+            ProxyConfig(
+                optimize=True,
+                cache_enabled=False,
+                rate_limit_enabled=False,
+                cost_tracking_enabled=False,
+            )
+        )
+        app.dependency_overrides[require_loopback] = lambda: None
+        server = app.state.proxy
+
+        loop_threads: list[int] = []
+        parse_threads: list[int] = []
+        real_parse = parser_module.parse_messages
+
+        def _recording_parse(*args, **kwargs):
+            parse_threads.append(threading.get_ident())
+            return real_parse(*args, **kwargs)
+
+        monkeypatch.setattr(parser_module, "parse_messages", _recording_parse)
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):
+            loop_threads.append(threading.get_ident())
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_test",
+                    "object": "response",
+                    "output": [],
+                    "usage": {"input_tokens": 12, "output_tokens": 3},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+        server._retry_request = _fake_retry
+
+        async def _fake_compress(payload, **kwargs):
+            # Clear the >100 saved-token gate so the waste parse runs.
+            return (
+                dict(payload),
+                True,
+                5_000,
+                ["openai:responses:trim"],
+                None,
+                20_000,
+                15_000,
+                5_000,
+                {},
+            )
+
+        server._compress_openai_responses_payload_in_executor = _fake_compress
+
+        outcomes = []
+
+        async def _capture_outcome(outcome):
+            outcomes.append(outcome)
+
+        server._record_request_outcome = _capture_outcome
+
+        payload = {
+            "model": "gpt-5-codex",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                },
+                {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+                _fco(_big_output()),
+            ],
+        }
+
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer sk-test", "Content-Type": "application/json"},
+                json=payload,
+            )
+
+        assert resp.status_code == 200
+        assert loop_threads, "upstream call never ran"
+        assert parse_threads, "waste-signal parse never ran"
+        assert parse_threads[0] != loop_threads[0], "waste-signal parse ran on the event loop"
+        assert outcomes, "no RequestOutcome recorded"
+        assert outcomes[0].waste_signals
+        assert outcomes[0].waste_signals["json_bloat"] > 0
