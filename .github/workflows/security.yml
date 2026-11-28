@@ -41,7 +41,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
       - name: Export production dependency set from uv.lock
         run: |
@@ -97,7 +97,7 @@ jobs:
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
       - name: Resolve what pip installs from the package metadata
         if: steps.gate.outputs.run == 'true'
@@ -167,7 +167,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install cargo-audit + cargo-deny
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-audit,cargo-deny
 
@@ -270,7 +270,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           languages: ${{ matrix.language }}
           queries: security-extended
@@ -282,7 +282,7 @@ jobs:
               - tests
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           category: "/language:${{ matrix.language }}"
 
