@@ -20,16 +20,19 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
 import time
+from collections.abc import Collection
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...fileperms import ensure_private_file
 from ...log_safety import WarnOnce, safe_id
+from ..context_clock import ContextTurnSnapshot, advance_context_state, resolve_context_conversation
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -47,6 +50,13 @@ CREATE INDEX IF NOT EXISTS idx_ccr_expiry_deadline ON ccr_entries (created_at + 
 -- Superseded by idx_ccr_expiry_deadline: no query searches or orders by bare
 -- created_at, so the old index only cost writes. Drop it from existing files.
 DROP INDEX IF EXISTS idx_ccr_expiry;
+CREATE TABLE IF NOT EXISTS ccr_context_states (
+    conversation_key TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    namespace_key TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ccr_context_expiry ON ccr_context_states(expires_at);
 """
 
 # Purge expired rows at most this often (seconds). Purging is hygiene,
@@ -134,6 +144,7 @@ class SQLiteBackend:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        self._migrate_context_namespaces(conn)
         # Startup hygiene: expired rows are only purged opportunistically
         # on writes, so a quiet store could otherwise hold expired
         # originals (which may contain sensitive tool output) on disk
@@ -142,6 +153,7 @@ class SQLiteBackend:
             "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
             (time.time(),),
         )
+        conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (time.time(),))
         conn.commit()
         # Originals can contain sensitive tool output (file contents,
         # command output) — keep the database private to the user.
@@ -179,6 +191,35 @@ class SQLiteBackend:
     def _schedule_reopen(self, now: float) -> None:
         self._next_reopen_at = now + self._reopen_backoff
         self._reopen_backoff = min(self._reopen_backoff * 2, _REOPEN_BACKOFF_MAX)
+
+    @staticmethod
+    def _migrate_context_namespaces(conn: sqlite3.Connection) -> None:
+        """Index clock ownership independently of JSON, preserving legacy anchors."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(ccr_context_states)")}
+            if "namespace_key" not in columns:
+                conn.execute("ALTER TABLE ccr_context_states ADD COLUMN namespace_key TEXT")
+                for key, raw in conn.execute(
+                    "SELECT conversation_key, state_json FROM ccr_context_states"
+                ).fetchall():
+                    try:
+                        state = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    namespace = state.get("namespace") if isinstance(state, dict) else None
+                    if isinstance(namespace, str) and namespace:
+                        conn.execute(
+                            "UPDATE ccr_context_states SET namespace_key=? WHERE conversation_key=?",
+                            (namespace, key),
+                        )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ccr_context_namespace ON ccr_context_states(namespace_key)"
+            )
+            conn.commit()
+        except sqlite3.DatabaseError:
+            conn.rollback()
+            raise
 
     @staticmethod
     def _is_corruption(error: Exception) -> bool:
@@ -276,6 +317,7 @@ class SQLiteBackend:
             "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
             (now,),
         )
+        conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (now,))
         conn.commit()
         self._last_purge = now
         return cursor.rowcount
@@ -296,6 +338,86 @@ class SQLiteBackend:
             return
         self._purge_expired(now)
 
+    def observe_context_turn(
+        self, conversation_key: str, hash_keys: Collection[str], *, namespace_key: str | None = None
+    ) -> ContextTurnSnapshot | None:
+        """Persist the counter and event anchors in one cross-worker transaction."""
+        if not hash_keys:
+            return None
+        with self._lock:
+            conn = None
+            try:
+                conn = self._connection()
+                conn.execute("BEGIN IMMEDIATE")
+                now = time.time()
+                events = {}
+                for hash_key in set(hash_keys):
+                    row = conn.execute(
+                        "SELECT created_at, ttl, entry_json FROM ccr_entries "
+                        "WHERE hash = ? AND created_at + ttl >= ?",
+                        (hash_key, now),
+                    ).fetchone()
+                    if row is not None:
+                        entry = self._entry_from_json(row[2], hash_key)
+                        if entry is not None:
+                            events[hash_key] = (row[0], row[0] + row[1], entry.event_identity)
+                if not events:
+                    conn.rollback()
+                    return None
+                conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (now,))
+                if namespace_key is not None:
+                    states = {}
+                    for key, raw, indexed_namespace in conn.execute(
+                        "SELECT conversation_key, state_json, namespace_key FROM ccr_context_states "
+                        "WHERE namespace_key=? OR namespace_key IS NULL OR conversation_key=?",
+                        (namespace_key, conversation_key),
+                    ):
+                        candidate = json.loads(raw)
+                        if indexed_namespace is not None and (
+                            not isinstance(candidate, dict)
+                            or candidate.get("namespace") != indexed_namespace
+                        ):
+                            raise ValueError(
+                                "CCR clock namespace does not match its retained ownership"
+                            )
+                        states[key] = candidate
+                    conversation_key = resolve_context_conversation(
+                        conversation_key, namespace_key, states, events
+                    )
+                row = conn.execute(
+                    "SELECT state_json FROM ccr_context_states WHERE conversation_key = ?",
+                    (conversation_key,),
+                ).fetchone()
+                live_hashes = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT hash FROM ccr_entries WHERE created_at + ttl >= ?", (now,)
+                    )
+                }
+                state, snapshot, expires_at = advance_context_state(
+                    None if row is None else json.loads(row[0]), events, live_hashes, now
+                )
+                state["namespace"] = namespace_key if namespace_key is not None else "explicit"
+                conn.execute(
+                    "INSERT INTO ccr_context_states(conversation_key, state_json, expires_at, namespace_key) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(conversation_key) DO UPDATE SET "
+                    "state_json = excluded.state_json, expires_at = excluded.expires_at, "
+                    "namespace_key = excluded.namespace_key",
+                    (conversation_key, json.dumps(state), expires_at, state["namespace"]),
+                )
+                conn.commit()
+                return snapshot
+            except (ValueError, TypeError) as error:
+                if conn is not None:
+                    conn.rollback()
+                logger.warning("CCR context clock invalid; proactive expansion skipped: %s", error)
+                return None
+            except sqlite3.DatabaseError as error:
+                if conn is not None:
+                    conn.rollback()
+                self._handle_db_error(error, "context clock")
+                return None
+
     def get(self, hash_key: str) -> CompressionEntry | None:
         with self._lock:
             try:
@@ -311,45 +433,71 @@ class SQLiteBackend:
             return None
         return self._entry_from_json(row[0], hash_key)
 
-    def set(self, hash_key: str, entry: CompressionEntry) -> bool | None:
-        """Persist ``entry``; return ``False`` if it was not.
-
-        Unlike reads, a failed write must not look like success: the caller
-        is about to hand out ``hash_key`` in place of the original, so it has
-        to learn that the original is not retrievable and keep it instead.
-        ``CompressionStore.store`` turns the ``False`` into ``StorageError``.
-        """
-        payload = json.dumps(asdict(entry), ensure_ascii=False)
+    def record_retrieval(self, hash_key: str, entry: CompressionEntry, query: str | None) -> None:
+        """Compare event identity and merge access metadata in one transaction."""
         with self._lock:
+            conn = None
             try:
                 conn = self._connection()
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT entry_json FROM ccr_entries WHERE hash = ?", (hash_key,)
+                ).fetchone()
+                current = None if row is None else self._entry_from_json(row[0], hash_key)
+                if current is None or current.event_identity != entry.event_identity:
+                    conn.rollback()
+                    return
+                current.record_access(query)
+                conn.execute(
+                    "UPDATE ccr_entries SET entry_json = ? WHERE hash = ?",
+                    (json.dumps(asdict(current), ensure_ascii=False), hash_key),
+                )
+                conn.commit()
+                entry.retrieval_count = current.retrieval_count
+                entry.last_accessed = current.last_accessed
+                entry.search_queries = current.search_queries.copy()
+            except sqlite3.DatabaseError as error:
+                if conn is not None:
+                    conn.rollback()
+                self._handle_db_error(error, "record retrieval")
+
+    def set(self, hash_key: str, entry: CompressionEntry) -> bool:
+        return self._set(hash_key, entry, fresh_event=False)
+
+    def set_new(self, hash_key: str, entry: CompressionEntry) -> bool:
+        """Assign fresh event timestamp atomically across SQLite writers."""
+        return self._set(hash_key, entry, fresh_event=True)
+
+    def _set(self, hash_key: str, entry: CompressionEntry, *, fresh_event: bool) -> bool:
+        with self._lock:
+            conn = None
+            try:
+                conn = self._connection()
+                if fresh_event:
+                    conn.execute("BEGIN IMMEDIATE")
+                    previous = conn.execute(
+                        "SELECT created_at FROM ccr_entries WHERE hash = ?", (hash_key,)
+                    ).fetchone()
+                    if previous is not None and entry.created_at <= previous[0]:
+                        entry.created_at = math.nextafter(previous[0], math.inf)
+                payload = json.dumps(asdict(entry), ensure_ascii=False)
                 conn.execute(
                     "INSERT OR REPLACE INTO ccr_entries "
                     "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
                     (hash_key, payload, entry.created_at, entry.ttl),
                 )
                 conn.commit()
-            except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, f"set {safe_id(hash_key)}")
-                logger.warning(
-                    "CCR SQLite write of %s was not persisted; the producer "
-                    "must keep the original content",
-                    safe_id(hash_key),
-                )
+            except sqlite3.DatabaseError as error:
+                if conn is not None:
+                    conn.rollback()
+                self._handle_db_error(error, f"set {safe_id(hash_key)}")
+                logger.warning("CCR SQLite write of %s was not persisted", safe_id(hash_key))
                 return False
             try:
                 self._maybe_purge()
-            except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "purge")
-                if self._is_corruption(e):
-                    # The store went offline mid-write; whether the row just
-                    # committed is still readable is unknown, so report the
-                    # write as lost rather than hand out its hash.
-                    logger.warning(
-                        "CCR SQLite write of %s was lost when the store went "
-                        "offline during the post-write purge",
-                        safe_id(hash_key),
-                    )
+            except sqlite3.DatabaseError as error:
+                self._handle_db_error(error, "purge")
+                if self._is_corruption(error):
                     return False
         return True
 
@@ -385,6 +533,7 @@ class SQLiteBackend:
             try:
                 conn = self._connection()
                 conn.execute("DELETE FROM ccr_entries")
+                conn.execute("DELETE FROM ccr_context_states")
                 conn.commit()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "clear")

@@ -346,6 +346,60 @@ class TestQueryAnalysis:
 
         assert len(recommendations) <= 2
 
+    def test_analyze_query_rejects_context_beyond_turn_distance(self):
+        """Fast sessions expire old contexts by conversational distance."""
+        tracker = ContextTracker(
+            ContextTrackerConfig(relevance_threshold=0.1, max_turn_distance=10)
+        )
+        tracker.track_compression(
+            hash_key="stale_auth",
+            turn_number=3,
+            tool_name="Read",
+            original_count=100,
+            compressed_count=10,
+            query_context="debug authentication middleware",
+            sample_content="authentication middleware validates bearer tokens",
+            workspace_key="project-a",
+        )
+
+        recommendations = tracker.analyze_query(
+            "debug authentication middleware",
+            current_turn=14,
+            workspace_key="project-a",
+        )
+
+        assert recommendations == []
+
+    def test_analyze_query_decays_relevance_by_turn_distance(self):
+        """A nearby context outranks identical older context in a fast session."""
+        tracker = ContextTracker(
+            ContextTrackerConfig(
+                relevance_threshold=0.0,
+                max_proactive_expansions=2,
+                max_turn_distance=10,
+            )
+        )
+        for hash_key, turn in (("older", 2), ("newer", 9)):
+            tracker.track_compression(
+                hash_key=hash_key,
+                turn_number=turn,
+                tool_name="Read",
+                original_count=100,
+                compressed_count=10,
+                query_context="debug authentication middleware",
+                sample_content="authentication middleware validates bearer tokens",
+                workspace_key="project-a",
+            )
+
+        recommendations = tracker.analyze_query(
+            "debug authentication middleware",
+            current_turn=10,
+            workspace_key="project-a",
+        )
+
+        scores = {item.hash_key: item.relevance_score for item in recommendations}
+        assert scores["newer"] > scores["older"]
+
 
 class TestRelevanceCalculation:
     """Test relevance score calculation."""
@@ -594,6 +648,7 @@ class TestContextTrackerConfig:
         assert config.max_tracked_contexts == 100
         assert config.relevance_threshold == 0.3
         assert config.max_context_age_seconds == 300.0
+        assert config.max_turn_distance == 10
         assert config.proactive_expansion is True
         assert config.max_proactive_expansions == 2
 
@@ -604,12 +659,14 @@ class TestContextTrackerConfig:
             max_tracked_contexts=50,
             relevance_threshold=0.5,
             max_proactive_expansions=5,
+            max_turn_distance=4,
         )
 
         assert config.enabled is False
         assert config.max_tracked_contexts == 50
         assert config.relevance_threshold == 0.5
         assert config.max_proactive_expansions == 5
+        assert config.max_turn_distance == 4
 
 
 class TestCompressedContextDataClass:
