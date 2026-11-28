@@ -429,6 +429,13 @@ class ProxyConfig:
     # Probes go every 10s and give up after 6, so a dead link fails over after
     # about this + 60s. See headroom/proxy/tcp_keepalive.py.
     upstream_tcp_keepalive_seconds: int = 30
+    # Seconds a request may take to get its headers onto an upstream connection
+    # (pool wait, connect, TLS, HTTP/2 stream slot) before the watchdog fails it
+    # with 504 and recycles the shared client (0 disables). httpx's timeouts do
+    # not bound httpcore's internal HTTP/2 waits, so without this one jammed
+    # connection parks every request indefinitely. Never shorter than the
+    # request's own pool + connect timeouts. See headroom/proxy/upstream_watchdog.py.
+    upstream_watchdog_seconds: int = 60
     # Anthropic buffered reads can legitimately run longer than the generic
     # proxy request cap. Keep the generic timeout unchanged elsewhere.
     anthropic_buffered_request_timeout_seconds: int = 600

@@ -34,6 +34,7 @@ from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.proxy.upstream_watchdog import gateway_timeout_status
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -1263,7 +1264,7 @@ class GeminiHandlerMixin:
                 request_id, "Gemini request", e, provider=provider_name, model=model
             )
             return JSONResponse(
-                status_code=502,
+                status_code=gateway_timeout_status(e, 502),
                 content={
                     "error": {
                         "message": "An error occurred while processing your request. Please try again.",
@@ -1736,7 +1737,7 @@ class GeminiHandlerMixin:
                 request_id, "Gemini countTokens", e, provider=provider_name, model=model
             )
             return JSONResponse(
-                status_code=502,
+                status_code=gateway_timeout_status(e, 502),
                 content={
                     "error": {
                         "message": "An error occurred while processing your request. Please try again.",

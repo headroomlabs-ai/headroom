@@ -659,6 +659,22 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="advanced",
     ),
     SettingField(
+        "HEADROOM_UPSTREAM_WATCHDOG_SECONDS",
+        "upstream_watchdog_seconds",
+        "Upstream watchdog (s)",
+        "Timeouts",
+        "int",
+        default=None,
+        minimum=0,
+        help=(
+            "Seconds a request may wait to get onto an upstream connection before "
+            "it fails with 504 and the shared upstream client is replaced. "
+            "Default: 60, 0 disables. Catches HTTP/2 connection stalls that the "
+            "other timeouts cannot see."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
         "anthropic_buffered_request_timeout_seconds",
         "Anthropic buffered timeout (s)",
