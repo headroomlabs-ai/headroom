@@ -22,7 +22,9 @@ from .grok import GrokRegistrar
 from .install import (
     CLAUDE_SERENA_CONTEXT,
     DEFAULT_PROXY_URL,
+    IX_MCP_SERVER_NAME,
     build_headroom_spec,
+    build_ix_spec,
     build_serena_spec,
     get_all_registrars,
     install_everywhere,
@@ -33,6 +35,7 @@ from .server_json import build_server_json, render_server_json
 __all__ = [
     "DEFAULT_PROXY_URL",
     "CLAUDE_SERENA_CONTEXT",
+    "IX_MCP_SERVER_NAME",
     "AntigravityRegistrar",
     "ClaudeConfigMutationError",
     "ClaudeRegistrar",
@@ -45,6 +48,7 @@ __all__ = [
     "ServerSpec",
     "any_succeeded",
     "build_headroom_spec",
+    "build_ix_spec",
     "build_serena_spec",
     "build_server_json",
     "format_result",
