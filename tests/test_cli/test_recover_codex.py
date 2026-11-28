@@ -3,12 +3,14 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import stat
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -102,7 +104,7 @@ def _write_thread_db(
 
 def test_discover_dangling_homes_only_returns_codex_homes(tmp_path: Path) -> None:
     candidate = tmp_path / "headroom-codex-home-abc"
-    candidate.mkdir()
+    candidate.mkdir(mode=0o700)
     (candidate / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
     (tmp_path / "headroom-codex-home-empty").mkdir()
     (tmp_path / "other").mkdir()
@@ -114,13 +116,257 @@ def test_discover_dangling_homes_only_returns_codex_homes(tmp_path: Path) -> Non
     assert discover_dangling_homes(tmp_path) == [candidate]
 
 
+def test_discover_dangling_homes_skips_homes_owned_by_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "headroom-codex-home-planted"
+    candidate.mkdir()
+    candidate.chmod(0o755)  # independent of the runner's umask (002 would add group write)
+    (candidate / "config.toml").write_text('[mcp_servers.x]\ncommand = "true"\n', encoding="utf-8")
+
+    # Positive control: an owned home that others cannot write is still found.
+    assert discover_dangling_homes(tmp_path) == [candidate]
+
+    # Simulated foreign owner: the current uid is not the directory's uid.
+    own_uid = candidate.lstat().st_uid
+    monkeypatch.setattr(codex_recovery.os, "getuid", lambda: own_uid + 1, raising=False)
+    assert discover_dangling_homes(tmp_path) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_discover_dangling_homes_skips_group_or_world_writable_homes(tmp_path: Path) -> None:
+    candidate = tmp_path / "headroom-codex-home-writable"
+    candidate.mkdir()
+    (candidate / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
+    candidate.chmod(0o777)
+    assert discover_dangling_homes(tmp_path) == []
+    candidate.chmod(0o755)
+    assert discover_dangling_homes(tmp_path) == [candidate]
+
+
+def test_windows_has_no_automatic_temp_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Privacy of a Windows temp dir cannot be verified here (ACLs), so none is searched,
+    not even one under the user profile; --source still works."""
+    home = tmp_path / "home"
+    # Only the module's platform check is switched; os.name stays put so
+    # pathlib keeps building native paths.
+    monkeypatch.setattr(codex_recovery.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "env-tmp"))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(home / "AppData" / "Local" / "Temp"))
+
+    assert codex_recovery._temp_roots() == []
+
+
+def test_discover_dangling_homes_skips_a_home_that_vanishes_before_ranking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept = tmp_path / "headroom-codex-home-kept"
+    gone = tmp_path / "headroom-codex-home-gone"
+    for home in (kept, gone):
+        home.mkdir(mode=0o700)
+        (home / "history.jsonl").write_text("{}\n", encoding="utf-8")
+    latest = codex_recovery._latest_state_mtime_ns
+
+    def latest_or_gone(home: Path) -> int:
+        if home == gone:
+            raise FileNotFoundError(home)
+        return latest(home)
+
+    monkeypatch.setattr(codex_recovery, "_latest_state_mtime_ns", latest_or_gone)
+    assert discover_dangling_homes(tmp_path) == [kept]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX owner check")
+def test_recovery_refuses_a_source_owned_by_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-swapped"
+    target.mkdir()
+    source.mkdir()
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    (source / "config.toml").write_text('[mcp_servers.x]\ncommand = "true"\n', encoding="utf-8")
+    own_uid = source.lstat().st_uid
+    monkeypatch.setattr(codex_recovery.os, "getuid", lambda: own_uid + 1, raising=False)
+
+    with pytest.raises(ValueError, match="not owned by the current user"):
+        recover_codex_home(source=source, target=target)
+    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+
+
+@pytest.mark.parametrize(
+    ("planted", "error"),
+    [
+        ('model = "mine-too"\n', "replaced while it was being pinned"),
+        ('[mcp_servers.x]\ncommand = "true"\n', "changed while it was being pinned"),
+    ],
+    ids=["same-content", "different-content"],
+)
+def test_recovery_refuses_a_source_swapped_after_the_owner_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planted: str, error: str
+) -> None:
+    """The source path is swapped after its owner was checked, before the copy.
+
+    On POSIX the copy reads through the held descriptor, so it holds the
+    checked directory's bytes, never the replacement's. Either way the swap
+    is refused and no copy is left for a later `headroom recover codex`.
+    """
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-swapped"
+    target.mkdir()
+    source.mkdir()
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    (source / "config.toml").write_text('model = "mine-too"\n', encoding="utf-8")
+    new_backup_dir = codex_recovery._new_backup_dir
+    fingerprint = codex_recovery.home_fingerprint
+    staging: list[Path] = []
+    copied: list[str] = []
+
+    def swap_then_back_up(home: Path) -> Path:
+        resolved = source.resolve()
+        resolved.rename(tmp_path / "original")
+        shutil.copytree(tmp_path / "original", resolved)
+        if planted != 'model = "mine-too"\n':
+            (resolved / "config.toml").write_text(planted, encoding="utf-8")
+        backup_dir = new_backup_dir(home)
+        staging.append(backup_dir / "source-pinned.partial")
+        return backup_dir
+
+    def fingerprint_after_copy(home: Path) -> str:
+        if staging and (staging[0] / "config.toml").exists():
+            copied.append((staging[0] / "config.toml").read_text(encoding="utf-8"))
+        return fingerprint(home)
+
+    monkeypatch.setattr(codex_recovery, "_new_backup_dir", swap_then_back_up)
+    monkeypatch.setattr(codex_recovery, "home_fingerprint", fingerprint_after_copy)
+    with pytest.raises(RuntimeError, match=error):
+        recover_codex_home(source=source, target=target)
+    if sys.platform != "win32":
+        assert copied == ['model = "mine-too"\n']
+    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+    assert not staging[0].exists()
+    assert not (staging[0].parent / "source-pinned").exists()
+    assert codex_recovery.discover_retained_sources(target) == []
+
+
+_unreadable_dirs = pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="needs POSIX permissions that bind the current user (not root)",
+)
+
+
+@pytest.fixture
+def locked_dirs() -> Any:
+    """Directories made unreadable for a test, restored afterwards so tmp_path can be removed."""
+    locked: list[Path] = []
+    yield locked
+    for path in locked:
+        path.chmod(0o700)
+
+
+@_unreadable_dirs
+def test_recovery_refuses_a_source_with_an_unreadable_directory(
+    tmp_path: Path, locked_dirs: list[Path]
+) -> None:
+    """A session directory the copy cannot list must not be silently left out."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-locked"
+    target.mkdir()
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    (source / "sessions" / "2026").mkdir(parents=True)
+    (source / "sessions" / "2026" / "a.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "sessions" / "locked").mkdir()
+    (source / "sessions" / "locked" / "b.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "sessions" / "locked").chmod(0)
+    locked_dirs.append(source / "sessions" / "locked")
+
+    with pytest.raises(RuntimeError, match=r"cannot read .*sessions/locked"):
+        recover_codex_home(source=source, target=target)
+    assert sorted(p.name for p in target.iterdir()) == ["config.toml"]
+    assert codex_recovery.discover_retained_sources(target) == []
+    assert list((tmp_path / codex_recovery._RECOVERY_DIR).iterdir()) == []
+
+
+@_unreadable_dirs
+def test_recovery_refuses_a_target_whose_backup_would_be_incomplete(
+    tmp_path: Path, locked_dirs: list[Path]
+) -> None:
+    """The by-path copy (the target backup, and the source pin on Windows) fails closed too."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-ok"
+    (target / "sessions" / "locked").mkdir(parents=True)
+    (target / "sessions" / "locked" / "b.jsonl").write_text("{}\n", encoding="utf-8")
+    (target / "config.toml").write_text('model = "mine"\n', encoding="utf-8")
+    source.mkdir()
+    (source / "config.toml").write_text('model = "theirs"\n', encoding="utf-8")
+    (target / "sessions" / "locked").chmod(0)
+    locked_dirs.append(target / "sessions" / "locked")
+
+    with pytest.raises(RuntimeError, match=r"cannot read .*sessions/locked"):
+        recover_codex_home(source=source, target=target)
+    assert (target / "config.toml").read_text(encoding="utf-8") == 'model = "mine"\n'
+    # `target-before` is what a failed merge restores: never leave a partial one.
+    assert not list((tmp_path / codex_recovery._RECOVERY_DIR).glob("*/target-before*"))
+
+
+def test_recovery_offers_no_snapshot_when_the_pinning_copy_fails_midway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy that fails part way (disk full on the second file) leaves nothing to merge later."""
+    target = tmp_path / "codex"
+    source = tmp_path / "headroom-codex-home-partial"
+    target.mkdir()
+    source.mkdir()
+    (source / "a.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "b.jsonl").write_text("{}\n", encoding="utf-8")
+    copies: list[str] = []
+
+    def fail_second_copy(copy: Any) -> Any:
+        def copy_until_disk_full(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+            copies.append(str(src))
+            if len(copies) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device", str(dst))
+            return copy(src, dst, *args, **kwargs)
+
+        return copy_until_disk_full
+
+    # The by-path copy (Windows) uses copy2; the held-descriptor copy, copyfileobj.
+    monkeypatch.setattr(shutil, "copy2", fail_second_copy(shutil.copy2))
+    monkeypatch.setattr(shutil, "copyfileobj", fail_second_copy(shutil.copyfileobj))
+    with pytest.raises(OSError, match="No space left"):
+        recover_codex_home(source=source, target=target)
+
+    assert codex_recovery.discover_retained_sources(target) == []
+
+
+def test_windows_discovery_without_a_locatable_profile_finds_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows discovery never needs the profile; recovery with --target still runs."""
+
+    def no_profile(cls: type[Path]) -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(codex_recovery.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "home", classmethod(no_profile))
+    assert codex_recovery._temp_roots() == []
+
+    target = tmp_path / "codex"
+    target.mkdir()
+    result = CliRunner().invoke(main, ["recover", "codex", "--target", str(target)])
+    assert result.exit_code == 0, result.output
+
+
 def test_discover_dangling_homes_uses_newest_state_not_directory_mtime(
     tmp_path: Path,
 ) -> None:
     newest_state = tmp_path / "headroom-codex-home-newest-state"
     newest_directory = tmp_path / "headroom-codex-home-newest-directory"
-    newest_state.mkdir()
-    newest_directory.mkdir()
+    newest_state.mkdir(mode=0o700)
+    newest_directory.mkdir(mode=0o700)
     newest_state_file = newest_state / "history.jsonl"
     newest_directory_file = newest_directory / "history.jsonl"
     newest_state_file.write_text('{"session_id":"newest"}\n', encoding="utf-8")
@@ -143,6 +389,8 @@ def test_discover_dangling_homes_searches_tmpdir_and_python_temp_root(
     python_candidate = python_root / "headroom-codex-home-python"
     env_candidate.mkdir(parents=True)
     python_candidate.mkdir(parents=True)
+    env_candidate.chmod(0o700)  # not group-writable under a 002 umask
+    python_candidate.chmod(0o700)
     (env_candidate / "history.jsonl").write_text("{}\n", encoding="utf-8")
     (python_candidate / "history.jsonl").write_text("{}\n", encoding="utf-8")
     os.utime(env_candidate / "history.jsonl", ns=(100, 100))
@@ -150,7 +398,10 @@ def test_discover_dangling_homes_searches_tmpdir_and_python_temp_root(
     monkeypatch.setenv("TMPDIR", str(env_root))
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(python_root))
 
-    assert discover_dangling_homes() == [python_candidate, env_candidate]
+    if sys.platform == "win32":
+        assert discover_dangling_homes() == []  # no automatic roots on Windows
+    else:
+        assert discover_dangling_homes() == [python_candidate, env_candidate]
 
 
 def test_recovery_merges_files_config_and_sqlite_with_backups(tmp_path: Path) -> None:

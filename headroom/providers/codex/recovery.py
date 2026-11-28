@@ -9,8 +9,11 @@ import os
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,34 +52,103 @@ class CodexHistoryAudit:
     history_without_rollout: tuple[str, ...]
 
 
+def _owned_by_current_user(path: Path) -> bool:
+    """On POSIX, whether the current user owns ``path`` itself (not a link target)."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return True  # Windows: no POSIX owner to compare
+    return bool(path.lstat().st_uid == getuid())
+
+
+def _is_trusted_owner(path: Path) -> bool:
+    """On POSIX, require the current user as owner and no group/world write bit.
+
+    A shared temp root lets another local user plant a directory with the Headroom
+    prefix; merging it would write that user's config into the active Codex home.
+    """
+    if not _owned_by_current_user(path):
+        return False
+    return sys.platform == "win32" or not path.lstat().st_mode & 0o022
+
+
+def _temp_roots() -> list[Path]:
+    """Temp directories an older Headroom may have left a Codex home in.
+
+    None on Windows: discovery cannot verify there that a temp directory is
+    private to the user (no POSIX owner or mode bits, and a directory under
+    the profile can still carry a permissive ACL), and ``Path("/tmp")`` is
+    ``C:\\tmp``, which any user can create. Recover a known home on Windows
+    with ``headroom recover codex --source``.
+    """
+    if sys.platform == "win32":
+        return []
+    roots = [Path(tempfile.gettempdir())]
+    if env_tmpdir := os.environ.get("TMPDIR"):
+        roots.append(Path(env_tmpdir))
+    roots.extend((Path("/tmp"), Path("/private/tmp")))
+    roots.extend(Path("/private/var/folders").glob("*/*/T"))
+    return roots
+
+
+@contextmanager
+def _held_source(source: Path) -> Iterator[tuple[os.stat_result, int | None]]:
+    """Hold ``source`` open while it is pinned; yield its metadata and descriptor.
+
+    On POSIX the directory is opened once (no symlink followed); the owner
+    check and the identity used later both come from that one ``fstat``, and
+    the pinning copy reads through the descriptor, so what is copied is the
+    directory that passed the owner check. Windows has no POSIX owner and no
+    ``os.fwalk``, so only the identity is taken and the copy goes by path.
+    """
+    if sys.platform == "win32":
+        yield source.lstat(), None
+        return
+    fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        held = os.fstat(fd)
+        if held.st_uid != os.getuid():
+            raise ValueError(f"source Codex home {source} is not owned by the current user")
+        yield held, fd
+    finally:
+        os.close(fd)
+
+
+def _newest_first(homes: list[Path]) -> list[Path]:
+    """``homes`` newest state first; a home that vanished meanwhile is dropped."""
+    ranked: list[tuple[int, Path]] = []
+    for home in homes:
+        try:
+            ranked.append((_latest_state_mtime_ns(home), home))
+        except OSError:
+            continue
+    return [home for _, home in sorted(ranked, key=lambda item: item[0], reverse=True)]
+
+
 def discover_dangling_homes(temp_root: Path | None = None) -> list[Path]:
     """Find non-empty Headroom temporary Codex homes, newest first."""
-    if temp_root is not None:
-        roots = [temp_root]
-    else:
-        roots = [Path(tempfile.gettempdir())]
-        if env_tmpdir := os.environ.get("TMPDIR"):
-            roots.append(Path(env_tmpdir))
-        roots.extend((Path("/tmp"), Path("/private/tmp")))
-        roots.extend(Path("/private/var/folders").glob("*/*/T"))
+    roots = [temp_root] if temp_root is not None else _temp_roots()
     candidates: list[Path] = []
     seen: set[Path] = set()
     for root in roots:
         try:
-            paths = root.glob(f"{_TEMP_HOME_PREFIX}*")
-            for path in paths:
+            paths = list(root.glob(f"{_TEMP_HOME_PREFIX}*"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
                 resolved = path.resolve()
                 if (
                     resolved not in seen
                     and path.is_dir()
                     and not path.is_symlink()
+                    and _is_trusted_owner(path)
                     and any(path.iterdir())
                 ):
                     seen.add(resolved)
                     candidates.append(path)
-        except OSError:
-            continue
-    return sorted(candidates, key=_latest_state_mtime_ns, reverse=True)
+            except OSError:  # removed or unreadable since the listing
+                continue
+    return _newest_first(candidates)
 
 
 def discover_referenced_temp_homes(target: Path) -> list[Path]:
@@ -236,30 +308,105 @@ def _secure_tree(path: Path) -> None:
         entry.chmod(0o700 if entry.is_dir() else 0o600)
 
 
+def _unreadable(path: Path, err: OSError) -> RuntimeError:
+    return RuntimeError(
+        f"cannot read {path} while copying a Codex home ({err.strerror}); nothing was "
+        "recovered. Make it readable by the current user, or move it aside, and rerun."
+    )
+
+
 def _copy_home(source: Path, destination: Path, skipped: list[str]) -> None:
+    """Copy ``source`` by path; a directory that cannot be listed aborts the copy."""
+
+    def refuse(err: OSError) -> None:
+        raise _unreadable(Path(err.filename or source), err) from err
+
     destination.mkdir(parents=True, exist_ok=False)
     destination.chmod(0o700)
-    for entry in source.rglob("*"):
-        relative = entry.relative_to(source)
-        output = destination / relative
+    for dirpath, dirnames, filenames in os.walk(source, onerror=refuse):
+        for name in [*dirnames, *filenames]:
+            entry = Path(dirpath) / name
+            relative = entry.relative_to(source)
+            output = destination / relative
+            try:
+                metadata = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISSOCK(metadata.st_mode):
+                skipped.append(str(relative))
+                continue
+            if entry.is_symlink():
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.symlink_to(os.readlink(entry))
+            elif entry.is_dir():
+                output.mkdir(parents=True, exist_ok=True)
+            elif entry.is_file():
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(entry, output, follow_symlinks=False)
+            else:
+                skipped.append(str(relative))
+    _secure_tree(destination)
+
+
+def _copy_held_home(source_fd: int, source: Path, destination: Path, skipped: list[str]) -> None:
+    """``_copy_home`` for a held directory: every read goes through ``source_fd``.
+
+    Entries are opened relative to their parent's descriptor and never through
+    a symlink, so renaming or replacing the source path meanwhile cannot change
+    what is copied. Symlinks are recreated as links, sockets and other special
+    files are recorded in ``skipped``, file times are kept for the merge, and
+    anything that cannot be read aborts the copy (``source`` names it).
+    """
+    destination.mkdir(parents=True, exist_ok=False)
+    destination.chmod(0o700)
+    _copy_held_dir(source_fd, source, Path(), destination, skipped)
+    _secure_tree(destination)
+
+
+def _copy_held_dir(
+    dir_fd: int, source: Path, relative: Path, destination: Path, skipped: list[str]
+) -> None:
+    try:
+        names = sorted(os.listdir(dir_fd))
+    except OSError as err:
+        raise _unreadable(source / relative, err) from err
+    for name in names:
+        entry = relative / name
+        output = destination / entry
         try:
-            metadata = entry.lstat()
+            metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                output.symlink_to(os.readlink(name, dir_fd=dir_fd))
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+                )
+            elif stat.S_ISREG(metadata.st_mode):
+                file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            else:
+                skipped.append(str(entry))
+                continue
         except FileNotFoundError:
             continue
-        if stat.S_ISSOCK(metadata.st_mode):
-            skipped.append(str(relative))
-            continue
-        if entry.is_symlink():
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.symlink_to(os.readlink(entry))
-        elif entry.is_dir():
-            output.mkdir(parents=True, exist_ok=True)
-        elif entry.is_file():
-            output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(entry, output, follow_symlinks=False)
+        except OSError as err:
+            raise _unreadable(source / entry, err) from err
+        if stat.S_ISDIR(metadata.st_mode):
+            try:
+                output.mkdir()
+                _copy_held_dir(child_fd, source, entry, destination, skipped)
+            finally:
+                os.close(child_fd)
         else:
-            skipped.append(str(relative))
-    _secure_tree(destination)
+            _copy_file_from(file_fd, output)
+
+
+def _copy_file_from(fd: int, output: Path) -> None:
+    """Copy the open regular file ``fd`` to ``output`` (closing ``fd``), keeping its times."""
+    with os.fdopen(fd, "rb") as src, output.open("xb") as dst:
+        shutil.copyfileobj(src, dst)
+        metadata = os.fstat(src.fileno())
+    os.utime(output, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
 
 
 def _new_backup_dir(target: Path) -> Path:
@@ -739,22 +886,52 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     if source in target.parents or target in source.parents or target == Path(target.anchor):
         raise ValueError("source and target Codex homes must not overlap")
     _reject_target_symlink_traversal(source, target)
-    before = home_fingerprint(source)
-    backup_dir = _new_backup_dir(target)
-    report = RecoveryReport(source=source, target=target, backup_dir=backup_dir)
-    pinned = backup_dir / "source-pinned"
+    with _held_source(source) as (held, held_fd):
+        before = home_fingerprint(source)
+        backup_dir = _new_backup_dir(target)
+        report = RecoveryReport(source=source, target=target, backup_dir=backup_dir)
+        pinned = backup_dir / "source-pinned"
+        # Copied under a staging name and published only once complete and
+        # verified: discover_retained_sources offers any `source-pinned`, so a
+        # partial or unverified copy must never carry that name.
+        staging = backup_dir / "source-pinned.partial"
+        try:
+            if held_fd is None:
+                _copy_home(source, staging, report.skipped_runtime)
+            else:
+                _copy_held_home(held_fd, source, staging, report.skipped_runtime)
+            copied_from = source.lstat()
+            if home_fingerprint(source) != before:
+                raise RuntimeError("source Codex home changed while it was being pinned")
+            if (copied_from.st_dev, copied_from.st_ino) != (held.st_dev, held.st_ino):
+                # The path no longer names the held directory; refuse it too.
+                raise RuntimeError("source Codex home was replaced while it was being pinned")
+        except BaseException:
+            # Best effort: a leftover staging dir is never offered for recovery,
+            # and the original error is the one to report. The backup dir holds
+            # nothing else yet, so it goes too rather than look like a backup.
+            shutil.rmtree(staging, ignore_errors=True)
+            with suppress(OSError):
+                backup_dir.rmdir()
+            raise
+        staging.rename(pinned)
     target_backup = backup_dir / "target-before"
-    _copy_home(source, pinned, report.skipped_runtime)
-    if home_fingerprint(source) != before:
-        raise RuntimeError("source Codex home changed while it was being pinned")
     target_existed = target.exists()
     target_modes: dict[str, int] = {}
     if target_existed:
         target_modes = _capture_modes(target)
         target_fingerprint = home_fingerprint(target)
-        _copy_home(target, target_backup, report.skipped_runtime)
-        if home_fingerprint(target) != target_fingerprint:
-            raise RuntimeError("target Codex home changed while it was being backed up")
+        # Staged like the pin: `target-before` is what a failed merge restores,
+        # so it gets that name only once complete and verified.
+        target_staging = backup_dir / "target-before.partial"
+        try:
+            _copy_home(target, target_staging, report.skipped_runtime)
+            if home_fingerprint(target) != target_fingerprint:
+                raise RuntimeError("target Codex home changed while it was being backed up")
+        except BaseException:
+            shutil.rmtree(target_staging, ignore_errors=True)
+            raise
+        target_staging.rename(target_backup)
     else:
         target.mkdir(mode=0o700, parents=True)
     try:
