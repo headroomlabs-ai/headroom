@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from urllib.parse import urlparse
 
 OPENCODE_ZEN_HOSTS = {"opencode.ai", "www.opencode.ai"}
@@ -47,6 +48,21 @@ CUSTOM_BASE_CHAT_PROVIDERS = {
 
 # Fixed label for chat traffic on any other custom base.
 CUSTOM_BASE_PROVIDER = "custom"
+
+
+def is_openai_compatible_passthrough(provider: str | None, headers: Mapping[str, str]) -> bool:
+    """Return whether a passthrough request targets an OpenAI-compatible API.
+
+    Unlabelled requests are classified by the auth headers that
+    ``select_passthrough_base_url`` routes on.
+    """
+    if provider == "openai":
+        return True
+    if provider and (provider in {"anthropic", "gemini"} or provider.startswith("vertex:")):
+        return False
+    from headroom.providers.registry import _is_anthropic_auth
+
+    return not (headers.get("x-goog-api-key") or _is_anthropic_auth(headers))
 
 
 def is_opencode_zen_base(base_url: str | None) -> bool:

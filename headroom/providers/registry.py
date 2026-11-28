@@ -95,13 +95,18 @@ class ProxyProviderRuntime:
         return self.api_targets.openai
 
 
-def _normalize_api_url(url: str | None, *, default: str) -> str:
+def _normalize_api_url(url: str | None, *, default: str, keep_versioned_v1: bool = False) -> str:
     if not url:
         return default
 
     normalized = url.rstrip("/")
     if normalized.endswith("/v1"):
-        normalized = normalized[:-3]
+        from headroom.copilot_auth import _ends_in_version_segment
+
+        # ``https://gw/api/v3/v1``: the /v1 is part of a vendor path that is already
+        # versioned, so stripping it would send traffic to ``/api/v3`` instead.
+        if not (keep_versioned_v1 and _ends_in_version_segment(normalized[:-3])):
+            normalized = normalized[:-3]
     return normalized
 
 
@@ -172,7 +177,9 @@ def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
     """Resolve normalized upstream provider targets from configured overrides."""
     from headroom.copilot_auth import is_copilot_upstream_url
 
-    openai = _normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL)
+    openai = _normalize_api_url(
+        overrides.openai, default=DEFAULT_OPENAI_API_URL, keep_versioned_v1=True
+    )
 
     # GitHub Copilot serves BOTH its OpenAI surface (``/chat/completions``,
     # ``/responses``) and its Anthropic surface (``/v1/messages``, for Claude

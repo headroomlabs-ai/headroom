@@ -1715,6 +1715,32 @@ def test_no_proxy_with_openai_api_url_rejects_mismatched_listener(
     assert "headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1" in message
 
 
+@pytest.mark.parametrize(
+    ("running", "requested"),
+    [
+        ("https://gateway.example/api/v3", "https://gateway.example/api/v3/v1"),
+        ("https://gateway.example/api/v3/v1", "https://gateway.example/api/v3"),
+    ],
+)
+def test_no_proxy_rejects_a_listener_that_routes_a_versioned_base_differently(
+    monkeypatch: pytest.MonkeyPatch, running: str, requested: str
+) -> None:
+    """``/api/v3`` and ``/api/v3/v1`` are distinct upstreams, so neither reuses the other."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: _no_proxy_health(running))
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._ensure_proxy_unlocked(
+            8787, True, openai_api_url=requested, require_openai_api_url=True
+        )
+    assert f"{running}, not {requested}" in str(excinfo.value)
+
+    # An exact match is still reused.
+    assert wrap_mod._ensure_proxy_unlocked(
+        8787, True, openai_api_url=f"{running}/", require_openai_api_url=True
+    ) == (None, 8787)
+
+
 def test_no_proxy_without_required_openai_api_url_keeps_lenient_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

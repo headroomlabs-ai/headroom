@@ -555,6 +555,23 @@ def test_proxy_routing_mismatches_detects_backend_and_urls(monkeypatch) -> None:
         )
         == []
     )
+    # Under an already versioned path the OpenAI /v1 selects a different upstream ...
+    versioned = "https://gateway.example/api/v3"
+    for running, requested in ((versioned, f"{versioned}/v1"), (f"{versioned}/v1", versioned)):
+        assert check(
+            {"backend": "anthropic", "openai_api_url": running},
+            backend=None,
+            requested_api_urls={"openai_api_url": requested},
+        ) == ["openai_api_url"]
+    # ... but not for the other providers, whose trailing /v1 routing still drops.
+    assert (
+        check(
+            {"backend": "anthropic", "anthropic_api_url": versioned},
+            backend=None,
+            requested_api_urls={"anthropic_api_url": f"{versioned}/v1"},
+        )
+        == []
+    )
     # Captive provider paths are semantic; /v1 is not a removable transport
     # convention for their REST catch-all routing.
     assert check(

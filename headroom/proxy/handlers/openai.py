@@ -134,6 +134,7 @@ from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
 from headroom.proxy.passthrough import (
     CUSTOM_BASE_PROVIDER,
+    is_openai_compatible_passthrough,
     is_opencode_zen_base,
     provider_label_from_model,
 )
@@ -12564,7 +12565,11 @@ class OpenAIHandlerMixin:
         # passthrough prefixes; joining those paths onto the base URL's own
         # path would double or misroot the upstream URL.
         origin_passthrough_url = resolve_origin_passthrough_url(base_url, path)
-        url = origin_passthrough_url or build_copilot_upstream_url(base_url, path)
+        url = origin_passthrough_url or build_copilot_upstream_url(
+            base_url,
+            path,
+            openai_compatible=is_openai_compatible_passthrough(provider, request.headers),
+        )
 
         # Preserve query string parameters
         if request.url.query:
@@ -12849,7 +12854,11 @@ class OpenAIHandlerMixin:
 
         start_time = _start_time if _start_time is not None else time.time()
         path = request.url.path
-        url = build_copilot_upstream_url(base_url, path)
+        url = build_copilot_upstream_url(
+            base_url,
+            path,
+            openai_compatible=is_openai_compatible_passthrough(provider, request.headers),
+        )
         if request.url.query:
             url = f"{url}?{request.url.query}"
 

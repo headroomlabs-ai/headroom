@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import Response
 
+from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.handlers._failure_logging import log_request_failure
 from headroom.proxy.helpers import (
@@ -1007,7 +1008,7 @@ class BatchHandlerMixin:
                 "metadata": compression_metadata,
             }
 
-            url = f"{self.OPENAI_API_URL}/v1/batches"
+            url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/batches")
 
             # Byte-faithful re-serialization (PR-A3, fixes P0-2).
             # batch_body is synthesized by Headroom (compressed file_id +
@@ -1095,7 +1096,7 @@ class BatchHandlerMixin:
 
     async def _download_openai_file(self, file_id: str, headers: dict) -> str | None:
         """Download file content from OpenAI."""
-        url = f"{self.OPENAI_API_URL}/v1/files/{file_id}/content"
+        url = build_copilot_upstream_url(self.OPENAI_API_URL, f"/v1/files/{file_id}/content")
         try:
             response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
             if response.status_code == 200:
@@ -1108,7 +1109,7 @@ class BatchHandlerMixin:
 
     async def _upload_openai_file(self, content: str, filename: str, headers: dict) -> str | None:
         """Upload a file to OpenAI for batch processing."""
-        url = f"{self.OPENAI_API_URL}/v1/files"
+        url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/files")
 
         # Prepare multipart form data
         # We need to use httpx's files parameter for multipart upload
@@ -1318,7 +1319,7 @@ class BatchHandlerMixin:
             request_id=None,
         )
 
-        url = f"{self.OPENAI_API_URL}/v1/batches"
+        url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/batches")
 
         # Best effort: capture the original (decompressed) bytes so the
         # passthrough is truly byte-faithful. If the body was already
@@ -1382,12 +1383,12 @@ class BatchHandlerMixin:
 
     async def handle_batch_list(self, request: Request) -> Response:
         """Handle GET /v1/batches - List batches (passthrough)."""
-        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+        return await self.handle_passthrough(request, self.OPENAI_API_URL, provider="openai")
 
     async def handle_batch_get(self, request: Request, batch_id: str) -> Response:
         """Handle GET /v1/batches/{batch_id} - Get batch (passthrough)."""
-        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+        return await self.handle_passthrough(request, self.OPENAI_API_URL, provider="openai")
 
     async def handle_batch_cancel(self, request: Request, batch_id: str) -> Response:
         """Handle POST /v1/batches/{batch_id}/cancel - Cancel batch (passthrough)."""
-        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+        return await self.handle_passthrough(request, self.OPENAI_API_URL, provider="openai")
